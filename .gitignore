@@ -1,0 +1,6 @@
+/target
+*.log
+.DS_Store
+
+# Local test data: never redistributed, may be copyrighted
+fixtures/local/
