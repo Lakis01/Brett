@@ -6,4 +6,5 @@
 pub mod app;
 pub mod domain;
 pub mod library;
+pub mod position;
 pub mod ui;

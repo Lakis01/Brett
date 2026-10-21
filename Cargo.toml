@@ -16,6 +16,7 @@ egui = "0.37"
 shakmaty = "0.30"
 pgn-reader = "0.29"
 image = { version = "0.25", default-features = false, features = ["png"] }
+memmap2 = "0.9"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

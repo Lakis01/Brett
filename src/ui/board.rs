@@ -1,4 +1,4 @@
-use egui::{Color32, Rect, Sense, Ui, Vec2, pos2};
+use egui::{Color32, Pos2, Rect, Sense, Stroke, StrokeKind, Ui, Vec2, pos2};
 use shakmaty::{Chess, Color, File, Position, Rank, Square};
 
 use crate::ui::pieces::PieceTextures;
@@ -8,6 +8,16 @@ const DARK: Color32 = Color32::from_rgb(0x77, 0x96, 0x56);
 const LAST_MOVE: Color32 = Color32::from_rgba_premultiplied(0x58, 0x54, 0x15, 0x70);
 const SELECTED: Color32 = Color32::from_rgba_premultiplied(0x12, 0x51, 0x24, 0x90);
 const TARGET: Color32 = Color32::from_rgba_premultiplied(0x06, 0x13, 0x06, 0x66);
+const DROP_TARGET: Color32 = Color32::from_rgba_premultiplied(0xE6, 0xF0, 0xDA, 0x38);
+
+/// One user interaction on the board.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BoardEvent {
+    Click(Square),
+    DragStart(Square),
+    Drop { from: Square, to: Square },
+    DragCancel,
+}
 
 pub struct BoardState<'a> {
     pub pos: &'a Chess,
@@ -15,12 +25,14 @@ pub struct BoardState<'a> {
     pub last_move: Option<(Square, Square)>,
     pub selected: Option<Square>,
     pub targets: &'a [Square],
+    /// Square currently being dragged, if any. Kept by the app across frames.
+    pub drag_from: Option<Square>,
 }
 
-/// Draw an interactive board. Returns the square that was clicked, if any.
-pub fn draw(ui: &mut Ui, tex: &PieceTextures, st: BoardState<'_>, side: f32) -> Option<Square> {
+/// Draw an interactive board. Pieces can be moved by clicking or by dragging.
+pub fn draw(ui: &mut Ui, tex: &PieceTextures, st: BoardState<'_>, side: f32) -> Option<BoardEvent> {
     let side = side.clamp(64.0, 4096.0);
-    let (rect, response) = ui.allocate_exact_size(Vec2::splat(side), Sense::click());
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(side), Sense::click_and_drag());
     let painter = ui.painter_at(rect);
     let cell = side / 8.0;
 
@@ -34,6 +46,21 @@ pub fn draw(ui: &mut Ui, tex: &PieceTextures, st: BoardState<'_>, side: f32) -> 
             Vec2::splat(cell),
         )
     };
+
+    let pointer = response.interact_pointer_pos();
+    let hovered = pointer.and_then(|p| square_at_pos(rect, cell, p, st.orientation));
+    let press_origin = ui.input(|i| i.pointer.press_origin());
+    let drag_origin = press_origin
+        .and_then(|p| square_at_pos(rect, cell, p, st.orientation))
+        .or(hovered);
+    let just_started = response
+        .drag_started()
+        .then_some(drag_origin)
+        .flatten()
+        .filter(|sq| is_movable(st.pos, *sq));
+    let active_drag = (response.dragged() || response.drag_started() || response.drag_stopped())
+        .then(|| st.drag_from.or(just_started))
+        .flatten();
 
     for row in 0..8 {
         for col in 0..8 {
@@ -92,19 +119,32 @@ pub fn draw(ui: &mut Ui, tex: &PieceTextures, st: BoardState<'_>, side: f32) -> 
     for sq in st.targets {
         let r = square_rect(*sq);
         if st.pos.board().piece_at(*sq).is_some() {
-            painter.circle_stroke(
-                r.center(),
-                cell * 0.42,
-                egui::Stroke::new(cell * 0.07, TARGET),
-            );
+            painter.circle_stroke(r.center(), cell * 0.42, Stroke::new(cell * 0.07, TARGET));
         } else {
             painter.circle_filled(r.center(), cell * 0.14, TARGET);
         }
     }
 
+    if active_drag.is_some()
+        && let Some(to) = hovered
+        && st.targets.contains(&to)
+    {
+        let r = square_rect(to);
+        painter.rect_filled(r, 0.0, DROP_TARGET);
+        painter.rect_stroke(
+            r.shrink(2.0),
+            0.0,
+            Stroke::new(2.0, Color32::from_white_alpha(180)),
+            StrokeKind::Inside,
+        );
+    }
+
     for row in 0..8 {
         for col in 0..8 {
             let sq = square_at(col, row, st.orientation);
+            if active_drag == Some(sq) {
+                continue;
+            }
             if let Some(piece) = st.pos.board().piece_at(sq)
                 && let Some(texture) = tex.get(piece)
             {
@@ -119,17 +159,64 @@ pub fn draw(ui: &mut Ui, tex: &PieceTextures, st: BoardState<'_>, side: f32) -> 
         }
     }
 
-    if response.clicked()
-        && let Some(p) = response.interact_pointer_pos()
+    if let Some(from) = active_drag
+        && let Some(piece) = st.pos.board().piece_at(from)
+        && let Some(texture) = tex.get(piece)
     {
-        let col = ((p.x - rect.left()) / cell).floor();
-        let row = ((p.y - rect.top()) / cell).floor();
-        if (0.0..8.0).contains(&col) && (0.0..8.0).contains(&row) {
-            return Some(square_at(col as i32, row as i32, st.orientation));
+        let center = pointer.unwrap_or_else(|| square_rect(from).center());
+        let r = Rect::from_center_size(center, Vec2::splat(cell * 0.96));
+        painter.image(
+            texture.id(),
+            r,
+            Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+            Color32::from_white_alpha(235),
+        );
+    }
+
+    if active_drag.is_some() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+    } else if hovered.is_some_and(|sq| is_movable(st.pos, sq)) {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+    }
+
+    if response.drag_stopped()
+        && let Some(from) = active_drag
+    {
+        if let Some(to) = hovered
+            && to != from
+        {
+            return Some(BoardEvent::Drop { from, to });
         }
+        return Some(BoardEvent::DragCancel);
+    }
+
+    if let Some(from) = just_started {
+        return Some(BoardEvent::DragStart(from));
+    }
+
+    if response.clicked()
+        && let Some(sq) = hovered
+    {
+        return Some(BoardEvent::Click(sq));
     }
 
     None
+}
+
+fn is_movable(pos: &Chess, sq: Square) -> bool {
+    pos.board()
+        .piece_at(sq)
+        .is_some_and(|piece| piece.color == pos.turn())
+}
+
+fn square_at_pos(rect: Rect, cell: f32, p: Pos2, orientation: Color) -> Option<Square> {
+    let col = ((p.x - rect.left()) / cell).floor();
+    let row = ((p.y - rect.top()) / cell).floor();
+    if (0.0..8.0).contains(&col) && (0.0..8.0).contains(&row) {
+        Some(square_at(col as i32, row as i32, orientation))
+    } else {
+        None
+    }
 }
 
 fn is_dark(sq: Square) -> bool {
@@ -188,6 +275,23 @@ mod tests {
                 assert_eq!(square_at(col, row, orientation), sq);
             }
         }
+    }
+
+    #[test]
+    fn pointer_positions_map_to_squares() {
+        let rect = Rect::from_min_size(pos2(10.0, 20.0), Vec2::splat(800.0));
+        assert_eq!(
+            square_at_pos(rect, 100.0, pos2(15.0, 25.0), Color::White),
+            Some(Square::A8)
+        );
+        assert_eq!(
+            square_at_pos(rect, 100.0, pos2(805.0, 815.0), Color::White),
+            Some(Square::H1)
+        );
+        assert_eq!(
+            square_at_pos(rect, 100.0, pos2(5.0, 25.0), Color::White),
+            None
+        );
     }
 
     #[test]
