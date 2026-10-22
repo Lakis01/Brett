@@ -2637,14 +2637,14 @@ fn player_rating(game: &Game, color: Color) -> Option<String> {
     };
     if let Some(elo) = game
         .header(elo_key)
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .filter(|value| *value > 0)
     {
         return Some(elo.to_string());
     }
     game.header(dwz_key)
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .filter(|value| *value > 0)
         .map(|dwz| format!("DWZ {dwz}"))
 }
 
@@ -2725,37 +2725,43 @@ fn game_tags_card(
                     if game.headers.is_empty() {
                         ui.label(RichText::new("No tags.").weak().italics());
                     }
-                    egui::Grid::new("pgn-tags-grid")
-                        .num_columns(3)
-                        .spacing([6.0, 4.0])
-                        .striped(true)
+                    egui::ScrollArea::vertical()
+                        .id_salt("pgn-tags-scroll")
+                        .max_height(230.0)
+                        .auto_shrink([false, false])
                         .show(ui, |ui| {
-                            for (index, (name, value)) in game.headers.iter().enumerate() {
-                                ui.label(
-                                    RichText::new(name)
-                                        .monospace()
-                                        .small()
-                                        .color(Color32::from_gray(175)),
-                                );
-                                let mut edited = value.clone();
-                                let response = ui.add(
-                                    egui::TextEdit::singleline(&mut edited)
-                                        .id_salt(("pgn-tag", index))
-                                        .desired_width(205.0)
-                                        .hint_text("value"),
-                                );
-                                if response.changed() {
-                                    *tag_update = Some((index, edited));
-                                }
-                                if ui
-                                    .small_button("×")
-                                    .on_hover_text("Remove this tag")
-                                    .clicked()
-                                {
-                                    *tag_delete = Some(index);
-                                }
-                                ui.end_row();
-                            }
+                            egui::Grid::new("pgn-tags-grid")
+                                .num_columns(3)
+                                .spacing([6.0, 4.0])
+                                .striped(true)
+                                .show(ui, |ui| {
+                                    for (index, (name, value)) in game.headers.iter().enumerate() {
+                                        ui.label(
+                                            RichText::new(name)
+                                                .monospace()
+                                                .small()
+                                                .color(Color32::from_gray(175)),
+                                        );
+                                        let mut edited = value.clone();
+                                        let response = ui.add(
+                                            egui::TextEdit::singleline(&mut edited)
+                                                .id_salt(("pgn-tag", index))
+                                                .desired_width(205.0)
+                                                .hint_text("value"),
+                                        );
+                                        if response.changed() {
+                                            *tag_update = Some((index, edited));
+                                        }
+                                        if ui
+                                            .small_button("×")
+                                            .on_hover_text("Remove this tag")
+                                            .clicked()
+                                        {
+                                            *tag_delete = Some(index);
+                                        }
+                                        ui.end_row();
+                                    }
+                                });
                         });
                     ui.add_space(3.0);
                     ui.menu_button("+ Add tag", |ui| {
