@@ -5,9 +5,10 @@ dependency and user value, not by estimated effort. Completed work is recorded
 in `README.md`; this file tracks what is next.
 
 **Status (2026-10-22):** items 1 (UCI panel and engine settings), 2 (game
-review), 3 (PGN clocks beside the board), 4 (castling drag), and 5 (preparation
-view v2 and recent games) are implemented. Item 6, predictor v2 and the static
-reference distribution, is next.
+review), 3 (PGN clocks beside the board), 4 (castling drag), 5 (preparation
+view v2 and recent games), and 6 (predictor v2 and the static reference
+distribution) are implemented. Deferred predictor refinements are recorded
+under item 6.
 
 Game review follow-ups that are intentionally deferred: position-index book
 marking and review caching. Clock display currently lives in the board player
@@ -109,6 +110,17 @@ whose rows open a read-only preview without losing preparation state.
 **Depends on:** player book and prediction model.
 
 ## 6. Predictor v2 and a static reference distribution
+
+**Status:** implemented. Predictions now report posterior means and approximate
+90% credible intervals, reserve probability for unobserved legal moves, scale
+background strength with sample size, and use an optional separately cached
+rating-filtered reference index with a visible fallback. `predictor_eval`
+reports held-out log loss, Brier score, top-k accuracy, and top-1 calibration
+against frequency and Elo-filtered frequency baselines. Color and
+transpositions are handled through the player book and position keys, and move
+popularity through the background counts. Time-control, event/era,
+opponent-rating, local-engine, and fully incremental reference-refresh features
+remain deferred; a changed reference source rebuilds the cached window.
 
 **Goal:** make preparation probabilities honest, calibrated, and less dependent
 on the loaded player database.

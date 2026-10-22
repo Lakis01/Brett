@@ -18,10 +18,12 @@ use crate::engine::{EngineEvent, EngineHandle, EngineInfo, EngineOptions, Score,
 use crate::library::{GameLibrary, PgnLibrary};
 use crate::online::{self, ImportResult, OnlineSource};
 use crate::players::{self, PlayerBook, PlayerDirectory};
-use crate::position::{self, BuildOptions, BuildProgress, PositionIndex, PositionStats};
+use crate::position::{
+    self, BuildOptions, BuildProgress, PositionIndex, PositionStats, RatingFilter,
+};
 use crate::review::{self, Quality, ReviewConfig, ReviewState};
 use crate::scid::ScidLibrary;
-use crate::settings::EnginePrefs;
+use crate::settings::{EnginePrefs, PreparationPrefs};
 use crate::ui::board::{self, BoardEvent, BoardState};
 use crate::ui::fonts;
 use crate::ui::pieces::PieceTextures;
@@ -74,6 +76,41 @@ enum PlayerBookMessage {
     Done(Result<PlayerBook, String>),
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReferenceJob {
+    path: PathBuf,
+    /// Effective reference target after applying the configured offset.
+    target: u32,
+    band: u32,
+    offset: i32,
+}
+
+impl ReferenceJob {
+    fn rating_filter(&self) -> RatingFilter {
+        RatingFilter::around(self.target, self.band)
+    }
+
+    fn label(&self) -> String {
+        let offset = if self.offset == 0 {
+            String::new()
+        } else {
+            format!(" · offset {:+}", self.offset)
+        };
+        let filter = self.rating_filter();
+        format!("{}–{} Elo{offset}", filter.min, filter.max)
+    }
+}
+
+struct ReferenceIndex {
+    index: PositionIndex,
+    job: ReferenceJob,
+}
+
+enum ReferenceMessage {
+    Progress(BuildProgress),
+    Done(ReferenceJob, Result<PositionIndex, String>),
+}
+
 enum OnlineMessage {
     Progress(String),
     Done(Result<ImportResult, String>),
@@ -100,11 +137,21 @@ struct PrepPredictionRow {
     mv: Move,
     san: String,
     probability: f64,
+    probability_low: f64,
+    probability_high: f64,
     player_games: u32,
     recent_games: u32,
+    prior_games: u32,
     last_date: u32,
     trend_pp: Option<f64>,
     tree: Option<position::MoveStat>,
+}
+
+struct PrepPredictionData {
+    rows: Vec<PrepPredictionRow>,
+    stats: Option<players::PlayerPositionStats>,
+    prediction: players::Prediction,
+    warning: Option<String>,
 }
 
 /// One move by the prepared player in the line currently on the board.
@@ -114,6 +161,8 @@ struct PrepLineRow {
     date: u32,
     tree_score: Option<f32>,
     likelihood: Option<f64>,
+    likelihood_low: Option<f64>,
+    likelihood_high: Option<f64>,
 }
 
 /// One clickable recent-game row.
@@ -164,6 +213,14 @@ pub struct App {
     prep: Option<PrepSession>,
     prep_recent_limit: usize,
     recent_preview: Option<RecentPreview>,
+    reference_path: String,
+    reference_enabled: bool,
+    reference_band: u32,
+    reference_offset: i32,
+    reference: Option<ReferenceIndex>,
+    reference_rx: Option<mpsc::Receiver<ReferenceMessage>>,
+    reference_job: Option<ReferenceJob>,
+    reference_status: String,
     /// Move whose annotation editor is open. Clicking an annotation or using
     /// the move context menu enters this mode.
     annotation_editor: Option<usize>,
@@ -219,6 +276,28 @@ impl App {
         cc.egui_ctx.set_visuals(visuals);
         fonts::install(&cc.egui_ctx);
         let engine_prefs = EnginePrefs::load();
+        let preparation_prefs = PreparationPrefs::load();
+        let reference_path = preparation_prefs
+            .reference_path
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .or_else(|| {
+                std::env::var_os("BRETT_REFERENCE")
+                    .map(PathBuf::from)
+                    .filter(|path| !path.as_os_str().is_empty())
+                    .map(|path| path.display().to_string())
+            })
+            .unwrap_or_default();
+        let reference_status = if !preparation_prefs.reference_enabled {
+            "Reference database disabled — using the current database prior (may be skewed)."
+                .to_string()
+        } else if reference_path.is_empty() {
+            "No reference database configured — using the current database prior (may be skewed)."
+                .to_string()
+        } else {
+            "Reference database configured; it will be indexed for the prepared player's rating."
+                .to_string()
+        };
 
         let mut app = Self {
             library: None,
@@ -249,6 +328,14 @@ impl App {
             prep: None,
             prep_recent_limit: 10,
             recent_preview: None,
+            reference_path,
+            reference_enabled: preparation_prefs.reference_enabled,
+            reference_band: preparation_prefs.rating_band,
+            reference_offset: preparation_prefs.rating_offset,
+            reference: None,
+            reference_rx: None,
+            reference_job: None,
+            reference_status,
             annotation_editor: None,
             annotation_focus: false,
             online_open: false,
@@ -354,18 +441,7 @@ impl App {
     }
 
     fn load_file(&mut self, path: &std::path::Path) {
-        let extension = path
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        let opened: anyhow::Result<Arc<dyn GameLibrary>> =
-            if extension == "si4" || extension == "si3" {
-                ScidLibrary::open(path).map(|library| Arc::new(library) as Arc<dyn GameLibrary>)
-            } else {
-                PgnLibrary::build(path.to_path_buf())
-                    .map(|library| Arc::new(library) as Arc<dyn GameLibrary>)
-            };
+        let opened = open_library(path);
         match opened {
             Ok(library) => {
                 let count = library.len();
@@ -493,6 +569,232 @@ impl App {
         if keep {
             self.index_rx = Some(rx);
         }
+    }
+
+    fn reference_wanted(&self) -> bool {
+        self.reference_enabled && !self.reference_path.trim().is_empty()
+    }
+
+    fn reference_target(&self, player: &players::PlayerSummary) -> Option<u32> {
+        let base = player.elo_avg()?.round() as i64;
+        Some((base + i64::from(self.reference_offset)).clamp(50, 4_000) as u32)
+    }
+
+    fn save_reference_prefs(&mut self) {
+        let prefs = PreparationPrefs {
+            reference_path: {
+                let path = self.reference_path.trim();
+                (!path.is_empty()).then(|| PathBuf::from(path))
+            },
+            reference_enabled: self.reference_enabled,
+            rating_band: self.reference_band.clamp(25, 1_000),
+            rating_offset: self.reference_offset.clamp(-1_000, 1_000),
+        };
+        if let Err(err) = prefs.save() {
+            self.reference_status = format!("Could not save reference settings: {err:#}");
+        }
+    }
+
+    fn ensure_reference_for_player(&mut self, player: &players::PlayerSummary) {
+        if !self.reference_enabled {
+            self.reference = None;
+            self.reference_rx = None;
+            self.reference_job = None;
+            self.reference_status =
+                "Reference database disabled — using the current database prior (may be skewed)."
+                    .to_string();
+            return;
+        }
+        let path = self.reference_path.trim();
+        if path.is_empty() {
+            self.reference = None;
+            self.reference_rx = None;
+            self.reference_job = None;
+            self.reference_status =
+                "No reference database configured — using the current database prior (may be skewed)."
+                    .to_string();
+            return;
+        }
+        let Some(target) = self.reference_target(player) else {
+            self.reference = None;
+            self.reference_rx = None;
+            self.reference_job = None;
+            self.reference_status = format!(
+                "{} has no usable rating; cannot build a rating-filtered reference window. Using the current database prior; it may be skewed.",
+                player.name
+            );
+            return;
+        };
+        let job = ReferenceJob {
+            path: PathBuf::from(path),
+            target,
+            band: self.reference_band.clamp(25, 1_000),
+            offset: self.reference_offset,
+        };
+        if self
+            .reference
+            .as_ref()
+            .is_some_and(|reference| reference.job == job)
+        {
+            self.reference_status = self.reference_ready_status();
+            return;
+        }
+        if self.reference_job.as_ref() == Some(&job) {
+            return;
+        }
+        self.start_reference(job);
+    }
+
+    fn reference_ready_status(&self) -> String {
+        let Some(reference) = &self.reference else {
+            return "Reference index is not ready.".to_string();
+        };
+        format!(
+            "Reference prior ready: {} · {} games · {} positions",
+            reference.job.label(),
+            games_label(reference.index.game_count()),
+            positions_label(reference.index.position_count())
+        )
+    }
+
+    fn start_reference(&mut self, job: ReferenceJob) {
+        self.reference = None;
+        self.reference_job = Some(job.clone());
+        self.reference_status = format!(
+            "Indexing reference {} for {} — using the current database prior meanwhile…",
+            job.path.display(),
+            job.label()
+        );
+        let (tx, rx) = mpsc::channel();
+        let ctx = self.ctx.clone();
+        std::thread::spawn(move || {
+            let progress_tx = tx.clone();
+            let progress_ctx = ctx.clone();
+            let thread_job = job.clone();
+            let result = open_library(&thread_job.path)
+                .and_then(|library| {
+                    let filter = Some(thread_job.rating_filter());
+                    let cache = position::reference_cache_path(&thread_job.path, filter);
+                    if let Some(index) =
+                        PositionIndex::open_cached_for_at(library.as_ref(), &cache)?
+                    {
+                        return Ok(index);
+                    }
+                    PositionIndex::build_cached_for_at(
+                        library,
+                        &cache,
+                        BuildOptions {
+                            max_plies: u32::MAX,
+                            rating_filter: filter,
+                        },
+                        move |progress| {
+                            let _ = progress_tx.send(ReferenceMessage::Progress(progress));
+                            progress_ctx.request_repaint();
+                        },
+                    )
+                })
+                .map_err(|err| format!("{err:#}"));
+            let _ = tx.send(ReferenceMessage::Done(thread_job, result));
+            ctx.request_repaint();
+        });
+        self.reference_rx = Some(rx);
+    }
+
+    fn poll_reference(&mut self) {
+        let Some(rx) = self.reference_rx.take() else {
+            return;
+        };
+        let mut keep = true;
+        loop {
+            match rx.try_recv() {
+                Ok(ReferenceMessage::Progress(progress)) => {
+                    if let Some(job) = &self.reference_job {
+                        self.reference_status = format!(
+                            "Indexing reference for {}… {} included, {} moves ({:.1}s)",
+                            job.label(),
+                            games_label(progress.games),
+                            moves_label(progress.edges),
+                            progress.elapsed.as_secs_f64()
+                        );
+                    }
+                }
+                Ok(ReferenceMessage::Done(job, Ok(index))) => {
+                    if self.reference_job.as_ref() == Some(&job) {
+                        self.reference_job = None;
+                        self.reference = Some(ReferenceIndex { index, job });
+                        self.reference_status = self.reference_ready_status();
+                    }
+                    keep = false;
+                    break;
+                }
+                Ok(ReferenceMessage::Done(job, Err(err))) => {
+                    if self.reference_job.as_ref() == Some(&job) {
+                        self.reference_job = None;
+                        self.reference = None;
+                        self.reference_status = format!(
+                            "Reference index failed: {err} — using the current database prior (may be skewed)."
+                        );
+                    }
+                    keep = false;
+                    break;
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    if self.reference_job.is_some() {
+                        self.reference_job = None;
+                        self.reference_status =
+                            "Reference index build stopped unexpectedly — using the current database prior; it may be skewed."
+                                .to_string();
+                    }
+                    keep = false;
+                    break;
+                }
+            }
+        }
+        if keep {
+            self.reference_rx = Some(rx);
+        }
+    }
+
+    fn prior_for_position(&self, key: u64) -> (Vec<position::MoveStat>, players::PriorSource) {
+        if self.reference_wanted()
+            && let Some(reference) = &self.reference
+        {
+            let moves = reference.index.moves(key);
+            if !moves.is_empty() {
+                return (moves, players::PriorSource::Reference);
+            }
+        }
+        let moves = self
+            .index
+            .as_ref()
+            .map(|index| index.moves(key))
+            .unwrap_or_default();
+        (moves, players::PriorSource::CurrentDatabase)
+    }
+
+    fn prior_warning(&self, source: players::PriorSource) -> Option<String> {
+        if source == players::PriorSource::Reference {
+            return None;
+        }
+        let warning = if !self.reference_enabled {
+            "Reference database disabled — using the current database prior; it may be skewed."
+        } else if self.reference_path.trim().is_empty() {
+            "No reference database configured — using the current database prior; it may be skewed."
+        } else if self.reference_job.is_some() {
+            "Reference index is still building — using the current database prior meanwhile."
+        } else if self
+            .reference
+            .as_ref()
+            .is_some_and(|reference| reference.index.game_count() == 0)
+        {
+            "Reference window contains no rated games — using the current database prior; it may be skewed."
+        } else if self.reference.is_some() {
+            "Reference has no games at this position — using the current database prior; it may be skewed."
+        } else {
+            "Reference prior unavailable — using the current database prior; it may be skewed."
+        };
+        Some(warning.to_string())
     }
 
     fn current_fen(&self) -> Option<String> {
@@ -974,6 +1276,7 @@ impl App {
             return;
         };
 
+        self.ensure_reference_for_player(&player);
         let our_color = if as_white { Color::White } else { Color::Black };
         let previous_game = if let Some(prep) = &self.prep {
             prep.previous_game
@@ -1522,6 +1825,9 @@ impl App {
         let mut start_black = false;
         let mut exit = false;
         let mut select_game = None;
+        let mut apply_reference = false;
+        let mut save_reference = false;
+        let mut clear_reference = false;
 
         ui.horizontal(|ui| {
             if ui.button("←").on_hover_text("All players").clicked() {
@@ -1605,6 +1911,96 @@ impl App {
             }
         });
         ui.label(RichText::new(&self.player_book_status).weak().small());
+        ui.add_space(4.0);
+        egui::CollapsingHeader::new(RichText::new("Reference database prior").strong())
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.checkbox(
+                    &mut self.reference_enabled,
+                    "Use a separate reference database",
+                )
+                .on_hover_text(
+                    "Reference games are indexed separately and filtered to the prepared player's rating window. Without one, the current database prior is used and labelled as potentially skewed.",
+                );
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.reference_path)
+                        .hint_text("/path/to/masters.pgn or reference.si4")
+                        .desired_width(f32::INFINITY),
+                );
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Rating window ±");
+                    ui.add(
+                        egui::DragValue::new(&mut self.reference_band)
+                            .range(25..=1_000)
+                            .speed(10.0)
+                            .suffix(" Elo"),
+                    );
+                    ui.label("· offset");
+                    ui.add(
+                        egui::DragValue::new(&mut self.reference_offset)
+                            .range(-1_000..=1_000)
+                            .speed(5.0)
+                            .suffix(" Elo"),
+                    );
+                });
+                if let Some(elo) = player.elo_avg() {
+                    let target = (elo.round() as i64 + i64::from(self.reference_offset))
+                        .clamp(50, 4_000) as u32;
+                    let filter = RatingFilter::around(target, self.reference_band);
+                    ui.label(
+                        RichText::new(format!(
+                            "Player average {elo:.0} → reference window {}–{} Elo",
+                            filter.min, filter.max
+                        ))
+                        .weak()
+                        .small(),
+                    );
+                } else {
+                    ui.label(
+                        RichText::new("No player rating: a rating-filtered reference cannot be built.")
+                            .weak()
+                            .small(),
+                    );
+                }
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("Save & index for this player").clicked() {
+                        apply_reference = true;
+                        save_reference = true;
+                    }
+                    if ui.button("Clear reference").clicked() {
+                        clear_reference = true;
+                        save_reference = true;
+                    }
+                });
+                ui.label(RichText::new(&self.reference_status).weak().small());
+                if let Some(reference) = &self.reference {
+                    ui.label(
+                        RichText::new(format!(
+                            "Loaded: {} · {} · prior window {}",
+                            games_label(reference.index.game_count()),
+                            positions_label(reference.index.position_count()),
+                            reference.job.label()
+                        ))
+                        .weak()
+                        .small(),
+                    );
+                }
+            });
+        if clear_reference {
+            self.reference_path.clear();
+            self.reference = None;
+            self.reference_job = None;
+            self.reference_rx = None;
+            self.reference_status =
+                "No reference database configured — using the current database prior (may be skewed)."
+                    .to_string();
+        }
+        if save_reference {
+            self.save_reference_prefs();
+        }
+        if apply_reference {
+            self.ensure_reference_for_player(&player);
+        }
         ui.separator();
 
         let row_h = 42.0;
@@ -2677,22 +3073,32 @@ impl App {
                 continue;
             };
 
-            let global = index
+            let tree = index
                 .map(|index| index.moves(parent_key))
-                .unwrap_or_default();
-            let tree = global.iter().find(|stat| stat.mv == code).copied();
+                .unwrap_or_default()
+                .into_iter()
+                .find(|stat| stat.mv == code);
             let player_move = book.and_then(|book| {
                 book.moves(parent_key)
                     .into_iter()
                     .find(|stat| stat.mv == code)
             });
-            let likelihood = book.and_then(|book| {
-                players::predict(book, parent_key, &global)
-                    .moves
-                    .iter()
-                    .find(|predicted| predicted.mv == code)
-                    .map(|predicted| predicted.probability)
+            let predicted = book.and_then(|book| {
+                let (prior, prior_source) = self.prior_for_position(parent_key);
+                players::predict(
+                    book,
+                    parent_key,
+                    &prior,
+                    prior_source,
+                    parent_pos.legal_moves().len(),
+                )
+                .moves
+                .into_iter()
+                .find(|predicted| predicted.mv == code)
             });
+            let likelihood = predicted.map(|predicted| predicted.probability);
+            let likelihood_low = predicted.map(|predicted| predicted.probability_low);
+            let likelihood_high = predicted.map(|predicted| predicted.probability_high);
             let date = player_move
                 .map(|stat| stat.last_date)
                 .filter(|&date| date != 0)
@@ -2713,6 +3119,8 @@ impl App {
                 date,
                 tree_score: tree.map(|stat| stat.score_white()),
                 likelihood,
+                likelihood_low,
+                likelihood_high,
             });
         }
         rows
@@ -2723,23 +3131,20 @@ impl App {
         prep: &PrepSession,
         pos: &Chess,
         key: u64,
-    ) -> Option<(
-        Vec<PrepPredictionRow>,
-        Option<players::PlayerPositionStats>,
-        u32,
-        u32,
-    )> {
+    ) -> Option<PrepPredictionData> {
         let book = self
             .player_book
             .as_ref()
             .filter(|book| book.player_key() == prep.player_key)?;
-        let global = self
+        let (prior, prior_source) = self.prior_for_position(key);
+        let warning = self.prior_warning(prior_source);
+        let prediction = players::predict(book, key, &prior, prior_source, pos.legal_moves().len());
+        let stats = book.stats(key);
+        let tree_moves = self
             .index
             .as_ref()
             .map(|index| index.moves(key))
             .unwrap_or_default();
-        let prediction = players::predict(book, key, &global);
-        let stats = book.stats(key);
         let rows = prediction
             .moves
             .iter()
@@ -2747,25 +3152,31 @@ impl App {
             .filter_map(|predicted| {
                 let mv = position::decode_move(pos, predicted.mv)?;
                 let san = SanPlus::from_move(pos.clone(), mv).to_string();
-                let tree = global.iter().find(|stat| stat.mv == predicted.mv).copied();
+                let tree = tree_moves
+                    .iter()
+                    .find(|stat| stat.mv == predicted.mv)
+                    .copied();
                 Some(PrepPredictionRow {
                     mv,
                     san,
                     probability: predicted.probability,
+                    probability_low: predicted.probability_low,
+                    probability_high: predicted.probability_high,
                     player_games: predicted.player_games,
                     recent_games: predicted.recent_games,
+                    prior_games: predicted.prior_games,
                     last_date: predicted.last_date,
                     trend_pp: predicted.trend_pp,
                     tree,
                 })
             })
             .collect();
-        Some((
+        Some(PrepPredictionData {
             rows,
             stats,
-            prediction.player_games,
-            prediction.recent_games,
-        ))
+            prediction,
+            warning,
+        })
     }
 
     fn prep_recent_rows(&self, prep: &PrepSession, key: u64, limit: usize) -> Vec<PrepRecentRow> {
@@ -2840,6 +3251,7 @@ impl App {
             .is_some_and(|book| book.player_key() == prep.player_key);
         let book_loading = self.player_book_job.as_deref() == Some(prep.player_key.as_str());
         let book_status = self.player_book_status.clone();
+        let reference_status = self.reference_status.clone();
         let index = self.index.as_ref();
         let index_status = self.index_status.clone();
         let index_building = self.index_rx.is_some();
@@ -2908,7 +3320,15 @@ impl App {
                                     ui.label(
                                         row.likelihood
                                             .map(|probability| {
-                                                format!("{:.0}%", probability * 100.0)
+                                                match (row.likelihood_low, row.likelihood_high) {
+                                                    (Some(low), Some(high)) => format!(
+                                                        "{:.0}% [{:.0}–{:.0}]",
+                                                        probability * 100.0,
+                                                        low * 100.0,
+                                                        high * 100.0
+                                                    ),
+                                                    _ => format!("{:.0}%", probability * 100.0),
+                                                }
                                             })
                                             .unwrap_or_else(|| "—".to_string()),
                                     );
@@ -2916,16 +3336,19 @@ impl App {
                                 }
                             });
                     }
-                } else if let Some((rows, stats, player_games, recent_games)) = &prediction_data {
+                } else if let Some(data) = &prediction_data {
+                    let rows = &data.rows;
+                    let stats = &data.stats;
+                    let prediction = &data.prediction;
+                    let warning = &data.warning;
                     if let Some(stats) = stats {
                         ui.horizontal_wrapped(|ui| {
-                            ui.label(
-                                RichText::new(format!(
-                                    "{} player games here",
-                                    games_label(stats.games as usize)
-                                ))
-                                .strong(),
-                            );
+                            let games_here = if stats.games == 1 {
+                                "1 player game here".to_string()
+                            } else {
+                                format!("{} player games here", stats.games)
+                            };
+                            ui.label(RichText::new(games_here).strong());
                             ui.label(
                                 RichText::new(format!(
                                     "W {} · D {} · L {} · score {:.0}%",
@@ -2953,21 +3376,35 @@ impl App {
                             .weak(),
                         );
                     }
+                    let prior_label = match prediction.prior_source {
+                        players::PriorSource::Reference => {
+                            format!("reference prior ({} games)", games_label(prediction.prior_games as usize))
+                        }
+                        players::PriorSource::CurrentDatabase => format!(
+                            "current-database prior ({} games)",
+                            games_label(prediction.prior_games as usize)
+                        ),
+                    };
                     ui.label(
                         RichText::new(format!(
-                            "Recency-weighted Bayes · {} player games · {} in the last 2 years · prior from the database",
-                            player_games, recent_games
+                            "Recency-weighted Bayes · {} player games · {} in the last 2 years · {}",
+                            prediction.player_games, prediction.recent_games, prior_label
                         ))
                         .weak()
                         .small(),
                     )
                     .on_hover_text(
-                        "The model applies exponential time decay (18-month half-life), a small Dirichlet prior from database move frequencies, and a two-year recent-window mixture. It is a probability estimate, not a guarantee.",
+                        "Posterior mean with an approximate 90% credible interval. The model uses exponential time decay (18-month half-life), a sample-size-shrunk Dirichlet background prior, and a two-year recent-window mixture. Probability is reserved for legal moves that are not in the data.",
                     );
+                    if let Some(warning) = warning {
+                        ui.label(RichText::new(warning).small().color(Color32::from_rgb(
+                            0xD9, 0xA6, 0x6A,
+                        )));
+                    }
 
                     if let Some(top) = rows.first() {
                         ui.add_space(6.0);
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             ui.label(RichText::new("Predicted:").strong());
                             ui.label(
                                 RichText::new(domain::figurine_san(&top.san))
@@ -2976,12 +3413,22 @@ impl App {
                                     .strong(),
                             );
                             ui.label(
-                                RichText::new(format!("{:.0}%", top.probability * 100.0))
-                                    .strong()
-                                    .color(Color32::from_rgb(0x9F, 0xD0, 0xA8)),
+                                RichText::new(format!(
+                                    "{:.0}% · 90% CI {:.0}–{:.0}%",
+                                    top.probability * 100.0,
+                                    top.probability_low * 100.0,
+                                    top.probability_high * 100.0
+                                ))
+                                .strong()
+                                .color(Color32::from_rgb(0x9F, 0xD0, 0xA8)),
+                            );
+                            ui.label(
+                                RichText::new(prediction.confidence_label())
+                                    .weak()
+                                    .small(),
                             );
                             if top.player_games == 0 {
-                                ui.label(RichText::new("database prior only").weak().small());
+                                ui.label(RichText::new("prior only").weak().small());
                             }
                         });
                     }
@@ -3006,7 +3453,12 @@ impl App {
                                 {
                                     clicked = Some(row.mv);
                                 }
-                                probability_bar(ui, row.probability);
+                                probability_bar(
+                                    ui,
+                                    row.probability,
+                                    row.probability_low,
+                                    row.probability_high,
+                                );
                             });
                             ui.horizontal_wrapped(|ui| {
                                 ui.add_space(4.0);
@@ -3046,10 +3498,34 @@ impl App {
                                     },
                                 );
                                 ui.label(RichText::new(tree).small().weak());
+                                ui.label(
+                                    RichText::new(format!(
+                                        "· model prior {}",
+                                        games_label(row.prior_games as usize)
+                                    ))
+                                    .small()
+                                    .weak(),
+                                );
                             });
                             ui.add_space(4.0);
                             ui.separator();
                         }
+                    }
+                    if prediction.unseen_probability > 0.001 {
+                        ui.add_space(2.0);
+                        ui.label(
+                            RichText::new(format!(
+                                "Other legal moves not in the data: {:.1}% ({} of {} legal moves)",
+                                prediction.unseen_probability * 100.0,
+                                prediction.unseen_moves,
+                                prediction.legal_moves
+                            ))
+                            .weak()
+                            .small(),
+                        )
+                        .on_hover_text(
+                            "Residual probability reserved for moves absent from the player book and the background prior. This is why a small sample never reaches 100%.",
+                        );
                     }
                 } else {
                     ui.add_space(4.0);
@@ -3060,6 +3536,7 @@ impl App {
                 }
 
                 ui.add_space(8.0);
+                ui.label(RichText::new(&reference_status).small().weak());
                 egui::CollapsingHeader::new(RichText::new("Opening tree").strong())
                     .default_open(true)
                     .show(ui, |ui| {
@@ -3146,7 +3623,7 @@ impl App {
 
                 ui.add_space(8.0);
                 ui.label(
-                    RichText::new("Probabilities cover moves seen in this player's or the database's games at this position. Recent games are drawn from the player book.")
+                    RichText::new("Probabilities cover moves seen in this player's games and the background prior. Residual mass is shown for other legal moves. Recent games are drawn from the player book.")
                         .weak()
                         .small(),
                 );
@@ -3519,11 +3996,16 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         self.poll_index();
         self.poll_player_book();
+        self.poll_reference();
         self.poll_online();
         self.poll_engine();
         self.poll_review();
         self.maybe_engine_analysis();
-        if self.index_rx.is_some() || self.player_book_rx.is_some() || self.online_rx.is_some() {
+        if self.index_rx.is_some()
+            || self.player_book_rx.is_some()
+            || self.reference_rx.is_some()
+            || self.online_rx.is_some()
+        {
             ctx.request_repaint_after(Duration::from_millis(150));
         }
         if self.engine_searching || (self.engine.is_some() && !self.engine_ready) {
@@ -4422,6 +4904,22 @@ fn games_label(n: usize) -> String {
     }
 }
 
+fn positions_label(n: usize) -> String {
+    if n == 1 {
+        "1 position".to_string()
+    } else {
+        format!("{n} positions")
+    }
+}
+
+fn moves_label(n: usize) -> String {
+    if n == 1 {
+        "1 move".to_string()
+    } else {
+        format!("{n} moves")
+    }
+}
+
 /// Two-line, full-width selectable row for the game list.
 fn game_row(
     ui: &mut Ui,
@@ -4461,6 +4959,20 @@ fn game_row(
 
 fn fen_string(pos: &shakmaty::Chess) -> String {
     shakmaty::fen::Fen::from_position(pos, shakmaty::EnPassantMode::Legal).to_string()
+}
+
+fn open_library(path: &std::path::Path) -> anyhow::Result<Arc<dyn GameLibrary>> {
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if extension == "si4" || extension == "si3" {
+        ScidLibrary::open(path).map(|library| Arc::new(library) as Arc<dyn GameLibrary>)
+    } else {
+        PgnLibrary::build(path.to_path_buf())
+            .map(|library| Arc::new(library) as Arc<dyn GameLibrary>)
+    }
 }
 
 fn index_summary(index: &PositionIndex) -> String {
@@ -4547,8 +5059,9 @@ fn trend_label(trend: Option<f64>) -> (String, Color32) {
     }
 }
 
-/// Horizontal probability bar used by the player-prediction table.
-fn probability_bar(ui: &mut Ui, probability: f64) {
+/// Horizontal probability bar used by the player-prediction table. The filled
+/// width is the posterior mean; the gold segment marks the 90% interval.
+fn probability_bar(ui: &mut Ui, probability: f64, low: f64, high: f64) {
     let (rect, response) = ui.allocate_exact_size(vec2(84.0, 16.0), Sense::hover());
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 3.0, Color32::from_gray(45));
@@ -4560,6 +5073,10 @@ fn probability_bar(ui: &mut Ui, probability: f64) {
             Color32::from_rgb(0x4F, 0x8A, 0x5B),
         );
     }
+    let y = rect.center().y + 5.0;
+    let low_x = rect.left() + rect.width() * low.clamp(0.0, 1.0) as f32;
+    let high_x = rect.left() + rect.width() * high.clamp(0.0, 1.0) as f32;
+    painter.line_segment([pos2(low_x, y), pos2(high_x, y)], Stroke::new(2.0, GOLD));
     painter.text(
         rect.center(),
         Align2::CENTER_CENTER,
@@ -4568,8 +5085,10 @@ fn probability_bar(ui: &mut Ui, probability: f64) {
         Color32::WHITE,
     );
     response.on_hover_text(format!(
-        "Estimated probability of this move in the next game: {:.1}%",
-        probability * 100.0
+        "Posterior mean {:.1}% · approximate 90% credible interval {:.1}–{:.1}%",
+        probability * 100.0,
+        low * 100.0,
+        high * 100.0
     ));
 }
 
@@ -4843,6 +5362,14 @@ mod tests {
             prep: None,
             prep_recent_limit: 10,
             recent_preview: None,
+            reference_path: String::new(),
+            reference_enabled: false,
+            reference_band: 200,
+            reference_offset: 0,
+            reference: None,
+            reference_rx: None,
+            reference_job: None,
+            reference_status: String::new(),
             annotation_editor: None,
             annotation_focus: false,
             online_open: false,
@@ -4945,6 +5472,48 @@ mod tests {
     }
 
     #[test]
+    fn reference_prior_is_used_only_when_enabled() {
+        let dir = std::env::temp_dir().join(format!(
+            "brett-reference-prior-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pgn_path = dir.join("reference.pgn");
+        let index_path = dir.join("reference.brettpos");
+        std::fs::write(&pgn_path, include_bytes!("../fixtures/opera.pgn")).unwrap();
+        PositionIndex::build_to(&pgn_path, &index_path, BuildOptions::default(), |_| {}).unwrap();
+        let index = PositionIndex::open(&index_path).unwrap();
+        let mut app = test_app();
+        app.reference_path = pgn_path.display().to_string();
+        app.reference = Some(ReferenceIndex {
+            index,
+            job: ReferenceJob {
+                path: pgn_path.clone(),
+                target: 2_500,
+                band: 200,
+                offset: 0,
+            },
+        });
+        let key = position::position_key(&shakmaty::Chess::default());
+
+        app.reference_enabled = false;
+        let (moves, source) = app.prior_for_position(key);
+        assert!(moves.is_empty());
+        assert_eq!(source, players::PriorSource::CurrentDatabase);
+
+        app.reference_enabled = true;
+        let (moves, source) = app.prior_for_position(key);
+        assert!(!moves.is_empty());
+        assert_eq!(source, players::PriorSource::Reference);
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn prep_line_lists_opponent_moves_with_likelihoods() {
         let pgn = b"[Event \"Prep\"]\n[White \"You\"]\n[Black \"Opponent\"]\n[Date \"2024.01.01\"]\n[Result \"*\"]\n\n1. e4 e5 2. Nf3 Nc6 *\n";
         let mut games = domain::parse_pgn(&pgn[..]).unwrap();
@@ -4978,6 +5547,10 @@ mod tests {
         );
         assert_eq!(rows[0].date, 2024_0101);
         assert!(rows.iter().all(|row| row.likelihood.is_some()));
+        assert!(
+            rows.iter()
+                .all(|row| row.likelihood_low.is_some() && row.likelihood_high.is_some())
+        );
         assert!(rows.iter().all(|row| row.tree_score.is_none()));
     }
 

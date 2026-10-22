@@ -15,9 +15,11 @@ opponent likely to play next?**
    **Tree** tab. The normal database game is kept so that **Exit prep** can
    restore it.
 5. Play your move. On the opponent's turn, the prediction panel lists candidate
-   replies with probability, games seen, recent games, last-seen date, trend,
-   and the matching database tree columns (games, W/D/L, score, Elo, years).
-   Click a row to play it, or play any other legal move on the board.
+   replies with posterior mean, approximate 90% credible interval, games seen,
+   recent games, last-seen date, trend, and the matching database tree columns
+   (games, W/D/L, score, Elo, years). A residual line reports legal moves
+   absent from the data. Click a row to play it, or play any other legal move
+   on the board.
 6. On your turn, the panel shows the prepared player's moves from the current
    line so far: move, date, database score, and the likelihood assigned before
    the move was chosen. It is never empty.
@@ -28,6 +30,12 @@ opponent likely to play next?**
    row opens a read-only game view; **Close preview** or Escape restores the
    same preparation position and tab.
 9. **Exit prep** returns to the game that was open before preparation started.
+
+An optional **Reference database prior** section on the selected-player page
+configures a separate PGN or SCID corpus for the background distribution. The
+reference is indexed only for the prepared player's rating window and cached
+away from the player's own position index. Without one, the panel uses the
+current database prior and labels it as potentially skewed.
 
 Preparation moves are ordinary game-tree edits. They stay in memory for the
 session and are kept when switching between database games; they are not
@@ -97,19 +105,30 @@ several databases.
 
 ## Prediction model
 
-The model is deliberately small and inspectable. It is a time-decayed
-Dirichlet estimate with two components.
+The model is deliberately small and inspectable. It combines a background
+prior, the selected player's repertoire, recent form, and an explicit residual
+for legal moves that were never observed. It is a hierarchical Dirichlet model,
+not a single frequency count.
 
 ### Candidate moves
 
 At a position, candidates are the union of:
 
-- moves played in the whole database at this position, and
+- moves played in the background corpus at this position, and
 - moves this player played at this position.
 
-For each database move, Brett subtracts the player's own games before using the
-remaining database frequency as a prior. This prevents the opponent's games
-from being counted twice.
+The background corpus is the configured **reference database** when it has
+games at the position. Otherwise Brett falls back to the current database and
+shows a warning that the prior may be skewed. For the current-database
+fallback, the player's own games are subtracted from the background count so
+the player is not used as their own evidence. A reference corpus is treated as
+independent and is not adjusted.
+
+Positions are keyed by a Zobrist hash, so transpositions share evidence. Color
+is implicit: the side to move at a position fixes the color of the player who
+moved from it, and the player book only records positions where the selected
+player actually moved. Move popularity is the background count used both for
+the candidate set and for the prior share.
 
 ### Recency weights
 
@@ -125,17 +144,51 @@ fixed small weight. The default half-life is **547.5 days (18 months)**.
 The same game also belongs to the recent regime when its age is at most
 **730 days (24 months)**. Recent weights are summed separately.
 
-### Prior and mixture
+### Background strength and shrinkage
+
+The background corpus is evidence in its own right. Its strength grows with
+the number of background games, but is capped so that a very large reference
+cannot erase the player's repertoire:
+
+```text
+B     = prior_games + min(sqrt(background_games), 12)
+alpha = B * background_share + smoothing
+```
+
+A sparse background receives the `prior_games` floor. A large reference earns
+up to about 15 pseudo-games of background strength. This is the explicit
+sample-size shrinkage: the player's own games matter more when the background
+is thin, and less when it is well supported.
+
+### Unobserved legal moves
+
+The candidate set contains only observed moves. Real players can choose other
+legal moves, so the model reserves a residual:
+
+```text
+unseen_alpha = unseen_prior_games   if legal_moves > candidate_count
+             = 0                    otherwise
+```
+
+This is why a move seen in **2/2** games is not displayed as 100%. A legal
+position with 20 moves, one observed player move played twice, and no
+background candidates still assigns roughly 13% to unobserved moves. When
+every legal move has been observed, the residual is zero and the probabilities
+sum to one.
+
+### Mixture
 
 For each candidate move:
 
 ```text
-alpha = prior_games * database_share + smoothing
-P_decayed = (alpha + player_weight) / (sum(alpha) + sum(player_weight))
-P_recent  = (alpha + player_recent_weight) / (sum(alpha) + sum(player_recent_weight))
+P_decayed = (alpha + player_weight) / (sum(alpha) + unseen_alpha + sum(player_weight))
+P_recent  = (alpha + player_recent_weight) / (sum(alpha) + unseen_alpha + sum(player_recent_weight))
 P         = (1 - mixture) * P_decayed + mixture * P_recent
 mixture   = recent_weight / (recent_weight + recent_mix_games)
 ```
+
+The unobserved residual is mixed the same way, so the displayed candidate
+probabilities plus the **other legal moves** line sum to one.
 
 Defaults:
 
@@ -144,26 +197,118 @@ Defaults:
 | `half_life_days` | 547.5 | 18-month exponential half-life |
 | `recent_days` | 730 | 24-month recent window |
 | `unknown_date_weight` | 0.20 | weight of an undated game |
-| `prior_games` | 3.0 | strength of the database prior |
+| `prior_games` | 3.0 | floor of background-prior strength |
 | `smoothing` | 0.05 | additive smoothing per candidate |
 | `recent_mix_games` | 2.0 | recent pseudo-games needed for half mixture |
+| `unseen_prior_games` | 0.75 | residual mass for unobserved legal moves |
 
-If the player has no observed moves at the position, the model falls back to
-the database prior and marks the row as **database prior only**. If neither the
-player nor the database has a move, the panel says so.
+### Intervals and confidence
+
+Each candidate gets an approximate **90% credible interval**. The interval uses
+the marginal Beta variance of the decayed and recent components; the mixture
+variance is conservative because it ignores their positive covariance. The UI
+shows the posterior mean as the filled part of the bar and the interval as a
+gold segment across it.
+
+The confidence label is deliberately sample-size based:
+
+- **prior only** — no player games at this position;
+- **low confidence** — 1–2 player games;
+- **moderate confidence** — 3–8 player games;
+- **good confidence** — 9–19 player games;
+- **high confidence** — 20 or more player games.
+
+A wide interval is a feature, not a bug. Small samples and unfamiliar
+positions should look uncertain.
+
+### Trend
 
 The **trend** column compares the move's share inside the recent window with its
 share outside that window, in percentage points. It is only shown when there is
 enough recent and historical data to make the comparison meaningful. Trend is
 descriptive; it is not fed back into the probability.
 
+## Reference database
+
+The selected-player page has a collapsible **Reference database prior**
+section:
+
+- **Path** — a PGN or SCID3/SCID4 database. It is opened independently of the
+  player's database. If no path has been saved yet, Brett also honours the
+  `BRETT_REFERENCE` environment variable.
+- **Use a separate reference database** — enables or disables the reference.
+- **Rating window ±** — default **200 Elo**.
+- **Offset** — an explicit rating-scale mapping added to the player's average
+  Elo before selecting the window. For example, `-75` targets a reference
+  corpus whose ratings are about 75 points lower than the player's source;
+  `+75` targets an overrated reference corpus.
+
+The mapping is explicit:
+
+```text
+target = clamp(round(player_average_elo) + offset, 50, 4000)
+window = [max(0, target - band), target + band]
+```
+
+A game enters the reference index when the mean of its available `WhiteElo`
+and `BlackElo` tags is inside the window. Games without ratings are excluded
+from a filtered reference build.
+
+Reference indexing is optional and background-only:
+
+1. Configure the path and click **Save & index for this player** (or start a
+   preparation; Brett then prepares the window automatically).
+2. The reference library is opened and its cache is checked. The cache key
+   includes the reference source and the exact rating window.
+3. A missing cache is built in a worker thread. The panel keeps using the
+   current database fallback and says so while indexing.
+4. Once ready, the panel uses the reference prior and shows the window, game
+   count, and position count.
+
+Reference indexes live under `$XDG_CACHE_HOME/brett/index/` with a tagged
+filename. They can never be confused with the player's own index or another
+player's rating window. Settings are stored in
+`$XDG_CONFIG_HOME/brett/preparation.json`. Source databases are read-only; all
+writes go to the cache directory.
+
+If the reference is disabled, missing, fails to build, contains no rated games
+in the window, or has no games at the current position, the panel falls back to
+the current database prior and shows the warning. The fallback is never silent.
+
+## Held-out evaluation
+
+The example harness splits the selected player's games chronologically, builds
+the player book and background statistics only from earlier games, and scores
+the held-out moves. Games without usable dates remain in the book but cannot
+take part in the chronological split; the report warns when the held-out set
+has no usable dates:
+
+```sh
+cargo run --release --example predictor_eval -- database.pgn "Player Name" 20
+```
+
+The last argument is the number of held-out games (default: one fifth). The
+report contains:
+
+- **log loss** — lower is better;
+- **Brier score** — multiclass squared error over the observed moves and the
+  unobserved residual, with the residual spread uniformly over the remaining
+  legal moves;
+- **top-1** and **top-3** accuracy;
+- **top-1 calibration curves** for the model and each available baseline
+  (predicted probability versus observed hit rate).
+
+It compares the full model with a frequency-only baseline and, when ratings
+are available, an Elo-filtered frequency baseline built from the same training
+games. These metrics measure the model on one corpus; they are not a promise
+about a future game.
+
 ### What the number means
 
-The probability is a calibrated estimate from observed choices, not an engine
-evaluation and not a guarantee. Small samples are dominated by the database
-prior; a player with a short or undated history will produce wide uncertainty
-even though the UI displays a single percentage. The prior uses only games in
-the loaded database.
+The probability is an estimate from observed choices, not an engine evaluation
+and not a guarantee. Small samples are shrunk toward the background prior and
+carry wide intervals. The residual line keeps the model from implying certainty
+when the data simply contains no example of the alternatives.
 
 ## Online imports
 

@@ -5,9 +5,14 @@
 //! with the move they chose and the date/result of that game.
 //!
 //! Prediction uses an exponentially time-decayed Dirichlet model. A small
-//! empirical prior comes from the whole database at the same position, and a
-//! recent-window component makes a repertoire switch visible without throwing
-//! away the player's older history.
+//! empirical prior comes from a reference database at the same position (or the
+//! loaded database when no reference is configured), and a recent-window
+//! component makes a repertoire switch visible without throwing away the
+//! player's older history.
+//!
+//! The model deliberately reserves probability mass for legal moves that have
+//! not been observed. A 2/2 move is therefore never displayed as certain, and
+//! every estimate carries an approximate 90% credible interval.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -371,9 +376,12 @@ impl PlayerPositionStats {
 
 /// Parameters of the likelihood model.
 ///
-/// These are deliberately conservative for sparse chess data. The database
-/// prior contributes about three pseudo-games, the recent window is two years,
-/// and the recent component only dominates after several recent games.
+/// These are deliberately conservative for sparse chess data. The background
+/// prior starts at about three pseudo-games and grows with the background
+/// sample size up to a cap, the recent window is two years, and the recent
+/// component only dominates after several recent games. A separate
+/// pseudo-count is reserved for legal moves that do not appear in the data, so
+/// tiny samples cannot produce a probability of 100%.
 #[derive(Clone, Copy, Debug)]
 pub struct PredictionConfig {
     /// Half-life of the general time-decay weights, in days.
@@ -382,13 +390,16 @@ pub struct PredictionConfig {
     pub recent_days: i64,
     /// Weight of a game with no usable date.
     pub unknown_date_weight: f64,
-    /// Strength of the database prior, in pseudo-games.
+    /// Strength of the background prior, in pseudo-games.
     pub prior_games: f64,
     /// Smoothing added to every candidate move.
     pub smoothing: f64,
     /// Number of recent pseudo-games needed before the recent regime gets
     /// half of the mixture weight.
     pub recent_mix_games: f64,
+    /// Total pseudo-games reserved for legal moves that are absent from both
+    /// the player book and the background distribution.
+    pub unseen_prior_games: f64,
 }
 
 impl Default for PredictionConfig {
@@ -400,6 +411,7 @@ impl Default for PredictionConfig {
             prior_games: 3.0,
             smoothing: 0.05,
             recent_mix_games: 2.0,
+            unseen_prior_games: 0.75,
         }
     }
 }
@@ -645,13 +657,33 @@ impl PlayerBook {
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct MovePrediction {
     pub mv: u32,
+    /// Posterior mean of the move's probability.
     pub probability: f64,
+    /// Lower bound of the approximate 90% credible interval.
+    pub probability_low: f64,
+    /// Upper bound of the approximate 90% credible interval.
+    pub probability_high: f64,
     pub player_games: u32,
     pub recent_games: u32,
     pub last_date: u32,
+    /// Background games supporting this move. For a current-database prior
+    /// this excludes the prepared player's own games.
+    pub prior_games: u32,
     /// Change in share between the old and recent windows, in percentage
     /// points. Positive means the player is moving toward this move.
     pub trend_pp: Option<f64>,
+}
+
+/// What supplies the background distribution for one prediction.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PriorSource {
+    /// The loaded player database. The prepared player's games are subtracted
+    /// so the player is not used as their own evidence.
+    #[default]
+    CurrentDatabase,
+    /// A separately loaded reference database. No player-game subtraction is
+    /// applied because the reference is already a background corpus.
+    Reference,
 }
 
 /// Prediction output for one position.
@@ -662,15 +694,50 @@ pub struct Prediction {
     pub recent_games: u32,
     pub recent_mix: f64,
     pub has_player_data: bool,
+    /// Posterior probability that the player chooses a legal move that is not
+    /// listed in `moves`.
+    pub unseen_probability: f64,
+    /// Number of legal moves not represented by any observation.
+    pub unseen_moves: usize,
+    pub legal_moves: usize,
+    pub prior_games: u32,
+    pub prior_source: PriorSource,
+}
+
+impl Prediction {
+    /// A compact sample-size warning for the interface.
+    pub fn confidence_label(&self) -> &'static str {
+        if !self.has_player_data {
+            "prior only"
+        } else {
+            match self.player_games {
+                0..=2 => "low confidence",
+                3..=8 => "moderate confidence",
+                9..=19 => "good confidence",
+                _ => "high confidence",
+            }
+        }
+    }
 }
 
 /// Compute the predictive distribution for the selected player's next move.
 ///
-/// The database prior is the global distribution with this player's own games
-/// removed (so the player is not used as their own evidence). Player moves are
-/// weighted with an exponential time decay and combined with a recent-window
+/// The background prior comes from `prior_source`. For
+/// [`PriorSource::CurrentDatabase`] the prepared player's own games are removed
+/// from `global`, so the player is not used as their own evidence. Player moves
+/// are weighted with an exponential time decay and combined with a recent-window
 /// distribution. Both components are Dirichlet-smoothed.
-pub fn predict(book: &PlayerBook, key: u64, global: &[MoveStat]) -> Prediction {
+///
+/// `legal_moves` is the number of legal moves in the position. Moves that have
+/// no observation receive a small residual mass, which keeps tiny samples from
+/// being displayed as certain.
+pub fn predict(
+    book: &PlayerBook,
+    key: u64,
+    global: &[MoveStat],
+    prior_source: PriorSource,
+    legal_moves: usize,
+) -> Prediction {
     let player_moves: BTreeMap<u32, PlayerMoveStat> = book
         .positions
         .get(&key)
@@ -679,7 +746,11 @@ pub fn predict(book: &PlayerBook, key: u64, global: &[MoveStat]) -> Prediction {
 
     let mut candidates: BTreeMap<u32, Candidate> = BTreeMap::new();
     for stat in global {
-        let player_games = player_moves.get(&stat.mv).map_or(0, |mv| mv.games);
+        let player_games = if prior_source == PriorSource::CurrentDatabase {
+            player_moves.get(&stat.mv).map_or(0, |mv| mv.games)
+        } else {
+            0
+        };
         let database_games = stat.games.saturating_sub(player_games);
         let entry = candidates.entry(stat.mv).or_default();
         entry.database_games = entry.database_games.saturating_add(database_games);
@@ -688,7 +759,13 @@ pub fn predict(book: &PlayerBook, key: u64, global: &[MoveStat]) -> Prediction {
         candidates.entry(code).or_default();
     }
     if candidates.is_empty() {
-        return Prediction::default();
+        return Prediction {
+            unseen_probability: if legal_moves > 0 { 1.0 } else { 0.0 },
+            unseen_moves: legal_moves,
+            legal_moves,
+            prior_source,
+            ..Prediction::default()
+        };
     }
 
     let database_total: u64 = candidates
@@ -698,7 +775,18 @@ pub fn predict(book: &PlayerBook, key: u64, global: &[MoveStat]) -> Prediction {
     let candidate_count = candidates.len() as f64;
     let total_weight: f64 = player_moves.values().map(|mv| mv.weighted).sum();
     let recent_weight: f64 = player_moves.values().map(|mv| mv.recent_weighted).sum();
+    let unseen_moves = legal_moves.saturating_sub(candidates.len());
+    let unseen_alpha = if unseen_moves > 0 {
+        book.config.unseen_prior_games.max(0.0)
+    } else {
+        0.0
+    };
 
+    // The background corpus is itself evidence, but its influence is capped so
+    // a multi-million-game reference cannot completely erase a player's
+    // repertoire. Sample-size shrinkage remains explicit: sparse backgrounds
+    // receive the configured floor, larger ones earn more strength.
+    let background_strength = book.config.prior_games + (database_total as f64).sqrt().min(12.0);
     let mut prior_total = 0.0;
     for candidate in candidates.values_mut() {
         let share = if database_total > 0 {
@@ -706,12 +794,12 @@ pub fn predict(book: &PlayerBook, key: u64, global: &[MoveStat]) -> Prediction {
         } else {
             1.0 / candidate_count
         };
-        candidate.alpha = book.config.prior_games * share + book.config.smoothing;
+        candidate.alpha = background_strength * share + book.config.smoothing;
         prior_total += candidate.alpha;
     }
 
-    let decay_total = prior_total + total_weight;
-    let recent_total = prior_total + recent_weight;
+    let decay_total = prior_total + unseen_alpha + total_weight;
+    let recent_total = prior_total + unseen_alpha + recent_weight;
     let recent_mix = if recent_weight > 0.0 {
         recent_weight / (recent_weight + book.config.recent_mix_games)
     } else {
@@ -731,6 +819,19 @@ pub fn predict(book: &PlayerBook, key: u64, global: &[MoveStat]) -> Prediction {
         };
         let probability = (1.0 - recent_mix) * decay_probability + recent_mix * recent_probability;
 
+        // Approximate the marginal Beta posterior of this move against all
+        // other moves. The mixture variance is conservative: it ignores the
+        // positive covariance between the two shared-prior components.
+        let decay_variance =
+            beta_variance(decay_probability, prior_total + unseen_alpha + total_weight);
+        let recent_variance = beta_variance(
+            recent_probability,
+            prior_total + unseen_alpha + recent_weight,
+        );
+        let variance =
+            (1.0 - recent_mix).powi(2) * decay_variance + recent_mix.powi(2) * recent_variance;
+        let margin = CREDIBLE_Z_90 * variance.sqrt();
+
         let trend_pp = if recent_weight > 0.0 && total_weight > recent_weight {
             let recent_share = player.recent_weighted / recent_weight;
             let historical_weight = (player.weighted - player.recent_weighted).max(0.0);
@@ -745,9 +846,12 @@ pub fn predict(book: &PlayerBook, key: u64, global: &[MoveStat]) -> Prediction {
         moves.push(MovePrediction {
             mv: code,
             probability,
+            probability_low: (probability - margin).clamp(0.0, 1.0),
+            probability_high: (probability + margin).clamp(0.0, 1.0),
             player_games: player.games,
             recent_games: player.recent_games,
             last_date: player.last_date,
+            prior_games: candidate.database_games,
             trend_pp,
         });
     }
@@ -759,13 +863,42 @@ pub fn predict(book: &PlayerBook, key: u64, global: &[MoveStat]) -> Prediction {
             .then(a.mv.cmp(&b.mv))
     });
 
+    let unseen_probability = if unseen_alpha > 0.0 {
+        let decay_unseen = unseen_alpha / decay_total;
+        let recent_unseen = if recent_weight > 0.0 {
+            unseen_alpha / recent_total
+        } else {
+            decay_unseen
+        };
+        (1.0 - recent_mix) * decay_unseen + recent_mix * recent_unseen
+    } else {
+        0.0
+    };
+
     Prediction {
         moves,
         player_games,
         recent_games,
         recent_mix,
         has_player_data: total_weight > 0.0,
+        unseen_probability,
+        unseen_moves,
+        legal_moves,
+        prior_games: database_total.min(u64::from(u32::MAX)) as u32,
+        prior_source,
     }
+}
+
+/// Standard normal quantile for a two-sided 90% interval.
+const CREDIBLE_Z_90: f64 = 1.644_853_626_951_472_2;
+
+/// Beta variance for a marginal with mean `mean` and concentration
+/// `alpha + beta`.
+fn beta_variance(mean: f64, concentration: f64) -> f64 {
+    if concentration <= 0.0 {
+        return 0.0;
+    }
+    mean * (1.0 - mean) / (concentration + 1.0)
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -1060,7 +1193,13 @@ mod tests {
             )
             .unwrap();
         let key = position::position_key(&after_e4);
-        let prediction = predict(&book, key, &[]);
+        let prediction = predict(
+            &book,
+            key,
+            &[],
+            PriorSource::CurrentDatabase,
+            after_e4.legal_moves().len(),
+        );
         assert!(prediction.has_player_data);
         assert_eq!(prediction.player_games, 8);
         let c5 = prediction
@@ -1126,10 +1265,80 @@ mod tests {
                 ..MoveStat::default()
             },
         ];
-        let prediction = predict(&book, key, &global);
+        let prediction = predict(
+            &book,
+            key,
+            &global,
+            PriorSource::CurrentDatabase,
+            start.legal_moves().len(),
+        );
         assert!(!prediction.has_player_data);
         assert_eq!(prediction.moves[0].mv, global[0].mv);
         assert!(prediction.moves[0].probability > 0.8);
+        assert!(prediction.moves[0].probability < 1.0);
+        assert!(prediction.moves[0].probability_high > prediction.moves[0].probability);
+        assert!(prediction.unseen_probability > 0.0);
+    }
+
+    #[test]
+    fn tiny_sample_is_not_certain() {
+        let pgn = r#"
+[Event "First"]
+[Site "Test"]
+[Date "2025.01.01"]
+[White "Opponent"]
+[Black "Twice"]
+[Result "1-0"]
+
+1. e4 e5 2. Nf3 Nc6 1-0
+
+[Event "Second"]
+[Site "Test"]
+[Date "2025.02.01"]
+[White "Opponent"]
+[Black "Twice"]
+[Result "0-1"]
+
+1. e4 e5 2. Bc4 Nf6 0-1
+"#;
+        let games = domain::parse_pgn(pgn.as_bytes()).unwrap();
+        let book = PlayerBook::from_games(
+            "twice",
+            "Twice",
+            &games,
+            PredictionConfig::default(),
+            2025_0301,
+        );
+        let start = shakmaty::Chess::default();
+        let after_e4 = start
+            .clone()
+            .play(
+                shakmaty::san::SanPlus::from_ascii(b"e4")
+                    .unwrap()
+                    .san
+                    .to_move(&start)
+                    .unwrap(),
+            )
+            .unwrap();
+        let key = position::position_key(&after_e4);
+        let prediction = predict(
+            &book,
+            key,
+            &[],
+            PriorSource::CurrentDatabase,
+            after_e4.legal_moves().len(),
+        );
+        assert_eq!(prediction.player_games, 2);
+        assert_eq!(prediction.moves.len(), 1);
+        let move_prediction = prediction.moves[0];
+        assert!(move_prediction.probability < 1.0);
+        assert!(move_prediction.probability > 0.8);
+        assert!(move_prediction.probability_low < move_prediction.probability);
+        assert!(move_prediction.probability_high > move_prediction.probability);
+        assert!(prediction.unseen_probability > 0.0);
+        assert_eq!(prediction.unseen_moves, after_e4.legal_moves().len() - 1);
+        assert_eq!(prediction.confidence_label(), "low confidence");
+        assert!((move_prediction.probability + prediction.unseen_probability - 1.0).abs() < 1e-9);
     }
 
     #[test]

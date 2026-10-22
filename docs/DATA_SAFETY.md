@@ -44,7 +44,7 @@ format reference and fixture provenance are documented in
 
 ## Derived data
 
-Position indexes live only under:
+Player and reference position indexes live only under:
 
 ```text
 $XDG_CACHE_HOME/brett/index/       (or ~/.cache/brett/index/)
@@ -56,11 +56,12 @@ Online imports live only under:
 $XDG_CACHE_HOME/brett/online/      (or ~/.cache/brett/online/)
 ```
 
-User preferences, including the selected UCI engine path, thread count, and hash
-size, live under:
+User preferences, including the selected UCI engine path, thread count, hash
+size, and reference-database settings, live under:
 
 ```text
-$XDG_CONFIG_HOME/brett/engine.json (or ~/.config/brett/engine.json)
+$XDG_CONFIG_HOME/brett/engine.json       (or ~/.config/brett/engine.json)
+$XDG_CONFIG_HOME/brett/preparation.json  (or ~/.config/brett/preparation.json)
 ```
 
 Nothing is written beside a source database. A cache index is keyed by the

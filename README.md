@@ -38,20 +38,30 @@ its UI, and not a Wine package.
   **Prepare as Black**. Brett creates a scratch preparation game and opens the
   Tree tab.
 - For each opponent turn, the prediction panel shows likely replies, their
-  probability, the player's games/recent games/last-seen date/trend, and the
-  matching database tree columns (games, W/D/L, score, Elo, and years). Click a
-  row to play that reply.
+  posterior mean and approximate 90% credible interval, the player's
+  games/recent games/last-seen date/trend, and the matching database tree
+  columns (games, W/D/L, score, Elo, and years). Click a row to play that reply.
+- Probability mass is reserved for legal moves that do not appear in the data,
+  so a move seen in 2/2 games is not shown as certain. The panel also shows a
+  sample-size confidence label.
 - At your turn the panel switches to the prepared player's moves so far in the
-  current line, with each move's date, database score, and the likelihood it
-  had before it was played.
+  current line, with each move's date, database score, and the likelihood and
+  interval it had before it was played.
 - The normal opening tree for the current position is always visible below the
   preparation section.
 - **Recent games** lists the newest games in the player book that reached the
   current position. The limit is configurable (default 10). Clicking a game
   opens a read-only view; closing it returns to the same preparation position.
-- The model is a time-decayed Dirichlet estimate with a database prior and a
-  recent-window mixture. Defaults: 18-month half-life, 24-month recent window,
-  3 pseudo-games of database prior, and a 2-pseudo-game recent mixture.
+- The model is a time-decayed Dirichlet estimate with a background prior, a
+  recent-window mixture, and an explicit residual for unobserved legal moves.
+  Defaults: 18-month half-life, 24-month recent window, a sample-size-scaled
+  background prior, and a 2-pseudo-game recent mixture.
+- A separate reference PGN or SCID database can supply the background prior.
+  Brett indexes only the chosen rating window (default ±200 Elo, with a
+  configurable rating offset) and caches it separately from the player index.
+  If no reference is saved yet, `BRETT_REFERENCE` can supply a path. Without a
+  usable reference, the panel visibly falls back to the current database prior
+  and warns that it may be skewed.
 - Player books are built from the player's mainline games in a background
   thread. Player identities ignore punctuation and word order, so
   “Fischer, Robert James” and “Robert James Fischer” share a book.
@@ -77,7 +87,8 @@ its UI, and not a Wine package.
   then press **Apply & restart**. The settings are sent as UCI `setoption`
   commands when the engine advertises those options, saved in
   `$XDG_CONFIG_HOME/brett/engine.json` (or
-  `~/.config/brett/engine.json`), and reused at the next launch.
+  `~/.config/brett/engine.json`), and reused at the next launch. Reference
+  database settings are stored separately in `preparation.json` beside it.
 - Choose depth or time, 1–5 MultiPV lines, and auto-analysis on position change.
   Clicking a PV line plays its first move. Results from an older position are
   discarded.
@@ -155,6 +166,8 @@ cargo run --release -- path/to/database.si4
 cargo run --example report -- file.pgn           # PGN import statistics
 cargo run --example index_report -- file.pgn     # header index + lazy-load timing
 cargo run --example position_report -- file.pgn  # opening-tree index benchmark
+cargo run --example predictor_eval -- file.pgn "Player Name" 20
+                                                # chronological held-out metrics
 cargo run --example scid_report -- file.si4      # decode every SCID game
 scripts/scid-to-pgn.sh "/path/to/db" /tmp/opencode/out.pgn
 ```
@@ -170,10 +183,11 @@ never writes to the source database.
 | `src/scid.rs` | Native SCID3/SCID4 reader and `ScidLibrary` |
 | `src/position.rs` | Position index, opening-tree statistics, SCID/PGN generic builder |
 | `src/players.rs` | Player directory, per-player position books, Bayesian prediction |
+| `src/evaluation.rs` | Held-out log loss, Brier score, top-k accuracy, calibration |
 | `src/online.rs` | Public Lichess and Chess.com imports |
 | `src/domain.rs` | Game tree, PGN parsing, move lines, figurines, NAG palette, clocks |
 | `src/engine.rs` | Asynchronous UCI process, handshake, options, parser, worker threads |
-| `src/settings.rs` | Persistent engine path, thread, and hash settings |
+| `src/settings.rs` | Persistent engine and reference-database settings |
 | `src/review.rs` | Sequential game review, move grading, accuracy, eval chart data |
 | `src/app.rs` | egui application, tabs, preparation flow, annotation editor |
 | `src/ui/fonts.rs` | Embedded DejaVu Sans fallback for chess symbols |
@@ -204,8 +218,9 @@ never writes to the source database.
 - **Preparation view v2 (done).** Normal tree statistics at every turn,
   opponent move history, a configurable clickable recent-games window, and a
   read-only game preview that preserves preparation state.
-- **Predictor v2 and reference distribution:** posterior uncertainty, a static
-  and rating-matched reference distribution, and calibration checks.
+- **Predictor v2 and reference distribution (done).** Posterior uncertainty,
+  unobserved-move residual mass, a separately cached rating-matched reference
+  index, visible fallback, held-out metrics, and calibration output.
 - **Classic CBH support** for the older multi-file format (sample located;
   research pending).
 - **M2b — Mega-scale ingest.** External sorting, an on-disk header table, and
@@ -220,7 +235,7 @@ The detailed queue and acceptance criteria are in
 
 **`/home/gratis01/Chess Databases/` is treated as read-only.** Brett opens PGN
 and SCID files for reading only. Derived indexes and imported games go to
-`$XDG_CACHE_HOME/brett/`, and engine preferences go to
+`$XDG_CACHE_HOME/brett/`, and engine/reference preferences go to
 `$XDG_CONFIG_HOME/brett/`; nothing is written next to a source database.
 See [docs/DATA_SAFETY.md](docs/DATA_SAFETY.md).
 

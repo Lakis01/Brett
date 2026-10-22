@@ -1,8 +1,13 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use brett::domain;
-use brett::position::{BuildOptions, PositionIndex, decode_move, encode_move, position_key};
+use brett::library::{GameLibrary, PgnLibrary};
+use brett::position::{
+    BuildOptions, PositionIndex, RatingFilter, decode_move, encode_move, position_key,
+    reference_cache_path,
+};
 use pgn_reader::SanPlus;
 use shakmaty::{Chess, Position};
 
@@ -172,7 +177,14 @@ fn only_mainlines_are_counted() {
 
 #[test]
 fn max_plies_stops_the_index() {
-    let (pgn_path, index_path, index) = build("depth", FOUR_GAMES, BuildOptions { max_plies: 2 });
+    let (pgn_path, index_path, index) = build(
+        "depth",
+        FOUR_GAMES,
+        BuildOptions {
+            max_plies: 2,
+            ..BuildOptions::default()
+        },
+    );
     let start = Chess::default();
     assert_eq!(index.stats(position_key(&start)).unwrap().games, 4);
     let after_e4_e5 = after(start, &["e4", "e5"]);
@@ -214,6 +226,42 @@ fn missing_positions_return_none() {
     let (pgn_path, index_path, index) = build("missing", FOUR_GAMES, BuildOptions::default());
     assert!(index.stats(0xDEAD_BEEF_DEAD_BEEF).is_none());
     assert!(index.moves(0xDEAD_BEEF_DEAD_BEEF).is_empty());
+    std::fs::remove_file(pgn_path).unwrap();
+    std::fs::remove_file(index_path).unwrap();
+}
+
+#[test]
+fn reference_cache_is_separate_and_reopens() {
+    let pgn_path = temp_path("reference-cache", "pgn");
+    std::fs::write(&pgn_path, FOUR_GAMES).unwrap();
+    let library = Arc::new(PgnLibrary::build(pgn_path.clone()).unwrap()) as Arc<dyn GameLibrary>;
+    let filter = RatingFilter::around(2425, 50);
+    let index_path = reference_cache_path(&pgn_path, Some(filter));
+
+    assert!(
+        PositionIndex::open_cached_for_at(library.as_ref(), &index_path)
+            .unwrap()
+            .is_none()
+    );
+    PositionIndex::build_cached_for_at(
+        library.clone(),
+        &index_path,
+        BuildOptions {
+            rating_filter: Some(filter),
+            ..BuildOptions::default()
+        },
+        |_| {},
+    )
+    .unwrap();
+    let index = PositionIndex::open_cached_for_at(library.as_ref(), &index_path)
+        .unwrap()
+        .unwrap();
+    assert_eq!(index.game_count(), 2);
+    assert_eq!(
+        index.stats(position_key(&Chess::default())).unwrap().games,
+        2
+    );
+
     std::fs::remove_file(pgn_path).unwrap();
     std::fs::remove_file(index_path).unwrap();
 }

@@ -34,17 +34,47 @@ const HEADER_LEN: usize = 80;
 const EDGE_SIZE: usize = 48;
 const NO_PROMOTION: u32 = 7;
 
+/// Rating window used when building a reference index.
+///
+/// The filter uses the mean of the available WhiteElo and BlackElo tags. Games
+/// with no rating are excluded. The application applies any rating inflation
+/// offset before constructing the window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RatingFilter {
+    pub min: u32,
+    pub max: u32,
+}
+
+impl RatingFilter {
+    pub fn around(target: u32, half_width: u32) -> Self {
+        let half_width = half_width.min(2_000);
+        Self {
+            min: target.saturating_sub(half_width),
+            max: target.saturating_add(half_width),
+        }
+    }
+
+    fn accepts(&self, meta: &GameMeta) -> bool {
+        meta.average_elo()
+            .is_some_and(|elo| (self.min..=self.max).contains(&elo))
+    }
+}
+
 /// Build options for a position index.
 #[derive(Clone, Copy, Debug)]
 pub struct BuildOptions {
     /// Stop following a game after this many plies. `u32::MAX` means no limit.
     pub max_plies: u32,
+    /// Optional rating window for a reference corpus. Games outside the window
+    /// are not indexed. `None` indexes every game.
+    pub rating_filter: Option<RatingFilter>,
 }
 
 impl Default for BuildOptions {
     fn default() -> Self {
         Self {
             max_plies: u32::MAX,
+            rating_filter: None,
         }
     }
 }
@@ -178,37 +208,38 @@ impl PositionIndex {
     pub fn open_cached(source: impl AsRef<Path>) -> Result<Option<Self>> {
         let source = source.as_ref();
         let meta = SourceMeta::read(source)?;
-        let path = cache_path(source);
-        if !path.exists() {
-            return Ok(None);
-        }
-        match Self::open(&path) {
-            Ok(index) if index.source_matches(&meta) => Ok(Some(index)),
-            Ok(_) => Ok(None),
-            Err(err) => {
-                tracing::warn!(
-                    "ignoring stale or invalid index {}: {err:#}",
-                    path.display()
-                );
-                Ok(None)
-            }
-        }
+        Self::open_cached_at(source, &cache_path(source), &meta)
     }
 
     /// Open the cached index for a database, if it exists and is current.
     pub fn open_cached_for(library: &dyn GameLibrary) -> Result<Option<Self>> {
         let meta = library.source_meta()?;
         let path = cache_path(library.path());
-        if !path.exists() {
+        Self::open_cached_at(library.path(), &path, &meta)
+    }
+
+    /// Open a cached index at an explicit path, for callers that key the cache
+    /// by more than the source (for example a reference rating window).
+    pub fn open_cached_for_at(
+        library: &dyn GameLibrary,
+        index_path: impl AsRef<Path>,
+    ) -> Result<Option<Self>> {
+        let meta = library.source_meta()?;
+        Self::open_cached_at(library.path(), index_path.as_ref(), &meta)
+    }
+
+    fn open_cached_at(source: &Path, index_path: &Path, meta: &SourceMeta) -> Result<Option<Self>> {
+        if !index_path.exists() {
             return Ok(None);
         }
-        match Self::open(&path) {
-            Ok(index) if index.source_matches(&meta) => Ok(Some(index)),
+        match Self::open(index_path) {
+            Ok(index) if index.source_matches(meta) => Ok(Some(index)),
             Ok(_) => Ok(None),
             Err(err) => {
                 tracing::warn!(
-                    "ignoring stale or invalid index {}: {err:#}",
-                    path.display()
+                    "ignoring stale or invalid index {} for {}: {err:#}",
+                    index_path.display(),
+                    source.display()
                 );
                 Ok(None)
             }
@@ -235,12 +266,24 @@ impl PositionIndex {
         progress: impl FnMut(BuildProgress),
     ) -> Result<Self> {
         let path = cache_path(library.path());
+        Self::build_cached_for_at(library, path, options, progress)
+    }
+
+    /// Build a cache index at an explicit path. Reference indexes use this so
+    /// their rating-filtered cache can never be mistaken for the player index.
+    pub fn build_cached_for_at(
+        library: Arc<dyn GameLibrary>,
+        index_path: impl AsRef<Path>,
+        options: BuildOptions,
+        progress: impl FnMut(BuildProgress),
+    ) -> Result<Self> {
+        let index_path = index_path.as_ref();
         if let Some(pgn) = library.as_pgn() {
-            Self::build_to(pgn.path(), &path, options, progress)?;
+            Self::build_to(pgn.path(), index_path, options, progress)?;
         } else {
-            Self::build_library_to(library.as_ref(), &path, options, progress)?;
+            Self::build_library_to(library.as_ref(), index_path, options, progress)?;
         }
-        Self::open(&path)
+        Self::open(index_path)
     }
 
     /// Build an index from games loaded through the common database
@@ -260,57 +303,68 @@ impl PositionIndex {
         let mut last_report = 0usize;
 
         for index in 0..library.len() {
-            match library.load(index) {
+            let included = match library.load(index) {
                 Ok(game) => {
                     let game_meta = GameMeta::from_tags(&game.headers);
-                    let mut seen = HashSet::new();
-                    let mut node = 0usize;
-                    let mut plies = 0u32;
-                    while let Some(&child) = game.nodes[node].children.first() {
-                        let parent = &game.nodes[node];
-                        let Some(ply) = game.nodes[child].mv.as_ref() else {
-                            break;
-                        };
-                        if ply.uci == "0000" {
-                            break;
+                    if options
+                        .rating_filter
+                        .is_some_and(|filter| !filter.accepts(&game_meta))
+                    {
+                        false
+                    } else {
+                        let mut seen = HashSet::new();
+                        let mut node = 0usize;
+                        let mut plies = 0u32;
+                        while let Some(&child) = game.nodes[node].children.first() {
+                            let parent = &game.nodes[node];
+                            let Some(ply) = game.nodes[child].mv.as_ref() else {
+                                break;
+                            };
+                            if ply.uci == "0000" {
+                                break;
+                            }
+                            let Ok(ucimove) = UciMove::from_ascii(ply.uci.as_bytes()) else {
+                                break;
+                            };
+                            let Ok(mv) = ucimove.to_move(&parent.pos) else {
+                                break;
+                            };
+                            let Some(code) = encode_move(mv) else {
+                                break;
+                            };
+                            let key = position_key(&parent.pos);
+                            if !seen.insert(key) {
+                                break;
+                            }
+                            let record = records.entry((key, code)).or_default();
+                            record.key = key;
+                            record.mv = code;
+                            game_meta.add_to(record);
+                            node = child;
+                            plies += 1;
+                            if plies >= options.max_plies {
+                                break;
+                            }
                         }
-                        let Ok(ucimove) = UciMove::from_ascii(ply.uci.as_bytes()) else {
-                            break;
-                        };
-                        let Ok(mv) = ucimove.to_move(&parent.pos) else {
-                            break;
-                        };
-                        let Some(code) = encode_move(mv) else {
-                            break;
-                        };
-                        let key = position_key(&parent.pos);
-                        if !seen.insert(key) {
-                            break;
-                        }
-                        let record = records.entry((key, code)).or_default();
-                        record.key = key;
-                        record.mv = code;
-                        game_meta.add_to(record);
-                        node = child;
-                        plies += 1;
-                        if plies >= options.max_plies {
-                            break;
-                        }
+                        true
                     }
                 }
                 Err(err) => {
                     tracing::warn!("position index skipped game {index}: {err:#}");
+                    false
                 }
-            }
+            };
 
-            games += 1;
-            if games.saturating_sub(last_report) >= 1000 {
-                progress(BuildProgress {
-                    games,
-                    edges: records.len(),
-                    elapsed: started.elapsed(),
-                });
-                last_report = games;
+            if included {
+                games += 1;
+                if games.saturating_sub(last_report) >= 1000 {
+                    progress(BuildProgress {
+                        games,
+                        edges: records.len(),
+                        elapsed: started.elapsed(),
+                    });
+                    last_report = games;
+                }
             }
         }
 
@@ -699,11 +753,34 @@ impl IndexHeader {
 /// Cache location for the index of `source`. The index is never written next
 /// to a database or PGN file.
 pub fn cache_path(source: &Path) -> PathBuf {
+    cache_path_tagged(source, None)
+}
+
+/// Cache location for a reference index. The path includes the rating window,
+/// so a filtered reference cache can never be mistaken for the player index or
+/// for another player's rating band.
+pub fn reference_cache_path(source: &Path, filter: Option<RatingFilter>) -> PathBuf {
+    let tag = match filter {
+        Some(filter) => format!("reference-{}-{}", filter.min, filter.max),
+        None => "reference-all".to_string(),
+    };
+    cache_path_tagged(source, Some(&tag))
+}
+
+fn cache_path_tagged(source: &Path, tag: Option<&str>) -> PathBuf {
     let canonical = fs::canonicalize(source).unwrap_or_else(|_| source.to_path_buf());
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
     for byte in canonical.to_string_lossy().as_bytes() {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x100_0000_01b3);
+    }
+    if let Some(tag) = tag {
+        hash ^= 0xff;
+        hash = hash.wrapping_mul(0x100_0000_01b3);
+        for byte in tag.as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x100_0000_01b3);
+        }
     }
     cache_dir().join(format!("{hash:016x}.brettpos"))
 }
@@ -799,6 +876,14 @@ enum Outcome {
 }
 
 impl GameMeta {
+    fn average_elo(&self) -> Option<u32> {
+        match (self.white_elo, self.black_elo) {
+            (Some(white), Some(black)) => Some(((u64::from(white) + u64::from(black)) / 2) as u32),
+            (Some(elo), None) | (None, Some(elo)) => Some(elo),
+            (None, None) => None,
+        }
+    }
+
     fn from_tags(tags: &[(String, String)]) -> Self {
         let mut meta = Self::default();
         for (key, value) in tags {
@@ -867,25 +952,29 @@ struct GameState {
     meta: GameMeta,
     seen: HashSet<u64>,
     active: bool,
+    included: bool,
     plies: u32,
-    moves: usize,
 }
 
 impl GameState {
-    fn new(tags: &[(String, String)]) -> Self {
+    fn new(tags: &[(String, String)], options: BuildOptions) -> Self {
         let pos = tags
             .iter()
             .find(|(key, _)| key.eq_ignore_ascii_case("FEN"))
             .and_then(|(_, value)| Fen::from_ascii(value.as_bytes()).ok())
             .and_then(|fen| fen.into_position(CastlingMode::Standard).ok())
             .unwrap_or_default();
+        let meta = GameMeta::from_tags(tags);
+        let included = options
+            .rating_filter
+            .is_none_or(|filter| filter.accepts(&meta));
         Self {
             pos,
-            meta: GameMeta::from_tags(tags),
+            meta,
             seen: HashSet::new(),
-            active: true,
+            active: included,
+            included,
             plies: 0,
-            moves: 0,
         }
     }
 }
@@ -956,7 +1045,7 @@ where
     }
 
     fn begin_movetext(&mut self, tags: Vec<(String, String)>) -> ControlFlow<(), GameState> {
-        ControlFlow::Continue(GameState::new(&tags))
+        ControlFlow::Continue(GameState::new(&tags, self.options))
     }
 
     fn san(&mut self, state: &mut GameState, san_plus: SanPlus) -> ControlFlow<()> {
@@ -996,17 +1085,18 @@ where
         state.meta.add_to(record);
         state.pos = after;
         state.plies += 1;
-        state.moves += 1;
         if state.plies >= self.options.max_plies {
             state.active = false;
         }
         ControlFlow::Continue(())
     }
 
-    fn end_game(&mut self, _state: GameState) {
-        self.games += 1;
-        if self.games.saturating_sub(self.last_report) >= 1000 {
-            self.report();
+    fn end_game(&mut self, state: GameState) {
+        if state.included {
+            self.games += 1;
+            if self.games.saturating_sub(self.last_report) >= 1000 {
+                self.report();
+            }
         }
     }
 }
@@ -1040,6 +1130,74 @@ mod tests {
             let code = encode_move(mv).unwrap();
             assert_eq!(decode_move(&pos, code), Some(mv));
         }
+    }
+
+    #[test]
+    fn rating_filtered_reference_counts_selected_games() {
+        let pgn = r#"
+[Event "High"]
+[White "A"]
+[Black "B"]
+[WhiteElo "2500"]
+[BlackElo "2540"]
+[Result "1-0"]
+
+1. e4 e5 1-0
+
+[Event "Low"]
+[White "C"]
+[Black "D"]
+[WhiteElo "1500"]
+[BlackElo "1520"]
+[Result "0-1"]
+
+1. d4 d5 0-1
+
+[Event "Unrated"]
+[White "E"]
+[Black "F"]
+[Result "1/2-1/2"]
+
+1. c4 c5 1/2-1/2
+"#;
+        let dir = std::env::temp_dir().join(format!(
+            "brett-position-filter-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pgn_path = dir.join("reference.pgn");
+        let index_path = dir.join("reference.brettpos");
+        std::fs::write(&pgn_path, pgn).unwrap();
+
+        PositionIndex::build_to(
+            &pgn_path,
+            &index_path,
+            BuildOptions {
+                rating_filter: Some(RatingFilter::around(2520, 200)),
+                ..BuildOptions::default()
+            },
+            |_| {},
+        )
+        .unwrap();
+        let index = PositionIndex::open(&index_path).unwrap();
+        assert_eq!(index.game_count(), 1);
+        let moves = index.moves(position_key(&Chess::default()));
+        assert_eq!(moves.len(), 1);
+        assert_eq!(moves[0].games, 1);
+        assert_ne!(
+            cache_path(&pgn_path),
+            reference_cache_path(&pgn_path, Some(RatingFilter::around(2520, 200)))
+        );
+        assert_ne!(
+            reference_cache_path(&pgn_path, Some(RatingFilter::around(2520, 200))),
+            reference_cache_path(&pgn_path, Some(RatingFilter::around(2520, 300)))
+        );
+
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
