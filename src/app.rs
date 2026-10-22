@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::{self, TryRecvError};
@@ -5,12 +6,15 @@ use std::time::Duration;
 
 use eframe::egui::{
     self, Align, Align2, Color32, FontId, Key, Layout, RichText, Sense, Stroke, StrokeKind, Ui,
-    vec2,
+    pos2, vec2,
 };
+use shakmaty::fen::Fen;
+use shakmaty::san::SanPlus;
 use shakmaty::uci::UciMove;
-use shakmaty::{CastlingMode, Color, Move, Position, Square};
+use shakmaty::{CastlingMode, Chess, Color, EnPassantMode, Move, Position, Square};
 
-use crate::domain::{self, Game, Token};
+use crate::domain::{self, Clock, Game, Token};
+use crate::engine::{EngineEvent, EngineHandle, EngineInfo, Score, SearchLimit};
 use crate::library::{GameLibrary, PgnLibrary};
 use crate::online::{self, ImportResult, OnlineSource};
 use crate::players::{self, PlayerBook, PlayerDirectory};
@@ -27,6 +31,21 @@ const GOLD: Color32 = Color32::from_rgb(0xE8, 0xC4, 0x6A);
 const GOLD_SOFT: Color32 = Color32::from_rgb(0x4A, 0x3F, 0x24);
 const COMMENT_TEXT: Color32 = Color32::from_rgb(0x9E, 0xB0, 0xA9);
 
+struct PlayerBadge {
+    name: String,
+    rating: Option<String>,
+    clock: Option<Clock>,
+    color: Color,
+}
+
+struct BoardMeta {
+    pos: Chess,
+    last_move: Option<(Square, Square)>,
+    top: PlayerBadge,
+    bottom: PlayerBadge,
+    show_clocks: bool,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum LeftTab {
     #[default]
@@ -39,6 +58,7 @@ enum RightTab {
     #[default]
     Moves,
     Tree,
+    Engine,
 }
 
 enum IndexMessage {
@@ -80,6 +100,7 @@ pub struct App {
     game_idx: usize,
     node: usize,
     orientation: Color,
+    show_clocks: bool,
     selected: Option<Square>,
     targets: Vec<Square>,
     drag_from: Option<Square>,
@@ -109,6 +130,20 @@ pub struct App {
     online_max: usize,
     online_status: String,
     online_rx: Option<mpsc::Receiver<OnlineMessage>>,
+    engine: Option<EngineHandle>,
+    engine_status: String,
+    engine_name: String,
+    engine_ready: bool,
+    engine_auto: bool,
+    engine_multipv: usize,
+    engine_depth: u32,
+    engine_time_ms: u64,
+    engine_use_time: bool,
+    engine_request: u64,
+    engine_fen: Option<String>,
+    engine_infos: BTreeMap<usize, EngineInfo>,
+    engine_bestmove: Option<String>,
+    engine_searching: bool,
     path_input: String,
     filter: String,
     show_about: bool,
@@ -138,6 +173,7 @@ impl App {
             game_idx: 0,
             node: 0,
             orientation: Color::White,
+            show_clocks: false,
             selected: None,
             targets: Vec::new(),
             drag_from: None,
@@ -164,6 +200,20 @@ impl App {
             online_max: 500,
             online_status: String::new(),
             online_rx: None,
+            engine: None,
+            engine_status: "Engine not started.".to_string(),
+            engine_name: String::new(),
+            engine_ready: false,
+            engine_auto: true,
+            engine_multipv: 3,
+            engine_depth: 18,
+            engine_time_ms: 1_500,
+            engine_use_time: false,
+            engine_request: 0,
+            engine_fen: None,
+            engine_infos: BTreeMap::new(),
+            engine_bestmove: None,
+            engine_searching: false,
             path_input: String::new(),
             filter: String::new(),
             show_about: false,
@@ -182,6 +232,7 @@ impl App {
     }
 
     fn goto(&mut self, node: usize) {
+        let changed = self.node != node;
         if self
             .annotation_editor
             .is_some_and(|editing| editing != node)
@@ -193,6 +244,9 @@ impl App {
         self.selected = None;
         self.targets.clear();
         self.drag_from = None;
+        if changed {
+            self.clear_engine_results();
+        }
     }
 
     fn next_move(&mut self) {
@@ -256,6 +310,7 @@ impl App {
                 self.dirty = false;
                 self.game_idx = 0;
                 self.current = None;
+                self.clear_engine_results();
                 self.goto(0);
                 self.left_tab = LeftTab::Games;
                 self.right_tab = RightTab::Moves;
@@ -370,6 +425,149 @@ impl App {
         }
         if keep {
             self.index_rx = Some(rx);
+        }
+    }
+
+    fn current_fen(&self) -> Option<String> {
+        let game = self.current.as_ref()?;
+        let node = game.nodes.get(self.node)?;
+        Some(Fen::from_position(&node.pos, EnPassantMode::Legal).to_string())
+    }
+
+    fn engine_limit(&self) -> SearchLimit {
+        if self.engine_use_time {
+            SearchLimit::MoveTime(Duration::from_millis(self.engine_time_ms))
+        } else {
+            SearchLimit::Depth(self.engine_depth)
+        }
+    }
+
+    /// Start the engine lazily. The default is Stockfish, overridable through
+    /// `BRETT_ENGINE`.
+    fn ensure_engine(&mut self) -> bool {
+        if self.engine.is_some() {
+            return true;
+        }
+        let path = std::env::var_os("BRETT_ENGINE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/usr/bin/stockfish"));
+        match EngineHandle::spawn(&path) {
+            Ok(engine) => {
+                self.engine = Some(engine);
+                self.engine_ready = false;
+                self.engine_name.clear();
+                self.engine_status = format!("Starting {}…", path.display());
+                true
+            }
+            Err(err) => {
+                self.engine_status = format!("Engine unavailable: {err:#}");
+                false
+            }
+        }
+    }
+
+    fn clear_engine_results(&mut self) {
+        if let Some(engine) = &self.engine {
+            engine.stop();
+        }
+        self.engine_request = 0;
+        self.engine_fen = None;
+        self.engine_infos.clear();
+        self.engine_bestmove = None;
+        self.engine_searching = false;
+    }
+
+    fn request_engine_analysis(&mut self) {
+        if !self.ensure_engine() {
+            return;
+        }
+        let Some(fen) = self.current_fen() else {
+            return;
+        };
+        let multipv = self.engine_multipv;
+        let limit = self.engine_limit();
+        let Some(engine) = self.engine.as_mut() else {
+            return;
+        };
+        let request = engine.analyze(fen.clone(), multipv, limit);
+        self.engine_request = request;
+        self.engine_fen = Some(fen);
+        self.engine_infos.clear();
+        self.engine_bestmove = None;
+        self.engine_searching = true;
+        self.engine_status = match limit {
+            SearchLimit::Depth(depth) => format!("Searching to depth {depth}…"),
+            SearchLimit::MoveTime(time) => {
+                format!("Searching for {} ms…", time.as_millis())
+            }
+        };
+    }
+
+    fn maybe_engine_analysis(&mut self) {
+        if self.right_tab != RightTab::Engine {
+            return;
+        }
+        if self.engine.is_none() {
+            if self.engine_status.starts_with("Engine unavailable") {
+                return;
+            }
+            self.ensure_engine();
+            return;
+        }
+        if !self.engine_ready || !self.engine_auto {
+            return;
+        }
+        let Some(fen) = self.current_fen() else {
+            return;
+        };
+        if self.engine_fen.as_deref() != Some(fen.as_str()) {
+            self.request_engine_analysis();
+        }
+    }
+
+    fn poll_engine(&mut self) {
+        let Some(engine) = self.engine.as_ref() else {
+            return;
+        };
+        let mut events = Vec::new();
+        while let Some(event) = engine.try_recv() {
+            events.push(event);
+        }
+        for event in events {
+            match event {
+                EngineEvent::Name(name) => self.engine_name = name,
+                EngineEvent::Ready => {
+                    self.engine_ready = true;
+                    self.engine_status = if self.engine_name.is_empty() {
+                        "Engine ready.".to_string()
+                    } else {
+                        format!("{} ready.", self.engine_name)
+                    };
+                }
+                EngineEvent::Info { request, info } => {
+                    if request == self.engine_request {
+                        self.engine_infos.insert(info.multipv, info);
+                    }
+                }
+                EngineEvent::BestMove { request, best, .. } => {
+                    if request == self.engine_request {
+                        self.engine_searching = false;
+                        self.engine_bestmove = Some(best);
+                        self.engine_status = "Analysis complete.".to_string();
+                    }
+                }
+                EngineEvent::Error(err) => {
+                    self.engine_status = format!("Engine error: {err}");
+                }
+                EngineEvent::Exited => {
+                    self.engine = None;
+                    self.engine_ready = false;
+                    self.engine_searching = false;
+                    self.engine_infos.clear();
+                    self.engine_bestmove = None;
+                    self.engine_status = "Engine exited.".to_string();
+                }
+            }
         }
     }
 
@@ -798,20 +996,22 @@ impl App {
         if ctx.egui_wants_keyboard_input() {
             return;
         }
-        let (right, left, down, up, home, end, flip, tree, moves, annotate) = ctx.input(|i| {
-            (
-                i.key_pressed(Key::ArrowRight),
-                i.key_pressed(Key::ArrowLeft),
-                i.key_pressed(Key::ArrowDown),
-                i.key_pressed(Key::ArrowUp),
-                i.key_pressed(Key::Home),
-                i.key_pressed(Key::End),
-                i.key_pressed(Key::F),
-                i.key_pressed(Key::T),
-                i.key_pressed(Key::M),
-                i.key_pressed(Key::A),
-            )
-        });
+        let (right, left, down, up, home, end, flip, tree, moves, annotate, engine) =
+            ctx.input(|i| {
+                (
+                    i.key_pressed(Key::ArrowRight),
+                    i.key_pressed(Key::ArrowLeft),
+                    i.key_pressed(Key::ArrowDown),
+                    i.key_pressed(Key::ArrowUp),
+                    i.key_pressed(Key::Home),
+                    i.key_pressed(Key::End),
+                    i.key_pressed(Key::F),
+                    i.key_pressed(Key::T),
+                    i.key_pressed(Key::M),
+                    i.key_pressed(Key::A),
+                    i.key_pressed(Key::E),
+                )
+            });
 
         if right {
             self.next_move();
@@ -852,6 +1052,9 @@ impl App {
             self.annotation_editor = Some(self.node);
             self.annotation_focus = true;
         }
+        if engine {
+            self.right_tab = RightTab::Engine;
+        }
     }
 
     fn menu_bar(&mut self, root: &mut Ui) {
@@ -887,6 +1090,20 @@ impl App {
                     if ui.button("Start position (Home)").clicked() {
                         self.goto(0);
                         ui.close();
+                    }
+                    ui.separator();
+                    let has_clocks = self.current.as_ref().is_some_and(|game| game.has_clocks());
+                    ui.add_enabled(
+                        has_clocks,
+                        egui::Checkbox::new(&mut self.show_clocks, "Show PGN clocks"),
+                    )
+                    .on_hover_text(if has_clocks {
+                        "Show remaining time from [%clk] comments"
+                    } else {
+                        "This game has no [%clk] clock comments"
+                    });
+                    if !has_clocks {
+                        self.show_clocks = false;
                     }
                 });
 
@@ -1204,13 +1421,230 @@ impl App {
                         .on_hover_text("Move list (M)");
                     ui.selectable_value(&mut self.right_tab, RightTab::Tree, "Tree")
                         .on_hover_text("Tree (T)");
+                    ui.selectable_value(&mut self.right_tab, RightTab::Engine, "Engine")
+                        .on_hover_text("UCI engine (E)");
                 });
                 ui.separator();
                 match self.right_tab {
                     RightTab::Moves => self.moves_content(ui),
                     RightTab::Tree => self.tree_content(ui),
+                    RightTab::Engine => self.engine_content(ui),
                 }
             });
+    }
+
+    fn engine_content(&mut self, ui: &mut Ui) {
+        self.maybe_engine_analysis();
+
+        let mut start = false;
+        let mut stop = false;
+        let mut settings_changed = false;
+        let mut clicked_uci = None;
+
+        egui::Frame::new()
+            .fill(SURFACE)
+            .corner_radius(10.0)
+            .stroke(Stroke::new(1.0, BORDER))
+            .inner_margin(10.0)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.heading("Engine");
+                    if self.engine_searching {
+                        ui.spinner();
+                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.label(
+                            RichText::new(if self.engine_ready {
+                                "ready"
+                            } else if self.engine.is_some() {
+                                "starting"
+                            } else {
+                                "stopped"
+                            })
+                            .small()
+                            .weak(),
+                        );
+                    });
+                });
+                ui.label(
+                    RichText::new(if self.engine_name.is_empty() {
+                        "Stockfish / UCI"
+                    } else {
+                        &self.engine_name
+                    })
+                    .small()
+                    .weak(),
+                )
+                .on_hover_text("Set BRETT_ENGINE to use a different UCI engine");
+                ui.label(RichText::new(&self.engine_status).small().weak());
+                ui.add_space(4.0);
+
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .checkbox(&mut self.engine_auto, "Auto analyze")
+                        .on_hover_text("Re-analyze when the position changes")
+                        .changed()
+                    {
+                        settings_changed = true;
+                    }
+                    ui.label("MultiPV");
+                    if ui
+                        .add(egui::DragValue::new(&mut self.engine_multipv).range(1..=5))
+                        .changed()
+                    {
+                        settings_changed = true;
+                    }
+                });
+
+                ui.horizontal_wrapped(|ui| {
+                    egui::ComboBox::from_id_salt("engine-limit")
+                        .selected_text(if self.engine_use_time {
+                            "Time"
+                        } else {
+                            "Depth"
+                        })
+                        .show_ui(ui, |ui| {
+                            if ui
+                                .selectable_value(&mut self.engine_use_time, false, "Depth")
+                                .changed()
+                            {
+                                settings_changed = true;
+                            }
+                            if ui
+                                .selectable_value(&mut self.engine_use_time, true, "Time")
+                                .changed()
+                            {
+                                settings_changed = true;
+                            }
+                        });
+                    if self.engine_use_time {
+                        if ui
+                            .add(
+                                egui::DragValue::new(&mut self.engine_time_ms)
+                                    .range(100..=30_000)
+                                    .suffix(" ms")
+                                    .speed(50),
+                            )
+                            .changed()
+                        {
+                            settings_changed = true;
+                        }
+                    } else if ui
+                        .add(
+                            egui::DragValue::new(&mut self.engine_depth)
+                                .range(6..=40)
+                                .speed(1),
+                        )
+                        .changed()
+                    {
+                        settings_changed = true;
+                    }
+                });
+
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(!self.engine_searching, egui::Button::new("Analyze"))
+                        .clicked()
+                    {
+                        start = true;
+                    }
+                    if ui
+                        .add_enabled(self.engine_searching, egui::Button::new("Stop"))
+                        .clicked()
+                    {
+                        stop = true;
+                    }
+                    if self.engine.is_none() && ui.button("Start engine").clicked() {
+                        start = true;
+                    }
+                });
+            });
+
+        if settings_changed {
+            self.clear_engine_results();
+        }
+        if start {
+            self.request_engine_analysis();
+        }
+        if stop {
+            if let Some(engine) = &self.engine {
+                engine.stop();
+            }
+            self.engine_searching = false;
+            self.engine_status = "Stopped.".to_string();
+        }
+
+        ui.add_space(8.0);
+        let Some(pos) = self
+            .current
+            .as_ref()
+            .map(|game| game.nodes[self.node].pos.clone())
+        else {
+            ui.label(RichText::new("Open a game to analyze a position.").weak());
+            return;
+        };
+
+        let infos: Vec<EngineInfo> = self.engine_infos.values().cloned().collect();
+        if infos.is_empty() {
+            ui.label(
+                RichText::new(if self.engine_searching {
+                    "Waiting for engine output…"
+                } else {
+                    "No analysis yet. Press Analyze."
+                })
+                .weak()
+                .italics(),
+            );
+        } else {
+            for info in infos {
+                let score = engine_score_label(info.score, pos.turn());
+                let color = engine_eval_color(info.score, pos.turn());
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new(score).monospace().strong().color(color));
+                    ui.label(RichText::new(format!("d{}", info.depth)).small().weak());
+                    let line = pv_san(&pos, &info.pv, 12);
+                    if ui
+                        .selectable_label(
+                            false,
+                            RichText::new(if line.is_empty() { "…" } else { &line }).monospace(),
+                        )
+                        .on_hover_text("Play the first move of this line")
+                        .clicked()
+                        && let Some(first) = info.pv.first()
+                    {
+                        clicked_uci = Some(first.clone());
+                    }
+                });
+                let mut stats = Vec::new();
+                if let Some(nodes) = info.nodes {
+                    stats.push(format!("{nodes} nodes"));
+                }
+                if let Some(time) = info.time_ms
+                    && time > 0
+                {
+                    stats.push(format!("{time} ms"));
+                }
+                if let Some(nps) = info.nps {
+                    stats.push(format!("{nps} nps"));
+                }
+                if !stats.is_empty() {
+                    ui.label(RichText::new(stats.join(" · ")).small().weak());
+                }
+                ui.add_space(3.0);
+            }
+        }
+
+        if let Some(best) = &self.engine_bestmove {
+            ui.label(
+                RichText::new(format!("bestmove {best}"))
+                    .monospace()
+                    .small()
+                    .weak(),
+            );
+        }
+        if let Some(uci) = clicked_uci {
+            self.play_uci(&uci);
+        }
     }
 
     fn moves_content(&mut self, ui: &mut Ui) {
@@ -1230,8 +1664,13 @@ impl App {
         let mut close_editor = false;
         let mut nag_action: Option<(usize, Option<u8>)> = None;
         let mut comment_update: Option<(usize, String)> = None;
+        let mut tag_update: Option<(usize, String)> = None;
+        let mut tag_delete: Option<usize> = None;
+        let mut tag_add: Option<&'static str> = None;
 
         game_header_card(ui, &game, prep.as_ref());
+        ui.add_space(6.0);
+        game_tags_card(ui, &game, &mut tag_update, &mut tag_delete, &mut tag_add);
         ui.add_space(8.0);
 
         let lines = domain::move_lines(&game);
@@ -1410,6 +1849,25 @@ impl App {
                 });
         });
 
+        if tag_update.is_some() || tag_delete.is_some() || tag_add.is_some() {
+            if let Some(game) = self.current.as_mut() {
+                if let Some((index, value)) = tag_update
+                    && let Some((_, current)) = game.headers.get_mut(index)
+                {
+                    *current = value;
+                }
+                if let Some(index) = tag_delete
+                    && index < game.headers.len()
+                {
+                    game.headers.remove(index);
+                }
+                if let Some(key) = tag_add {
+                    game.set_header(key, String::new());
+                }
+            }
+            self.dirty = true;
+        }
+
         if let Some(action) = nag_action {
             self.set_nag(action.0, action.1);
         }
@@ -1421,7 +1879,7 @@ impl App {
             && let Some(game) = self.current.as_mut()
             && let Some(node) = game.nodes.get_mut(node)
         {
-            node.comment = text;
+            node.replace_comment(&text);
             self.dirty = true;
         }
         if let Some(node) = open_editor {
@@ -1801,6 +2259,23 @@ impl App {
         self.goto(id);
     }
 
+    fn play_uci(&mut self, uci: &str) {
+        let Some(pos) = self
+            .current
+            .as_ref()
+            .map(|game| game.nodes[self.node].pos.clone())
+        else {
+            return;
+        };
+        let Ok(uci) = UciMove::from_ascii(uci.as_bytes()) else {
+            return;
+        };
+        let Ok(mv) = uci.to_move(&pos) else {
+            return;
+        };
+        self.play_move(mv);
+    }
+
     fn bottom_bar(&mut self, root: &mut Ui) {
         egui::Panel::bottom("nav").show(root, |ui| {
             ui.add_space(4.0);
@@ -1820,6 +2295,10 @@ impl App {
                 ui.separator();
                 if ui.button("Flip").on_hover_text("Flip board (F)").clicked() {
                     self.orientation = self.orientation.other();
+                }
+                if self.current.as_ref().is_some_and(|game| game.has_clocks()) {
+                    ui.toggle_value(&mut self.show_clocks, "Clocks")
+                        .on_hover_text("Show PGN clock times beside the board");
                 }
                 if ui.button("Var").on_hover_text("Next variation").clicked() {
                     self.next_variation();
@@ -1965,8 +2444,13 @@ impl eframe::App for App {
         self.poll_index();
         self.poll_player_book();
         self.poll_online();
+        self.poll_engine();
+        self.maybe_engine_analysis();
         if self.index_rx.is_some() || self.player_book_rx.is_some() || self.online_rx.is_some() {
             ctx.request_repaint_after(Duration::from_millis(150));
+        }
+        if self.engine_searching || (self.engine.is_some() && !self.engine_ready) {
+            ctx.request_repaint_after(Duration::from_millis(80));
         }
 
         let dropped: Vec<std::path::PathBuf> = ctx.input(|i| {
@@ -1988,27 +2472,54 @@ impl eframe::App for App {
 
         egui::CentralPanel::default_margins().show(ui, |ui| {
             let avail = ui.available_size();
-            let side = (avail.x.min(avail.y) - 24.0).max(120.0);
+            let side = (avail.x.min(avail.y - 64.0) - 24.0).max(120.0);
             ui.with_layout(Layout::top_down(Align::Center), |ui| {
-                ui.add_space(8.0);
-                let board_data = self.game().map(|game| {
+                ui.add_space(6.0);
+                let board_meta = self.game().map(|game| {
                     let node = &game.nodes[self.node];
-                    (&node.pos, domain::last_move_squares(node))
+                    let top_color = self.orientation.other();
+                    let bottom_color = self.orientation;
+                    let show_clocks = self.show_clocks && game.has_clocks();
+                    let badge = |color: Color| PlayerBadge {
+                        name: if color == Color::White {
+                            game.white().to_string()
+                        } else {
+                            game.black().to_string()
+                        },
+                        rating: player_rating(game, color),
+                        clock: if show_clocks {
+                            game.clock_for(self.node, color)
+                        } else {
+                            None
+                        },
+                        color,
+                    };
+                    BoardMeta {
+                        pos: node.pos.clone(),
+                        last_move: domain::last_move_squares(node),
+                        top: badge(top_color),
+                        bottom: badge(bottom_color),
+                        show_clocks,
+                    }
                 });
-                if let Some((pos, last_move)) = board_data {
+                if let Some(meta) = board_meta {
+                    player_strip(ui, side, &meta.top, meta.show_clocks);
+                    ui.add_space(2.0);
                     let event = board::draw(
                         ui,
                         &self.textures,
                         BoardState {
-                            pos,
+                            pos: &meta.pos,
                             orientation: self.orientation,
-                            last_move,
+                            last_move: meta.last_move,
                             selected: self.selected,
                             targets: &self.targets,
                             drag_from: self.drag_from,
                         },
                         side,
                     );
+                    ui.add_space(2.0);
+                    player_strip(ui, side, &meta.bottom, meta.show_clocks);
                     if let Some(event) = event {
                         self.handle_board_event(event);
                     }
@@ -2025,6 +2536,245 @@ impl eframe::App for App {
         self.about(&ctx);
         self.online_dialog(&ctx);
     }
+}
+
+/// Player name, rating and (optionally) clock above/below the board.
+fn player_strip(ui: &mut Ui, side: f32, player: &PlayerBadge, show_clock: bool) {
+    let (rect, response) = ui.allocate_exact_size(vec2(side, 27.0), Sense::hover());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 6.0, Color32::from_rgb(0x1F, 0x22, 0x25));
+
+    let dot = pos2(rect.left() + 12.0, rect.center().y);
+    let fill = match player.color {
+        Color::White => Color32::from_gray(235),
+        Color::Black => Color32::from_gray(35),
+    };
+    painter.circle_filled(dot, 4.5, fill);
+    painter.circle_stroke(dot, 4.5, Stroke::new(1.0, Color32::from_gray(135)));
+
+    let mut label = player.name.clone();
+    if let Some(rating) = &player.rating {
+        label.push_str(&format!("  ({rating})"));
+    }
+    let name_clip = egui::Rect::from_min_max(
+        rect.min,
+        pos2(
+            rect.right() - if show_clock { 104.0 } else { 8.0 },
+            rect.bottom(),
+        ),
+    );
+    let name_painter = ui.painter_at(name_clip);
+    let name_galley =
+        name_painter.layout_no_wrap(label, FontId::proportional(14.0), Color32::from_gray(226));
+    name_painter.galley(
+        pos2(
+            rect.left() + 23.0,
+            rect.center().y - name_galley.size().y / 2.0,
+        ),
+        name_galley,
+        Color32::from_gray(226),
+    );
+
+    if show_clock {
+        let text = player
+            .clock
+            .map(Clock::display)
+            .unwrap_or_else(|| "--:--".to_string());
+        let color = if player.clock.is_some() {
+            Color32::from_rgb(0xE8, 0xE4, 0xD8)
+        } else {
+            Color32::from_gray(120)
+        };
+        let clock_galley = painter.layout_no_wrap(text, FontId::monospace(14.0), color);
+        let clock_rect = egui::Rect::from_min_size(
+            pos2(
+                rect.right() - clock_galley.size().x - 10.0,
+                rect.center().y - clock_galley.size().y / 2.0,
+            ),
+            clock_galley.size(),
+        );
+        painter.rect_filled(
+            clock_rect.expand2(vec2(7.0, 3.0)),
+            4.0,
+            Color32::from_rgb(0x2A, 0x2E, 0x32),
+        );
+        painter.galley(clock_rect.min, clock_galley, color);
+    }
+
+    response.on_hover_text(format!(
+        "{} · {}",
+        color_name(player.color),
+        player.rating.as_deref().unwrap_or("no rating")
+    ));
+}
+
+/// Convert an engine PV from UCI to a short figurine SAN line.
+fn pv_san(pos: &Chess, pv: &[String], limit: usize) -> String {
+    let mut pos = pos.clone();
+    let mut out = Vec::new();
+    for text in pv.iter().take(limit) {
+        let Ok(uci) = UciMove::from_ascii(text.as_bytes()) else {
+            break;
+        };
+        let Ok(mv) = uci.to_move(&pos) else {
+            break;
+        };
+        let san = SanPlus::from_move(pos.clone(), mv).to_string();
+        out.push(domain::figurine_san(&san));
+        let Ok(next) = pos.clone().play(mv) else {
+            break;
+        };
+        pos = next;
+    }
+    out.join(" ")
+}
+
+/// Rating shown beside a player's name. Elo wins over DWZ when both exist.
+fn player_rating(game: &Game, color: Color) -> Option<String> {
+    let (elo_key, dwz_key) = match color {
+        Color::White => ("WhiteElo", "WhiteDWZ"),
+        Color::Black => ("BlackElo", "BlackDWZ"),
+    };
+    if let Some(elo) = game
+        .header(elo_key)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
+        return Some(elo.to_string());
+    }
+    game.header(dwz_key)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(|dwz| format!("DWZ {dwz}"))
+}
+
+fn engine_score_label(score: Option<Score>, turn: Color) -> String {
+    match score {
+        Some(Score::Cp(cp)) => {
+            let white = if turn == Color::White { cp } else { -cp };
+            format!("{:+.2}", white as f64 / 100.0)
+        }
+        Some(Score::Mate(mate)) => {
+            let white = if turn == Color::White { mate } else { -mate };
+            format!("#{white}")
+        }
+        None => "—".to_string(),
+    }
+}
+
+fn engine_eval_color(score: Option<Score>, turn: Color) -> Color32 {
+    match score {
+        Some(Score::Mate(_)) => GOLD,
+        Some(Score::Cp(cp)) => {
+            let white = if turn == Color::White { cp } else { -cp };
+            if white > 20 {
+                Color32::from_rgb(0x9E, 0xD8, 0xA8)
+            } else if white < -20 {
+                Color32::from_rgb(0xE0, 0xA0, 0xA0)
+            } else {
+                Color32::from_gray(190)
+            }
+        }
+        None => Color32::from_gray(150),
+    }
+}
+
+const COMMON_PGN_TAGS: &[&str] = &[
+    "Event",
+    "Site",
+    "Date",
+    "Round",
+    "White",
+    "Black",
+    "Result",
+    "WhiteElo",
+    "BlackElo",
+    "WhiteDWZ",
+    "BlackDWZ",
+    "ECO",
+    "Opening",
+    "Variation",
+    "TimeControl",
+    "Termination",
+    "Annotator",
+    "EventDate",
+    "EventType",
+    "FEN",
+    "SetUp",
+];
+
+/// Editable PGN tag list. Tag names are fixed labels; only the value can be
+/// changed. A field can be removed with its delete button and added back from
+/// the common-tag menu.
+fn game_tags_card(
+    ui: &mut Ui,
+    game: &Game,
+    tag_update: &mut Option<(usize, String)>,
+    tag_delete: &mut Option<usize>,
+    tag_add: &mut Option<&'static str>,
+) {
+    egui::Frame::new()
+        .fill(SURFACE)
+        .corner_radius(10.0)
+        .stroke(Stroke::new(1.0, BORDER))
+        .inner_margin(10.0)
+        .show(ui, |ui| {
+            egui::CollapsingHeader::new(RichText::new("PGN tags").strong())
+                .default_open(true)
+                .show(ui, |ui| {
+                    if game.headers.is_empty() {
+                        ui.label(RichText::new("No tags.").weak().italics());
+                    }
+                    egui::Grid::new("pgn-tags-grid")
+                        .num_columns(3)
+                        .spacing([6.0, 4.0])
+                        .striped(true)
+                        .show(ui, |ui| {
+                            for (index, (name, value)) in game.headers.iter().enumerate() {
+                                ui.label(
+                                    RichText::new(name)
+                                        .monospace()
+                                        .small()
+                                        .color(Color32::from_gray(175)),
+                                );
+                                let mut edited = value.clone();
+                                let response = ui.add(
+                                    egui::TextEdit::singleline(&mut edited)
+                                        .id_salt(("pgn-tag", index))
+                                        .desired_width(205.0)
+                                        .hint_text("value"),
+                                );
+                                if response.changed() {
+                                    *tag_update = Some((index, edited));
+                                }
+                                if ui
+                                    .small_button("×")
+                                    .on_hover_text("Remove this tag")
+                                    .clicked()
+                                {
+                                    *tag_delete = Some(index);
+                                }
+                                ui.end_row();
+                            }
+                        });
+                    ui.add_space(3.0);
+                    ui.menu_button("+ Add tag", |ui| {
+                        let mut any = false;
+                        for &tag in COMMON_PGN_TAGS {
+                            if game.header(tag).is_none() {
+                                any = true;
+                                if ui.button(tag).clicked() {
+                                    *tag_add = Some(tag);
+                                    ui.close();
+                                }
+                            }
+                        }
+                        if !any {
+                            ui.label(RichText::new("All common tags are present.").weak());
+                        }
+                    });
+                });
+        });
 }
 
 /// Header card above the PGN move list.
@@ -2064,8 +2814,14 @@ fn game_header_card(ui: &mut Ui, game: &Game, prep: Option<&PrepSession>) {
             ui.add_space(2.0);
             ui.horizontal_wrapped(|ui| {
                 ui.label(RichText::new(game.white()).strong().size(16.0));
+                if let Some(rating) = player_rating(game, Color::White) {
+                    ui.label(RichText::new(format!("({rating})")).small().weak());
+                }
                 ui.label(RichText::new("vs").weak().small());
                 ui.label(RichText::new(game.black()).strong().size(16.0));
+                if let Some(rating) = player_rating(game, Color::Black) {
+                    ui.label(RichText::new(format!("({rating})")).small().weak());
+                }
             });
             let mut details = vec![game.date().to_string()];
             if let Some(round) = game
@@ -2667,6 +3423,7 @@ mod tests {
             game_idx: 0,
             node: 0,
             orientation: Color::White,
+            show_clocks: false,
             selected: None,
             targets: Vec::new(),
             drag_from: None,
@@ -2693,6 +3450,20 @@ mod tests {
             online_max: 500,
             online_status: String::new(),
             online_rx: None,
+            engine: None,
+            engine_status: "Engine not started.".to_string(),
+            engine_name: String::new(),
+            engine_ready: false,
+            engine_auto: true,
+            engine_multipv: 3,
+            engine_depth: 18,
+            engine_time_ms: 1_500,
+            engine_use_time: false,
+            engine_request: 0,
+            engine_fen: None,
+            engine_infos: BTreeMap::new(),
+            engine_bestmove: None,
+            engine_searching: false,
             path_input: String::new(),
             filter: String::new(),
             show_about: false,

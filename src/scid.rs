@@ -826,17 +826,7 @@ fn apply_comments(game: &mut Game, marks: &[usize], comments: &[String]) {
 }
 
 fn set_comment(game: &mut Game, node: usize, comment: &str) {
-    let comment = comment.trim();
-    if comment.is_empty() {
-        return;
-    }
-    let target = &mut game.nodes[node].comment;
-    if target.is_empty() {
-        target.push_str(comment);
-    } else {
-        target.push(' ');
-        target.push_str(comment);
-    }
+    game.nodes[node].add_comment(comment);
 }
 
 /// Nodes in PGN order: a move, then alternatives to that move, then the
@@ -904,6 +894,7 @@ fn add_null_move(game: &mut Game, parent: usize, parent_pos: &Chess) -> Result<u
             color: parent_pos.turn(),
         }),
         comment: String::new(),
+        clock: None,
         nags: Vec::new(),
         parent: Some(parent),
         children: Vec::new(),

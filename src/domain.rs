@@ -30,12 +30,62 @@ impl Ply {
     }
 }
 
+/// A clock value from a PGN `[%clk ...]` directive.
+///
+/// Stored in centiseconds so fractional seconds from online PGNs survive
+/// without turning the UI into a floating-point formatting problem.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Clock {
+    pub centis: u64,
+}
+
+impl Clock {
+    /// Parse PGN clock syntax such as `0:03:00`, `3:00`, or `0:02:59.8`.
+    pub fn parse(text: &str) -> Option<Self> {
+        let text = text.trim();
+        if text.is_empty() || text.starts_with('-') {
+            return None;
+        }
+        let mut seconds = 0.0f64;
+        let mut parts = 0usize;
+        for part in text.split(':') {
+            parts += 1;
+            let value = part.parse::<f64>().ok()?;
+            if !value.is_finite() || value < 0.0 {
+                return None;
+            }
+            seconds = seconds * 60.0 + value;
+        }
+        if parts == 0 || parts > 3 || seconds > 100.0 * 3600.0 {
+            return None;
+        }
+        Some(Self {
+            centis: (seconds * 100.0).round() as u64,
+        })
+    }
+
+    /// Human-readable clock. Hours are only shown when non-zero.
+    pub fn display(self) -> String {
+        let total = self.centis / 100;
+        let hours = total / 3600;
+        let minutes = (total % 3600) / 60;
+        let seconds = total % 60;
+        if hours > 0 {
+            format!("{hours}:{minutes:02}:{seconds:02}")
+        } else {
+            format!("{minutes}:{seconds:02}")
+        }
+    }
+}
+
 /// A position in the game tree.
 #[derive(Clone, Debug)]
 pub struct Node {
     /// `None` only for the root node.
     pub mv: Option<Ply>,
     pub comment: String,
+    /// Remaining time for the player who made `mv`, when the PGN has clocks.
+    pub clock: Option<Clock>,
     pub nags: Vec<u8>,
     pub parent: Option<usize>,
     pub children: Vec<usize>,
@@ -47,6 +97,60 @@ impl Node {
     pub fn san(&self) -> Option<&str> {
         self.mv.as_ref().map(|m| m.san.as_str())
     }
+
+    /// Append a PGN comment, extracting clock directives from it.
+    pub fn add_comment(&mut self, text: &str) {
+        let (comment, clock) = parse_comment_directives(text);
+        if let Some(clock) = clock {
+            self.clock = Some(clock);
+        }
+        if !comment.is_empty() {
+            if !self.comment.is_empty() {
+                self.comment.push(' ');
+            }
+            self.comment.push_str(&comment);
+        }
+    }
+
+    /// Replace the human comment while preserving any existing clock.
+    pub fn replace_comment(&mut self, text: &str) {
+        let (comment, clock) = parse_comment_directives(text);
+        self.comment = comment;
+        if let Some(clock) = clock {
+            self.clock = Some(clock);
+        }
+    }
+}
+
+/// Split `[%clk ...]` out of a PGN comment. Other directives remain text.
+fn parse_comment_directives(text: &str) -> (String, Option<Clock>) {
+    let mut out = String::new();
+    let mut rest = text;
+    let mut clock = None;
+    loop {
+        let Some(start) = rest.find("[%") else {
+            out.push_str(rest);
+            break;
+        };
+        out.push_str(&rest[..start]);
+        let directive = &rest[start + 2..];
+        let Some(end) = directive.find(']') else {
+            out.push_str(&rest[start..]);
+            break;
+        };
+        let body = &directive[..end];
+        let mut fields = body.split_whitespace();
+        let name = fields.next().unwrap_or_default();
+        if name.eq_ignore_ascii_case("clk") {
+            if let Some(value) = fields.next() {
+                clock = Clock::parse(value);
+            }
+        } else {
+            out.push_str(&rest[start..start + 2 + end + 1]);
+        }
+        rest = &directive[end + 1..];
+    }
+    (out.split_whitespace().collect::<Vec<_>>().join(" "), clock)
 }
 
 /// A single game: headers plus an arena of nodes rooted at index 0.
@@ -65,6 +169,7 @@ impl Default for Game {
             nodes: vec![Node {
                 mv: None,
                 comment: String::new(),
+                clock: None,
                 nags: Vec::new(),
                 parent: None,
                 children: Vec::new(),
@@ -101,6 +206,45 @@ impl Game {
 
     pub fn event(&self) -> &str {
         self.header("Event").unwrap_or("?")
+    }
+
+    pub fn set_header(&mut self, key: &str, value: String) {
+        if let Some((_, current)) = self
+            .headers
+            .iter_mut()
+            .find(|(name, _)| name.eq_ignore_ascii_case(key))
+        {
+            *current = value;
+        } else {
+            self.headers.push((key.to_string(), value));
+        }
+    }
+
+    pub fn remove_header(&mut self, key: &str) {
+        self.headers
+            .retain(|(name, _)| !name.eq_ignore_ascii_case(key));
+    }
+
+    pub fn has_clocks(&self) -> bool {
+        self.nodes.iter().any(|node| node.clock.is_some())
+    }
+
+    /// Most recent clock for `color` at or before `node`.
+    ///
+    /// Clock comments in PGN belong to the player who just moved, so this
+    /// walks the parent chain to find that player's latest known time.
+    pub fn clock_for(&self, node: usize, color: Color) -> Option<Clock> {
+        let mut current = Some(node);
+        while let Some(id) = current {
+            let node = self.nodes.get(id)?;
+            if node.mv.as_ref().is_some_and(|ply| ply.color == color)
+                && let Some(clock) = node.clock
+            {
+                return Some(clock);
+            }
+            current = node.parent;
+        }
+        None
     }
 
     pub fn root(&self) -> &Node {
@@ -168,6 +312,7 @@ impl Game {
         self.nodes.push(Node {
             mv: Some(ply),
             comment: String::new(),
+            clock: None,
             nags: Vec::new(),
             parent: Some(parent),
             children: Vec::new(),
@@ -234,13 +379,7 @@ impl Visitor for TreeVisitor {
 
     fn comment(&mut self, mt: &mut Builder, comment: RawComment<'_>) -> ControlFlow<Game> {
         let text = String::from_utf8_lossy(comment.0);
-        let node = &mut mt.nodes[mt.current];
-        if !text.is_empty() {
-            if !node.comment.is_empty() {
-                node.comment.push(' ');
-            }
-            node.comment.push_str(text.trim());
-        }
+        mt.nodes[mt.current].add_comment(&text);
         ControlFlow::Continue(())
     }
 
@@ -295,6 +434,7 @@ impl Builder {
             nodes: vec![Node {
                 mv: None,
                 comment: String::new(),
+                clock: None,
                 nags: Vec::new(),
                 parent: None,
                 children: Vec::new(),
@@ -374,6 +514,7 @@ impl Builder {
         self.nodes.push(Node {
             mv: Some(ply),
             comment: String::new(),
+            clock: None,
             nags: Vec::new(),
             parent: Some(parent),
             children: Vec::new(),
@@ -811,16 +952,44 @@ pub fn last_move_squares(node: &Node) -> Option<(Square, Square)> {
     Some((from, to))
 }
 
+/// Destination of the king in a castling move.
+///
+/// `shakmaty::Move::Castle::to()` is the rook's square, which is useful for
+/// UCI but not what a player drags the king onto. Standard chess puts the king
+/// on the G-file after kingside castling and the C-file after queenside.
+fn castle_king_destination(mv: &shakmaty::Move) -> Option<Square> {
+    let shakmaty::Move::Castle { king, rook } = mv else {
+        return None;
+    };
+    let file = if rook.file() > king.file() {
+        shakmaty::File::G
+    } else {
+        shakmaty::File::C
+    };
+    Some(Square::from_coords(file, king.rank()))
+}
+
 /// All legal destination squares from `from`, with the move that gets there.
+///
+/// Castling exposes both the king's destination and the rook's square as
+/// targets, so a king can be clicked or dragged onto either one.
 pub fn legal_targets(pos: &Chess, from: Square) -> Vec<(Square, shakmaty::Move)> {
-    pos.legal_moves()
-        .iter()
-        .filter(|m| m.from() == Some(from))
-        .map(|m| (m.to(), *m))
-        .collect()
+    let mut targets = Vec::new();
+    for mv in pos.legal_moves().iter().filter(|m| m.from() == Some(from)) {
+        targets.push((mv.to(), *mv));
+        if let Some(destination) = castle_king_destination(mv)
+            && destination != mv.to()
+        {
+            targets.push((destination, *mv));
+        }
+    }
+    targets
 }
 
 /// Choose a promotion piece when several moves share from/to (default: queen).
+///
+/// For castling, `to` may be the king's destination (`g1`/`c1`) rather than
+/// the rook's square that shakmaty reports.
 pub fn pick_move(pos: &Chess, from: Square, to: Square) -> Option<shakmaty::Move> {
     let candidates: Vec<shakmaty::Move> = pos
         .legal_moves()
@@ -828,10 +997,72 @@ pub fn pick_move(pos: &Chess, from: Square, to: Square) -> Option<shakmaty::Move
         .filter(|m| m.from() == Some(from) && m.to() == to)
         .copied()
         .collect();
-
-    candidates
+    if let Some(mv) = candidates
         .iter()
         .find(|m| m.promotion() == Some(Role::Queen))
         .or_else(|| candidates.first())
+    {
+        return Some(*mv);
+    }
+
+    pos.legal_moves()
+        .iter()
+        .find(|m| {
+            m.from() == Some(from)
+                && castle_king_destination(m).is_some_and(|destination| destination == to)
+        })
         .copied()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_and_formats_pgn_clocks() {
+        assert_eq!(Clock::parse("0:03:00").unwrap().display(), "3:00");
+        assert_eq!(Clock::parse("1:02:03").unwrap().display(), "1:02:03");
+        assert_eq!(Clock::parse("0:02:59.8").unwrap().display(), "2:59");
+        assert!(Clock::parse("hello").is_none());
+        assert!(Clock::parse("-1:00").is_none());
+    }
+
+    #[test]
+    fn clock_comments_attach_to_the_move_and_hide_from_text() {
+        let games = parse_pgn(
+            br#"[Event "Clock test"]
+
+1. e4 {[%clk 0:05:00] King pawn.} e5 {[%clk 0:04:58]} *
+"#,
+        )
+        .unwrap();
+        let game = &games[0];
+        assert_eq!(game.nodes[1].comment, "King pawn.");
+        assert_eq!(game.nodes[1].clock.unwrap().display(), "5:00");
+        assert_eq!(game.clock_for(2, Color::White).unwrap().display(), "5:00");
+        assert_eq!(game.clock_for(2, Color::Black).unwrap().display(), "4:58");
+        assert!(game.clock_for(1, Color::Black).is_none());
+    }
+
+    #[test]
+    fn castling_accepts_king_and_rook_destinations() {
+        let pos = Fen::from_ascii(b"r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1")
+            .unwrap()
+            .into_position(CastlingMode::Standard)
+            .unwrap();
+        let kingside = pick_move(&pos, Square::E1, Square::G1).unwrap();
+        assert_eq!(
+            kingside,
+            shakmaty::Move::Castle {
+                king: Square::E1,
+                rook: Square::H1,
+            }
+        );
+        assert_eq!(pick_move(&pos, Square::E1, Square::H1), Some(kingside));
+        let queenside = pick_move(&pos, Square::E1, Square::C1).unwrap();
+        assert_eq!(pick_move(&pos, Square::E1, Square::A1), Some(queenside));
+        let targets = legal_targets(&pos, Square::E1);
+        assert!(targets.iter().any(|(square, _)| *square == Square::G1));
+        assert!(targets.iter().any(|(square, _)| *square == Square::C1));
+    }
 }

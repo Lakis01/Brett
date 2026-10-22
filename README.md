@@ -59,13 +59,32 @@ its UI, and not a Wine package.
 - Imports are capped at 5,000 games and cached under
   `$XDG_CACHE_HOME/brett/online/`. Nothing is written next to a source database.
 
+### Engine analysis
+
+- The **Engine** tab starts Stockfish from `/usr/bin/stockfish` (override with
+  `BRETT_ENGINE`), performs the UCI handshake off the UI thread, and streams
+  MultiPV scores and principal variations without blocking the board.
+- Choose depth or time, 1–5 MultiPV lines, and auto-analysis on position change.
+  Clicking a PV line plays its first move. Results from an older position are
+  discarded.
+- The worker kills the engine cleanly on exit and reports protocol or process
+  errors in the panel.
+
 ### Board and move list
 
 - 2D board with the cburnett piece set, coordinates, legal-move hints, click or
-  drag-and-drop to play moves, and branching into variations.
-- The right-side PGN panel has a styled game header, result badge, move cards,
-  selected-move highlighting, variation cards, clickable comment previews, and
-  a collapsible FEN.
+  drag-and-drop to play moves, and branching into variations. Castling accepts
+  a king dragged to its destination square (`g1`/`c1`/`g8`/`c8`) as well as to
+  the rook.
+- Player names and ratings are shown above and below the board on their playing
+  side. Elo is preferred; `WhiteDWZ`/`BlackDWZ` is used when no Elo tag exists.
+- PGN clock comments (`[%clk ...]`) are parsed separately from human comments
+  and hidden by default. The **Clocks** toggle in the bottom bar displays the
+  latest remaining time for each side at the right of its board strip.
+- The right-side PGN panel has a styled game header, an editable tag table,
+  result badge, move cards, selected-move highlighting, variation cards,
+  clickable comment previews, and a collapsible FEN. Tag names are fixed; values
+  can be edited, tags can be removed, and common missing tags can be added.
 - Chess figurines are used for piece moves. The embedded DejaVu Sans fallback
   provides the chess and annotation glyphs.
 - Clicking an annotation opens the inline annotation editor. Right-clicking a
@@ -73,8 +92,9 @@ its UI, and not a Wine package.
   `∞`, `□`, and the other standard symbols. Comments are editable in the same
   panel.
 - Keyboard: `←`/`→` previous/next move, `↑`/`↓` previous/next game,
-  `Home`/`End` start/end, `F` flip board, `T` tree, `M` moves, `A` annotate the
-  selected move, `Escape` closes the annotation editor or board selection.
+  `Home`/`End` start/end, `F` flip board, `T` tree, `M` moves,
+  `E` engine, `A` annotate the selected move, `Escape` closes the annotation
+  editor or board selection.
 
 ### Benchmarks
 
@@ -119,7 +139,8 @@ never writes to the source database.
 | `src/position.rs` | Position index, opening-tree statistics, SCID/PGN generic builder |
 | `src/players.rs` | Player directory, per-player position books, Bayesian prediction |
 | `src/online.rs` | Public Lichess and Chess.com imports |
-| `src/domain.rs` | Game tree, PGN parsing, move lines, figurines, NAG palette |
+| `src/domain.rs` | Game tree, PGN parsing, move lines, figurines, NAG palette, clocks |
+| `src/engine.rs` | Asynchronous UCI process, handshake, parser, worker threads |
 | `src/app.rs` | egui application, tabs, preparation flow, annotation editor |
 | `src/ui/fonts.rs` | Embedded DejaVu Sans fallback for chess symbols |
 | `docs/` | Data safety, position-index format, preparation model, SCID reader, backlog |
@@ -134,13 +155,16 @@ never writes to the source database.
   comments, NAGs, custom FEN, null moves, and position indexing.
 - **Preparation stage (done).** Player directory, player books, prediction,
   Prepare as White/Black, online imports, annotation editing, PGN panel.
-- **UCI engine** using the installed Stockfish at `/usr/bin/stockfish`, with
-  MultiPV analysis and clickable lines.
+- **UCI engine (done).** Stockfish/MultiPV analysis, asynchronous worker,
+  clickable principal variations, `/usr/bin/stockfish` default.
+- **Clock display (done).** PGN `[%clk]` parsing, hidden by default, shown
+  beside the players at the board.
+- **Castling by dragging the king (done).** King-to-destination and
+  king-to-rook gestures both work.
+- **PGN metadata (done).** Editable common tags, fixed tag names, delete/add,
+  Elo/DWZ ratings, and player strips above and below the board.
 - **Game Review** using the local engine: per-move evaluations, centipawn loss,
   accuracy, blunder classification, and an evaluation graph.
-- **Clock display** parsed from PGN `[%clk]` comments, hidden by default.
-- **Castling by dragging the king** onto `g1`/`c1`/`g8`/`c8`, in addition to
-  dragging it onto the rook.
 - **Preparation view v2:** normal tree statistics at every turn, opponent move
   history, calibrated likelihoods with uncertainty, a static and rating-matched
   reference distribution, and a clickable recent-games window.

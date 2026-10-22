@@ -4,6 +4,9 @@ This is the working backlog after the preparation stage. Items are ordered by
 dependency and user value, not by estimated effort. Completed work is recorded
 in `README.md`; this file tracks what is next.
 
+**Status (2026-10-22):** items 1 (UCI panel), 3 (PGN clocks), and 4 (castling
+drag) are implemented. Item 2, Game Review, is next.
+
 ## 1. UCI engine foundation
 
 **Goal:** use the locally installed Stockfish for analysis without blocking the

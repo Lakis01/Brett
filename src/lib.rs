@@ -5,6 +5,7 @@
 
 pub mod app;
 pub mod domain;
+pub mod engine;
 pub mod library;
 pub mod online;
 pub mod players;
