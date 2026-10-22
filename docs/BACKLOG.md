@@ -5,8 +5,9 @@ dependency and user value, not by estimated effort. Completed work is recorded
 in `README.md`; this file tracks what is next.
 
 **Status (2026-10-22):** items 1 (UCI panel and engine settings), 2 (game
-review), 3 (PGN clocks beside the board), and 4 (castling drag) are implemented.
-Item 5, preparation view v2, is next.
+review), 3 (PGN clocks beside the board), 4 (castling drag), and 5 (preparation
+view v2 and recent games) are implemented. Item 6, predictor v2 and the static
+reference distribution, is next.
 
 Game review follow-ups that are intentionally deferred: position-index book
 marking and review caching. Clock display currently lives in the board player
@@ -83,6 +84,11 @@ NAG write-back is included; book marking and caching are deferred.
 **Depends on:** nothing.
 
 ## 5. Preparation view and recent games
+
+**Status:** implemented. The preparation panel shows combined likelihood/tree
+rows on the opponent's turn, the prepared player's line history on the user's
+turn, the normal opening tree at all times, and a configurable recent-games list
+whose rows open a read-only preview without losing preparation state.
 
 **Goal:** never show an empty preparation panel when it is the user's move.
 

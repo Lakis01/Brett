@@ -38,8 +38,17 @@ its UI, and not a Wine package.
   **Prepare as Black**. Brett creates a scratch preparation game and opens the
   Tree tab.
 - For each opponent turn, the prediction panel shows likely replies, their
-  probability, games seen, recent games, last-seen date, and trend. Click a row
-  to play that reply.
+  probability, the player's games/recent games/last-seen date/trend, and the
+  matching database tree columns (games, W/D/L, score, Elo, and years). Click a
+  row to play that reply.
+- At your turn the panel switches to the prepared player's moves so far in the
+  current line, with each move's date, database score, and the likelihood it
+  had before it was played.
+- The normal opening tree for the current position is always visible below the
+  preparation section.
+- **Recent games** lists the newest games in the player book that reached the
+  current position. The limit is configurable (default 10). Clicking a game
+  opens a read-only view; closing it returns to the same preparation position.
 - The model is a time-decayed Dirichlet estimate with a database prior and a
   recent-window mixture. Defaults: 18-month half-life, 24-month recent window,
   3 pseudo-games of database prior, and a 2-pseudo-game recent mixture.
@@ -192,9 +201,11 @@ never writes to the source database.
 - **Game Review (done).** Per-position Stockfish pass with progress/cancel,
   centipawn-loss grades, forced-move handling, accuracy summary, evaluation
   graph, clickable move list, and optional NAG write-back.
-- **Preparation view v2:** normal tree statistics at every turn, opponent move
-  history, calibrated likelihoods with uncertainty, a static and rating-matched
-  reference distribution, and a clickable recent-games window.
+- **Preparation view v2 (done).** Normal tree statistics at every turn,
+  opponent move history, a configurable clickable recent-games window, and a
+  read-only game preview that preserves preparation state.
+- **Predictor v2 and reference distribution:** posterior uncertainty, a static
+  and rating-matched reference distribution, and calibration checks.
 - **Classic CBH support** for the older multi-file format (sample located;
   research pending).
 - **M2b — Mega-scale ingest.** External sorting, an on-disk header table, and

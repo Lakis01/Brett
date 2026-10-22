@@ -93,6 +93,46 @@ impl PrepSession {
     }
 }
 
+/// One row of the opponent-prediction table, combining player likelihood with
+/// the normal position-tree statistics for the same candidate move.
+#[derive(Clone, Debug)]
+struct PrepPredictionRow {
+    mv: Move,
+    san: String,
+    probability: f64,
+    player_games: u32,
+    recent_games: u32,
+    last_date: u32,
+    trend_pp: Option<f64>,
+    tree: Option<position::MoveStat>,
+}
+
+/// One move by the prepared player in the line currently on the board.
+#[derive(Clone, Debug)]
+struct PrepLineRow {
+    label: String,
+    date: u32,
+    tree_score: Option<f32>,
+    likelihood: Option<f64>,
+}
+
+/// One clickable recent-game row.
+#[derive(Clone, Debug)]
+struct PrepRecentRow {
+    index: usize,
+    title: String,
+    subtitle: String,
+}
+
+/// Read-only recent-game view. The preparation game and cursor are kept intact
+/// so closing the preview can restore them exactly.
+#[derive(Clone, Debug)]
+struct RecentPreview {
+    return_game: Game,
+    return_node: usize,
+    return_tab: RightTab,
+}
+
 pub struct App {
     library: Option<Arc<dyn GameLibrary>>,
     current: Option<Game>,
@@ -122,6 +162,8 @@ pub struct App {
     player_book_job: Option<String>,
     player_book_status: String,
     prep: Option<PrepSession>,
+    prep_recent_limit: usize,
+    recent_preview: Option<RecentPreview>,
     /// Move whose annotation editor is open. Clicking an annotation or using
     /// the move context menu enters this mode.
     annotation_editor: Option<usize>,
@@ -205,6 +247,8 @@ impl App {
             player_book_job: None,
             player_book_status: "Select a player to build their preparation book.".to_string(),
             prep: None,
+            prep_recent_limit: 10,
+            recent_preview: None,
             annotation_editor: None,
             annotation_focus: false,
             online_open: false,
@@ -344,6 +388,7 @@ impl App {
                 self.player_book_status =
                     "Select a player to build their preparation book.".to_string();
                 self.prep = None;
+                self.recent_preview = None;
                 self.annotation_editor = None;
                 self.annotation_focus = false;
                 self.index_status = format!(
@@ -963,6 +1008,7 @@ impl App {
         };
 
         self.clear_review();
+        self.recent_preview = None;
         self.prep = Some(PrepSession {
             player_key: player.key.clone(),
             player_name: player.name.clone(),
@@ -988,6 +1034,7 @@ impl App {
         let Some(prep) = self.prep.take() else {
             return;
         };
+        self.recent_preview = None;
         self.dirty = false;
         self.current = None;
         self.game_idx = usize::MAX;
@@ -1083,6 +1130,7 @@ impl App {
             return;
         }
         self.clear_review();
+        self.recent_preview = None;
         self.annotation_editor = None;
         self.annotation_focus = false;
         if self.prep.take().is_some() {
@@ -1174,6 +1222,9 @@ impl App {
     /// Play a move if it is legal in the current position. Used by both click
     /// and drag-and-drop so the two input paths share exactly one move path.
     fn try_move(&mut self, from: Square, to: Square) -> bool {
+        if self.recent_preview.is_some() {
+            return false;
+        }
         let Some(pos) = self
             .current
             .as_ref()
@@ -1194,6 +1245,9 @@ impl App {
     }
 
     fn handle_board_event(&mut self, event: BoardEvent) {
+        if self.recent_preview.is_some() {
+            return;
+        }
         match event {
             BoardEvent::Click(sq) => self.click_square(sq),
             BoardEvent::DragStart(from) => {
@@ -1228,6 +1282,9 @@ impl App {
     fn handle_keys(&mut self, ctx: &egui::Context) {
         let cancel = ctx.input(|i| i.key_pressed(Key::Escape));
         if cancel {
+            if self.recent_preview.is_some() {
+                self.close_recent_preview();
+            }
             self.drag_from = None;
             self.selected = None;
             self.targets.clear();
@@ -1289,7 +1346,7 @@ impl App {
         if moves {
             self.right_tab = RightTab::Moves;
         }
-        if annotate && self.current.is_some() {
+        if annotate && self.current.is_some() && self.recent_preview.is_none() {
             self.right_tab = RightTab::Moves;
             self.annotation_editor = Some(self.node);
             self.annotation_focus = true;
@@ -1673,6 +1730,7 @@ impl App {
                 });
                 ui.separator();
                 match self.right_tab {
+                    RightTab::Moves if self.recent_preview.is_some() => self.preview_content(ui),
                     RightTab::Moves => self.moves_content(ui),
                     RightTab::Tree => self.tree_content(ui),
                     RightTab::Engine => self.engine_content(ui),
@@ -1995,6 +2053,7 @@ impl App {
 
     fn review_content(&mut self, ui: &mut Ui) {
         let running = self.review.as_ref().is_some_and(|review| review.running);
+        let can_write_nags = self.recent_preview.is_none();
         let mut start = false;
         let mut cancel = false;
         let mut write_nags = false;
@@ -2146,6 +2205,7 @@ impl App {
             review_graph(ui, review);
 
             if !running
+                && can_write_nags
                 && !moves.is_empty()
                 && ui
                     .button("Write NAGs to mainline")
@@ -2528,16 +2588,12 @@ impl App {
         };
         let pos = game.nodes[self.node].pos.clone();
         let key = position::position_key(&pos);
-        if let Some(prep) = self.prep.clone() {
+        if self.recent_preview.is_none()
+            && let Some(prep) = self.prep.clone()
+        {
             self.prep_tree(ui, &prep, &pos, key);
             return;
         }
-        let stats = self.index.as_ref().and_then(|index| index.stats(key));
-        let moves = self
-            .index
-            .as_ref()
-            .map(|index| index.moves(key))
-            .unwrap_or_default();
 
         ui.heading("Tree");
         ui.label(RichText::new(&self.index_status).weak());
@@ -2555,48 +2611,6 @@ impl App {
             return;
         }
 
-        ui.add_space(4.0);
-        if let Some(stats) = stats {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(games_label(stats.games as usize)).strong());
-                ui.label(
-                    RichText::new(format!(
-                        "W {} · D {} · B {}",
-                        stats.white, stats.draw, stats.black
-                    ))
-                    .weak(),
-                );
-            });
-            wdl_bar(ui, &stats);
-            let mut summary = Vec::new();
-            if let Some(elo) = stats.elo_avg() {
-                summary.push(format!("avg Elo {elo:.0}"));
-            }
-            let dates = date_range(stats.first_date, stats.last_date);
-            if dates != "—" {
-                summary.push(dates);
-            }
-            if !summary.is_empty() {
-                ui.label(RichText::new(summary.join(" · ")).weak().small());
-            }
-        } else {
-            ui.label(RichText::new("No indexed game reached this position.").weak());
-        }
-
-        if moves.is_empty() {
-            return;
-        }
-
-        let mut rows: Vec<(String, Move, position::MoveStat)> = moves
-            .into_iter()
-            .filter_map(|stat| {
-                let mv = stat.to_move(&pos)?;
-                let san = stat.san(&pos)?;
-                Some((san, mv, stat))
-            })
-            .collect();
-        rows.sort_by(|a, b| b.2.games.cmp(&a.2.games).then(a.0.cmp(&b.0)));
-
         let mut clicked = None;
         ui.add_space(4.0);
         egui::ScrollArea::vertical()
@@ -2604,44 +2618,184 @@ impl App {
             .max_height((ui.available_height() - 8.0).max(80.0))
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                egui::Grid::new("opening-tree-grid")
-                    .num_columns(6)
-                    .striped(true)
-                    .spacing([10.0, 4.0])
-                    .show(ui, |ui| {
-                        ui.label(RichText::new("Move").strong());
-                        ui.label(RichText::new("Games").strong());
-                        ui.label(RichText::new("Score").strong());
-                        ui.label(RichText::new("W/D/B").strong());
-                        ui.label(RichText::new("Elo").strong());
-                        ui.label(RichText::new("Years").strong());
-                        ui.end_row();
-
-                        for (san, mv, stat) in rows {
-                            if ui
-                                .selectable_label(false, RichText::new(&san).monospace())
-                                .on_hover_text("Play this move")
-                                .clicked()
-                            {
-                                clicked = Some(mv);
-                            }
-                            ui.label(stat.games.to_string());
-                            ui.label(format!("{:.0}%", stat.score_white() * 100.0));
-                            ui.label(format!("{}/{}/{}", stat.white, stat.draw, stat.black));
-                            ui.label(
-                                stat.elo_avg()
-                                    .map(|elo| format!("{elo:.0}"))
-                                    .unwrap_or_else(|| "—".to_string()),
-                            );
-                            ui.label(date_range(stat.first_date, stat.last_date));
-                            ui.end_row();
-                        }
-                    });
+                clicked = opening_tree_table(
+                    ui,
+                    self.index.as_ref(),
+                    key,
+                    &pos,
+                    "No indexed game reached this position.",
+                );
             });
 
         if let Some(mv) = clicked {
             self.play_move(mv);
         }
+    }
+
+    /// Build the prepared player's moves from the root to the current node.
+    /// Likelihoods are evaluated at the parent position, which is the same
+    /// distribution that was shown before the move was played.
+    fn prep_line_rows(&self, prep: &PrepSession) -> Vec<PrepLineRow> {
+        let Some(game) = self.current.as_ref() else {
+            return Vec::new();
+        };
+        let book = self
+            .player_book
+            .as_ref()
+            .filter(|book| book.player_key() == prep.player_key);
+        let index = self.index.as_ref();
+
+        let mut line_nodes = Vec::new();
+        let mut node = self.node.min(game.nodes.len().saturating_sub(1));
+        while let Some(parent) = game.nodes[node].parent {
+            line_nodes.push(node);
+            node = parent;
+        }
+        line_nodes.reverse();
+
+        let mut rows = Vec::new();
+        for node_id in line_nodes {
+            let current = &game.nodes[node_id];
+            let Some(ply) = &current.mv else {
+                continue;
+            };
+            if ply.color != prep.opponent_color() {
+                continue;
+            }
+            let Some(parent) = current.parent else {
+                continue;
+            };
+            let parent_pos = &game.nodes[parent].pos;
+            let parent_key = position::position_key(parent_pos);
+            let Ok(uci) = ply.uci.parse::<UciMove>() else {
+                continue;
+            };
+            let Ok(mv) = uci.to_move(parent_pos) else {
+                continue;
+            };
+            let Some(code) = position::encode_move(mv) else {
+                continue;
+            };
+
+            let global = index
+                .map(|index| index.moves(parent_key))
+                .unwrap_or_default();
+            let tree = global.iter().find(|stat| stat.mv == code).copied();
+            let player_move = book.and_then(|book| {
+                book.moves(parent_key)
+                    .into_iter()
+                    .find(|stat| stat.mv == code)
+            });
+            let likelihood = book.and_then(|book| {
+                players::predict(book, parent_key, &global)
+                    .moves
+                    .iter()
+                    .find(|predicted| predicted.mv == code)
+                    .map(|predicted| predicted.probability)
+            });
+            let date = player_move
+                .map(|stat| stat.last_date)
+                .filter(|&date| date != 0)
+                .or_else(|| tree.map(|stat| stat.last_date).filter(|&date| date != 0))
+                .unwrap_or(0);
+
+            rows.push(PrepLineRow {
+                label: format!(
+                    "{}{} {}",
+                    ply.number,
+                    if ply.color == Color::White {
+                        "."
+                    } else {
+                        "..."
+                    },
+                    domain::figurine_san(&ply.san)
+                ),
+                date,
+                tree_score: tree.map(|stat| stat.score_white()),
+                likelihood,
+            });
+        }
+        rows
+    }
+
+    fn prep_prediction_data(
+        &self,
+        prep: &PrepSession,
+        pos: &Chess,
+        key: u64,
+    ) -> Option<(
+        Vec<PrepPredictionRow>,
+        Option<players::PlayerPositionStats>,
+        u32,
+        u32,
+    )> {
+        let book = self
+            .player_book
+            .as_ref()
+            .filter(|book| book.player_key() == prep.player_key)?;
+        let global = self
+            .index
+            .as_ref()
+            .map(|index| index.moves(key))
+            .unwrap_or_default();
+        let prediction = players::predict(book, key, &global);
+        let stats = book.stats(key);
+        let rows = prediction
+            .moves
+            .iter()
+            .take(24)
+            .filter_map(|predicted| {
+                let mv = position::decode_move(pos, predicted.mv)?;
+                let san = SanPlus::from_move(pos.clone(), mv).to_string();
+                let tree = global.iter().find(|stat| stat.mv == predicted.mv).copied();
+                Some(PrepPredictionRow {
+                    mv,
+                    san,
+                    probability: predicted.probability,
+                    player_games: predicted.player_games,
+                    recent_games: predicted.recent_games,
+                    last_date: predicted.last_date,
+                    trend_pp: predicted.trend_pp,
+                    tree,
+                })
+            })
+            .collect();
+        Some((
+            rows,
+            stats,
+            prediction.player_games,
+            prediction.recent_games,
+        ))
+    }
+
+    fn prep_recent_rows(&self, prep: &PrepSession, key: u64, limit: usize) -> Vec<PrepRecentRow> {
+        let Some(book) = self
+            .player_book
+            .as_ref()
+            .filter(|book| book.player_key() == prep.player_key)
+        else {
+            return Vec::new();
+        };
+        let Some(library) = self.library.as_ref() else {
+            return Vec::new();
+        };
+        book.recent_games(key, limit)
+            .into_iter()
+            .filter_map(|game| {
+                let indexed = library.get(game.index)?;
+                Some(PrepRecentRow {
+                    index: game.index,
+                    title: format!("{} – {}", indexed.white(), indexed.black()),
+                    subtitle: format!(
+                        "{} · as {} · {} · {}",
+                        short_date(game.date),
+                        color_name(game.color),
+                        outcome_label(indexed.result(), game.color),
+                        indexed.event()
+                    ),
+                })
+            })
+            .collect()
     }
 
     fn prep_tree(&mut self, ui: &mut Ui, prep: &PrepSession, pos: &shakmaty::Chess, key: u64) {
@@ -2668,176 +2822,490 @@ impl App {
             return;
         }
 
-        if pos.turn() != prep.opponent_color() {
-            ui.add_space(8.0);
-            ui.label(
-                RichText::new(format!(
-                    "It is your move. Play a move; {}'s likely replies appear here.",
-                    prep.player_name
-                ))
-                .italics(),
-            );
+        let our_turn = pos.turn() != prep.opponent_color();
+        let prediction_data = if our_turn {
+            None
+        } else {
+            self.prep_prediction_data(prep, pos, key)
+        };
+        let line_rows = if our_turn {
+            self.prep_line_rows(prep)
+        } else {
+            Vec::new()
+        };
+        let recent_rows = self.prep_recent_rows(prep, key, 50);
+        let book_loaded = self
+            .player_book
+            .as_ref()
+            .is_some_and(|book| book.player_key() == prep.player_key);
+        let book_loading = self.player_book_job.as_deref() == Some(prep.player_key.as_str());
+        let book_status = self.player_book_status.clone();
+        let index = self.index.as_ref();
+        let index_status = self.index_status.clone();
+        let index_building = self.index_rx.is_some();
+        let index_job = self
+            .index_job
+            .as_ref()
+            .map(|path| path.display().to_string());
+        let mut recent_limit = self.prep_recent_limit.clamp(1, 50);
+        let mut clicked = None;
+        let mut preview = None;
+
+        egui::ScrollArea::vertical()
+            .id_salt("prep-tree-scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                if our_turn {
+                    ui.add_space(2.0);
+                    ui.label(RichText::new("It is your move").strong());
+                    ui.label(
+                        RichText::new(format!(
+                            "{}'s moves from earlier in this line stay visible below.",
+                            prep.player_name
+                        ))
+                        .weak()
+                        .small(),
+                    );
+                    ui.add_space(4.0);
+                    if line_rows.is_empty() {
+                        ui.label(
+                            RichText::new(format!(
+                                "No moves by {} yet in this line.",
+                                prep.player_name
+                            ))
+                            .weak()
+                            .italics(),
+                        );
+                    } else {
+                        egui::Grid::new("prep-line-grid")
+                            .num_columns(4)
+                            .striped(true)
+                            .spacing([10.0, 5.0])
+                            .show(ui, |ui| {
+                                ui.label(RichText::new("Move").strong());
+                                ui.label(RichText::new("Date").strong());
+                                ui.label(RichText::new("Tree score").strong())
+                                    .on_hover_text("White's score in database games where this move was played.");
+                                ui.label(RichText::new("Predicted").strong())
+                                    .on_hover_text("Likelihood assigned before this move was chosen.");
+                                ui.end_row();
+
+                                for row in &line_rows {
+                                    ui.label(RichText::new(&row.label).monospace());
+                                    ui.label(
+                                        RichText::new(if row.date == 0 {
+                                            "—".to_string()
+                                        } else {
+                                            pgn_date(row.date)
+                                        })
+                                        .small(),
+                                    );
+                                    ui.label(
+                                        row.tree_score
+                                            .map(|score| format!("{:.0}%", score * 100.0))
+                                            .unwrap_or_else(|| "—".to_string()),
+                                    );
+                                    ui.label(
+                                        row.likelihood
+                                            .map(|probability| {
+                                                format!("{:.0}%", probability * 100.0)
+                                            })
+                                            .unwrap_or_else(|| "—".to_string()),
+                                    );
+                                    ui.end_row();
+                                }
+                            });
+                    }
+                } else if let Some((rows, stats, player_games, recent_games)) = &prediction_data {
+                    if let Some(stats) = stats {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(
+                                RichText::new(format!(
+                                    "{} player games here",
+                                    games_label(stats.games as usize)
+                                ))
+                                .strong(),
+                            );
+                            ui.label(
+                                RichText::new(format!(
+                                    "W {} · D {} · L {} · score {:.0}%",
+                                    stats.wins,
+                                    stats.draws,
+                                    stats.losses,
+                                    stats.score() * 100.0
+                                ))
+                                .weak(),
+                            );
+                            if stats.recent_games > 0 {
+                                ui.label(
+                                    RichText::new(format!("{} recent", stats.recent_games))
+                                        .weak()
+                                        .small(),
+                                );
+                            }
+                        });
+                    } else {
+                        ui.label(
+                            RichText::new(format!(
+                                "No direct games by {} reached this position.",
+                                prep.player_name
+                            ))
+                            .weak(),
+                        );
+                    }
+                    ui.label(
+                        RichText::new(format!(
+                            "Recency-weighted Bayes · {} player games · {} in the last 2 years · prior from the database",
+                            player_games, recent_games
+                        ))
+                        .weak()
+                        .small(),
+                    )
+                    .on_hover_text(
+                        "The model applies exponential time decay (18-month half-life), a small Dirichlet prior from database move frequencies, and a two-year recent-window mixture. It is a probability estimate, not a guarantee.",
+                    );
+
+                    if let Some(top) = rows.first() {
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("Predicted:").strong());
+                            ui.label(
+                                RichText::new(domain::figurine_san(&top.san))
+                                    .monospace()
+                                    .size(18.0)
+                                    .strong(),
+                            );
+                            ui.label(
+                                RichText::new(format!("{:.0}%", top.probability * 100.0))
+                                    .strong()
+                                    .color(Color32::from_rgb(0x9F, 0xD0, 0xA8)),
+                            );
+                            if top.player_games == 0 {
+                                ui.label(RichText::new("database prior only").weak().small());
+                            }
+                        });
+                    }
+
+                    if rows.is_empty() {
+                        ui.add_space(8.0);
+                        ui.label(RichText::new("No move observations to predict from.").weak());
+                    } else {
+                        ui.add_space(4.0);
+                        for row in rows {
+                            ui.horizontal(|ui| {
+                                let mut text = RichText::new(domain::figurine_san(&row.san))
+                                    .monospace()
+                                    .strong();
+                                if row.player_games == 0 {
+                                    text = text.weak();
+                                }
+                                if ui
+                                    .selectable_label(false, text)
+                                    .on_hover_text("Play this response")
+                                    .clicked()
+                                {
+                                    clicked = Some(row.mv);
+                                }
+                                probability_bar(ui, row.probability);
+                            });
+                            ui.horizontal_wrapped(|ui| {
+                                ui.add_space(4.0);
+                                let player = if row.player_games == 0 {
+                                    "player: no direct games".to_string()
+                                } else {
+                                    format!(
+                                        "player: {} · {} recent · last {}",
+                                        games_label(row.player_games as usize),
+                                        row.recent_games,
+                                        short_date(row.last_date)
+                                    )
+                                };
+                                ui.label(RichText::new(player).small().weak());
+                                let (trend, color) = trend_label(row.trend_pp);
+                                ui.label(RichText::new(trend).small().color(color));
+                            });
+                            ui.horizontal_wrapped(|ui| {
+                                ui.add_space(4.0);
+                                let tree = row.tree.map_or_else(
+                                    || "tree: no database games".to_string(),
+                                    |stat| {
+                                        let elo = stat
+                                            .elo_avg()
+                                            .map(|elo| format!("{elo:.0}"))
+                                            .unwrap_or_else(|| "—".to_string());
+                                        format!(
+                                            "tree: {} · score {:.0}% · W/D/B {}/{}/{} · Elo {} · {}",
+                                            games_label(stat.games as usize),
+                                            stat.score_white() * 100.0,
+                                            stat.white,
+                                            stat.draw,
+                                            stat.black,
+                                            elo,
+                                            date_range(stat.first_date, stat.last_date)
+                                        )
+                                    },
+                                );
+                                ui.label(RichText::new(tree).small().weak());
+                            });
+                            ui.add_space(4.0);
+                            ui.separator();
+                        }
+                    }
+                } else {
+                    ui.add_space(4.0);
+                    ui.label(RichText::new(&book_status).weak());
+                    if book_loading {
+                        ui.spinner();
+                    }
+                }
+
+                ui.add_space(8.0);
+                egui::CollapsingHeader::new(RichText::new("Opening tree").strong())
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        if index.is_some() {
+                            clicked = opening_tree_table(
+                                ui,
+                                index,
+                                key,
+                                pos,
+                                "No indexed game reached this position.",
+                            )
+                            .or(clicked);
+                        } else {
+                            ui.label(RichText::new(&index_status).weak());
+                            if index_building {
+                                ui.label(
+                                    RichText::new(
+                                        "Building the position index in the background.",
+                                    )
+                                    .weak()
+                                    .small(),
+                                );
+                            } else if let Some(job) = &index_job {
+                                ui.label(RichText::new(job).weak().small());
+                            }
+                        }
+                    });
+
+                ui.add_space(4.0);
+                egui::CollapsingHeader::new(RichText::new("Recent games").strong())
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label("Show last");
+                            ui.add(
+                                egui::DragValue::new(&mut recent_limit)
+                                    .range(1..=50)
+                                    .speed(1.0),
+                            );
+                            ui.label("games");
+                        });
+                        ui.label(
+                            RichText::new(format!(
+                                "Newest first · from {}'s games in this database",
+                                prep.player_name
+                            ))
+                            .weak()
+                            .small(),
+                        );
+                        ui.add_space(3.0);
+                        if !book_loaded {
+                            ui.label(RichText::new(&book_status).weak());
+                            if book_loading {
+                                ui.spinner();
+                            }
+                        } else if recent_rows.is_empty() {
+                            ui.label(
+                                RichText::new(format!(
+                                    "No {} game reached this position.",
+                                    prep.player_name
+                                ))
+                                .weak()
+                                .italics(),
+                            );
+                        } else {
+                            let width = (ui.available_width() - 4.0).max(100.0);
+                            for row in recent_rows.iter().take(recent_limit) {
+                                if game_row(ui, false, &row.title, &row.subtitle, width, 40.0) {
+                                    preview = Some(row.index);
+                                }
+                            }
+                            if recent_rows.len() > recent_limit {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "Showing {} of up to 50 loaded games.",
+                                        recent_limit
+                                    ))
+                                    .weak()
+                                    .small(),
+                                );
+                            }
+                        }
+                    });
+
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new("Probabilities cover moves seen in this player's or the database's games at this position. Recent games are drawn from the player book.")
+                        .weak()
+                        .small(),
+                );
+            });
+
+        self.prep_recent_limit = recent_limit;
+        if let Some(mv) = clicked {
+            self.play_move(mv);
+        }
+        if let Some(index) = preview {
+            self.open_recent_preview(index);
+        }
+    }
+
+    /// Open a database game in read-only preview while retaining the whole
+    /// preparation session, including the current node and right-hand tab.
+    fn open_recent_preview(&mut self, index: usize) {
+        if self.prep.is_none() || self.recent_preview.is_some() {
             return;
         }
-
-        let (prediction, stats) = {
-            let Some(book) = self
-                .player_book
-                .as_ref()
-                .filter(|book| book.player_key() == prep.player_key)
-            else {
-                ui.add_space(8.0);
-                ui.label(RichText::new(&self.player_book_status).weak());
-                if self.player_book_job.as_deref() == Some(prep.player_key.as_str()) {
-                    ui.spinner();
-                }
-                return;
-            };
-            let global = self
-                .index
-                .as_ref()
-                .map(|index| index.moves(key))
-                .unwrap_or_default();
-            (players::predict(book, key, &global), book.stats(key))
+        let Some(library) = self.library.clone() else {
+            return;
         };
+        let Some(return_game) = self.current.clone() else {
+            return;
+        };
+        let return_node = self.node;
+        let return_tab = self.right_tab;
+        match library.load(index) {
+            Ok(game) => {
+                self.clear_review();
+                self.clear_engine_results();
+                self.annotation_editor = None;
+                self.annotation_focus = false;
+                self.recent_preview = Some(RecentPreview {
+                    return_game,
+                    return_node,
+                    return_tab,
+                });
+                self.current = Some(game);
+                self.game_idx = usize::MAX;
+                self.dirty = false;
+                self.right_tab = RightTab::Moves;
+                self.goto(0);
+                self.status = format!("Previewing game {} · read only", index + 1);
+            }
+            Err(err) => {
+                self.status = format!("Could not open game {}: {err}", index + 1);
+            }
+        }
+    }
 
-        if let Some(stats) = stats {
-            ui.horizontal_wrapped(|ui| {
-                ui.label(
-                    RichText::new(format!(
-                        "{} player games here",
-                        games_label(stats.games as usize)
-                    ))
-                    .strong(),
-                );
-                ui.label(
-                    RichText::new(format!(
-                        "W {} · D {} · L {} · score {:.0}%",
-                        stats.wins,
-                        stats.draws,
-                        stats.losses,
-                        stats.score() * 100.0
-                    ))
-                    .weak(),
-                );
-                if stats.recent_games > 0 {
+    fn close_recent_preview(&mut self) {
+        let Some(preview) = self.recent_preview.take() else {
+            return;
+        };
+        // Review and engine results belong to the preview, not to the
+        // preparation game that is about to be restored.
+        self.clear_review();
+        self.clear_engine_results();
+        self.current = Some(preview.return_game);
+        self.game_idx = usize::MAX;
+        self.dirty = false;
+        self.right_tab = preview.return_tab;
+        self.annotation_editor = None;
+        self.annotation_focus = false;
+        self.goto(preview.return_node);
+        self.status = if let Some(prep) = &self.prep {
+            format!("Returned to preparation against {}", prep.player_name)
+        } else {
+            "Closed game preview.".to_string()
+        };
+    }
+
+    fn preview_content(&mut self, ui: &mut Ui) {
+        let Some(game) = self.current.clone() else {
+            ui.heading("No game");
+            return;
+        };
+        let node = self.node.min(game.nodes.len().saturating_sub(1));
+        let mut close = false;
+        let mut clicked = None;
+
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Recent game").strong().color(GOLD));
+            ui.label(RichText::new("read only").small().weak());
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui.small_button("Close preview").clicked() {
+                    close = true;
+                }
+            });
+        });
+        ui.label(
+            RichText::new("Preparation is paused; closing returns to the same position.")
+                .weak()
+                .small(),
+        );
+        ui.add_space(6.0);
+        game_header_card(ui, &game, None);
+        ui.add_space(8.0);
+
+        let lines = domain::move_lines(&game);
+        egui::Frame::new()
+            .fill(SURFACE)
+            .corner_radius(10.0)
+            .stroke(Stroke::new(1.0, BORDER))
+            .inner_margin(10.0)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Moves").strong());
                     ui.label(
-                        RichText::new(format!("{} recent", stats.recent_games))
+                        RichText::new(format!("{} plies", game.mainline_len()))
                             .weak()
                             .small(),
                     );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.label(RichText::new("← / → to step").small().weak());
+                    });
+                });
+                ui.add_space(2.0);
+
+                let root_comment = game.nodes[0].comment.trim();
+                if !root_comment.is_empty() {
+                    ui.label(
+                        RichText::new(format!("“{}”", comment_preview(root_comment, 72)))
+                            .italics()
+                            .small()
+                            .color(COMMENT_TEXT),
+                    )
+                    .on_hover_text(root_comment);
                 }
-            });
-        } else {
-            ui.label(
-                RichText::new(format!(
-                    "No direct games by {} reached this position.",
-                    prep.player_name
-                ))
-                .weak(),
-            );
-        }
-        ui.label(
-            RichText::new(format!(
-                "Recency-weighted Bayes · {} player games · {} in the last 2 years · prior from the database",
-                prediction.player_games, prediction.recent_games
-            ))
-            .weak()
-            .small(),
-        )
-        .on_hover_text(
-            "The model applies exponential time decay (18-month half-life), a small Dirichlet prior from database move frequencies, and a two-year recent-window mixture. It is a probability estimate, not a guarantee.",
-        );
 
-        if prediction.moves.is_empty() {
-            ui.add_space(8.0);
-            ui.label(RichText::new("No move observations to predict from.").weak());
-            return;
-        }
-
-        let top = prediction.moves[0];
-        if let Some(mv) = position::decode_move(pos, top.mv) {
-            let san = shakmaty::san::SanPlus::from_move(pos.clone(), mv).to_string();
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("Predicted:").strong());
-                ui.label(
-                    RichText::new(domain::figurine_san(&san))
-                        .monospace()
-                        .size(18.0)
-                        .strong(),
-                );
-                ui.label(
-                    RichText::new(format!("{:.0}%", top.probability * 100.0))
-                        .strong()
-                        .color(Color32::from_rgb(0x9F, 0xD0, 0xA8)),
-                );
-                if top.player_games == 0 {
-                    ui.label(RichText::new("database prior only").weak().small());
-                }
-            });
-        }
-
-        let mut clicked = None;
-        ui.add_space(4.0);
-        egui::ScrollArea::vertical()
-            .id_salt("player-tree")
-            .max_height((ui.available_height() - 8.0).max(80.0))
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                egui::Grid::new("player-tree-grid")
-                    .num_columns(6)
-                    .striped(true)
-                    .spacing([10.0, 5.0])
+                egui::ScrollArea::vertical()
+                    .id_salt("preview-moves")
+                    .max_height((ui.available_height() - 8.0).max(100.0))
+                    .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        ui.label(RichText::new("Move").strong());
-                        ui.label(RichText::new("Likelihood").strong());
-                        ui.label(RichText::new("Games").strong());
-                        ui.label(RichText::new("Recent").strong());
-                        ui.label(RichText::new("Last").strong());
-                        ui.label(RichText::new("Trend").strong());
-                        ui.end_row();
-
-                        for predicted in prediction.moves.iter().take(24) {
-                            let Some(mv) = position::decode_move(pos, predicted.mv) else {
-                                continue;
-                            };
-                            let san =
-                                shakmaty::san::SanPlus::from_move(pos.clone(), mv).to_string();
-                            let figurine = domain::figurine_san(&san);
-                            let mut text = RichText::new(figurine).monospace();
-                            if predicted.player_games == 0 {
-                                text = text.weak();
-                            }
-                            if ui
-                                .selectable_label(false, text)
-                                .on_hover_text("Play this response")
-                                .clicked()
-                            {
-                                clicked = Some(mv);
-                            }
-                            probability_bar(ui, predicted.probability);
-                            ui.label(predicted.player_games.to_string());
-                            ui.label(predicted.recent_games.to_string());
-                            ui.label(short_date(predicted.last_date));
-                            let (trend, color) = trend_label(predicted.trend_pp);
-                            ui.label(RichText::new(trend).small().color(color));
-                            ui.end_row();
+                        if lines.is_empty() {
+                            ui.label(RichText::new("No moves in this game.").weak().italics());
+                            return;
+                        }
+                        ui.spacing_mut().item_spacing = vec2(4.0, 3.0);
+                        for line in &lines {
+                            render_readonly_move_line(ui, line, &game, node, &mut clicked);
                         }
                     });
             });
 
-        ui.label(
-            RichText::new("Probabilities cover moves seen in this player's or the database's games at this position.")
-                .weak()
-                .small(),
-        );
-        if let Some(mv) = clicked {
-            self.play_move(mv);
+        if close {
+            self.close_recent_preview();
+        } else if let Some(node) = clicked {
+            self.goto(node);
         }
     }
 
     fn play_move(&mut self, mv: Move) {
+        if self.recent_preview.is_some() {
+            return;
+        }
         let uci = UciMove::from_move(mv, CastlingMode::Standard).to_string();
         let existing = {
             let Some(game) = self.current.as_ref() else {
@@ -3579,6 +4047,91 @@ fn result_badge(ui: &mut Ui, result: &str) {
         });
 }
 
+fn render_readonly_move_line(
+    ui: &mut Ui,
+    line: &domain::MoveLine,
+    game: &Game,
+    selected: usize,
+    clicked: &mut Option<usize>,
+) {
+    if line.depth > 0 {
+        ui.horizontal(|ui| {
+            ui.add_space(8.0 * line.depth as f32);
+            egui::Frame::new()
+                .fill(VARIATION_BG)
+                .corner_radius(5.0)
+                .inner_margin(5.0)
+                .show(ui, |ui| {
+                    render_readonly_move_tokens(ui, line, game, selected, clicked);
+                });
+        });
+    } else {
+        render_readonly_move_tokens(ui, line, game, selected, clicked);
+    }
+}
+
+fn render_readonly_move_tokens(
+    ui: &mut Ui,
+    line: &domain::MoveLine,
+    game: &Game,
+    selected: usize,
+    clicked: &mut Option<usize>,
+) {
+    ui.horizontal_wrapped(|ui| {
+        for token in &line.tokens {
+            match token {
+                Token::OpenParen => {
+                    ui.label(RichText::new("(").weak().small());
+                }
+                Token::CloseParen => {
+                    ui.label(RichText::new(")").weak().small());
+                }
+                Token::Move {
+                    node,
+                    number,
+                    color,
+                    san,
+                    line_start,
+                } => {
+                    let prefix = match color {
+                        Color::White => format!("{number}."),
+                        Color::Black if *line_start => format!("{number}…"),
+                        Color::Black => String::new(),
+                    };
+                    if !prefix.is_empty() {
+                        ui.label(
+                            RichText::new(prefix)
+                                .monospace()
+                                .small()
+                                .color(Color32::from_gray(135)),
+                        );
+                    }
+                    let response = move_chip(ui, *node == selected, san, line.depth > 0);
+                    if response.clicked() {
+                        *clicked = Some(*node);
+                    }
+
+                    let symbols = nag_symbols(&game.nodes[*node].nags);
+                    if !symbols.is_empty() {
+                        ui.label(RichText::new(symbols).small().strong().color(GOLD));
+                    }
+
+                    let comment = game.nodes[*node].comment.trim();
+                    if !comment.is_empty() {
+                        ui.label(
+                            RichText::new(format!("“{}”", comment_preview(comment, 48)))
+                                .italics()
+                                .small()
+                                .color(COMMENT_TEXT),
+                        )
+                        .on_hover_text(comment);
+                    }
+                }
+            }
+        }
+    });
+}
+
 fn render_move_line(
     ui: &mut Ui,
     line: &domain::MoveLine,
@@ -3947,6 +4500,16 @@ fn color_name(color: Color) -> &'static str {
     }
 }
 
+/// Result from the prepared player's perspective.
+fn outcome_label(result: &str, color: Color) -> &'static str {
+    match (result, color) {
+        ("1-0", Color::White) | ("0-1", Color::Black) => "won",
+        ("0-1", Color::White) | ("1-0", Color::Black) => "lost",
+        ("1/2-1/2", _) => "drew",
+        _ => "unfinished",
+    }
+}
+
 fn prep_matches(app: &App, player_key: &str) -> bool {
     app.prep
         .as_ref()
@@ -4075,6 +4638,101 @@ fn wdl_bar(ui: &mut Ui, stats: &PositionStats) {
     ));
 }
 
+/// Normal opening-tree summary and table for one position. Kept free of
+/// scrolling so preparation mode can place it inside its own scroll area.
+fn opening_tree_table(
+    ui: &mut Ui,
+    index: Option<&PositionIndex>,
+    key: u64,
+    pos: &Chess,
+    empty_message: &str,
+) -> Option<Move> {
+    let Some(index) = index else {
+        ui.label(RichText::new(empty_message).weak());
+        return None;
+    };
+    let stats = index.stats(key);
+    let moves = index.moves(key);
+
+    if let Some(stats) = stats {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(games_label(stats.games as usize)).strong());
+            ui.label(
+                RichText::new(format!(
+                    "W {} · D {} · B {}",
+                    stats.white, stats.draw, stats.black
+                ))
+                .weak(),
+            );
+        });
+        wdl_bar(ui, &stats);
+        let mut summary = Vec::new();
+        if let Some(elo) = stats.elo_avg() {
+            summary.push(format!("avg Elo {elo:.0}"));
+        }
+        let dates = date_range(stats.first_date, stats.last_date);
+        if dates != "—" {
+            summary.push(dates);
+        }
+        if !summary.is_empty() {
+            ui.label(RichText::new(summary.join(" · ")).weak().small());
+        }
+    } else {
+        ui.label(RichText::new(empty_message).weak());
+    }
+
+    if moves.is_empty() {
+        return None;
+    }
+
+    let mut rows: Vec<(String, Move, position::MoveStat)> = moves
+        .into_iter()
+        .filter_map(|stat| {
+            let mv = stat.to_move(pos)?;
+            let san = stat.san(pos)?;
+            Some((san, mv, stat))
+        })
+        .collect();
+    rows.sort_by(|a, b| b.2.games.cmp(&a.2.games).then(a.0.cmp(&b.0)));
+
+    let mut clicked = None;
+    ui.add_space(4.0);
+    egui::Grid::new("opening-tree-grid")
+        .num_columns(6)
+        .striped(true)
+        .spacing([10.0, 4.0])
+        .show(ui, |ui| {
+            ui.label(RichText::new("Move").strong());
+            ui.label(RichText::new("Games").strong());
+            ui.label(RichText::new("Score").strong());
+            ui.label(RichText::new("W/D/B").strong());
+            ui.label(RichText::new("Elo").strong());
+            ui.label(RichText::new("Years").strong());
+            ui.end_row();
+
+            for (san, mv, stat) in rows {
+                if ui
+                    .selectable_label(false, RichText::new(&san).monospace())
+                    .on_hover_text("Play this move")
+                    .clicked()
+                {
+                    clicked = Some(mv);
+                }
+                ui.label(stat.games.to_string());
+                ui.label(format!("{:.0}%", stat.score_white() * 100.0));
+                ui.label(format!("{}/{}/{}", stat.white, stat.draw, stat.black));
+                ui.label(
+                    stat.elo_avg()
+                        .map(|elo| format!("{elo:.0}"))
+                        .unwrap_or_else(|| "—".to_string()),
+                );
+                ui.label(date_range(stat.first_date, stat.last_date));
+                ui.end_row();
+            }
+        });
+    clicked
+}
+
 /// Native executable picker for an arbitrary UCI engine.
 fn open_engine_dialog() -> Option<std::path::PathBuf> {
     use std::process::Command;
@@ -4183,6 +4841,8 @@ mod tests {
             player_book_job: None,
             player_book_status: String::new(),
             prep: None,
+            prep_recent_limit: 10,
+            recent_preview: None,
             annotation_editor: None,
             annotation_focus: false,
             online_open: false,
@@ -4282,5 +4942,97 @@ mod tests {
             app.current.as_ref().unwrap().nodes[app.node].san(),
             Some("e4")
         );
+    }
+
+    #[test]
+    fn prep_line_lists_opponent_moves_with_likelihoods() {
+        let pgn = b"[Event \"Prep\"]\n[White \"You\"]\n[Black \"Opponent\"]\n[Date \"2024.01.01\"]\n[Result \"*\"]\n\n1. e4 e5 2. Nf3 Nc6 *\n";
+        let mut games = domain::parse_pgn(&pgn[..]).unwrap();
+        let game = games.remove(0);
+        let book = players::PlayerBook::from_games(
+            "opponent",
+            "Opponent",
+            std::slice::from_ref(&game),
+            players::PredictionConfig::default(),
+            players::today(),
+        );
+
+        let mut app = test_app();
+        app.node = game.nodes.len() - 1;
+        app.current = Some(game);
+        app.player_book = Some(book);
+        app.prep = Some(PrepSession {
+            player_key: "opponent".to_string(),
+            player_name: "Opponent".to_string(),
+            our_color: Color::White,
+            previous_game: None,
+        });
+
+        let prep = app.prep.clone().unwrap();
+        let rows = app.prep_line_rows(&prep);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].label, "1... e5");
+        assert_eq!(
+            rows[1].label,
+            format!("2... {}", domain::figurine_san("Nc6"))
+        );
+        assert_eq!(rows[0].date, 2024_0101);
+        assert!(rows.iter().all(|row| row.likelihood.is_some()));
+        assert!(rows.iter().all(|row| row.tree_score.is_none()));
+    }
+
+    #[test]
+    fn recent_preview_is_read_only_and_restores_preparation() {
+        let pgn = b"[Event \"Preview\"]\n[White \"Preview White\"]\n[Black \"Preview Black\"]\n[Date \"2025.05.05\"]\n[Result \"*\"]\n\n1. d4 d5 *\n";
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "brett-preview-{}-{}.pgn",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, pgn).unwrap();
+        let library = PgnLibrary::build(&path).unwrap();
+
+        let mut app = test_app();
+        let prep_game = app.current.clone().unwrap();
+        app.library = Some(Arc::new(library) as Arc<dyn GameLibrary>);
+        app.node = 2;
+        app.right_tab = RightTab::Tree;
+        app.prep = Some(PrepSession {
+            player_key: "opponent".to_string(),
+            player_name: "Opponent".to_string(),
+            our_color: Color::White,
+            previous_game: None,
+        });
+
+        app.open_recent_preview(0);
+        assert!(app.prep.is_some());
+        assert!(app.recent_preview.is_some());
+        assert_eq!(app.current.as_ref().unwrap().event(), "Preview");
+        assert_eq!(app.node, 0);
+        assert_eq!(app.right_tab, RightTab::Moves);
+
+        let before = app.current.as_ref().unwrap().mainline_len();
+        app.handle_board_event(BoardEvent::Drop {
+            from: Square::E2,
+            to: Square::E4,
+        });
+        assert_eq!(app.node, 0);
+        assert_eq!(app.current.as_ref().unwrap().mainline_len(), before);
+        app.play_uci("d2d4");
+        assert_eq!(app.node, 0);
+        assert_eq!(app.current.as_ref().unwrap().mainline_len(), before);
+
+        app.close_recent_preview();
+        assert!(app.prep.is_some());
+        assert!(app.recent_preview.is_none());
+        assert_eq!(app.current.as_ref().unwrap().event(), prep_game.event());
+        assert_eq!(app.node, 2);
+        assert_eq!(app.right_tab, RightTab::Tree);
+
+        std::fs::remove_file(path).unwrap();
     }
 }

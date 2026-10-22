@@ -15,13 +15,49 @@ opponent likely to play next?**
    **Tree** tab. The normal database game is kept so that **Exit prep** can
    restore it.
 5. Play your move. On the opponent's turn, the prediction panel lists candidate
-   replies with probability, games seen, recent games, last-seen date, and
-   trend. Click a row to play it, or play any other legal move on the board.
-6. **Exit prep** returns to the game that was open before preparation started.
+   replies with probability, games seen, recent games, last-seen date, trend,
+   and the matching database tree columns (games, W/D/L, score, Elo, years).
+   Click a row to play it, or play any other legal move on the board.
+6. On your turn, the panel shows the prepared player's moves from the current
+   line so far: move, date, database score, and the likelihood assigned before
+   the move was chosen. It is never empty.
+7. The normal opening tree for the current position is always shown below the
+   preparation section, in both players' turns.
+8. **Recent games** lists the newest games in the player book that reached the
+   current position. Set the limit (default **10**) in the section. Clicking a
+   row opens a read-only game view; **Close preview** or Escape restores the
+   same preparation position and tab.
+9. **Exit prep** returns to the game that was open before preparation started.
 
 Preparation moves are ordinary game-tree edits. They stay in memory for the
 session and are kept when switching between database games; they are not
 written back to the source database.
+
+## Preparation view
+
+The right-hand panel has three parts in preparation mode:
+
+- **Preparation section.** On the opponent's turn this is the likelihood list.
+  Each row combines the player probability with the database tree statistics
+  for the same move: games, score (from White's perspective), W/D/B, average
+  Elo, and year range. On the user's turn it becomes the prepared player's move
+  history in the current line. The likelihood for a past move is evaluated at
+  the parent position, which is the same distribution that was shown before
+  the move was chosen.
+- **Opening tree.** The normal tree table for the current position is always
+  present, even when the player book is empty. It can be collapsed but not
+  hidden by the preparation state.
+- **Recent games.** Newest-first games from the prepared player's book that
+  reached the current position. The number is configurable from 1 to 50; the
+  default is 10. Unknown dates sort last. Each row shows the game, date, the
+  player's colour, result, and event.
+
+Clicking a recent game loads that database game in a read-only preview. The
+preparation game, its current node, and the right-hand tab are kept aside.
+Board moves, tree clicks, tag editing, and annotation actions are disabled
+while previewing. **Close preview** (or Escape) restores the preparation game
+and exact cursor position. The recent-games preview does not mark the game
+dirty and never writes to the source database.
 
 ## Player identity
 
@@ -47,9 +83,12 @@ demand in a background thread; the UI shows progress while it works.
 For each game in which the selected player appears:
 
 - the mainline is followed (variations are analysis, not tournament history);
-- the book records the position before each move made by the selected player;
+- the book records every position the game reached, including the final
+  position, so recent-game lookups work regardless of whose turn it is;
 - the move, game result from that player's perspective, date, and recency
-  weight are stored;
+  weight are stored for every position where the selected player moved;
+- each position also keeps a small reference to the source game, allowing the
+  recent-games list to be built without rescanning the whole database;
 - the walk stops at the first repeated position, null move, illegal move, or
   malformed game.
 

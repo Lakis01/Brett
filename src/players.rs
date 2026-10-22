@@ -404,11 +404,24 @@ impl Default for PredictionConfig {
     }
 }
 
+/// A game that reached one position in the player's book.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlayerGameRef {
+    /// Index in the database that produced the book.
+    pub index: usize,
+    /// Parsed PGN date (`YYYYMMDD`), or zero when unknown.
+    pub date: u32,
+    /// The prepared player's colour in that game.
+    pub color: Color,
+}
+
 /// A player's position book. Built off the UI thread.
 pub struct PlayerBook {
     player_key: String,
     player_name: String,
     positions: HashMap<u64, BTreeMap<u32, PlayerMoveStat>>,
+    /// Games that reached each position, used by the recent-games panel.
+    game_refs: HashMap<u64, Vec<PlayerGameRef>>,
     games: usize,
     as_of: u32,
     config: PredictionConfig,
@@ -449,6 +462,7 @@ impl PlayerBook {
             player_key: summary.key.clone(),
             player_name: summary.name.clone(),
             positions: HashMap::new(),
+            game_refs: HashMap::new(),
             games: 0,
             as_of,
             config,
@@ -456,7 +470,7 @@ impl PlayerBook {
         let total = summary.game_indices.len();
         for (position, &index) in summary.game_indices.iter().enumerate() {
             match library.load(index) {
-                Ok(game) => book.add_game(&game),
+                Ok(game) => book.add_game(&game, Some(index)),
                 Err(err) => {
                     tracing::warn!("player book skipped game {index}: {err:#}");
                 }
@@ -465,6 +479,7 @@ impl PlayerBook {
                 progress(position + 1, total);
             }
         }
+        book.sort_game_refs();
         Ok(book)
     }
 
@@ -480,17 +495,25 @@ impl PlayerBook {
             player_key: player_key.into(),
             player_name: player_name.into(),
             positions: HashMap::new(),
+            game_refs: HashMap::new(),
             games: 0,
             as_of,
             config,
         };
         for game in games {
-            book.add_game(game);
+            book.add_game(game, None);
         }
+        book.sort_game_refs();
         book
     }
 
-    fn add_game(&mut self, game: &Game) {
+    fn sort_game_refs(&mut self) {
+        for games in self.game_refs.values_mut() {
+            games.sort_by(|a, b| b.date.cmp(&a.date).then(b.index.cmp(&a.index)));
+        }
+    }
+
+    fn add_game(&mut self, game: &Game, game_index: Option<usize>) {
         let white_key = player_key(game.white());
         let black_key = player_key(game.black());
         let color = if white_key.as_deref() == Some(self.player_key.as_str()) {
@@ -506,12 +529,23 @@ impl PlayerBook {
         let mut seen = HashSet::new();
         let mut node = 0;
 
-        while let Some(&child) = game.nodes[node].children.first() {
+        loop {
             let parent_pos = &game.nodes[node].pos;
             let key = position::position_key(parent_pos);
             if !seen.insert(key) {
                 break;
             }
+            // Record every position the game reached, including the final
+            // position where no reply was played.
+            if let Some(index) = game_index {
+                self.game_refs
+                    .entry(key)
+                    .or_default()
+                    .push(PlayerGameRef { index, date, color });
+            }
+            let Some(&child) = game.nodes[node].children.first() else {
+                break;
+            };
             let Some(ply) = &game.nodes[child].mv else {
                 break;
             };
@@ -527,39 +561,36 @@ impl PlayerBook {
             let Some(code) = position::encode_move(mv) else {
                 break;
             };
-            if ply.color != color {
-                node = child;
-                continue;
-            }
-
-            let (weight, recent) = recency(date, self.as_of, self.config);
-            let entry = self
-                .positions
-                .entry(key)
-                .or_default()
-                .entry(code)
-                .or_insert(PlayerMoveStat {
-                    key,
-                    mv: code,
-                    ..PlayerMoveStat::default()
-                });
-            entry.games += 1;
-            entry.weighted += weight;
-            match result {
-                GameResult::Win => entry.wins += 1,
-                GameResult::Draw => entry.draws += 1,
-                GameResult::Loss => entry.losses += 1,
-                GameResult::Unknown => {}
-            }
-            if recent {
-                entry.recent_games += 1;
-                entry.recent_weighted += weight;
-            }
-            if date != 0 {
-                if entry.first_date == 0 || date < entry.first_date {
-                    entry.first_date = date;
+            if ply.color == color {
+                let (weight, recent) = recency(date, self.as_of, self.config);
+                let entry = self
+                    .positions
+                    .entry(key)
+                    .or_default()
+                    .entry(code)
+                    .or_insert(PlayerMoveStat {
+                        key,
+                        mv: code,
+                        ..PlayerMoveStat::default()
+                    });
+                entry.games += 1;
+                entry.weighted += weight;
+                match result {
+                    GameResult::Win => entry.wins += 1,
+                    GameResult::Draw => entry.draws += 1,
+                    GameResult::Loss => entry.losses += 1,
+                    GameResult::Unknown => {}
                 }
-                entry.last_date = entry.last_date.max(date);
+                if recent {
+                    entry.recent_games += 1;
+                    entry.recent_weighted += weight;
+                }
+                if date != 0 {
+                    if entry.first_date == 0 || date < entry.first_date {
+                        entry.first_date = date;
+                    }
+                    entry.last_date = entry.last_date.max(date);
+                }
             }
             node = child;
         }
@@ -596,6 +627,17 @@ impl PlayerBook {
             stats.last_date = stats.last_date.max(mv.last_date);
         }
         Some(stats)
+    }
+
+    /// Most recent games in this book that reached `key`, newest first.
+    ///
+    /// Games with unknown dates sort after dated games. Ties are broken by
+    /// database index so the result is stable.
+    pub fn recent_games(&self, key: u64, limit: usize) -> Vec<PlayerGameRef> {
+        let Some(games) = self.game_refs.get(&key) else {
+            return Vec::new();
+        };
+        games.iter().take(limit).copied().collect()
     }
 }
 
@@ -952,6 +994,55 @@ mod tests {
         assert_eq!(opponent.white.games, 8);
         assert_eq!(opponent.wins() + opponent.draws() + opponent.losses(), 8);
         drop(games);
+    }
+
+    #[test]
+    fn recent_games_are_newest_first_and_limited() {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "brett-recent-{}-{}.pgn",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, TREND_GAMES).unwrap();
+        let library = PgnLibrary::build(&path).unwrap();
+        let directory = PlayerDirectory::build(&library);
+        let index = directory.find_key("trendy").unwrap();
+        let summary = directory.get(index).unwrap();
+        let book = PlayerBook::build(
+            &library,
+            summary,
+            PredictionConfig::default(),
+            2026_1001,
+            |_, _| {},
+        )
+        .unwrap();
+
+        let start = shakmaty::Chess::default();
+        let key = position::position_key(&start);
+        let recent = book.recent_games(key, 3);
+        assert_eq!(recent.len(), 3);
+        assert_eq!(recent[0].date, 2026_0601);
+        assert_eq!(recent[1].date, 2026_0101);
+        assert_eq!(recent[2].date, 2025_0601);
+        assert!(recent.iter().all(|game| game.color == Color::Black));
+        assert_eq!(recent[0].index, 7);
+
+        // The final position has no outgoing move, but the game still reached
+        // it and must appear in recent-game lookups.
+        let newest = library.load(7).unwrap();
+        let leaf = newest.nodes.last().unwrap();
+        let leaf_key = position::position_key(&leaf.pos);
+        assert!(
+            book.recent_games(leaf_key, 10)
+                .iter()
+                .any(|game| game.index == 7)
+        );
+
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
