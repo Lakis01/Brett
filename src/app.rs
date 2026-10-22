@@ -14,13 +14,14 @@ use shakmaty::uci::UciMove;
 use shakmaty::{CastlingMode, Chess, Color, EnPassantMode, Move, Position, Square};
 
 use crate::domain::{self, Clock, Game, Token};
-use crate::engine::{EngineEvent, EngineHandle, EngineInfo, Score, SearchLimit};
+use crate::engine::{EngineEvent, EngineHandle, EngineInfo, EngineOptions, Score, SearchLimit};
 use crate::library::{GameLibrary, PgnLibrary};
 use crate::online::{self, ImportResult, OnlineSource};
 use crate::players::{self, PlayerBook, PlayerDirectory};
 use crate::position::{self, BuildOptions, BuildProgress, PositionIndex, PositionStats};
 use crate::review::{self, Quality, ReviewConfig, ReviewState};
 use crate::scid::ScidLibrary;
+use crate::settings::EnginePrefs;
 use crate::ui::board::{self, BoardEvent, BoardState};
 use crate::ui::fonts;
 use crate::ui::pieces::PieceTextures;
@@ -146,6 +147,9 @@ pub struct App {
     engine_infos: BTreeMap<usize, EngineInfo>,
     engine_bestmove: Option<String>,
     engine_searching: bool,
+    engine_path: String,
+    engine_threads: u32,
+    engine_hash_mb: u32,
     review_engine: Option<EngineHandle>,
     review: Option<ReviewState>,
     review_status: String,
@@ -172,6 +176,7 @@ impl App {
         visuals.extreme_bg_color = Color32::from_rgb(0x14, 0x15, 0x17);
         cc.egui_ctx.set_visuals(visuals);
         fonts::install(&cc.egui_ctx);
+        let engine_prefs = EnginePrefs::load();
 
         let mut app = Self {
             library: None,
@@ -222,6 +227,9 @@ impl App {
             engine_infos: BTreeMap::new(),
             engine_bestmove: None,
             engine_searching: false,
+            engine_path: engine_prefs.resolved_path().display().to_string(),
+            engine_threads: engine_prefs.threads,
+            engine_hash_mb: engine_prefs.hash_mb,
             review_engine: None,
             review: None,
             review_status: "No game review yet.".to_string(),
@@ -456,17 +464,54 @@ impl App {
         }
     }
 
-    /// Start the engine lazily. The default is Stockfish, overridable through
-    /// `BRETT_ENGINE`.
-    fn ensure_engine(&mut self) -> bool {
-        if self.engine.is_some() {
-            return true;
+    fn engine_path(&self) -> PathBuf {
+        let trimmed = self.engine_path.trim();
+        if trimmed.is_empty() {
+            crate::engine::default_engine_path()
+        } else {
+            PathBuf::from(trimmed)
         }
-        let path = crate::engine::default_engine_path();
-        match EngineHandle::spawn(&path) {
+    }
+
+    fn engine_options(&self) -> EngineOptions {
+        EngineOptions {
+            threads: self.engine_threads.clamp(1, 256),
+            hash_mb: self.engine_hash_mb.clamp(1, 32_768),
+        }
+    }
+
+    fn engine_settings_pending(&self) -> bool {
+        self.engine.as_ref().is_some_and(|engine| {
+            engine.path() != self.engine_path() || engine.options() != self.engine_options()
+        })
+    }
+
+    fn reset_engine_events(&mut self) {
+        self.engine_request = 0;
+        self.engine_fen = None;
+        self.engine_infos.clear();
+        self.engine_bestmove = None;
+        self.engine_searching = false;
+        self.engine_ready = false;
+    }
+
+    /// Start the engine lazily with the current executable and resource
+    /// settings. If the settings changed, the old process is replaced.
+    fn ensure_engine(&mut self) -> bool {
+        let path = self.engine_path();
+        let options = self.engine_options();
+        if let Some(engine) = &self.engine {
+            if engine.path() == path && engine.options() == options {
+                return true;
+            }
+            self.engine = None;
+            self.reset_engine_events();
+            self.engine_name.clear();
+        }
+        match EngineHandle::spawn_with_options(&path, options) {
             Ok(engine) => {
                 self.engine = Some(engine);
-                self.engine_ready = false;
+                self.reset_engine_events();
                 self.engine_name.clear();
                 self.engine_status = format!("Starting {}…", path.display());
                 true
@@ -475,6 +520,47 @@ impl App {
                 self.engine_status = format!("Engine unavailable: {err:#}");
                 false
             }
+        }
+    }
+
+    /// Save the current engine selection and replace both engine processes.
+    fn apply_engine_settings(&mut self) {
+        self.engine_path = self.engine_path().display().to_string();
+        self.engine_threads = self.engine_options().threads;
+        self.engine_hash_mb = self.engine_options().hash_mb;
+        let was_running = self.engine.is_some();
+        if let Some(engine) = &self.engine {
+            engine.stop();
+        }
+        if let Some(engine) = &self.review_engine {
+            engine.stop();
+        }
+        self.engine = None;
+        self.review_engine = None;
+        self.reset_engine_events();
+        self.engine_name.clear();
+
+        let review_was_running = self.review.as_ref().is_some_and(|review| review.running);
+        if review_was_running {
+            self.cancel_review();
+            self.review_status = "Review canceled: engine settings changed.".to_string();
+        }
+
+        let prefs = EnginePrefs {
+            path: Some(self.engine_path()),
+            threads: self.engine_options().threads,
+            hash_mb: self.engine_options().hash_mb,
+        };
+        if let Err(err) = prefs.save() {
+            self.status = format!("Could not save engine settings: {err:#}");
+        } else if let Some(path) = crate::settings::config_path() {
+            self.status = format!("Engine settings saved to {}.", path.display());
+        }
+
+        if was_running || self.right_tab == RightTab::Engine {
+            self.ensure_engine();
+        } else {
+            self.engine_status = "Engine settings saved.".to_string();
         }
     }
 
@@ -592,11 +678,15 @@ impl App {
     }
 
     fn ensure_review_engine(&mut self) -> bool {
-        if self.review_engine.is_some() {
-            return true;
+        let path = self.engine_path();
+        let options = self.engine_options();
+        if let Some(engine) = &self.review_engine {
+            if engine.path() == path && engine.options() == options {
+                return true;
+            }
+            self.review_engine = None;
         }
-        let path = crate::engine::default_engine_path();
-        match EngineHandle::spawn(&path) {
+        match EngineHandle::spawn_with_options(&path, options) {
             Ok(engine) => {
                 self.review_engine = Some(engine);
                 true
@@ -1598,6 +1688,8 @@ impl App {
         let mut stop = false;
         let mut settings_changed = false;
         let mut clicked_uci = None;
+        let mut browse_engine = false;
+        let mut apply_engine = false;
 
         egui::Frame::new()
             .fill(SURFACE)
@@ -1626,15 +1718,105 @@ impl App {
                 });
                 ui.label(
                     RichText::new(if self.engine_name.is_empty() {
-                        "Stockfish / UCI"
+                        "UCI engine"
                     } else {
                         &self.engine_name
                     })
                     .small()
                     .weak(),
                 )
-                .on_hover_text("Set BRETT_ENGINE to use a different UCI engine");
+                .on_hover_text("UCI engine selected in Engine settings");
                 ui.label(RichText::new(&self.engine_status).small().weak());
+                ui.add_space(4.0);
+
+                egui::CollapsingHeader::new(RichText::new("Engine and hardware").strong())
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label("Executable");
+                            let width = (ui.available_width() - 8.0).max(120.0);
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.engine_path)
+                                    .desired_width(width)
+                                    .hint_text("/usr/bin/stockfish"),
+                            )
+                            .on_hover_text("Path to any UCI-compatible engine");
+                        });
+                        ui.horizontal_wrapped(|ui| {
+                            if ui.button("Browse…").clicked() {
+                                browse_engine = true;
+                            }
+                            if ui
+                                .button("Default Stockfish")
+                                .on_hover_text(
+                                    "Reset the path to $BRETT_ENGINE or /usr/bin/stockfish",
+                                )
+                                .clicked()
+                            {
+                                self.engine_path = crate::engine::default_engine_path()
+                                    .display()
+                                    .to_string();
+                            }
+                            if ui
+                                .button("Apply & restart")
+                                .on_hover_text(
+                                    "Save the executable, threads, and hash size, then restart the engine",
+                                )
+                                .clicked()
+                            {
+                                apply_engine = true;
+                            }
+                        });
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label("Threads");
+                            ui.add(
+                                egui::DragValue::new(&mut self.engine_threads)
+                                    .range(1..=256)
+                                    .speed(1),
+                            )
+                            .on_hover_text(
+                                "UCI Threads option. Applied when the engine advertises it.",
+                            );
+                            ui.label("Hash / RAM");
+                            ui.add(
+                                egui::DragValue::new(&mut self.engine_hash_mb)
+                                    .range(1..=32_768)
+                                    .suffix(" MB")
+                                    .speed(64),
+                            )
+                            .on_hover_text(
+                                "UCI Hash option: transposition-table memory in megabytes.",
+                            );
+                        });
+                        if let Some(engine) = &self.engine {
+                            let active = engine.options();
+                            ui.label(
+                                RichText::new(format!(
+                                    "Active: {} · {} threads · {} MB hash",
+                                    engine.path().display(),
+                                    active.threads,
+                                    active.hash_mb
+                                ))
+                                .small()
+                                .weak(),
+                            );
+                        }
+                        if self.engine_settings_pending() {
+                            ui.label(
+                                RichText::new("Settings changed — Apply & restart to use them.")
+                                    .small()
+                                    .color(GOLD),
+                            );
+                        } else if self.engine.is_none() {
+                            ui.label(
+                                RichText::new(
+                                    "The engine starts when analysis is requested or Apply is pressed.",
+                                )
+                                .small()
+                                .weak(),
+                            );
+                        }
+                    });
                 ui.add_space(4.0);
 
                 ui.horizontal_wrapped(|ui| {
@@ -1718,6 +1900,12 @@ impl App {
                 });
             });
 
+        if browse_engine && let Some(path) = open_engine_dialog() {
+            self.engine_path = path.display().to_string();
+        }
+        if apply_engine {
+            self.apply_engine_settings();
+        }
         if settings_changed {
             self.clear_engine_results();
         }
@@ -1886,6 +2074,17 @@ impl App {
                     }
                 });
                 ui.label(RichText::new(&self.review_status).small().weak());
+                ui.label(
+                    RichText::new(format!(
+                        "{} · {} threads · {} MB hash",
+                        self.engine_path().display(),
+                        self.engine_threads,
+                        self.engine_hash_mb
+                    ))
+                    .small()
+                    .weak(),
+                )
+                .on_hover_text("Change the engine in the Engine tab");
             });
 
         if start {
@@ -3876,6 +4075,37 @@ fn wdl_bar(ui: &mut Ui, stats: &PositionStats) {
     ));
 }
 
+/// Native executable picker for an arbitrary UCI engine.
+fn open_engine_dialog() -> Option<std::path::PathBuf> {
+    use std::process::Command;
+
+    let dialogs: [(&str, &[&str]); 2] = [
+        (
+            "zenity",
+            &[
+                "--file-selection",
+                "--title=Select UCI engine",
+                "--file-filter=All files | *",
+            ],
+        ),
+        ("kdialog", &["--getopenfilename", ".", "*|All files"]),
+    ];
+
+    for (program, args) in dialogs {
+        match Command::new(program).args(args).output() {
+            Ok(out) if out.status.success() => {
+                let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                return (!path.is_empty()).then(|| std::path::PathBuf::from(path));
+            }
+            Ok(_) => return None,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return None,
+        }
+    }
+
+    None
+}
+
 /// Native file dialog. Prefers zenity/kdialog (both common on Linux desktops)
 /// and returns `None` when no dialog is available or the user cancels.
 fn open_dialog() -> Option<std::path::PathBuf> {
@@ -3975,6 +4205,9 @@ mod tests {
             engine_infos: BTreeMap::new(),
             engine_bestmove: None,
             engine_searching: false,
+            engine_path: "/usr/bin/stockfish".to_string(),
+            engine_threads: 1,
+            engine_hash_mb: 16,
             review_engine: None,
             review: None,
             review_status: "No game review yet.".to_string(),

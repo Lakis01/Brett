@@ -56,6 +56,13 @@ Online imports live only under:
 $XDG_CACHE_HOME/brett/online/      (or ~/.cache/brett/online/)
 ```
 
+User preferences, including the selected UCI engine path, thread count, and hash
+size, live under:
+
+```text
+$XDG_CONFIG_HOME/brett/engine.json (or ~/.config/brett/engine.json)
+```
+
 Nothing is written beside a source database. A cache index is keyed by the
 canonical source path and validated against the PGN file's length/mtime or the
 combined SCID triple fingerprint. Builds use a temporary file in the cache

@@ -4,9 +4,9 @@ This is the working backlog after the preparation stage. Items are ordered by
 dependency and user value, not by estimated effort. Completed work is recorded
 in `README.md`; this file tracks what is next.
 
-**Status (2026-10-22):** items 1 (UCI panel), 2 (game review), 3 (PGN clocks
-beside the board), and 4 (castling drag) are implemented. Item 5, preparation
-view v2, is next.
+**Status (2026-10-22):** items 1 (UCI panel and engine settings), 2 (game
+review), 3 (PGN clocks beside the board), and 4 (castling drag) are implemented.
+Item 5, preparation view v2, is next.
 
 Game review follow-ups that are intentionally deferred: position-index book
 marking and review caching. Clock display currently lives in the board player
@@ -14,13 +14,18 @@ strips rather than move-list/header chips.
 
 ## 1. UCI engine foundation
 
+**Status:** implemented. The **Engine** tab accepts any UCI executable, exposes
+Threads and Hash/RAM, persists the selection under `$XDG_CONFIG_HOME/brett/`,
+and reuses the same engine settings for Game Review.
+
 **Goal:** use the locally installed Stockfish for analysis without blocking the
 UI.
 
 - Detect `/usr/bin/stockfish` and allow an explicit engine path in settings
   (`BRETT_ENGINE` or a file picker).
 - Spawn the engine with piped stdin/stdout (never through a shell), perform the
-  UCI handshake, wait for `readyok`, and apply `Threads`, `Hash`, and `MultiPV`.
+  UCI handshake, wait for `readyok`, and apply `Threads`, `Hash`, and `MultiPV`
+  when advertised by the engine.
 - Analysis panel for the current position: start/stop, depth/time limit,
   centipawn and mate scores, principal variation, MultiPV lines.
 - Clicking a PV move plays it. Results for an old position must be discarded.

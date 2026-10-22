@@ -8,6 +8,7 @@
 //! UCI scores are reported **from the side to move's point of view**. The UI
 //! is responsible for converting them to White's perspective.
 
+use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command as ProcessCommand, Stdio};
@@ -25,6 +26,23 @@ pub fn default_engine_path() -> PathBuf {
     std::env::var_os("BRETT_ENGINE")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/usr/bin/stockfish"))
+}
+
+/// Common UCI engine resources applied when the engine advertises the options.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EngineOptions {
+    pub threads: u32,
+    /// Transposition-table size in megabytes.
+    pub hash_mb: u32,
+}
+
+impl Default for EngineOptions {
+    fn default() -> Self {
+        Self {
+            threads: 1,
+            hash_mb: 16,
+        }
+    }
 }
 
 /// A score reported by UCI. Values are from the side to move's perspective.
@@ -108,14 +126,20 @@ enum EngineCommand {
 /// process does not outlive the application.
 pub struct EngineHandle {
     path: PathBuf,
+    options: EngineOptions,
     commands: Sender<EngineCommand>,
     events: Receiver<EngineEvent>,
     next_request: u64,
 }
 
 impl EngineHandle {
-    /// Spawn an engine and begin the UCI handshake asynchronously.
+    /// Spawn an engine with default resource settings.
     pub fn spawn(path: impl Into<PathBuf>) -> Result<Self> {
+        Self::spawn_with_options(path, EngineOptions::default())
+    }
+
+    /// Spawn an engine and begin the UCI handshake asynchronously.
+    pub fn spawn_with_options(path: impl Into<PathBuf>, options: EngineOptions) -> Result<Self> {
         let path = path.into();
         let mut child = ProcessCommand::new(&path)
             .stdin(Stdio::piped())
@@ -152,11 +176,12 @@ impl EngineHandle {
 
         thread::Builder::new()
             .name("brett-engine-worker".to_string())
-            .spawn(move || run_worker(child, stdin, commands_rx, lines_rx, events_tx))
+            .spawn(move || run_worker(child, stdin, commands_rx, lines_rx, events_tx, options))
             .context("spawning engine worker thread")?;
 
         Ok(Self {
             path,
+            options,
             commands: commands_tx,
             events: events_rx,
             next_request: 0,
@@ -165,6 +190,10 @@ impl EngineHandle {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub fn options(&self) -> EngineOptions {
+        self.options
     }
 
     /// Queue a search. Any search currently running is stopped first.
@@ -205,17 +234,24 @@ impl Drop for EngineHandle {
     }
 }
 
+#[derive(Default)]
+struct WorkerState {
+    ready: bool,
+    searching: bool,
+    current_request: u64,
+    pending: Option<EngineCommand>,
+    advertised_options: HashSet<String>,
+}
+
 fn run_worker(
     mut child: Child,
     mut stdin: ChildStdin,
     commands: Receiver<EngineCommand>,
     lines: Receiver<String>,
     events: Sender<EngineEvent>,
+    options: EngineOptions,
 ) {
-    let mut ready = false;
-    let mut searching = false;
-    let mut pending: Option<EngineCommand> = None;
-    let mut current_request = 0u64;
+    let mut state = WorkerState::default();
     let mut handshake_deadline = Instant::now() + HANDSHAKE_TIMEOUT;
     let mut quit = false;
 
@@ -238,15 +274,7 @@ fn run_worker(
                         quit = true;
                         break;
                     }
-                    handle_line(
-                        &line,
-                        &mut stdin,
-                        &mut ready,
-                        &mut searching,
-                        &mut current_request,
-                        &mut pending,
-                        &events,
-                    );
+                    handle_line(&line, &mut stdin, &events, &options, &mut state);
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
@@ -263,19 +291,25 @@ fn run_worker(
                     break;
                 }
                 Ok(EngineCommand::Stop) => {
-                    pending = None;
-                    if searching {
+                    state.pending = None;
+                    if state.searching {
                         let _ = write_line(&mut stdin, "stop");
                     }
                 }
                 Ok(command @ EngineCommand::Analyze { .. }) => {
-                    if !ready {
-                        pending = Some(command);
-                    } else if searching {
+                    if !state.ready {
+                        state.pending = Some(command);
+                    } else if state.searching {
                         let _ = write_line(&mut stdin, "stop");
-                        pending = Some(command);
+                        state.pending = Some(command);
                     } else {
-                        start_command(&mut stdin, &command, &mut searching, &mut current_request);
+                        start_command(
+                            &mut stdin,
+                            &command,
+                            &mut state.searching,
+                            &mut state.current_request,
+                            &state.advertised_options,
+                        );
                     }
                 }
                 Err(TryRecvError::Empty) => break,
@@ -286,17 +320,23 @@ fn run_worker(
             }
         }
 
-        if ready
-            && !searching
-            && let Some(command) = pending.take()
+        if state.ready
+            && !state.searching
+            && let Some(command) = state.pending.take()
         {
-            start_command(&mut stdin, &command, &mut searching, &mut current_request);
+            start_command(
+                &mut stdin,
+                &command,
+                &mut state.searching,
+                &mut state.current_request,
+                &state.advertised_options,
+            );
         }
 
         if quit {
             break;
         }
-        if !ready && Instant::now() >= handshake_deadline {
+        if !state.ready && Instant::now() >= handshake_deadline {
             let _ = events.send(EngineEvent::Error(format!(
                 "{} did not answer the UCI handshake within {} seconds",
                 "engine",
@@ -321,20 +361,37 @@ fn run_worker(
 fn handle_line(
     line: &str,
     stdin: &mut ChildStdin,
-    ready: &mut bool,
-    searching: &mut bool,
-    current_request: &mut u64,
-    pending: &mut Option<EngineCommand>,
     events: &Sender<EngineEvent>,
+    options: &EngineOptions,
+    state: &mut WorkerState,
 ) {
+    if let Some(rest) = line.strip_prefix("option name ") {
+        let name = rest.split_once(" type ").map_or(rest, |(name, _)| name);
+        state.advertised_options.insert(name.trim().to_string());
+        return;
+    }
     if line == "uciok" {
         // `uciok` only means the option list is complete. UCI engines must
         // also answer `isready` before a search is queued.
+        // Only send options the engine advertised: arbitrary UCI engines may
+        // not implement Stockfish's Threads/Hash controls.
+        if state.advertised_options.contains("Threads") {
+            let _ = write_line(
+                stdin,
+                &format!("setoption name Threads value {}", options.threads.max(1)),
+            );
+        }
+        if state.advertised_options.contains("Hash") {
+            let _ = write_line(
+                stdin,
+                &format!("setoption name Hash value {}", options.hash_mb.max(1)),
+            );
+        }
         let _ = write_line(stdin, "isready");
         return;
     }
     if line == "readyok" {
-        *ready = true;
+        state.ready = true;
         let _ = events.send(EngineEvent::Ready);
         return;
     }
@@ -343,9 +400,11 @@ fn handle_line(
         return;
     }
     if line.starts_with("info ") {
-        if *searching && let Some(info) = parse_info(line) {
+        if state.searching
+            && let Some(info) = parse_info(line)
+        {
             let _ = events.send(EngineEvent::Info {
-                request: *current_request,
+                request: state.current_request,
                 info,
             });
         }
@@ -359,16 +418,22 @@ fn handle_line(
         } else {
             None
         };
-        if *searching {
+        if state.searching {
             let _ = events.send(EngineEvent::BestMove {
-                request: *current_request,
+                request: state.current_request,
                 best,
                 ponder,
             });
-            *searching = false;
+            state.searching = false;
         }
-        if let Some(command @ EngineCommand::Analyze { .. }) = pending.take() {
-            start_command(stdin, &command, searching, current_request);
+        if let Some(command @ EngineCommand::Analyze { .. }) = state.pending.take() {
+            start_command(
+                stdin,
+                &command,
+                &mut state.searching,
+                &mut state.current_request,
+                &state.advertised_options,
+            );
         }
         return;
     }
@@ -385,6 +450,7 @@ fn start_command(
     command: &EngineCommand,
     searching: &mut bool,
     current_request: &mut u64,
+    advertised_options: &HashSet<String>,
 ) {
     let EngineCommand::Analyze {
         request,
@@ -395,15 +461,22 @@ fn start_command(
     else {
         return;
     };
-    if !write_line(
-        stdin,
-        &format!(
-            "setoption name MultiPV value {}",
-            (*multipv).clamp(1, MAX_MULTIPV)
-        ),
-    ) || !write_line(stdin, &format!("position fen {fen}"))
-        || !write_line(stdin, &format!("go {}", limit.uci()))
-    {
+    let mut wrote = write_line(stdin, &format!("position fen {fen}"));
+    if wrote && advertised_options.contains("MultiPV") {
+        // MultiPV must be set before `go`. Engines without the option simply
+        // analyze one line instead of rejecting the search.
+        wrote = write_line(
+            stdin,
+            &format!(
+                "setoption name MultiPV value {}",
+                (*multipv).clamp(1, MAX_MULTIPV)
+            ),
+        );
+    }
+    if wrote {
+        wrote = write_line(stdin, &format!("go {}", limit.uci()));
+    }
+    if !wrote {
         *searching = false;
         return;
     }
@@ -521,11 +594,30 @@ mod tests {
         fs::write(
             &script,
             r#"#!/bin/sh
+threads=0
+hash=0
+multipv=0
 while IFS= read -r line; do
   case "$line" in
-    uci) echo "id name Fake Engine"; echo "uciok" ;;
-    isready) echo "readyok" ;;
-    go*) echo "info depth 5 seldepth 7 multipv 1 score cp 42 nodes 1000 nps 200000 time 5 pv e2e4 e7e5"; echo "bestmove e2e4 ponder e7e5" ;;
+    uci)
+      echo "id name Fake Engine"
+      echo "option name Threads type spin default 1 min 1 max 32"
+      echo "option name Hash type spin default 16 min 1 max 1024"
+      echo "option name MultiPV type spin default 1 min 1 max 500"
+      echo "uciok"
+      ;;
+    "setoption name Threads value 3") threads=1 ;;
+    "setoption name Hash value 64") hash=1 ;;
+    "setoption name MultiPV value 1") multipv=1 ;;
+    isready)
+      if [ "$threads" -eq 1 ] && [ "$hash" -eq 1 ]; then echo "readyok"; fi
+      ;;
+    go*)
+      if [ "$multipv" -eq 1 ]; then
+        echo "info depth 5 seldepth 7 multipv 1 score cp 42 nodes 1000 nps 200000 time 5 pv e2e4 e7e5"
+        echo "bestmove e2e4 ponder e7e5"
+      fi
+      ;;
     stop) echo "bestmove e2e4" ;;
     quit) exit 0 ;;
   esac
@@ -537,7 +629,14 @@ done
         permissions.set_mode(0o755);
         fs::set_permissions(&script, permissions).unwrap();
 
-        let mut engine = EngineHandle::spawn(&script).unwrap();
+        let mut engine = EngineHandle::spawn_with_options(
+            &script,
+            EngineOptions {
+                threads: 3,
+                hash_mb: 64,
+            },
+        )
+        .unwrap();
         let deadline = Instant::now() + Duration::from_secs(3);
         let mut ready = false;
         let mut requested = false;

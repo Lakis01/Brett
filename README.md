@@ -61,19 +61,26 @@ its UI, and not a Wine package.
 
 ### Engine analysis
 
-- The **Engine** tab starts Stockfish from `/usr/bin/stockfish` (override with
-  `BRETT_ENGINE`), performs the UCI handshake off the UI thread, and streams
-  MultiPV scores and principal variations without blocking the board.
+- The **Engine** tab works with any UCI engine: type its executable path or use
+  **Browse…** to pick a downloaded engine. **Default Stockfish** resets the path
+  to `$BRETT_ENGINE` or `/usr/bin/stockfish`.
+- Choose the engine's **Threads** and **Hash / RAM** size (up to 32,768 MB),
+  then press **Apply & restart**. The settings are sent as UCI `setoption`
+  commands when the engine advertises those options, saved in
+  `$XDG_CONFIG_HOME/brett/engine.json` (or
+  `~/.config/brett/engine.json`), and reused at the next launch.
 - Choose depth or time, 1–5 MultiPV lines, and auto-analysis on position change.
   Clicking a PV line plays its first move. Results from an older position are
   discarded.
-- The worker kills the engine cleanly on exit and reports protocol or process
-  errors in the panel.
+- The worker performs the UCI handshake off the UI thread, waits for `readyok`,
+  kills the engine cleanly on exit, and reports protocol or process errors in
+  the panel.
 
 ### Game review
 
-- The **Review** tab analyzes every mainline position with a second Stockfish
-  process, by depth or time per move, with a progress bar and cancel button.
+- The **Review** tab analyzes every mainline position with a second process
+  using the same selected engine, thread count, and hash size, by depth or time
+  per move, with a progress bar and cancel button.
 - Each move is graded from the centipawn change between the engine evaluation
   before and after the move: best move, excellent (≤20 cp lost), good
   (≤50), inaccuracy (≤100), mistake (≤250), or blunder (>250). Forced moves
@@ -156,7 +163,8 @@ never writes to the source database.
 | `src/players.rs` | Player directory, per-player position books, Bayesian prediction |
 | `src/online.rs` | Public Lichess and Chess.com imports |
 | `src/domain.rs` | Game tree, PGN parsing, move lines, figurines, NAG palette, clocks |
-| `src/engine.rs` | Asynchronous UCI process, handshake, parser, worker threads |
+| `src/engine.rs` | Asynchronous UCI process, handshake, options, parser, worker threads |
+| `src/settings.rs` | Persistent engine path, thread, and hash settings |
 | `src/review.rs` | Sequential game review, move grading, accuracy, eval chart data |
 | `src/app.rs` | egui application, tabs, preparation flow, annotation editor |
 | `src/ui/fonts.rs` | Embedded DejaVu Sans fallback for chess symbols |
@@ -172,8 +180,9 @@ never writes to the source database.
   comments, NAGs, custom FEN, null moves, and position indexing.
 - **Preparation stage (done).** Player directory, player books, prediction,
   Prepare as White/Black, online imports, annotation editing, PGN panel.
-- **UCI engine (done).** Stockfish/MultiPV analysis, asynchronous worker,
-  clickable principal variations, `/usr/bin/stockfish` default.
+- **UCI engine (done).** Any UCI executable, persistent Threads/Hash settings,
+  MultiPV analysis, asynchronous worker, clickable principal variations,
+  Stockfish default.
 - **Clock display (done).** PGN `[%clk]` parsing, hidden by default, shown
   beside the players at the board.
 - **Castling by dragging the king (done).** King-to-destination and
@@ -200,7 +209,8 @@ The detailed queue and acceptance criteria are in
 
 **`/home/gratis01/Chess Databases/` is treated as read-only.** Brett opens PGN
 and SCID files for reading only. Derived indexes and imported games go to
-`$XDG_CACHE_HOME/brett/`; nothing is written next to a source database.
+`$XDG_CACHE_HOME/brett/`, and engine preferences go to
+`$XDG_CONFIG_HOME/brett/`; nothing is written next to a source database.
 See [docs/DATA_SAFETY.md](docs/DATA_SAFETY.md).
 
 ## Third-party assets and references
