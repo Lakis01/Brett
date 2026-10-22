@@ -6,5 +6,8 @@
 pub mod app;
 pub mod domain;
 pub mod library;
+pub mod online;
+pub mod players;
 pub mod position;
+pub mod scid;
 pub mod ui;

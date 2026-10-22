@@ -406,6 +406,357 @@ pub enum Token {
     CloseParen,
 }
 
+/// One visually distinct line of PGN movetext.
+///
+/// Top-level variations are placed on their own indented lines. Nested
+/// variations stay inline inside their parent variation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MoveLine {
+    pub depth: usize,
+    pub tokens: Vec<Token>,
+}
+
+/// Split a game into readable PGN lines.
+///
+/// The mainline remains continuous until a position has an alternative move.
+/// At that point the mainline line is flushed, each alternative is rendered on
+/// an indented line, and the mainline resumes on a fresh line. This keeps long
+/// annotated games readable without losing PGN ordering.
+pub fn move_lines(game: &Game) -> Vec<MoveLine> {
+    let mut lines = Vec::new();
+    let mut current = Vec::new();
+    walk_lines(game, 0, 0, &mut current, &mut lines);
+    flush_line(0, current, &mut lines);
+    lines
+}
+
+fn flush_line(depth: usize, tokens: Vec<Token>, lines: &mut Vec<MoveLine>) {
+    if !tokens.is_empty() {
+        lines.push(MoveLine { depth, tokens });
+    }
+}
+
+fn walk_lines(
+    game: &Game,
+    node: usize,
+    depth: usize,
+    current: &mut Vec<Token>,
+    lines: &mut Vec<MoveLine>,
+) {
+    let Some(&first) = game.nodes[node].children.first() else {
+        return;
+    };
+
+    push_move(game, first, current.is_empty(), current);
+
+    if game.nodes[node].children.len() > 1 {
+        flush_line(depth, std::mem::take(current), lines);
+        for &alternative in game.nodes[node].children.iter().skip(1) {
+            let mut variation = vec![Token::OpenParen];
+            push_move(game, alternative, true, &mut variation);
+            walk_inline(game, alternative, &mut variation);
+            variation.push(Token::CloseParen);
+            lines.push(MoveLine {
+                depth: depth + 1,
+                tokens: variation,
+            });
+        }
+    }
+
+    walk_lines(game, first, depth, current, lines);
+}
+
+/// Flatten an alternative line, including its own nested variations inline.
+fn walk_inline(game: &Game, node: usize, out: &mut Vec<Token>) {
+    let Some(&first) = game.nodes[node].children.first() else {
+        return;
+    };
+
+    push_move(game, first, false, out);
+    for &alternative in game.nodes[node].children.iter().skip(1) {
+        out.push(Token::OpenParen);
+        push_move(game, alternative, true, out);
+        walk_inline(game, alternative, out);
+        out.push(Token::CloseParen);
+    }
+    walk_inline(game, first, out);
+}
+
+/// Render SAN with Unicode figurines (`Nf3` → `♘f3`).
+///
+/// Castling and pawn moves keep their normal notation. Promotion letters are
+/// replaced as well (`e8=Q+` → `e8=♕+`).
+pub fn figurine_san(san: &str) -> String {
+    let mut out = String::with_capacity(san.len() + 3);
+    let mut chars = san.chars();
+    if let Some(first) = chars.next() {
+        if let Some(glyph) = piece_glyph(first) {
+            out.push(glyph);
+        } else {
+            out.push(first);
+        }
+    }
+
+    let rest: String = chars.collect();
+    let mut iter = rest.chars().peekable();
+    while let Some(c) = iter.next() {
+        if c == '='
+            && let Some(glyph) = iter.peek().and_then(|next| piece_glyph(*next))
+        {
+            out.push('=');
+            out.push(glyph);
+            iter.next();
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn piece_glyph(letter: char) -> Option<char> {
+    match letter {
+        'K' => Some('♔'),
+        'Q' => Some('♕'),
+        'R' => Some('♖'),
+        'B' => Some('♗'),
+        'N' => Some('♘'),
+        _ => None,
+    }
+}
+
+/// Unicode annotation symbol for a standard PGN NAG.
+pub fn nag_symbol(nag: u8) -> Option<&'static str> {
+    Some(match nag {
+        1 => "!",
+        2 => "?",
+        3 => "!!",
+        4 => "??",
+        5 => "!?",
+        6 => "?!",
+        7 | 8 => "□",
+        9 => "??",
+        10 | 11 => "=",
+        12 | 13 => "∞",
+        14 => "+=",
+        15 => "=+",
+        16 => "±",
+        17 => "∓",
+        18 => "+−",
+        19 => "−+",
+        20 => "+−−",
+        21 => "−−+",
+        22 | 23 => "⨀",
+        26 | 35 | 36 => "↑",
+        40 | 41 => "→",
+        44 => "+=",
+        48 | 50 => "⊕",
+        54 | 56 | 58 => "→",
+        60 | 62 | 64 => "←",
+        130..=135 => "⇆",
+        136 => "⏱",
+        140 => "∆",
+        142 => ">",
+        144 => "⇄",
+        145 => "RR",
+        146 => "N",
+        147 => "×",
+        149 => "≡",
+        151 => "BP",
+        153 => "OB",
+        154 => "SB",
+        190 => "≈",
+        191 => "2P",
+        192 => "SP",
+        193 => "UP",
+        201 => "D",
+        210 => "↗",
+        211 => "#",
+        212 => "↑",
+        213 => "＋",
+        214 => "|_",
+        215 => "_|",
+        _ => return None,
+    })
+}
+
+/// One selectable annotation in the move context menu.
+#[derive(Clone, Copy, Debug)]
+pub struct NagChoice {
+    pub code: u8,
+    pub symbol: &'static str,
+    pub label: &'static str,
+}
+
+/// Common chess annotation symbols, grouped for menus and the annotation
+/// editor. The numeric code is the standard NAG stored in the PGN.
+pub const NAG_GROUPS: &[(&str, &[NagChoice])] = &[
+    (
+        "Move quality",
+        &[
+            NagChoice {
+                code: 1,
+                symbol: "!",
+                label: "Good move",
+            },
+            NagChoice {
+                code: 2,
+                symbol: "?",
+                label: "Poor move",
+            },
+            NagChoice {
+                code: 3,
+                symbol: "!!",
+                label: "Excellent move",
+            },
+            NagChoice {
+                code: 4,
+                symbol: "??",
+                label: "Blunder",
+            },
+            NagChoice {
+                code: 5,
+                symbol: "!?",
+                label: "Interesting move",
+            },
+            NagChoice {
+                code: 6,
+                symbol: "?!",
+                label: "Dubious move",
+            },
+            NagChoice {
+                code: 7,
+                symbol: "□",
+                label: "Forced move",
+            },
+            NagChoice {
+                code: 8,
+                symbol: "□",
+                label: "Only move",
+            },
+        ],
+    ),
+    (
+        "Evaluation",
+        &[
+            NagChoice {
+                code: 10,
+                symbol: "=",
+                label: "Equal position",
+            },
+            NagChoice {
+                code: 12,
+                symbol: "∞",
+                label: "Unclear position",
+            },
+            NagChoice {
+                code: 14,
+                symbol: "+=",
+                label: "White is slightly better",
+            },
+            NagChoice {
+                code: 15,
+                symbol: "=+",
+                label: "Black is slightly better",
+            },
+            NagChoice {
+                code: 16,
+                symbol: "±",
+                label: "White is better",
+            },
+            NagChoice {
+                code: 17,
+                symbol: "∓",
+                label: "Black is better",
+            },
+            NagChoice {
+                code: 18,
+                symbol: "+−",
+                label: "White is winning",
+            },
+            NagChoice {
+                code: 19,
+                symbol: "−+",
+                label: "Black is winning",
+            },
+            NagChoice {
+                code: 20,
+                symbol: "+−−",
+                label: "White has a decisive advantage",
+            },
+            NagChoice {
+                code: 21,
+                symbol: "−−+",
+                label: "Black has a decisive advantage",
+            },
+        ],
+    ),
+    (
+        "Ideas and structure",
+        &[
+            NagChoice {
+                code: 22,
+                symbol: "⨀",
+                label: "Zugzwang",
+            },
+            NagChoice {
+                code: 36,
+                symbol: "↑",
+                label: "With the initiative",
+            },
+            NagChoice {
+                code: 40,
+                symbol: "→",
+                label: "With an attack",
+            },
+            NagChoice {
+                code: 130,
+                symbol: "⇆",
+                label: "Counterplay",
+            },
+            NagChoice {
+                code: 140,
+                symbol: "∆",
+                label: "With the idea",
+            },
+            NagChoice {
+                code: 142,
+                symbol: ">",
+                label: "Better is",
+            },
+            NagChoice {
+                code: 146,
+                symbol: "N",
+                label: "Novelty",
+            },
+            NagChoice {
+                code: 201,
+                symbol: "D",
+                label: "Diagram",
+            },
+            NagChoice {
+                code: 48,
+                symbol: "⊕",
+                label: "White has a slight centre",
+            },
+            NagChoice {
+                code: 191,
+                symbol: "2P",
+                label: "Double pawns",
+            },
+            NagChoice {
+                code: 192,
+                symbol: "SP",
+                label: "Separated pawns",
+            },
+            NagChoice {
+                code: 193,
+                symbol: "UP",
+                label: "United pawns",
+            },
+        ],
+    ),
+];
+
 /// Flatten the tree into PGN-style ordered tokens.
 ///
 /// At every position the mainline move is written first, followed by the

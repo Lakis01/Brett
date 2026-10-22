@@ -14,6 +14,7 @@ use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Write};
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
@@ -21,8 +22,11 @@ use memmap2::{Mmap, MmapOptions};
 use pgn_reader::{RawTag, Reader, SanPlus, Visitor};
 use shakmaty::fen::Fen;
 use shakmaty::san::San;
+use shakmaty::uci::UciMove;
 use shakmaty::zobrist::Zobrist64;
 use shakmaty::{CastlingMode, Chess, EnPassantMode, Move, Position, Role, Square};
+
+use crate::library::{GameLibrary, SourceMeta};
 
 const MAGIC: &[u8; 8] = b"BRETTPOS";
 const VERSION: u32 = 1;
@@ -191,6 +195,26 @@ impl PositionIndex {
         }
     }
 
+    /// Open the cached index for a database, if it exists and is current.
+    pub fn open_cached_for(library: &dyn GameLibrary) -> Result<Option<Self>> {
+        let meta = library.source_meta()?;
+        let path = cache_path(library.path());
+        if !path.exists() {
+            return Ok(None);
+        }
+        match Self::open(&path) {
+            Ok(index) if index.source_matches(&meta) => Ok(Some(index)),
+            Ok(_) => Ok(None),
+            Err(err) => {
+                tracing::warn!(
+                    "ignoring stale or invalid index {}: {err:#}",
+                    path.display()
+                );
+                Ok(None)
+            }
+        }
+    }
+
     /// Build an index into the cache and open it.
     pub fn build_cached(
         source: impl AsRef<Path>,
@@ -201,6 +225,148 @@ impl PositionIndex {
         let path = cache_path(source);
         Self::build_to(source, &path, options, progress)?;
         Self::open(&path)
+    }
+
+    /// Build a cache index for any [`GameLibrary`], using the streaming PGN
+    /// fast path when possible and a generic loader for SCID.
+    pub fn build_cached_for(
+        library: Arc<dyn GameLibrary>,
+        options: BuildOptions,
+        progress: impl FnMut(BuildProgress),
+    ) -> Result<Self> {
+        let path = cache_path(library.path());
+        if let Some(pgn) = library.as_pgn() {
+            Self::build_to(pgn.path(), &path, options, progress)?;
+        } else {
+            Self::build_library_to(library.as_ref(), &path, options, progress)?;
+        }
+        Self::open(&path)
+    }
+
+    /// Build an index from games loaded through the common database
+    /// interface. Used for SCID, where the streaming PGN reader cannot be
+    /// applied directly.
+    pub fn build_library_to(
+        library: &dyn GameLibrary,
+        index_path: impl AsRef<Path>,
+        options: BuildOptions,
+        mut progress: impl FnMut(BuildProgress),
+    ) -> Result<BuildReport> {
+        let index_path = index_path.as_ref();
+        let started = Instant::now();
+        let meta = library.source_meta()?;
+        let mut records: HashMap<(u64, u32), EdgeRecord> = HashMap::new();
+        let mut games = 0usize;
+        let mut last_report = 0usize;
+
+        for index in 0..library.len() {
+            match library.load(index) {
+                Ok(game) => {
+                    let game_meta = GameMeta::from_tags(&game.headers);
+                    let mut seen = HashSet::new();
+                    let mut node = 0usize;
+                    let mut plies = 0u32;
+                    while let Some(&child) = game.nodes[node].children.first() {
+                        let parent = &game.nodes[node];
+                        let Some(ply) = game.nodes[child].mv.as_ref() else {
+                            break;
+                        };
+                        if ply.uci == "0000" {
+                            break;
+                        }
+                        let Ok(ucimove) = UciMove::from_ascii(ply.uci.as_bytes()) else {
+                            break;
+                        };
+                        let Ok(mv) = ucimove.to_move(&parent.pos) else {
+                            break;
+                        };
+                        let Some(code) = encode_move(mv) else {
+                            break;
+                        };
+                        let key = position_key(&parent.pos);
+                        if !seen.insert(key) {
+                            break;
+                        }
+                        let record = records.entry((key, code)).or_default();
+                        record.key = key;
+                        record.mv = code;
+                        game_meta.add_to(record);
+                        node = child;
+                        plies += 1;
+                        if plies >= options.max_plies {
+                            break;
+                        }
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!("position index skipped game {index}: {err:#}");
+                }
+            }
+
+            games += 1;
+            if games.saturating_sub(last_report) >= 1000 {
+                progress(BuildProgress {
+                    games,
+                    edges: records.len(),
+                    elapsed: started.elapsed(),
+                });
+                last_report = games;
+            }
+        }
+
+        let mut records: Vec<EdgeRecord> = records.into_values().collect();
+        records.sort_unstable_by(|a, b| a.key.cmp(&b.key).then(a.mv.cmp(&b.mv)));
+        let elapsed = started.elapsed();
+        let positions = records
+            .windows(2)
+            .filter(|pair| pair[0].key != pair[1].key)
+            .count()
+            + usize::from(!records.is_empty());
+        let header = IndexHeader {
+            source_len: meta.len,
+            source_mtime_secs: meta.mtime_secs,
+            source_mtime_nanos: meta.mtime_nanos,
+            max_plies: options.max_plies,
+            edge_count: records.len() as u64,
+            game_count: games as u64,
+            position_count: positions as u64,
+            build_millis: elapsed.as_millis().min(u64::MAX as u128) as u64,
+        };
+
+        if let Some(parent) = index_path
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+        {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("creating index directory {}", parent.display()))?;
+        }
+        let tmp = temp_path(index_path);
+        let write_result = write_index(&tmp, &header, &records);
+        if let Err(err) = write_result {
+            let _ = fs::remove_file(&tmp);
+            return Err(err);
+        }
+        fs::rename(&tmp, index_path).with_context(|| {
+            format!(
+                "installing index {} -> {}",
+                tmp.display(),
+                index_path.display()
+            )
+        })?;
+
+        let bytes = HEADER_LEN as u64 + records.len() as u64 * EDGE_SIZE as u64;
+        progress(BuildProgress {
+            games,
+            edges: records.len(),
+            elapsed,
+        });
+        Ok(BuildReport {
+            games,
+            edges: records.len(),
+            positions,
+            elapsed,
+            bytes,
+        })
     }
 
     /// Build an index file at `index_path`.
@@ -526,27 +692,6 @@ impl IndexHeader {
             game_count: u64::from_le_bytes(bytes[48..56].try_into().unwrap()),
             position_count: u64::from_le_bytes(bytes[56..64].try_into().unwrap()),
             build_millis: u64::from_le_bytes(bytes[64..72].try_into().unwrap()),
-        })
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-struct SourceMeta {
-    len: u64,
-    mtime_secs: u64,
-    mtime_nanos: u32,
-}
-
-impl SourceMeta {
-    fn read(source: &Path) -> Result<Self> {
-        let metadata = fs::metadata(source)
-            .with_context(|| format!("reading metadata for {}", source.display()))?;
-        let modified = metadata.modified().unwrap_or(UNIX_EPOCH);
-        let since_epoch = modified.duration_since(UNIX_EPOCH).unwrap_or_default();
-        Ok(Self {
-            len: metadata.len(),
-            mtime_secs: since_epoch.as_secs(),
-            mtime_nanos: since_epoch.subsec_nanos(),
         })
     }
 }

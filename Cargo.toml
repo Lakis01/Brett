@@ -2,7 +2,7 @@
 name = "brett"
 version = "0.1.0"
 edition = "2024"
-description = "Brett: native Linux chess preparation workspace with PGN/CBH databases, position tree, UCI engine and cloud evaluation"
+description = "Brett: native Linux chess preparation workspace for PGN/SCID databases"
 license = "MIT"
 
 [dependencies]
@@ -18,8 +18,10 @@ pgn-reader = "0.29"
 image = { version = "0.25", default-features = false, features = ["png"] }
 memmap2 = "0.9"
 anyhow = "1"
+serde_json = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+ureq = "2.12"
 
 [profile.dev]
 opt-level = 1

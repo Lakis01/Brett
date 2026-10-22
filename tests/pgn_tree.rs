@@ -58,6 +58,55 @@ fn variation_hangs_off_the_alternative_move() {
 }
 
 #[test]
+fn figurine_san_uses_unicode_pieces_without_touching_pawns_or_castling() {
+    assert_eq!(domain::figurine_san("Nf3"), "♘f3");
+    assert_eq!(domain::figurine_san("Bxe6+"), "♗xe6+");
+    assert_eq!(domain::figurine_san("exd8=Q+"), "exd8=♕+");
+    assert_eq!(domain::figurine_san("O-O-O"), "O-O-O");
+    assert_eq!(domain::figurine_san("b4"), "b4");
+    assert_eq!(domain::nag_symbol(1), Some("!"));
+    assert_eq!(domain::nag_symbol(3), Some("!!"));
+    assert_eq!(domain::nag_symbol(13), Some("∞"));
+    assert_eq!(domain::nag_symbol(14), Some("+="));
+    assert_eq!(domain::nag_symbol(15), Some("=+"));
+    assert_eq!(domain::nag_symbol(255), None);
+}
+
+#[test]
+fn move_lines_place_variations_on_an_indented_line() {
+    let g = opera();
+    let lines = domain::move_lines(&g);
+
+    let variation = lines
+        .iter()
+        .find(|line| {
+            line.depth == 1
+                && line
+                    .tokens
+                    .iter()
+                    .any(|token| matches!(token, Token::Move { san, .. } if san == "exd4"))
+        })
+        .expect("exd4 variation line");
+    assert!(matches!(variation.tokens.first(), Some(Token::OpenParen)));
+    assert!(matches!(variation.tokens.last(), Some(Token::CloseParen)));
+
+    let mainline_has_exd4 = lines
+        .iter()
+        .filter(|line| line.depth == 0)
+        .flat_map(|line| &line.tokens)
+        .any(|token| matches!(token, Token::Move { san, .. } if san == "exd4"));
+    assert!(!mainline_has_exd4, "variation leaked into the mainline");
+
+    let line_moves = lines
+        .iter()
+        .flat_map(|line| &line.tokens)
+        .filter(|token| matches!(token, Token::Move { .. }))
+        .count();
+    let tree_moves = g.nodes.iter().filter(|node| node.mv.is_some()).count();
+    assert_eq!(line_moves, tree_moves, "every move appears exactly once");
+}
+
+#[test]
 fn comments_attach_to_the_preceding_move() {
     let g = opera();
     assert!(g.nodes[0].comment.contains("Opera Game"));
