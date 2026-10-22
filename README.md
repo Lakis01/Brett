@@ -70,6 +70,22 @@ its UI, and not a Wine package.
 - The worker kills the engine cleanly on exit and reports protocol or process
   errors in the panel.
 
+### Game review
+
+- The **Review** tab analyzes every mainline position with a second Stockfish
+  process, by depth or time per move, with a progress bar and cancel button.
+- Each move is graded from the centipawn change between the engine evaluation
+  before and after the move: best move, excellent (≤20 cp lost), good
+  (≤50), inaccuracy (≤100), mistake (≤250), or blunder (>250). Forced moves
+  are marked without a centipawn penalty, and mate scores are compressed so
+  they dominate normal evaluations without breaking the graph.
+- The panel shows an estimated accuracy percentage, a white-perspective
+  evaluation graph, and a clickable move list. Clicking a row jumps to that
+  move. **Write NAGs to mainline** copies the grades into the in-memory tree as
+  `!!`/`!`/`?!`/`?`/`??` annotations.
+- Accuracy is a documented heuristic based on centipawn loss, not an official
+  rating.
+
 ### Board and move list
 
 - 2D board with the cburnett piece set, coordinates, legal-move hints, click or
@@ -93,8 +109,8 @@ its UI, and not a Wine package.
   panel.
 - Keyboard: `←`/`→` previous/next move, `↑`/`↓` previous/next game,
   `Home`/`End` start/end, `F` flip board, `T` tree, `M` moves,
-  `E` engine, `A` annotate the selected move, `Escape` closes the annotation
-  editor or board selection.
+  `E` engine, `R` review, `A` annotate the selected move, `Escape` closes the
+  annotation editor or board selection.
 
 ### Benchmarks
 
@@ -141,6 +157,7 @@ never writes to the source database.
 | `src/online.rs` | Public Lichess and Chess.com imports |
 | `src/domain.rs` | Game tree, PGN parsing, move lines, figurines, NAG palette, clocks |
 | `src/engine.rs` | Asynchronous UCI process, handshake, parser, worker threads |
+| `src/review.rs` | Sequential game review, move grading, accuracy, eval chart data |
 | `src/app.rs` | egui application, tabs, preparation flow, annotation editor |
 | `src/ui/fonts.rs` | Embedded DejaVu Sans fallback for chess symbols |
 | `docs/` | Data safety, position-index format, preparation model, SCID reader, backlog |
@@ -163,8 +180,9 @@ never writes to the source database.
   king-to-rook gestures both work.
 - **PGN metadata (done).** Editable common tags, fixed tag names, delete/add,
   Elo/DWZ ratings, and player strips above and below the board.
-- **Game Review** using the local engine: per-move evaluations, centipawn loss,
-  accuracy, blunder classification, and an evaluation graph.
+- **Game Review (done).** Per-position Stockfish pass with progress/cancel,
+  centipawn-loss grades, forced-move handling, accuracy summary, evaluation
+  graph, clickable move list, and optional NAG write-back.
 - **Preparation view v2:** normal tree statistics at every turn, opponent move
   history, calibrated likelihoods with uncertainty, a static and rating-matched
   reference distribution, and a clickable recent-games window.

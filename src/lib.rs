@@ -10,5 +10,6 @@ pub mod library;
 pub mod online;
 pub mod players;
 pub mod position;
+pub mod review;
 pub mod scid;
 pub mod ui;

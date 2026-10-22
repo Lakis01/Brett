@@ -20,6 +20,13 @@ use anyhow::{Context, Result};
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(8);
 const MAX_MULTIPV: usize = 8;
 
+/// Default Stockfish location, overridable with `BRETT_ENGINE`.
+pub fn default_engine_path() -> PathBuf {
+    std::env::var_os("BRETT_ENGINE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/usr/bin/stockfish"))
+}
+
 /// A score reported by UCI. Values are from the side to move's perspective.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Score {
@@ -321,11 +328,14 @@ fn handle_line(
     events: &Sender<EngineEvent>,
 ) {
     if line == "uciok" {
-        *ready = true;
-        let _ = events.send(EngineEvent::Ready);
+        // `uciok` only means the option list is complete. UCI engines must
+        // also answer `isready` before a search is queued.
+        let _ = write_line(stdin, "isready");
         return;
     }
     if line == "readyok" {
+        *ready = true;
+        let _ = events.send(EngineEvent::Ready);
         return;
     }
     if let Some(name) = line.strip_prefix("id name ") {

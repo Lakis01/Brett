@@ -4,8 +4,13 @@ This is the working backlog after the preparation stage. Items are ordered by
 dependency and user value, not by estimated effort. Completed work is recorded
 in `README.md`; this file tracks what is next.
 
-**Status (2026-10-22):** items 1 (UCI panel), 3 (PGN clocks), and 4 (castling
-drag) are implemented. Item 2, Game Review, is next.
+**Status (2026-10-22):** items 1 (UCI panel), 2 (game review), 3 (PGN clocks
+beside the board), and 4 (castling drag) are implemented. Item 5, preparation
+view v2, is next.
+
+Game review follow-ups that are intentionally deferred: position-index book
+marking and review caching. Clock display currently lives in the board player
+strips rather than move-list/header chips.
 
 ## 1. UCI engine foundation
 
@@ -26,6 +31,9 @@ UI.
 **Depends on:** nothing. **Unblocks:** game review.
 
 ## 2. Game Review with the local engine
+
+**Status:** implemented in `src/review.rs` and the **Review** tab. The optional
+NAG write-back is included; book marking and caching are deferred.
 
 **Goal:** annotate and grade a complete game.
 

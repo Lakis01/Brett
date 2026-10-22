@@ -19,6 +19,7 @@ use crate::library::{GameLibrary, PgnLibrary};
 use crate::online::{self, ImportResult, OnlineSource};
 use crate::players::{self, PlayerBook, PlayerDirectory};
 use crate::position::{self, BuildOptions, BuildProgress, PositionIndex, PositionStats};
+use crate::review::{self, Quality, ReviewConfig, ReviewState};
 use crate::scid::ScidLibrary;
 use crate::ui::board::{self, BoardEvent, BoardState};
 use crate::ui::fonts;
@@ -59,6 +60,7 @@ enum RightTab {
     Moves,
     Tree,
     Engine,
+    Review,
 }
 
 enum IndexMessage {
@@ -144,6 +146,12 @@ pub struct App {
     engine_infos: BTreeMap<usize, EngineInfo>,
     engine_bestmove: Option<String>,
     engine_searching: bool,
+    review_engine: Option<EngineHandle>,
+    review: Option<ReviewState>,
+    review_status: String,
+    review_depth: u32,
+    review_time_ms: u64,
+    review_use_time: bool,
     path_input: String,
     filter: String,
     show_about: bool,
@@ -214,6 +222,12 @@ impl App {
             engine_infos: BTreeMap::new(),
             engine_bestmove: None,
             engine_searching: false,
+            review_engine: None,
+            review: None,
+            review_status: "No game review yet.".to_string(),
+            review_depth: 14,
+            review_time_ms: 500,
+            review_use_time: true,
             path_input: String::new(),
             filter: String::new(),
             show_about: false,
@@ -448,9 +462,7 @@ impl App {
         if self.engine.is_some() {
             return true;
         }
-        let path = std::env::var_os("BRETT_ENGINE")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("/usr/bin/stockfish"));
+        let path = crate::engine::default_engine_path();
         match EngineHandle::spawn(&path) {
             Ok(engine) => {
                 self.engine = Some(engine);
@@ -567,6 +579,143 @@ impl App {
                     self.engine_bestmove = None;
                     self.engine_status = "Engine exited.".to_string();
                 }
+            }
+        }
+    }
+
+    fn review_limit(&self) -> SearchLimit {
+        if self.review_use_time {
+            SearchLimit::MoveTime(Duration::from_millis(self.review_time_ms))
+        } else {
+            SearchLimit::Depth(self.review_depth)
+        }
+    }
+
+    fn ensure_review_engine(&mut self) -> bool {
+        if self.review_engine.is_some() {
+            return true;
+        }
+        let path = crate::engine::default_engine_path();
+        match EngineHandle::spawn(&path) {
+            Ok(engine) => {
+                self.review_engine = Some(engine);
+                true
+            }
+            Err(err) => {
+                self.review_status = format!("Review engine unavailable: {err:#}");
+                false
+            }
+        }
+    }
+
+    fn start_review(&mut self) {
+        let Some(game) = self.current.as_ref() else {
+            self.review_status = "Open a game before starting a review.".to_string();
+            return;
+        };
+        let config = ReviewConfig {
+            limit: self.review_limit(),
+        };
+        let mut review = ReviewState::new(game, config);
+        if !self.ensure_review_engine() {
+            return;
+        }
+        if let Some(engine) = &self.review_engine {
+            engine.stop();
+        }
+        let Some(engine) = self.review_engine.as_mut() else {
+            return;
+        };
+        if !review.request_next(engine) {
+            self.review_status = "This game has no positions to review.".to_string();
+            return;
+        }
+        let total = review.total();
+        self.review = Some(review);
+        self.review_status = format!("Reviewing {total} positions…");
+    }
+
+    fn cancel_review(&mut self) {
+        if let Some(engine) = &self.review_engine {
+            engine.stop();
+        }
+        if let Some(review) = &mut self.review {
+            review.cancel();
+        }
+        self.review_status = "Review stopped.".to_string();
+    }
+
+    fn clear_review(&mut self) {
+        if let Some(engine) = &self.review_engine {
+            engine.stop();
+        }
+        self.review = None;
+        self.review_status = "No game review yet.".to_string();
+    }
+
+    fn poll_review(&mut self) {
+        let Some(engine) = self.review_engine.as_ref() else {
+            return;
+        };
+        let mut events = Vec::new();
+        while let Some(event) = engine.try_recv() {
+            events.push(event);
+        }
+        for event in events {
+            match event {
+                EngineEvent::Info { request, info } => {
+                    if let Some(review) = &mut self.review {
+                        review.note_info(request, info);
+                    }
+                }
+                EngineEvent::BestMove { request, best, .. } => {
+                    let mut next_request = false;
+                    let mut status = None;
+                    if let Some(review) = &mut self.review
+                        && review.finish_search(request, &best)
+                    {
+                        next_request = review.running;
+                        let (done, total) = review.progress();
+                        status = Some(if next_request {
+                            format!("Reviewing: {done}/{total} positions…")
+                        } else {
+                            format!("Review complete: {done}/{total} positions.")
+                        });
+                    }
+                    if let Some(status) = status {
+                        self.review_status = status;
+                    }
+                    if next_request {
+                        let mut failed = false;
+                        if let (Some(engine), Some(review)) =
+                            (self.review_engine.as_mut(), self.review.as_mut())
+                            && !review.request_next(engine)
+                        {
+                            review.running = false;
+                            failed = true;
+                        }
+                        if failed {
+                            self.review_status =
+                                "Review stopped: the engine request failed.".to_string();
+                        }
+                    }
+                }
+                EngineEvent::Error(err) => {
+                    self.review_status = format!("Review engine error: {err}");
+                    if let Some(review) = &mut self.review {
+                        review.cancel();
+                    }
+                }
+                EngineEvent::Exited => {
+                    self.review_engine = None;
+                    if let Some(review) = &mut self.review
+                        && review.running
+                    {
+                        review.cancel();
+                        self.review_status = "Review engine exited.".to_string();
+                    }
+                }
+                EngineEvent::Name(_) | EngineEvent::Ready => {}
             }
         }
     }
@@ -723,6 +872,7 @@ impl App {
             ..Game::default()
         };
 
+        self.clear_review();
         self.prep = Some(PrepSession {
             player_key: player.key.clone(),
             player_name: player.name.clone(),
@@ -842,6 +992,7 @@ impl App {
         if index == self.game_idx && self.current.is_some() && self.prep.is_none() {
             return;
         }
+        self.clear_review();
         self.annotation_editor = None;
         self.annotation_focus = false;
         if self.prep.take().is_some() {
@@ -996,8 +1147,8 @@ impl App {
         if ctx.egui_wants_keyboard_input() {
             return;
         }
-        let (right, left, down, up, home, end, flip, tree, moves, annotate, engine) =
-            ctx.input(|i| {
+        let (right, left, down, up, home, end, flip, tree, moves, annotate, engine, review) = ctx
+            .input(|i| {
                 (
                     i.key_pressed(Key::ArrowRight),
                     i.key_pressed(Key::ArrowLeft),
@@ -1010,6 +1161,7 @@ impl App {
                     i.key_pressed(Key::M),
                     i.key_pressed(Key::A),
                     i.key_pressed(Key::E),
+                    i.key_pressed(Key::R),
                 )
             });
 
@@ -1054,6 +1206,9 @@ impl App {
         }
         if engine {
             self.right_tab = RightTab::Engine;
+        }
+        if review {
+            self.right_tab = RightTab::Review;
         }
     }
 
@@ -1423,12 +1578,15 @@ impl App {
                         .on_hover_text("Tree (T)");
                     ui.selectable_value(&mut self.right_tab, RightTab::Engine, "Engine")
                         .on_hover_text("UCI engine (E)");
+                    ui.selectable_value(&mut self.right_tab, RightTab::Review, "Review")
+                        .on_hover_text("Game review (R)");
                 });
                 ui.separator();
                 match self.right_tab {
                     RightTab::Moves => self.moves_content(ui),
                     RightTab::Tree => self.tree_content(ui),
                     RightTab::Engine => self.engine_content(ui),
+                    RightTab::Review => self.review_content(ui),
                 }
             });
     }
@@ -1645,6 +1803,257 @@ impl App {
         if let Some(uci) = clicked_uci {
             self.play_uci(&uci);
         }
+    }
+
+    fn review_content(&mut self, ui: &mut Ui) {
+        let running = self.review.as_ref().is_some_and(|review| review.running);
+        let mut start = false;
+        let mut cancel = false;
+        let mut write_nags = false;
+
+        egui::Frame::new()
+            .fill(SURFACE)
+            .corner_radius(10.0)
+            .stroke(Stroke::new(1.0, BORDER))
+            .inner_margin(10.0)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.heading("Game review");
+                    if running {
+                        ui.spinner();
+                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.label(
+                            RichText::new(if running { "analyzing" } else { "idle" })
+                                .small()
+                                .weak(),
+                        );
+                    });
+                });
+                ui.label(
+                    RichText::new("Stockfish grades every mainline move by centipawn loss.")
+                        .small()
+                        .weak(),
+                );
+                ui.add_space(4.0);
+
+                ui.add_enabled_ui(!running, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        egui::ComboBox::from_id_salt("review-limit")
+                            .selected_text(if self.review_use_time {
+                                "Time"
+                            } else {
+                                "Depth"
+                            })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut self.review_use_time, false, "Depth");
+                                ui.selectable_value(&mut self.review_use_time, true, "Time");
+                            });
+                        if self.review_use_time {
+                            ui.add(
+                                egui::DragValue::new(&mut self.review_time_ms)
+                                    .range(100..=10_000)
+                                    .suffix(" ms")
+                                    .speed(50),
+                            );
+                        } else {
+                            ui.add(
+                                egui::DragValue::new(&mut self.review_depth)
+                                    .range(6..=30)
+                                    .speed(1),
+                            );
+                        }
+                    });
+                });
+
+                ui.horizontal(|ui| {
+                    let label = if self.review.is_some() {
+                        "Restart review"
+                    } else {
+                        "Analyze game"
+                    };
+                    if ui
+                        .add_enabled(self.current.is_some(), egui::Button::new(label))
+                        .clicked()
+                    {
+                        start = true;
+                    }
+                    if ui
+                        .add_enabled(running, egui::Button::new("Cancel"))
+                        .clicked()
+                    {
+                        cancel = true;
+                    }
+                });
+                ui.label(RichText::new(&self.review_status).small().weak());
+            });
+
+        if start {
+            self.start_review();
+        }
+        if cancel {
+            self.cancel_review();
+        }
+
+        let mut clicked_node = None;
+        if let Some(review) = &self.review
+            && let Some(game) = &self.current
+        {
+            let moves = review.moves(game);
+            let (done, total) = review.progress();
+            let fraction = if total == 0 {
+                0.0
+            } else {
+                done as f32 / total as f32
+            };
+            ui.add_space(8.0);
+            ui.add(
+                egui::ProgressBar::new(fraction)
+                    .text(format!("{done} / {total} positions analyzed"))
+                    .desired_width(ui.available_width()),
+            );
+
+            ui.horizontal_wrapped(|ui| {
+                match review::accuracy(&moves) {
+                    Some(accuracy) => {
+                        ui.label(
+                            RichText::new(format!("Accuracy {accuracy:.1}%"))
+                                .strong()
+                                .color(GOLD),
+                        )
+                        .on_hover_text(
+                            "Heuristic estimate from centipawn loss, not an official rating",
+                        );
+                    }
+                    None => {
+                        ui.label(RichText::new("Accuracy pending").weak());
+                    }
+                }
+                let counts = review.quality_counts(&moves);
+                for quality in Quality::ALL {
+                    let count = counts[quality.index()];
+                    if count > 0 {
+                        ui.label(
+                            RichText::new(format!("{} {count}", quality.symbol()))
+                                .small()
+                                .color(quality_color(quality)),
+                        )
+                        .on_hover_text(quality.label());
+                    }
+                }
+            });
+
+            ui.add_space(6.0);
+            review_graph(ui, review);
+
+            if !running
+                && !moves.is_empty()
+                && ui
+                    .button("Write NAGs to mainline")
+                    .on_hover_text("Add !! / ! / ?! / ? / ?? annotations to the reviewed moves")
+                    .clicked()
+            {
+                write_nags = true;
+            }
+
+            if moves.is_empty() {
+                ui.label(
+                    RichText::new("Move grades appear as each position is analyzed.")
+                        .small()
+                        .weak()
+                        .italics(),
+                );
+            } else {
+                ui.add_space(4.0);
+                egui::ScrollArea::vertical()
+                    .id_salt("review-moves")
+                    .max_height(250.0)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        for mov in &moves {
+                            let number = if mov.color == Color::White {
+                                format!("{}. ", mov.number)
+                            } else {
+                                format!("{}… ", mov.number)
+                            };
+                            let eval = mov
+                                .eval_before
+                                .map(|score| engine_score_label(Some(score), mov.color))
+                                .unwrap_or_else(|| "—".to_string());
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new(mov.quality.symbol())
+                                        .monospace()
+                                        .strong()
+                                        .color(quality_color(mov.quality)),
+                                )
+                                .on_hover_text(mov.quality.label());
+                                let label = format!("{number}{}  {eval}", mov.san);
+                                let best = mov.best.as_deref().unwrap_or("?");
+                                if ui
+                                    .selectable_label(
+                                        self.node == mov.node,
+                                        RichText::new(label).monospace().small(),
+                                    )
+                                    .on_hover_text(format!(
+                                        "{} · played {} · best {best}",
+                                        mov.quality.label(),
+                                        mov.played
+                                    ))
+                                    .clicked()
+                                {
+                                    clicked_node = Some(mov.node);
+                                }
+                                if let Some(loss) = mov.cp_loss {
+                                    ui.label(
+                                        RichText::new(format!("-{loss}"))
+                                            .monospace()
+                                            .small()
+                                            .color(quality_color(mov.quality)),
+                                    );
+                                }
+                            });
+                        }
+                    });
+            }
+        }
+
+        if write_nags {
+            self.write_review_nags();
+        }
+        if let Some(node) = clicked_node {
+            self.goto(node);
+        }
+    }
+
+    fn write_review_nags(&mut self) {
+        let moves = self
+            .review
+            .as_ref()
+            .and_then(|review| self.current.as_ref().map(|game| review.moves(game)))
+            .unwrap_or_default();
+        let actions: Vec<(usize, u8)> = moves
+            .iter()
+            .filter_map(|mov| quality_nag(mov.quality).map(|nag| (mov.node, nag)))
+            .collect();
+        let mut changed = 0usize;
+        for (node, nag) in actions {
+            let already = self
+                .current
+                .as_ref()
+                .and_then(|game| game.nodes.get(node))
+                .is_some_and(|node| node.nags.contains(&nag));
+            if already {
+                continue;
+            }
+            self.set_nag(node, Some(nag));
+            changed += 1;
+        }
+        self.review_status = if changed == 0 {
+            "Review NAGs already match the current grades.".to_string()
+        } else {
+            format!("Wrote {changed} review annotations to the mainline.")
+        };
     }
 
     fn moves_content(&mut self, ui: &mut Ui) {
@@ -2445,11 +2854,15 @@ impl eframe::App for App {
         self.poll_player_book();
         self.poll_online();
         self.poll_engine();
+        self.poll_review();
         self.maybe_engine_analysis();
         if self.index_rx.is_some() || self.player_book_rx.is_some() || self.online_rx.is_some() {
             ctx.request_repaint_after(Duration::from_millis(150));
         }
         if self.engine_searching || (self.engine.is_some() && !self.engine_ready) {
+            ctx.request_repaint_after(Duration::from_millis(80));
+        }
+        if self.review.as_ref().is_some_and(|review| review.running) {
             ctx.request_repaint_after(Duration::from_millis(80));
         }
 
@@ -2659,6 +3072,98 @@ fn engine_score_label(score: Option<Score>, turn: Color) -> String {
             format!("#{white}")
         }
         None => "—".to_string(),
+    }
+}
+
+fn quality_nag(quality: Quality) -> Option<u8> {
+    match quality {
+        Quality::Best => Some(3),      // ‼ / very good
+        Quality::Excellent => Some(1), // !
+        Quality::Good => None,
+        Quality::Inaccuracy => Some(6), // ?!
+        Quality::Mistake => Some(2),    // ?
+        Quality::Blunder => Some(4),    // ??
+        Quality::Forced | Quality::Unknown => None,
+    }
+}
+
+fn quality_color(quality: Quality) -> Color32 {
+    match quality {
+        Quality::Best => Color32::from_rgb(0x7E, 0xD3, 0x8A),
+        Quality::Excellent => Color32::from_rgb(0x9C, 0xD3, 0x93),
+        Quality::Good => Color32::from_rgb(0xB8, 0xC4, 0xA8),
+        Quality::Inaccuracy => Color32::from_rgb(0xE8, 0xC4, 0x6A),
+        Quality::Mistake => Color32::from_rgb(0xE8, 0x99, 0x5A),
+        Quality::Blunder => Color32::from_rgb(0xE0, 0x6C, 0x6C),
+        Quality::Forced => Color32::from_gray(155),
+        Quality::Unknown => Color32::from_gray(135),
+    }
+}
+
+/// Small white-perspective evaluation chart. Mates are clamped to the top and
+/// bottom so one forced mate does not flatten the rest of the game.
+fn review_graph(ui: &mut Ui, review: &ReviewState) {
+    let width = ui.available_width().max(160.0);
+    let (rect, _) = ui.allocate_exact_size(vec2(width, 96.0), Sense::hover());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 6.0, Color32::from_rgb(0x18, 0x1A, 0x1C));
+    painter.rect_stroke(rect, 6.0, Stroke::new(1.0, BORDER), StrokeKind::Inside);
+    let middle = rect.center().y;
+    painter.line_segment(
+        [
+            pos2(rect.left() + 6.0, middle),
+            pos2(rect.right() - 6.0, middle),
+        ],
+        Stroke::new(1.0, Color32::from_gray(62)),
+    );
+    painter.text(
+        pos2(rect.left() + 7.0, rect.top() + 4.0),
+        Align2::LEFT_TOP,
+        "+8",
+        FontId::monospace(9.0),
+        Color32::from_gray(95),
+    );
+    painter.text(
+        pos2(rect.left() + 7.0, rect.bottom() - 4.0),
+        Align2::LEFT_BOTTOM,
+        "−8",
+        FontId::monospace(9.0),
+        Color32::from_gray(95),
+    );
+
+    let points = review.eval_points();
+    if points.is_empty() {
+        painter.text(
+            rect.center(),
+            Align2::CENTER_CENTER,
+            "Waiting for evaluations…",
+            FontId::proportional(11.0),
+            Color32::from_gray(110),
+        );
+        return;
+    }
+
+    let denominator = review.total().max(2).saturating_sub(1) as f32;
+    let scale = (rect.height() / 2.0 - 10.0) / 800.0;
+    let position = |index: usize, cp: f64| {
+        pos2(
+            rect.left() + 8.0 + (index as f32 / denominator) * (rect.width() - 16.0),
+            middle - (cp.clamp(-800.0, 800.0) as f32) * scale,
+        )
+    };
+    let mut previous = None;
+    for &(index, cp) in &points {
+        let point = position(index, cp);
+        if let Some(previous) = previous {
+            painter.line_segment(
+                [previous, point],
+                Stroke::new(1.5, Color32::from_rgb(0xC9, 0xB4, 0x7A)),
+            );
+        }
+        previous = Some(point);
+    }
+    if let Some(&(index, cp)) = points.last() {
+        painter.circle_filled(position(index, cp), 3.0, GOLD);
     }
 }
 
@@ -3470,6 +3975,12 @@ mod tests {
             engine_infos: BTreeMap::new(),
             engine_bestmove: None,
             engine_searching: false,
+            review_engine: None,
+            review: None,
+            review_status: "No game review yet.".to_string(),
+            review_depth: 14,
+            review_time_ms: 500,
+            review_use_time: true,
             path_input: String::new(),
             filter: String::new(),
             show_about: false,
