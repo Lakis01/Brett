@@ -13,6 +13,7 @@ use shakmaty::san::SanPlus;
 use shakmaty::uci::UciMove;
 use shakmaty::{CastlingMode, Chess, Color, EnPassantMode, Move, Position, Square};
 
+use crate::cbh::CbhLibrary;
 use crate::domain::{self, Clock, Game, Token};
 use crate::engine::{EngineEvent, EngineHandle, EngineInfo, EngineOptions, Score, SearchLimit};
 use crate::library::{GameLibrary, PgnLibrary};
@@ -311,7 +312,8 @@ impl App {
             selected: None,
             targets: Vec::new(),
             drag_from: None,
-            status: "Open a PGN or SCID database, or drop one onto the window.".to_string(),
+            status: "Open a PGN, SCID, or classic ChessBase database, or drop one onto the window."
+                .to_string(),
             index: None,
             index_rx: None,
             index_job: None,
@@ -1684,7 +1686,7 @@ impl App {
                         ui.close();
                     }
                     ui.separator();
-                    ui.label("Or drop a .pgn, .si4, or .si3 onto the window.");
+                    ui.label("Or drop a .pgn, .si4, .si3, or .cbh onto the window.");
                 });
 
                 ui.menu_button("Board", |ui| {
@@ -1924,7 +1926,7 @@ impl App {
                 );
                 ui.add(
                     egui::TextEdit::singleline(&mut self.reference_path)
-                        .hint_text("/path/to/masters.pgn or reference.si4")
+                        .hint_text("/path/to/masters.pgn, reference.si4, or database.cbh")
                         .desired_width(f32::INFINITY),
                 );
                 ui.horizontal_wrapped(|ui| {
@@ -3873,7 +3875,7 @@ impl App {
                     }
                     ui.add(
                         egui::TextEdit::singleline(&mut self.path_input)
-                            .hint_text("/path/to/file.pgn or database.si4")
+                            .hint_text("/path/to/file.pgn, database.si4, or database.cbh")
                             .desired_width(340.0),
                     );
                     if ui.button("Open…").clicked()
@@ -3981,7 +3983,7 @@ impl App {
                 ui.add_space(6.0);
                 ui.label("Piece set: cburnett by Colin M. L. Burnett, CC BY-SA 3.0.");
                 ui.label("Rules and SAN: shakmaty. PGN: pgn-reader.");
-                ui.label("SCID reader: independent native implementation.");
+                ui.label("SCID and classic CBH readers: independent native implementations.");
                 ui.label("Chess symbols: DejaVu Sans, Bitstream Vera / public-domain licence.");
                 ui.add_space(6.0);
                 if ui.button("Close").clicked() {
@@ -4089,7 +4091,10 @@ impl eframe::App for App {
                     ui.add_space(40.0);
                     ui.label(RichText::new("Drop a chess database here").heading());
                     ui.label(
-                        RichText::new("PGN, SCID4, or SCID3 · or use File → Open database…").weak(),
+                        RichText::new(
+                            "PGN, SCID4/3, or classic ChessBase · or use File → Open database…",
+                        )
+                        .weak(),
                     );
                 }
             });
@@ -4969,6 +4974,8 @@ fn open_library(path: &std::path::Path) -> anyhow::Result<Arc<dyn GameLibrary>> 
         .to_ascii_lowercase();
     if extension == "si4" || extension == "si3" {
         ScidLibrary::open(path).map(|library| Arc::new(library) as Arc<dyn GameLibrary>)
+    } else if extension == "cbh" {
+        CbhLibrary::open(path).map(|library| Arc::new(library) as Arc<dyn GameLibrary>)
     } else {
         PgnLibrary::build(path.to_path_buf())
             .map(|library| Arc::new(library) as Arc<dyn GameLibrary>)
@@ -5294,9 +5301,10 @@ fn open_dialog() -> Option<std::path::PathBuf> {
             &[
                 "--file-selection",
                 "--title=Open chess database",
-                "--file-filter=Chess databases | *.pgn *.PGN *.si4 *.si3",
+                "--file-filter=Chess databases | *.pgn *.PGN *.si4 *.si3 *.cbh *.CBH",
                 "--file-filter=PGN files | *.pgn *.PGN",
                 "--file-filter=SCID databases | *.si4 *.si3",
+                "--file-filter=ChessBase databases | *.cbh *.CBH",
                 "--file-filter=All files | *",
             ],
         ),
@@ -5305,7 +5313,7 @@ fn open_dialog() -> Option<std::path::PathBuf> {
             &[
                 "--getopenfilename",
                 ".",
-                "*.pgn *.PGN *.si4 *.si3|Chess databases",
+                "*.pgn *.PGN *.si4 *.si3 *.cbh *.CBH|Chess databases",
             ],
         ),
     ];

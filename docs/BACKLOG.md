@@ -4,11 +4,11 @@ This is the working backlog after the preparation stage. Items are ordered by
 dependency and user value, not by estimated effort. Completed work is recorded
 in `README.md`; this file tracks what is next.
 
-**Status (2026-10-22):** items 1 (UCI panel and engine settings), 2 (game
+**Status (2026-10-23):** items 1 (UCI panel and engine settings), 2 (game
 review), 3 (PGN clocks beside the board), 4 (castling drag), 5 (preparation
-view v2 and recent games), and 6 (predictor v2 and the static reference
-distribution) are implemented. Deferred predictor refinements are recorded
-under item 6.
+view v2 and recent games), 6 (predictor v2 and the static reference
+distribution), and 7 (classic CBH support) are implemented. Deferred predictor
+refinements are recorded under item 6.
 
 Game review follow-ups that are intentionally deferred: position-index book
 marking and review caching. Clock display currently lives in the board player
@@ -157,6 +157,11 @@ on the loaded player database.
 
 ## 7. Classic CBH database support
 
+**Status:** implemented in `src/cbh/` and wired into the normal database
+opening path. The native reader is read-only and works behind `GameLibrary`,
+so the Games, Players, Tree, and position-index paths need no format-specific
+UI. Format details and validation results are in [CBH.md](CBH.md).
+
 **Goal:** read the older multi-file ChessBase CBH format (not CBH2/2CBH).
 
 A sample is available at:
@@ -169,22 +174,41 @@ It is a classic multi-file database (`.cba`, `.cbb`, `.cbc`, `.cbe`, `.cbg`,
 `.cbgi`, `.cbh`, `.cbj`, `.cbm`, `.cbp`, `.cbs`, `.cbt`, `.cbtt`, `.flags`,
 `.ini`), not a 2CBH container.
 
-Research and implementation:
+Implemented:
 
-- Copy the sample to `/tmp/opencode` for analysis; the Downloads copy and the
-  chess database tree remain read-only.
-- Identify the roles of the index, game, name, annotation, and metadata files
-  from independently published format descriptions; do not copy GPL/runtime
-  converter code.
-- Implement the reader behind `GameLibrary` so players, games, filters, and
-  position indexing work without format-specific UI.
-- Add a small lawfully redistributable fixture or a synthetic writer test; do
-  not commit the personal/commercial sample database.
-- Validate decoded headers, mainline, variations, comments, and NAGs against a
-  trusted export of the same sample.
+- Open the `.cbh` index and its `.cbg` moves, `.cba` annotations, and
+  `.cbp`/`.cbt`/`.cbc`/`.cbs` name files directly. A `.cbj` wide index is
+  consulted when the move or annotation file exceeds 4 GiB.
+- Decode move-encoding modes 0, 4, 5, and 10 natively, including explicit
+  start positions, Chess960 castling, promotions, en passant, null moves,
+  recursive variations, and the stored node order used by annotations.
+- Decode text comments, NAGs, coloured squares and arrows, time spent, engine
+  evaluations, and medals into the normal game tree. Drawing tokens are kept
+  as PGN comment text, the same form ChessBase's export uses.
+- Skip mode-11 games with a visible error and show the header only.
+- Reject malformed headers, records, and entity files without writing to the
+  source database.
 
-**Depends on:** format research. **Blocks:** the CBH part of the database
-roadmap.
+Validation:
+
+- The full personal sample opens as **24,865 games** and **2,003,054 nodes**
+  with **zero decode errors**.
+- A full structural export comparison against the independent MIT `cbvault`
+  reader found no mismatches in tree paths, SAN, or NAGs across all games.
+- All **168 annotated games** match `cbvault` for comments and NAGs after the
+  drawing/evaluation tokens are included.
+- Header values match except 90 names where `cbvault`'s current name-buffer
+  path drops a final non-ASCII character; Brett preserves the byte-decoded
+  name. Brett also keeps an `Annotator` tag for 134 games that `cbvault` does
+  not emit.
+- A synthetic byte-level writer in `src/cbh/tests.rs` covers headers, names,
+  modes 0/4/5/10, explicit starts and Chess960, variations, comments, NAGs,
+  drawing/evaluation tokens, empty move records, wide `.cbj` offsets,
+  deleted/mode-11/truncated games, bad headers, and position indexing. No
+  personal database is committed.
+
+**Depends on:** format research (complete). **Unblocks:** the classic-database
+part of the roadmap.
 
 ## 8. Larger infrastructure
 

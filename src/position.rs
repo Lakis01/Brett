@@ -259,7 +259,7 @@ impl PositionIndex {
     }
 
     /// Build a cache index for any [`GameLibrary`], using the streaming PGN
-    /// fast path when possible and a generic loader for SCID.
+    /// fast path when possible and a generic loader for SCID and classic CBH.
     pub fn build_cached_for(
         library: Arc<dyn GameLibrary>,
         options: BuildOptions,
@@ -287,8 +287,8 @@ impl PositionIndex {
     }
 
     /// Build an index from games loaded through the common database
-    /// interface. Used for SCID, where the streaming PGN reader cannot be
-    /// applied directly.
+    /// interface. Used for SCID and classic CBH, where the streaming PGN
+    /// reader cannot be applied directly.
     pub fn build_library_to(
         library: &dyn GameLibrary,
         index_path: impl AsRef<Path>,

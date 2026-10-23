@@ -1,8 +1,8 @@
 # Position index
 
 Brett's opening tree is backed by a position index derived from the currently
-loaded PGN or SCID database. This document describes what is counted, the
-on-disk format, cache invalidation, and current limits.
+loaded PGN, SCID, or classic CBH database. This document describes what is
+counted, the on-disk format, cache invalidation, and current limits.
 
 ## What is counted
 
@@ -24,9 +24,10 @@ the opening tree is about moves that were actually played.
 
 PGN files use the streaming `pgn-reader` visitor: tags and byte ranges are
 indexed once, and the position builder reads the file directly without building
-a full game tree. SCID databases implement the shared `GameLibrary` interface
-and use the generic builder, which loads one decoded game at a time through the
-native reader. Both paths produce the same edge records.
+a full game tree. SCID and classic CBH databases implement the shared
+`GameLibrary` interface and use the generic builder, which loads one decoded
+game at a time through the native reader. Both paths produce the same edge
+records.
 
 ## On-disk layout
 
@@ -77,15 +78,19 @@ $XDG_CACHE_HOME/brett/index/<fnv1a-of-canonical-path>.brettpos
 ```
 
 or `~/.cache/brett/index/` when `XDG_CACHE_HOME` is unset. The filename depends
-on the canonical path of the PGN or the SCID `.si` file.
+on the canonical path of the PGN, the SCID `.si` file, or the classic CBH
+`.cbh` file.
 
 The header stores a source fingerprint. For PGN it is the file length and
 modification time. For SCID it combines the lengths of `.si`, `.sn`, and `.sg`
 and uses the newest modification time among them; changing any part of the
-triple therefore invalidates the cache. A stale or corrupt index is ignored and
-rebuilt. Builds write to a temporary file in the cache directory and atomically
-rename it into place, so a crash cannot leave a half-written index under the
-final name.
+triple therefore invalidates the cache. For classic CBH it combines the
+lengths of `.cbh`, `.cbg`, and every present companion (`.cba`, name files,
+`.cbj`) and uses the newest modification time; changing any part of the file
+set invalidates the cache. A stale or corrupt index is ignored and rebuilt.
+Builds write to a temporary file in the cache directory and atomically rename
+it into place, so a crash cannot leave a half-written index under the final
+name.
 
 The fingerprint is metadata-based. Replacing a source with one of exactly the
 same total length while also preserving its modification time would not be
@@ -110,9 +115,10 @@ there.
 - The build aggregates in `HashMap`s in memory. That is comfortable for 50k
   games, but a multi-million-game Mega Database will need external sorting or a
   chunked merge.
-- The header table for both PGN and SCID is still in RAM. Moving it on disk is
-  tracked as M2b.
+- The header table for PGN, SCID, and classic CBH is still in RAM. Moving it
+  on disk is tracked as M2b.
 - An index is built for one database at a time. Reference-database merging
   (several files into one opening tree) and a static, rating-matched
   background distribution for preparation are future work.
-- Chess960 SCID games are rejected by the reader before indexing.
+- Chess960 SCID games are rejected by the reader before indexing. Classic CBH
+  mode-10 Chess960 games are supported.

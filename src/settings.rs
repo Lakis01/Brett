@@ -114,8 +114,8 @@ impl EnginePrefs {
 /// so a player database never needs to know about the reference corpus.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PreparationPrefs {
-    /// Reference PGN or SCID database. `None` means use the current database
-    /// prior with the visible fallback warning.
+    /// Reference PGN, SCID, or classic CBH database. `None` means use the
+    /// current database prior with the visible fallback warning.
     pub reference_path: Option<PathBuf>,
     /// Whether the reference database should be used when preparing.
     pub reference_enabled: bool,

@@ -1,8 +1,8 @@
 # Preparation
 
-Brett's preparation stage is built around a loaded PGN or SCID database. It
-answers one practical question: **given the position on the board, what is this
-opponent likely to play next?**
+Brett's preparation stage is built around a loaded PGN, SCID, or classic CBH
+database. It answers one practical question: **given the position on the board,
+what is this opponent likely to play next?**
 
 ## Workflow
 
@@ -32,10 +32,10 @@ opponent likely to play next?**
 9. **Exit prep** returns to the game that was open before preparation started.
 
 An optional **Reference database prior** section on the selected-player page
-configures a separate PGN or SCID corpus for the background distribution. The
-reference is indexed only for the prepared player's rating window and cached
-away from the player's own position index. Without one, the panel uses the
-current database prior and labels it as potentially skewed.
+configures a separate PGN, SCID, or classic CBH corpus for the background
+distribution. The reference is indexed only for the prepared player's rating
+window and cached away from the player's own position index. Without one, the
+panel uses the current database prior and labels it as potentially skewed.
 
 Preparation moves are ordinary game-tree edits. They stay in memory for the
 session and are kept when switching between database games; they are not
@@ -69,7 +69,7 @@ dirty and never writes to the source database.
 
 ## Player identity
 
-Player names in PGN and SCID databases are inconsistently formatted. Brett
+Player names in PGN, SCID, and CBH databases are inconsistently formatted. Brett
 normalises a name by splitting on non-alphanumeric characters, lowercasing the
 words, sorting them, and removing duplicates. Punctuation and word order
 therefore do not matter:
@@ -233,9 +233,9 @@ descriptive; it is not fed back into the probability.
 The selected-player page has a collapsible **Reference database prior**
 section:
 
-- **Path** — a PGN or SCID3/SCID4 database. It is opened independently of the
-  player's database. If no path has been saved yet, Brett also honours the
-  `BRETT_REFERENCE` environment variable.
+- **Path** — a PGN, SCID3/SCID4, or classic CBH database. It is opened
+  independently of the player's database. If no path has been saved yet, Brett
+  also honours the `BRETT_REFERENCE` environment variable.
 - **Use a separate reference database** — enables or disables the reference.
 - **Rating window ±** — default **200 Elo**.
 - **Offset** — an explicit rating-scale mapping added to the player's average

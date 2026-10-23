@@ -3,12 +3,14 @@
 ## The rule
 
 `/home/gratis01/Chess Databases/` — and every database directory inside it — is
-**read-only** for this project and for every agent session working on it.
+**read-only** for this project and for every agent session working on it. The
+classic CBH sample under `/home/gratis01/Downloads/CBH/` is also strictly
+read-only.
 
 Allowed:
 
 - Reading files.
-- Copying files **out** of the directory into `/tmp/opencode/` or
+- Copying files **out** of either read-only location into `/tmp/opencode/` or
   `Brett/fixtures/local/`.
 - Converting those copies in the destination.
 
@@ -29,8 +31,10 @@ file can corrupt a SCID index or a CBH container.
 
 ## Native readers
 
-Brett's PGN and SCID readers open source files with read-only handles. The SCID
-reader:
+Brett's PGN, SCID, and classic CBH readers open source files with read-only
+handles.
+
+The SCID reader:
 
 - opens the `.si4`/`.si3` index and reads its header, entries, and companion
   `.sn`/`.sg` files;
@@ -38,9 +42,18 @@ reader:
 - never writes to the database directory;
 - decodes one `.sg` record at a time on demand.
 
-No SCID installation or `scidpgn` subprocess is involved. The independent
-format reference and fixture provenance are documented in
-[SCID.md](SCID.md) and [THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md).
+The classic CBH reader:
+
+- opens `.cbh` and `.cbg`, and reads optional `.cba`, `.cbp`, `.cbt`, `.cbc`,
+  `.cbs`, and `.cbj` files;
+- never creates a missing companion file or a `.cbj`;
+- never writes to the database directory;
+- decodes one `.cbg` and `.cba` record at a time on demand.
+
+No SCID installation, ChessBase installation, `scidpgn`, or converter
+subprocess is involved. The independent format references and fixture
+provenance are documented in [SCID.md](SCID.md), [CBH.md](CBH.md), and
+[THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md).
 
 ## Derived data
 
@@ -65,17 +78,19 @@ $XDG_CONFIG_HOME/brett/preparation.json  (or ~/.config/brett/preparation.json)
 ```
 
 Nothing is written beside a source database. A cache index is keyed by the
-canonical source path and validated against the PGN file's length/mtime or the
-combined SCID triple fingerprint. Builds use a temporary file in the cache
-directory and an atomic rename.
+canonical source path and validated against the PGN file's length/mtime, the
+combined SCID triple fingerprint, or the combined classic CBH file-set
+fingerprint. Builds use a temporary file in the cache directory and an atomic
+rename.
 
 Player books and edited game trees are in memory for the session. They are not
 written back to the source database.
 
 ## Practical workflow
 
-1. `cp -p` the complete database triple (`.si4`, `.sn4`, `.sg4`) or CBH file
-   into `/tmp/opencode/…`.
+1. `cp -p` the complete database triple (`.si4`, `.sn4`, `.sg4`) or the
+   complete classic CBH file set (at least `.cbh` and `.cbg`, plus `.cba` and
+   name files when present) into `/tmp/opencode/…`.
 2. Run readers/converters there.
 3. Keep derived fixtures out of version control: `fixtures/local/` is
    git-ignored.
@@ -88,8 +103,8 @@ testing only and must never be redistributed.
 ## Enforcement
 
 - Import code opens source files read-only (`File::open`, no write flags).
-- SCID companion files are checked for existence but never created.
-- Tests never touch the real database directory; they use committed fixtures or
-  copies.
+- SCID and CBH companion files are checked for existence but never created.
+- Tests never touch the real database directory; they use committed fixtures,
+  synthetic databases, or copies.
 - The only tools allowed to touch the source tree are read-only inspectors
   (`ls`, `stat`, checksum tools). Converters run on copies.

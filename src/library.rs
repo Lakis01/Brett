@@ -5,7 +5,8 @@
 //! 50,000-game file costs megabytes instead of gigabytes.
 //!
 //! [`GameLibrary`] is the common interface shared with native SCID databases
-//! ([`crate::scid::ScidLibrary`]). The application, player directory and
+//! ([`crate::scid::ScidLibrary`]) and classic ChessBase CBH databases
+//! ([`crate::cbh::CbhLibrary`]). The application, player directory and
 //! position index all work against this interface rather than against a
 //! particular file format.
 //!
@@ -66,8 +67,20 @@ impl SourceMeta {
 /// Where a lazily loaded game lives inside its database.
 #[derive(Clone, Copy, Debug)]
 enum GameLocation {
-    Pgn { start: u64, end: u64 },
-    Scid { offset: u64, length: u32 },
+    Pgn {
+        start: u64,
+        end: u64,
+    },
+    Scid {
+        offset: u64,
+        length: u32,
+    },
+    Cbh {
+        id: u32,
+        moves_offset: u64,
+        annotations_offset: u64,
+        deleted: bool,
+    },
 }
 
 /// One indexed game: its headers and where its data lives in the source.
@@ -107,6 +120,24 @@ impl IndexedGame {
         Self::with_location(headers, GameLocation::Scid { offset, length })
     }
 
+    pub(crate) fn cbh(
+        headers: Vec<(String, String)>,
+        id: u32,
+        moves_offset: u64,
+        annotations_offset: u64,
+        deleted: bool,
+    ) -> Self {
+        Self::with_location(
+            headers,
+            GameLocation::Cbh {
+                id,
+                moves_offset,
+                annotations_offset,
+                deleted,
+            },
+        )
+    }
+
     pub fn headers(&self) -> &[(String, String)] {
         &self.headers
     }
@@ -138,6 +169,29 @@ impl IndexedGame {
         self.header("Result").unwrap_or("*")
     }
 
+    /// The classic CBH record number, when this game came from a `.cbh`.
+    pub fn cbh_record_id(&self) -> Option<u32> {
+        match self.location {
+            GameLocation::Cbh { id, .. } => Some(id),
+            _ => None,
+        }
+    }
+
+    /// Where this game's `.cba` annotations start, when it has any.
+    pub fn cbh_annotations_offset(&self) -> Option<u64> {
+        match self.location {
+            GameLocation::Cbh {
+                annotations_offset, ..
+            } if annotations_offset != 0 => Some(annotations_offset),
+            _ => None,
+        }
+    }
+
+    /// Whether the classic CBH header marks this game deleted.
+    pub fn cbh_deleted(&self) -> bool {
+        matches!(self.location, GameLocation::Cbh { deleted: true, .. })
+    }
+
     /// Byte range of the game inside its source file. For PGN this is the
     /// exact text range; for SCID it is the range inside the `.sg4` file.
     pub fn byte_range(&self) -> (u64, u64) {
@@ -146,6 +200,7 @@ impl IndexedGame {
             GameLocation::Scid { offset, length } => {
                 (offset, offset.saturating_add(u64::from(length)))
             }
+            GameLocation::Cbh { moves_offset, .. } => (moves_offset, moves_offset),
         }
     }
 

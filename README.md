@@ -14,11 +14,16 @@ its UI, and not a Wine package.
   (`src/scid.rs`). Brett reads the `.si4`/`.sn4`/`.sg4` triple directly; no SCID
   installation, conversion step, or GPL code is involved. Legacy SCID3
   (`.si3`/`.sn3`/`.sg3`) uses the same reader.
-- Lazy game loading for both formats, a searchable game list, and a **Players**
-  tab with career W/D/L, score, Elo, year range, and per-player game lists.
-- Full game-tree import for both formats: recursive variations, comments, NAGs,
+- **Classic ChessBase CBH** databases through a native, read-only reader
+  (`src/cbh/`). Brett opens the `.cbh` header file and its `.cbg` moves,
+  `.cba` annotations, and `.cbp`/`.cbt`/`.cbc`/`.cbs` names directly. This is
+  the older multi-file format, not CBH2/2CBH.
+- Lazy game loading for all three formats, a searchable game list, and a
+  **Players** tab with career W/D/L, score, Elo, year range, and per-player
+  game lists.
+- Full game-tree import for all formats: recursive variations, comments, NAGs,
   `SetUp`/`FEN` positions, and analysis null moves.
-- Drag and drop a `.pgn`, `.si4`, or `.si3` onto the window, or use
+- Drag and drop a `.pgn`, `.si4`, `.si3`, or `.cbh` onto the window, or use
   **File → Open database…**.
 
 ### Opening tree and position index
@@ -29,7 +34,7 @@ its UI, and not a Wine package.
 - The **Tree** tab lets you click any indexed move. The index is built in the
   background on first open and cached under `$XDG_CACHE_HOME/brett/index/`.
 - The index is built through a shared cache and edge format, with a streaming
-  fast path for PGN and the generic library loader for SCID.
+  fast path for PGN and the generic library loader for SCID and classic CBH.
   See [docs/POSITION_INDEX.md](docs/POSITION_INDEX.md).
 
 ### Preparation
@@ -56,7 +61,8 @@ its UI, and not a Wine package.
   recent-window mixture, and an explicit residual for unobserved legal moves.
   Defaults: 18-month half-life, 24-month recent window, a sample-size-scaled
   background prior, and a 2-pseudo-game recent mixture.
-- A separate reference PGN or SCID database can supply the background prior.
+- A separate reference PGN, SCID, or classic CBH database can supply the
+  background prior.
   Brett indexes only the chosen rating window (default ±200 Elo, with a
   configurable rating offset) and caches it separately from the player index.
   If no reference is saved yet, `BRETT_REFERENCE` can supply a path. Without a
@@ -181,7 +187,8 @@ never writes to the source database.
 | --- | --- |
 | `src/library.rs` | `GameLibrary` interface, streaming PGN index, shared source metadata |
 | `src/scid.rs` | Native SCID3/SCID4 reader and `ScidLibrary` |
-| `src/position.rs` | Position index, opening-tree statistics, SCID/PGN generic builder |
+| `src/cbh/` | Native classic ChessBase CBH reader and `CbhLibrary` |
+| `src/position.rs` | Position index, opening-tree statistics, shared library builder |
 | `src/players.rs` | Player directory, per-player position books, Bayesian prediction |
 | `src/evaluation.rs` | Held-out log loss, Brier score, top-k accuracy, calibration |
 | `src/online.rs` | Public Lichess and Chess.com imports |
@@ -191,7 +198,7 @@ never writes to the source database.
 | `src/review.rs` | Sequential game review, move grading, accuracy, eval chart data |
 | `src/app.rs` | egui application, tabs, preparation flow, annotation editor |
 | `src/ui/fonts.rs` | Embedded DejaVu Sans fallback for chess symbols |
-| `docs/` | Data safety, position-index format, preparation model, SCID reader, backlog |
+| `docs/` | Data safety, position-index format, preparation model, SCID/CBH readers, backlog |
 
 ## Roadmap
 
@@ -221,8 +228,10 @@ never writes to the source database.
 - **Predictor v2 and reference distribution (done).** Posterior uncertainty,
   unobserved-move residual mass, a separately cached rating-matched reference
   index, visible fallback, held-out metrics, and calibration output.
-- **Classic CBH support** for the older multi-file format (sample located;
-  research pending).
+- **Classic CBH support (done).** Native read-only support for the older
+  multi-file format, including modes 0/4/5/10, variations, comments, NAGs,
+  drawing tokens, custom starts, and Chess960. See
+  [docs/CBH.md](docs/CBH.md).
 - **M2b — Mega-scale ingest.** External sorting, an on-disk header table, and
   incremental updates for multi-million-game databases.
 - **Cloud evaluation** (Lichess cloud eval, ChessDB.cn) with local Stockfish
@@ -233,9 +242,9 @@ The detailed queue and acceptance criteria are in
 
 ## Data safety
 
-**`/home/gratis01/Chess Databases/` is treated as read-only.** Brett opens PGN
-and SCID files for reading only. Derived indexes and imported games go to
-`$XDG_CACHE_HOME/brett/`, and engine/reference preferences go to
+**`/home/gratis01/Chess Databases/` is treated as read-only.** Brett opens PGN,
+SCID, and classic CBH file sets for reading only. Derived indexes and imported
+games go to `$XDG_CACHE_HOME/brett/`, and engine/reference preferences go to
 `$XDG_CONFIG_HOME/brett/`; nothing is written next to a source database.
 See [docs/DATA_SAFETY.md](docs/DATA_SAFETY.md).
 
@@ -249,10 +258,10 @@ See `assets/pieces/README.md`.
 The embedded fallback font is **DejaVu Sans**, under the Bitstream Vera /
 DejaVu licence. See `assets/fonts/README.md`.
 
-The SCID reader is an independent implementation written from the published
-on-disk format. The GPL SCID source tree was used as a format reference only;
-no SCID code is linked or copied. See
-[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+The SCID and classic CBH readers are independent implementations written from
+published on-disk formats. The SCID source tree and the AGPL ChessBase bridge
+were used as format references only; no code from either is linked or copied.
+See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ## Licence
 
