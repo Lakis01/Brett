@@ -97,9 +97,13 @@ its UI, and not a Wine package.
   every move in the sequence can be hovered or clicked to play through it.
   Requests run off the UI thread, are debounced while navigating, and are
   cached in memory per FEN.
-- chessdb.cn and the Lichess cloud evaluation are public. The Lichess opening
-  explorer now requires an OAuth bearer token (no additional scopes are
-  needed).
+- The **Opening explorer** selector in the Refs tab defaults to **Masters**,
+  the strong over-the-board corpus. It is public and needs no token. Switch to
+  **Lichess (all games)** to query the full online database; that corpus
+  requires the token below. The choice is saved in `references.json`.
+- chessdb.cn, the Lichess cloud evaluation, and the Masters explorer are
+  public. The full Lichess opening explorer requires an OAuth bearer token
+  (no additional scopes are needed).
 - To create a token: sign in at <https://lichess.org>, open
   <https://lichess.org/account/oauth/token/create>, give it a name such as
   `Brett`, leave every scope unchecked, and press **Create**. Copy the
@@ -107,8 +111,9 @@ its UI, and not a Wine package.
   `{"lichess_token": "lip_..."}` to
   `$XDG_CONFIG_HOME/brett/references.json` (usually
   `~/.config/brett/references.json`) or set `BRETT_LICHESS_TOKEN`. The env
-  variable takes precedence. Without a token, the explorer explains how to
-  configure one and the other two references still work.
+  variable takes precedence. Without a token, the full Lichess corpus explains
+  how to configure one; Masters, chessdb.cn, and the cloud evaluation still
+  work.
 
 ### Engine analysis
 

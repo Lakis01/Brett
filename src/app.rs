@@ -206,12 +206,14 @@ struct RecentPreview {
 
 pub struct App {
     library: Option<Arc<dyn GameLibrary>>,
+    /// Ordered, editable view of the games currently shown in the Games tab.
+    session: crate::session::GameList,
     current: Option<Game>,
-    /// Games edited during this session, kept by index so switching away and
-    /// back does not discard new moves or variations.
+    /// Games edited during this session, keyed by stable row id so switching
+    /// away and back does not discard new moves or variations.
     edited: std::collections::HashMap<usize, Game>,
     dirty: bool,
-    game_idx: usize,
+    current_slot: Option<usize>,
     node: usize,
     orientation: Color,
     show_clocks: bool,
@@ -258,12 +260,13 @@ pub struct App {
     online_status: String,
     online_rx: Option<mpsc::Receiver<OnlineMessage>>,
     cloud: Option<cloud::Snapshot>,
-    cloud_cache: BTreeMap<String, cloud::Snapshot>,
+    cloud_cache: BTreeMap<(cloud::ExplorerSource, String), cloud::Snapshot>,
     cloud_rx: Option<mpsc::Receiver<CloudMessage>>,
     cloud_job: Option<String>,
     cloud_pending: Option<(String, Instant)>,
     cloud_status: String,
     lichess_token: Option<String>,
+    explorer_source: cloud::ExplorerSource,
     engine: Option<EngineHandle>,
     engine_status: String,
     engine_name: String,
@@ -334,10 +337,11 @@ impl App {
 
         let mut app = Self {
             library: None,
+            session: crate::session::GameList::empty(),
             current: None,
             edited: std::collections::HashMap::new(),
             dirty: false,
-            game_idx: 0,
+            current_slot: None,
             node: 0,
             orientation: Color::White,
             show_clocks: false,
@@ -386,6 +390,7 @@ impl App {
             cloud_pending: None,
             cloud_status: "Open a game and select References.".to_string(),
             lichess_token: cloud_prefs.lichess_token,
+            explorer_source: cloud_prefs.explorer_source,
             engine: None,
             engine_status: "Engine not started.".to_string(),
             engine_name: String::new(),
@@ -489,10 +494,11 @@ impl App {
                 let count = library.len();
                 let indexed_in = library.indexed_in();
                 self.players = PlayerDirectory::build(library.as_ref());
+                self.session = crate::session::GameList::from_library(library.clone());
                 self.library = Some(library);
                 self.edited.clear();
                 self.dirty = false;
-                self.game_idx = 0;
+                self.current_slot = None;
                 self.current = None;
                 self.clear_engine_results();
                 self.goto(0);
@@ -523,7 +529,9 @@ impl App {
                 );
                 self.status = self.index_status.clone();
                 self.path_input = path.display().to_string();
-                self.select_game(0);
+                if let Some(id) = self.session.id_at(0) {
+                    self.select_slot(id);
+                }
                 self.start_index();
             }
             Err(err) => self.status = format!("Could not read {}: {err}", path.display()),
@@ -1329,15 +1337,11 @@ impl App {
         let previous_game = if let Some(prep) = &self.prep {
             prep.previous_game
         } else {
-            let previous = (self
-                .library
-                .as_ref()
-                .is_some_and(|l| self.game_idx < l.len()))
-            .then_some(self.game_idx);
+            let previous = self.current_slot;
             if self.dirty
-                && let Some(game) = self.current.take()
+                && let (Some(id), Some(game)) = (self.current_slot, self.current.take())
             {
-                self.edited.insert(self.game_idx, game);
+                self.edited.insert(id, game);
             }
             previous
         };
@@ -1369,7 +1373,7 @@ impl App {
         self.annotation_editor = None;
         self.annotation_focus = false;
         self.current = Some(game);
-        self.game_idx = usize::MAX;
+        self.current_slot = None;
         self.dirty = false;
         self.right_tab = RightTab::Tree;
         self.goto(0);
@@ -1388,17 +1392,12 @@ impl App {
         self.recent_preview = None;
         self.dirty = false;
         self.current = None;
-        self.game_idx = usize::MAX;
+        self.current_slot = None;
         self.annotation_editor = None;
         self.annotation_focus = false;
-        let target = prep.previous_game.or_else(|| {
-            self.library
-                .as_ref()
-                .filter(|library| !library.is_empty())
-                .map(|_| 0)
-        });
-        if let Some(index) = target {
-            self.select_game(index);
+        let target = prep.previous_game.or_else(|| self.session.id_at(0));
+        if let Some(id) = target {
+            self.select_slot(id);
         } else {
             self.status = "Preparation closed.".to_string();
         }
@@ -1484,6 +1483,7 @@ impl App {
                 let fen = snapshot.fen.clone();
                 if let Some(current) = self.current_fen()
                     && current == fen
+                    && snapshot.explorer_source == self.explorer_source
                 {
                     self.cloud = Some(snapshot.clone());
                     self.cloud_status = if snapshot.has_any_data() {
@@ -1493,7 +1493,8 @@ impl App {
                     };
                 }
                 self.cloud_job = None;
-                self.cloud_cache.insert(fen, snapshot);
+                self.cloud_cache
+                    .insert((snapshot.explorer_source, fen), snapshot);
                 if self.cloud_cache.len() > 128
                     && let Some(key) = self.cloud_cache.keys().next().cloned()
                 {
@@ -1526,14 +1527,13 @@ impl App {
         if self.cloud_rx.is_some() {
             return;
         }
-        if self
-            .cloud
-            .as_ref()
-            .is_some_and(|snapshot| snapshot.fen == fen)
-        {
+        if self.cloud.as_ref().is_some_and(|snapshot| {
+            snapshot.fen == fen && snapshot.explorer_source == self.explorer_source
+        }) {
             return;
         }
-        if let Some(snapshot) = self.cloud_cache.get(&fen).cloned() {
+        let cache_key = (self.explorer_source, fen.clone());
+        if let Some(snapshot) = self.cloud_cache.get(&cache_key).cloned() {
             self.cloud = Some(snapshot);
             self.cloud_status = "References loaded from cache.".to_string();
             self.cloud_pending = None;
@@ -1565,10 +1565,11 @@ impl App {
         self.cloud_job = Some(fen.clone());
         self.cloud_status = "Querying chessdb.cn and Lichess…".to_string();
         let token = self.lichess_token.clone();
+        let explorer_source = self.explorer_source;
         let (tx, rx) = mpsc::channel();
         let ctx = self.ctx.clone();
         std::thread::spawn(move || {
-            let snapshot = cloud::fetch(&fen, token.as_deref());
+            let snapshot = cloud::fetch(&fen, token.as_deref(), explorer_source);
             let _ = tx.send(CloudMessage::Done(snapshot));
             ctx.request_repaint();
         });
@@ -1577,7 +1578,8 @@ impl App {
 
     fn refresh_cloud(&mut self) {
         if let Some(fen) = self.current_fen() {
-            self.cloud_cache.remove(&fen);
+            self.cloud_cache
+                .remove(&(self.explorer_source, fen.clone()));
             self.cloud = None;
             self.cloud_pending = None;
             self.cloud_job = None;
@@ -1586,9 +1588,18 @@ impl App {
         }
     }
 
-    /// Load one game tree from the index, replacing the current game.
-    fn select_game(&mut self, index: usize) {
-        if index == self.game_idx && self.current.is_some() && self.prep.is_none() {
+    /// Load a game by its original source index. Player lists use this path.
+    fn select_source(&mut self, source_index: usize) {
+        if let Some(id) = self.session.source_slot(source_index) {
+            self.select_slot(id);
+        } else {
+            self.status = format!("Game {} is no longer in the session.", source_index + 1);
+        }
+    }
+
+    /// Load one editable row, replacing the current game.
+    fn select_slot(&mut self, id: usize) {
+        if self.current_slot == Some(id) && self.current.is_some() && self.prep.is_none() {
             return;
         }
         self.clear_review();
@@ -1604,34 +1615,31 @@ impl App {
         // Keep edits to the game we are leaving, so navigating the database does
         // not silently discard new moves or variations.
         if self.dirty {
-            if let Some(game) = self.current.take() {
-                self.edited.insert(self.game_idx, game);
+            if let (Some(leaving), Some(game)) = (self.current_slot, self.current.take()) {
+                self.edited.insert(leaving, game);
             }
             self.dirty = false;
         }
 
-        let loaded = match self.library.as_ref() {
-            Some(library) if index < library.len() => Some(match self.edited.remove(&index) {
-                Some(game) => Ok(game),
-                None => library.load(index),
-            }),
-            _ => None,
+        let loaded = match self.edited.remove(&id) {
+            Some(game) => Ok(game),
+            None => self.session.load(id, &self.edited),
         };
-        let Some(loaded) = loaded else {
-            return;
-        };
-        self.game_idx = index;
+        let position = self.session.position_of(id);
+        self.current_slot = Some(id);
         self.right_tab = RightTab::Moves;
         self.goto(0);
         match loaded {
             Ok(game) => {
+                let label = position
+                    .map(|position| format!("game {} of {}", position + 1, self.session.len()))
+                    .unwrap_or_else(|| format!("game {id}"));
                 self.status = if game.errors.is_empty() {
-                    self.index_status.clone()
+                    format!("{} · {label}", self.index_status)
                 } else {
                     format!(
-                        "{} · game {}: {} import warnings",
+                        "{} · {label}: {} import warnings",
                         self.index_status,
-                        index + 1,
                         game.errors.len()
                     )
                 };
@@ -1639,8 +1647,19 @@ impl App {
             }
             Err(err) => {
                 self.current = None;
-                self.status = format!("Could not load game {}: {err}", index + 1);
+                self.status = format!("Could not load game: {err}");
             }
+        }
+    }
+
+    /// Keep the row's cached headers in sync while the selected game is being
+    /// edited. The game tree itself stays in `edited` until navigation.
+    fn sync_current_slot(&mut self) {
+        if !self.dirty {
+            return;
+        }
+        if let (Some(id), Some(game)) = (self.current_slot, self.current.as_ref()) {
+            self.session.update_headers(id, game);
         }
     }
 
@@ -1787,16 +1806,20 @@ impl App {
             self.go_end();
         }
         if up || down {
-            let next = self.library.as_ref().filter(|l| !l.is_empty()).map(|l| {
-                let n = l.len();
-                if down {
-                    (self.game_idx + 1) % n
+            let n = self.session.len();
+            if n > 0 {
+                let current = self
+                    .current_slot
+                    .and_then(|id| self.session.position_of(id))
+                    .unwrap_or(0);
+                let next = if down {
+                    (current + 1) % n
                 } else {
-                    (self.game_idx + n - 1) % n
+                    (current + n - 1) % n
+                };
+                if let Some(id) = self.session.id_at(next) {
+                    self.select_slot(id);
                 }
-            });
-            if let Some(next) = next {
-                self.select_game(next);
             }
         }
         if flip {
@@ -1925,11 +1948,7 @@ impl App {
         );
         ui.add_space(4.0);
 
-        let rows = self
-            .library
-            .as_ref()
-            .map(|library| library.filter(&self.filter))
-            .unwrap_or_default();
+        let rows = self.session.filter(&self.filter);
 
         if rows.is_empty() {
             let message = if self.filter.trim().is_empty() {
@@ -1947,25 +1966,21 @@ impl App {
             .id_salt("game-list")
             .auto_shrink([false, false])
             .show_rows(ui, row_h, rows.len(), |ui, range| {
-                for &idx in &rows[range] {
-                    let row = self.library.as_ref().and_then(|l| l.get(idx)).map(|g| {
-                        (
-                            format!("{} – {}", g.white(), g.black()),
-                            format!("{} · {}", g.event(), g.date()),
-                        )
-                    });
-                    let Some((title, subtitle)) = row else {
+                for &id in &rows[range] {
+                    let Some(slot) = self.session.slot(id) else {
                         continue;
                     };
-                    let selected = idx == self.game_idx && self.prep.is_none();
+                    let title = format!("{} – {}", slot.white(), slot.black());
+                    let subtitle = format!("{} · {}", slot.event(), slot.date());
+                    let selected = self.current_slot == Some(id) && self.prep.is_none();
                     let width = ui.available_width();
-                    if game_row(ui, selected, &title, &subtitle, width, row_h - 2.0) {
-                        select = Some(idx);
+                    if game_row(ui, selected, &title, &subtitle, width, row_h - 2.0).clicked() {
+                        select = Some(id);
                     }
                 }
             });
-        if let Some(index) = select {
-            self.select_game(index);
+        if let Some(id) = select {
+            self.select_slot(id);
         }
     }
 
@@ -2186,9 +2201,13 @@ impl App {
                         let title = format!("vs {opponent} · as {color}");
                         let subtitle =
                             format!("{} · {} · {}", entry.result(), entry.event(), entry.date());
-                        let selected = idx == self.game_idx && self.prep.is_none();
+                        let selected = self
+                            .session
+                            .source_slot(idx)
+                            .is_some_and(|id| self.current_slot == Some(id))
+                            && self.prep.is_none();
                         let width = ui.available_width();
-                        if game_row(ui, selected, &title, &subtitle, width, row_h - 2.0) {
+                        if game_row(ui, selected, &title, &subtitle, width, row_h - 2.0).clicked() {
                             select_game = Some(idx);
                         }
                     }
@@ -2212,7 +2231,7 @@ impl App {
             self.start_prep(false);
         }
         if let Some(index) = select_game {
-            self.select_game(index);
+            self.select_source(index);
         }
     }
 
@@ -2257,7 +2276,7 @@ impl App {
                     );
                     let selected = self.selected_player == Some(index);
                     let width = ui.available_width();
-                    if game_row(ui, selected, &title, &subtitle, width, row_h - 2.0) {
+                    if game_row(ui, selected, &title, &subtitle, width, row_h - 2.0).clicked() {
                         select = Some(index);
                     }
                 }
@@ -2333,6 +2352,36 @@ impl App {
                 if let Some(position) = &position {
                     ui.label(RichText::new(fen_string(position)).monospace().small().weak())
                         .on_hover_text("Current FEN");
+                }
+                let mut explorer_source = self.explorer_source;
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Opening explorer").small().strong());
+                    egui::ComboBox::from_id_salt("explorer-source")
+                        .selected_text(explorer_source.label())
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut explorer_source,
+                                cloud::ExplorerSource::Masters,
+                                "Masters · strong OTB games",
+                            );
+                            ui.selectable_value(
+                                &mut explorer_source,
+                                cloud::ExplorerSource::Lichess,
+                                "Lichess · all online games",
+                            );
+                        });
+                });
+                if explorer_source != self.explorer_source {
+                    self.explorer_source = explorer_source;
+                    self.cloud = None;
+                    self.cloud_pending = None;
+                    refresh = true;
+                    if let Err(err) =
+                        crate::settings::CloudPrefs::save_explorer_source(self.explorer_source)
+                    {
+                        self.cloud_status =
+                            format!("Could not save the explorer choice: {err:#}");
+                    }
                 }
                 ui.add_space(6.0);
 
@@ -2415,7 +2464,14 @@ impl App {
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
                             ui.heading("Lichess");
-                            ui.label(RichText::new("opening explorer").small().weak());
+                            ui.label(
+                                RichText::new(format!(
+                                    "{} opening explorer",
+                                    snapshot.explorer_source.label()
+                                ))
+                                .small()
+                                .weak(),
+                            );
                         });
                         match &snapshot.explorer {
                             Ok(data) => {
@@ -3242,15 +3298,15 @@ impl App {
         game_tags_card(ui, &game, &mut tag_update, &mut tag_delete, &mut tag_add);
         ui.add_space(8.0);
 
-        let lines = domain::move_lines(&game);
+        let tokens = domain::tokens(&game);
         egui::Frame::new()
             .fill(SURFACE)
-            .corner_radius(10.0)
+            .corner_radius(12.0)
             .stroke(Stroke::new(1.0, BORDER))
-            .inner_margin(10.0)
+            .inner_margin(12.0)
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("Moves").strong());
+                    ui.label(RichText::new("Moves").size(15.0).strong());
                     ui.label(
                         RichText::new(format!("{} plies", game.mainline_len()))
                             .weak()
@@ -3266,7 +3322,7 @@ impl App {
                         }
                     });
                 });
-                ui.add_space(2.0);
+                ui.add_space(4.0);
 
                 let root_comment = game.nodes[0].comment.trim();
                 if !root_comment.is_empty() {
@@ -3288,10 +3344,10 @@ impl App {
 
                 egui::ScrollArea::vertical()
                     .id_salt("moves")
-                    .max_height((ui.available_height() * 0.42).clamp(100.0, 330.0))
+                    .max_height((ui.available_height() * 0.44).clamp(120.0, 360.0))
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        if lines.is_empty() {
+                        if tokens.is_empty() {
                             ui.label(
                                 RichText::new("No moves yet. Play a move on the board.")
                                     .weak()
@@ -3299,18 +3355,15 @@ impl App {
                             );
                             return;
                         }
-                        ui.spacing_mut().item_spacing = vec2(4.0, 3.0);
-                        for line in &lines {
-                            render_move_line(
-                                ui,
-                                line,
-                                &game,
-                                node,
-                                &mut clicked,
-                                &mut open_editor,
-                                &mut nag_action,
-                            );
-                        }
+                        render_move_tokens_flat(
+                            ui,
+                            &tokens,
+                            &game,
+                            node,
+                            &mut clicked,
+                            &mut open_editor,
+                            &mut nag_action,
+                        );
                     });
             });
 
@@ -3331,16 +3384,16 @@ impl App {
 
         egui::Frame::new()
             .fill(SURFACE)
-            .corner_radius(10.0)
+            .corner_radius(12.0)
             .stroke(Stroke::new(
                 if editing { 1.5 } else { 1.0 },
                 if editing { GOLD } else { BORDER },
             ))
-            .inner_margin(10.0)
+            .inner_margin(12.0)
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("Annotations").strong());
-                    ui.label(RichText::new(selected_san).monospace().color(GOLD));
+                    ui.label(RichText::new("Annotations").size(15.0).strong());
+                    accent_chip(ui, &selected_san);
                     if !symbols.is_empty() {
                         ui.label(RichText::new(symbols).strong().color(GOLD));
                     }
@@ -3349,8 +3402,11 @@ impl App {
                             close_editor = true;
                         }
                         if ui
-                            .small_button("Clear")
-                            .on_hover_text("Remove all annotations from this move")
+                            .add_enabled(
+                                !selected_nags.is_empty(),
+                                egui::Button::new("Clear").small(),
+                            )
+                            .on_hover_text("Remove all symbols from this move")
                             .clicked()
                         {
                             nag_action = Some((edit_node, None));
@@ -3359,41 +3415,58 @@ impl App {
                 });
                 ui.label(
                     RichText::new(if editing {
-                        "Annotation editing · choose a symbol below"
+                        "Editing · click a symbol to toggle it"
                     } else {
-                        "Right-click a move for the symbol palette"
+                        "Click a move, then choose its symbols"
                     })
                     .small()
                     .weak(),
                 );
-                ui.add_space(4.0);
+                ui.add_space(5.0);
 
                 if edit_node > 0 {
-                    egui::ScrollArea::vertical()
-                        .id_salt("nag-palette")
-                        .max_height(250.0)
-                        .show(ui, |ui| {
-                            if let Some(nag) = nag_palette(ui, &selected_nags, false) {
-                                nag_action = Some((edit_node, Some(nag)));
-                            }
-                        });
+                    if let Some(nag) = nag_palette(ui, &selected_nags, false) {
+                        nag_action = Some((edit_node, Some(nag)));
+                    }
+                } else {
+                    ui.label(
+                        RichText::new("Annotations belong to moves; select a move first.")
+                            .small()
+                            .weak()
+                            .italics(),
+                    );
                 }
 
-                ui.add_space(5.0);
-                ui.label(RichText::new("Comment").small().strong().weak());
-                let response = ui.add(
-                    egui::TextEdit::multiline(&mut comment)
-                        .id_salt(("annotation-comment", edit_node))
-                        .hint_text("Add a note for this move…")
-                        .desired_rows(3)
-                        .desired_width(f32::INFINITY),
-                );
-                if response.changed() {
-                    comment_update = Some((edit_node, comment.clone()));
-                }
-                if focus_comment && edit_node == node {
-                    response.request_focus();
-                }
+                ui.add_space(7.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Comment").small().strong());
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.label(RichText::new("saved automatically").small().weak());
+                    });
+                });
+                egui::Frame::new()
+                    .fill(Color32::from_rgb(0x1A, 0x1C, 0x1F))
+                    .corner_radius(6.0)
+                    .inner_margin(egui::Margin::symmetric(8, 5))
+                    .show(ui, |ui| {
+                        let width = ui.available_width();
+                        let response = ui.add_sized(
+                            [width, 38.0],
+                            egui::TextEdit::multiline(&mut comment)
+                                .id_salt(("annotation-comment", edit_node))
+                                .frame(egui::Frame::NONE)
+                                .margin(egui::Margin::ZERO)
+                                .hint_text("Add a note for this move…")
+                                .desired_rows(2)
+                                .desired_width(width),
+                        );
+                        if response.changed() {
+                            comment_update = Some((edit_node, comment.clone()));
+                        }
+                        if focus_comment && edit_node == node {
+                            response.request_focus();
+                        }
+                    });
             });
 
         ui.add_space(6.0);
@@ -4117,7 +4190,7 @@ impl App {
                         } else {
                             let width = (ui.available_width() - 4.0).max(100.0);
                             for row in recent_rows.iter().take(recent_limit) {
-                                if game_row(ui, false, &row.title, &row.subtitle, width, 40.0) {
+                                if game_row(ui, false, &row.title, &row.subtitle, width, 40.0).clicked() {
                                     preview = Some(row.index);
                                 }
                             }
@@ -4178,7 +4251,7 @@ impl App {
                     return_tab,
                 });
                 self.current = Some(game);
-                self.game_idx = usize::MAX;
+                self.current_slot = None;
                 self.dirty = false;
                 self.right_tab = RightTab::Moves;
                 self.goto(0);
@@ -4199,7 +4272,7 @@ impl App {
         self.clear_review();
         self.clear_engine_results();
         self.current = Some(preview.return_game);
-        self.game_idx = usize::MAX;
+        self.current_slot = None;
         self.dirty = false;
         self.right_tab = preview.return_tab;
         self.annotation_editor = None;
@@ -4559,6 +4632,7 @@ impl eframe::App for App {
         self.menu_bar(ui);
         self.database_panel(ui);
         self.moves_panel(ui);
+        self.sync_current_slot();
         self.bottom_bar(ui);
 
         egui::CentralPanel::default_margins().show(ui, |ui| {
@@ -4932,72 +5006,111 @@ fn game_tags_card(
 ) {
     egui::Frame::new()
         .fill(SURFACE)
-        .corner_radius(10.0)
+        .corner_radius(12.0)
         .stroke(Stroke::new(1.0, BORDER))
-        .inner_margin(10.0)
+        .inner_margin(12.0)
         .show(ui, |ui| {
-            egui::CollapsingHeader::new(RichText::new("PGN tags").strong())
-                .default_open(true)
-                .show(ui, |ui| {
-                    if game.headers.is_empty() {
-                        ui.label(RichText::new("No tags.").weak().italics());
-                    }
-                    egui::ScrollArea::vertical()
-                        .id_salt("pgn-tags-scroll")
-                        .max_height(230.0)
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            egui::Grid::new("pgn-tags-grid")
-                                .num_columns(3)
-                                .spacing([6.0, 4.0])
-                                .striped(true)
+            egui::CollapsingHeader::new(
+                RichText::new(format!("PGN tags  ·  {}", game.headers.len()))
+                    .size(14.0)
+                    .strong(),
+            )
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Click a value to edit it").small().weak());
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.menu_button("+ Add tag", |ui| {
+                            let mut any = false;
+                            for &tag in COMMON_PGN_TAGS {
+                                if game.header(tag).is_none() {
+                                    any = true;
+                                    if ui.button(tag_display_name(tag)).clicked() {
+                                        *tag_add = Some(tag);
+                                        ui.close();
+                                    }
+                                }
+                            }
+                            if !any {
+                                ui.label(RichText::new("All common tags are present.").weak());
+                            }
+                        });
+                    });
+                });
+                ui.add_space(5.0);
+
+                if game.headers.is_empty() {
+                    ui.label(RichText::new("No tags.").weak().italics());
+                }
+                egui::ScrollArea::vertical()
+                    .id_salt("pgn-tags-scroll")
+                    .max_height(188.0)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        for (index, (name, value)) in game.headers.iter().enumerate() {
+                            let mut edited = value.clone();
+                            egui::Frame::new()
+                                .fill(Color32::from_rgb(0x20, 0x23, 0x26))
+                                .corner_radius(5.0)
+                                .inner_margin(egui::Margin::symmetric(7, 3))
                                 .show(ui, |ui| {
-                                    for (index, (name, value)) in game.headers.iter().enumerate() {
-                                        ui.label(
-                                            RichText::new(name)
-                                                .monospace()
+                                    ui.horizontal(|ui| {
+                                        left_sized_label(
+                                            ui,
+                                            76.0,
+                                            19.0,
+                                            RichText::new(tag_display_name(name))
                                                 .small()
-                                                .color(Color32::from_gray(175)),
-                                        );
-                                        let mut edited = value.clone();
-                                        let response = ui.add(
+                                                .color(Color32::from_gray(165)),
+                                        )
+                                        .on_hover_text(name);
+                                        let width = (ui.available_width() - 64.0).max(40.0);
+                                        let response = ui.add_sized(
+                                            [width, 19.0],
                                             egui::TextEdit::singleline(&mut edited)
                                                 .id_salt(("pgn-tag", index))
-                                                .desired_width(205.0)
+                                                .frame(egui::Frame::NONE)
+                                                .margin(egui::Margin::ZERO)
+                                                .font(FontId::monospace(12.5))
                                                 .hint_text("value"),
                                         );
                                         if response.changed() {
                                             *tag_update = Some((index, edited));
                                         }
-                                        if ui
-                                            .small_button("×")
-                                            .on_hover_text("Remove this tag")
-                                            .clicked()
+                                        let delete = egui::Button::new(
+                                            RichText::new("×")
+                                                .size(14.0)
+                                                .color(Color32::from_gray(145)),
+                                        )
+                                        .frame(false)
+                                        .min_size(vec2(18.0, 18.0));
+                                        if ui.add(delete).on_hover_text("Remove this tag").clicked()
                                         {
                                             *tag_delete = Some(index);
                                         }
-                                        ui.end_row();
-                                    }
+                                    });
                                 });
-                        });
-                    ui.add_space(3.0);
-                    ui.menu_button("+ Add tag", |ui| {
-                        let mut any = false;
-                        for &tag in COMMON_PGN_TAGS {
-                            if game.header(tag).is_none() {
-                                any = true;
-                                if ui.button(tag).clicked() {
-                                    *tag_add = Some(tag);
-                                    ui.close();
-                                }
-                            }
-                        }
-                        if !any {
-                            ui.label(RichText::new("All common tags are present.").weak());
+                            ui.add_space(3.0);
                         }
                     });
-                });
+            });
         });
+}
+
+/// Turn `WhiteElo` into `White Elo` without losing established acronyms.
+fn tag_display_name(name: &str) -> String {
+    let mut out = String::with_capacity(name.len() + 2);
+    for (index, ch) in name.char_indices() {
+        if index > 0
+            && ch.is_ascii_uppercase()
+            && let Some(previous) = name[..index].chars().next_back()
+            && (previous.is_ascii_lowercase() || previous.is_ascii_digit())
+        {
+            out.push(' ');
+        }
+        out.push(ch);
+    }
+    out
 }
 
 /// Header card above the PGN move list.
@@ -5028,35 +5141,111 @@ fn game_header_card(ui: &mut Ui, game: &Game, prep: Option<&PrepSession>) {
                 return;
             }
 
+            let event = game.event();
             ui.horizontal(|ui| {
-                ui.label(RichText::new(game.event()).small().strong().color(GOLD));
+                let width = (ui.available_width() - 62.0).max(80.0);
+                left_sized_label(
+                    ui,
+                    width,
+                    18.0,
+                    RichText::new(event).small().strong().color(GOLD),
+                )
+                .on_hover_text(event);
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     result_badge(ui, game.result());
                 });
             });
-            ui.add_space(2.0);
+            ui.add_space(6.0);
+            header_player_row(
+                ui,
+                game.white(),
+                player_rating(game, Color::White),
+                Color::White,
+            );
+            ui.add_space(3.0);
+            header_player_row(
+                ui,
+                game.black(),
+                player_rating(game, Color::Black),
+                Color::Black,
+            );
+            ui.add_space(7.0);
             ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new(game.white()).strong().size(16.0));
-                if let Some(rating) = player_rating(game, Color::White) {
-                    ui.label(RichText::new(format!("({rating})")).small().weak());
+                ui.spacing_mut().item_spacing = vec2(5.0, 4.0);
+                meta_chip(ui, game.date());
+                if let Some(round) = game
+                    .header("Round")
+                    .filter(|round| !round.is_empty() && *round != "?")
+                {
+                    meta_chip(ui, &format!("Round {round}"));
                 }
-                ui.label(RichText::new("vs").weak().small());
-                ui.label(RichText::new(game.black()).strong().size(16.0));
-                if let Some(rating) = player_rating(game, Color::Black) {
-                    ui.label(RichText::new(format!("({rating})")).small().weak());
+                if let Some(eco) = game.header("ECO").filter(|eco| !eco.is_empty()) {
+                    meta_chip(ui, eco);
+                }
+                if let Some(opening) = game.header("Opening").filter(|opening| !opening.is_empty())
+                {
+                    ui.label(RichText::new(opening).small().weak())
+                        .on_hover_text(opening);
                 }
             });
-            let mut details = vec![game.date().to_string()];
-            if let Some(round) = game
-                .header("Round")
-                .filter(|round| !round.is_empty() && *round != "?")
-            {
-                details.push(format!("Round {round}"));
-            }
-            if let Some(eco) = game.header("ECO").filter(|eco| !eco.is_empty()) {
-                details.push(eco.to_string());
-            }
-            ui.label(RichText::new(details.join(" · ")).weak().small());
+        });
+}
+
+fn header_player_row(ui: &mut Ui, name: &str, rating: Option<String>, color: Color) {
+    ui.horizontal(|ui| {
+        let (rect, _) = ui.allocate_exact_size(vec2(10.0, 10.0), Sense::hover());
+        let fill = match color {
+            Color::White => Color32::from_gray(235),
+            Color::Black => Color32::from_gray(45),
+        };
+        ui.painter().circle_filled(rect.center(), 4.0, fill);
+        ui.painter().circle_stroke(
+            rect.center(),
+            4.0,
+            Stroke::new(1.0, Color32::from_gray(120)),
+        );
+        let width = (ui.available_width() - 48.0).max(80.0);
+        left_sized_label(ui, width, 21.0, RichText::new(name).strong().size(15.5))
+            .on_hover_text(name);
+        if let Some(rating) = rating {
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                meta_chip(ui, &rating);
+            });
+        }
+    });
+}
+
+fn left_sized_label(ui: &mut Ui, width: f32, height: f32, text: RichText) -> egui::Response {
+    ui.allocate_ui_with_layout(
+        vec2(width, height),
+        Layout::left_to_right(Align::Center),
+        |ui| ui.add(egui::Label::new(text).truncate()),
+    )
+    .inner
+}
+
+fn meta_chip(ui: &mut Ui, text: &str) {
+    egui::Frame::new()
+        .fill(Color32::from_rgb(0x2A, 0x2E, 0x32))
+        .corner_radius(4.0)
+        .inner_margin(egui::Margin::symmetric(6, 2))
+        .show(ui, |ui| {
+            ui.label(
+                RichText::new(text)
+                    .monospace()
+                    .small()
+                    .color(Color32::from_gray(190)),
+            );
+        });
+}
+
+fn accent_chip(ui: &mut Ui, text: &str) {
+    egui::Frame::new()
+        .fill(GOLD_SOFT)
+        .corner_radius(4.0)
+        .inner_margin(egui::Margin::symmetric(6, 2))
+        .show(ui, |ui| {
+            ui.label(RichText::new(text).monospace().small().strong().color(GOLD));
         });
 }
 
@@ -5177,59 +5366,64 @@ fn render_readonly_move_tokens(
     });
 }
 
-fn render_move_line(
+/// Render the whole move tree as one continuous, wrapped PGN stream.
+///
+/// Variations stay inline inside parentheses instead of forcing the mainline
+/// onto a new line at every branch, which keeps long annotated games readable.
+fn render_move_tokens_flat(
     ui: &mut Ui,
-    line: &domain::MoveLine,
+    tokens: &[Token],
     game: &Game,
     selected: usize,
     clicked: &mut Option<usize>,
     open_editor: &mut Option<usize>,
     nag_action: &mut Option<(usize, Option<u8>)>,
 ) {
-    if line.depth > 0 {
-        ui.horizontal(|ui| {
-            ui.add_space(8.0 * line.depth as f32);
-            egui::Frame::new()
-                .fill(VARIATION_BG)
-                .corner_radius(5.0)
-                .inner_margin(5.0)
-                .show(ui, |ui| {
-                    render_move_tokens(ui, line, game, selected, clicked, open_editor, nag_action);
-                });
-        });
-    } else {
-        render_move_tokens(ui, line, game, selected, clicked, open_editor, nag_action);
-    }
-}
-
-fn render_move_tokens(
-    ui: &mut Ui,
-    line: &domain::MoveLine,
-    game: &Game,
-    selected: usize,
-    clicked: &mut Option<usize>,
-    open_editor: &mut Option<usize>,
-    nag_action: &mut Option<(usize, Option<u8>)>,
-) {
+    let mut depth = 0usize;
+    let mut last_move: Option<(u32, Color)> = None;
+    let mut force_number = true;
     ui.horizontal_wrapped(|ui| {
-        for token in &line.tokens {
+        ui.spacing_mut().item_spacing = vec2(2.5, 4.0);
+        for token in tokens {
             match token {
                 Token::OpenParen => {
-                    ui.label(RichText::new("(").weak().small());
+                    depth += 1;
+                    force_number = true;
+                    ui.label(
+                        RichText::new("(")
+                            .monospace()
+                            .small()
+                            .color(Color32::from_gray(120)),
+                    );
                 }
                 Token::CloseParen => {
-                    ui.label(RichText::new(")").weak().small());
+                    depth = depth.saturating_sub(1);
+                    force_number = true;
+                    ui.label(
+                        RichText::new(")")
+                            .monospace()
+                            .small()
+                            .color(Color32::from_gray(120)),
+                    );
                 }
                 Token::Move {
                     node,
                     number,
                     color,
                     san,
-                    line_start,
+                    ..
                 } => {
                     let prefix = match color {
                         Color::White => format!("{number}."),
-                        Color::Black if *line_start => format!("{number}…"),
+                        Color::Black
+                            if force_number
+                                || !matches!(
+                                    last_move,
+                                    Some((previous, Color::White)) if previous == *number
+                                ) =>
+                        {
+                            format!("{number}…")
+                        }
                         Color::Black => String::new(),
                     };
                     if !prefix.is_empty() {
@@ -5237,10 +5431,10 @@ fn render_move_tokens(
                             RichText::new(prefix)
                                 .monospace()
                                 .small()
-                                .color(Color32::from_gray(135)),
+                                .color(Color32::from_gray(128)),
                         );
                     }
-                    let response = move_chip(ui, *node == selected, san, line.depth > 0);
+                    let response = move_chip(ui, *node == selected, san, depth > 0);
                     if response.clicked() {
                         *clicked = Some(*node);
                     }
@@ -5248,7 +5442,7 @@ fn render_move_tokens(
 
                     let symbols = nag_symbols(&game.nodes[*node].nags);
                     if !symbols.is_empty() {
-                        let response = annotation_chip(ui, &symbols, line.depth > 0);
+                        let response = annotation_chip(ui, &symbols, depth > 0);
                         if response.clicked() {
                             *open_editor = Some(*node);
                         }
@@ -5257,7 +5451,7 @@ fn render_move_tokens(
 
                     let comment = game.nodes[*node].comment.trim();
                     if !comment.is_empty() {
-                        let preview = comment_preview(comment, 48);
+                        let preview = comment_preview(comment, 58);
                         let response = ui.add(
                             egui::Label::new(
                                 RichText::new(format!("“{preview}”"))
@@ -5274,6 +5468,8 @@ fn render_move_tokens(
                             .on_hover_text("Click to edit this comment")
                             .on_hover_text(comment);
                     }
+                    last_move = Some((*number, *color));
+                    force_number = false;
                 }
             }
         }
@@ -5372,21 +5568,24 @@ fn move_context_menu(
 
 fn nag_palette(ui: &mut Ui, current: &[u8], compact: bool) -> Option<u8> {
     let mut clicked = None;
+    let (button_width, button_height) = if compact { (22.0, 18.0) } else { (28.0, 22.0) };
     for &(group, choices) in domain::NAG_GROUPS {
-        ui.add_space(if compact { 1.0 } else { 2.0 });
-        ui.label(
-            RichText::new(group)
-                .small()
-                .strong()
-                .color(Color32::from_gray(160)),
-        );
         ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
+            ui.spacing_mut().item_spacing = vec2(3.0, 3.0);
+            ui.add_sized(
+                [if compact { 44.0 } else { 68.0 }, button_height],
+                egui::Label::new(
+                    RichText::new(group)
+                        .small()
+                        .strong()
+                        .color(Color32::from_gray(155)),
+                ),
+            );
             for &choice in choices {
                 let active = current.contains(&choice.code);
                 let button = egui::Button::new(
                     RichText::new(choice.symbol)
-                        .size(if compact { 12.0 } else { 14.0 })
+                        .size(if compact { 11.5 } else { 13.0 })
                         .strong()
                         .color(if active {
                             Color32::from_rgb(0x19, 0x1B, 0x1D)
@@ -5399,17 +5598,18 @@ fn nag_palette(ui: &mut Ui, current: &[u8], compact: bool) -> Option<u8> {
                 } else {
                     Color32::from_rgb(0x2A, 0x2E, 0x32)
                 })
-                .stroke(Stroke::new(1.0, if active { GOLD } else { BORDER }))
-                .corner_radius(4.0)
-                .min_size(vec2(
-                    if compact { 26.0 } else { 32.0 },
-                    if compact { 20.0 } else { 25.0 },
-                ));
-                if ui.add(button).on_hover_text(choice.label).clicked() {
+                .stroke(Stroke::NONE)
+                .corner_radius(4.0);
+                if ui
+                    .add_sized([button_width, button_height], button)
+                    .on_hover_text(choice.label)
+                    .clicked()
+                {
                     clicked = Some(choice.code);
                 }
             }
         });
+        ui.add_space(if compact { 1.0 } else { 2.0 });
     }
     clicked
 }
@@ -5491,8 +5691,8 @@ fn game_row(
     subtitle: &str,
     width: f32,
     height: f32,
-) -> bool {
-    let (rect, response) = ui.allocate_exact_size(vec2(width, height), Sense::click());
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(vec2(width, height), Sense::click_and_drag());
     let visuals = ui.visuals();
     let bg = if selected {
         visuals.selection.bg_fill
@@ -5517,7 +5717,7 @@ fn game_row(
         FontId::proportional(11.0),
         visuals.weak_text_color(),
     );
-    response.clicked()
+    response
 }
 
 fn fen_string(pos: &shakmaty::Chess) -> String {
@@ -5923,10 +6123,11 @@ mod tests {
         let ctx = egui::Context::default();
         App {
             library: None,
+            session: crate::session::GameList::empty(),
             current: Some(games.remove(0)),
             edited: std::collections::HashMap::new(),
             dirty: false,
-            game_idx: 0,
+            current_slot: None,
             node: 0,
             orientation: Color::White,
             show_clocks: false,
@@ -5974,6 +6175,7 @@ mod tests {
             cloud_pending: None,
             cloud_status: String::new(),
             lichess_token: None,
+            explorer_source: cloud::ExplorerSource::Masters,
             engine: None,
             engine_status: "Engine not started.".to_string(),
             engine_name: String::new(),

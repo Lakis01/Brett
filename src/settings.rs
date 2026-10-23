@@ -217,6 +217,7 @@ impl PreparationPrefs {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CloudPrefs {
     pub lichess_token: Option<String>,
+    pub explorer_source: crate::cloud::ExplorerSource,
 }
 
 impl CloudPrefs {
@@ -228,12 +229,21 @@ impl CloudPrefs {
             .map(str::trim)
             .filter(|token| !token.is_empty())
             .map(str::to_string);
-        Self { lichess_token }
+        let explorer_source = value
+            .get("explorer_source")
+            .and_then(Value::as_str)
+            .map(crate::cloud::ExplorerSource::from_config)
+            .unwrap_or_default();
+        Self {
+            lichess_token,
+            explorer_source,
+        }
     }
 
     pub fn to_json(&self) -> String {
         serde_json::to_string_pretty(&json!({
             "lichess_token": self.lichess_token,
+            "explorer_source": self.explorer_source.config_value(),
         }))
         .unwrap_or_default()
     }
@@ -247,6 +257,23 @@ impl CloudPrefs {
             }
         }
         prefs
+    }
+
+    /// Persist only the explorer choice, leaving the token from the config
+    /// file untouched. In particular, an environment token is not copied to
+    /// disk just because the corpus was changed.
+    pub fn save_explorer_source(source: crate::cloud::ExplorerSource) -> Result<()> {
+        let path = cloud_path().context("no XDG config or HOME directory is available")?;
+        let mut prefs = match fs::read_to_string(&path) {
+            Ok(text) => Self::from_json(&text),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Self::default(),
+            Err(err) => return Err(err).with_context(|| format!("reading {}", path.display())),
+        };
+        prefs.explorer_source = source;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+        }
+        fs::write(&path, prefs.to_json()).with_context(|| format!("writing {}", path.display()))
     }
 
     fn load_from(path: &std::path::Path) -> Self {
@@ -336,11 +363,20 @@ mod tests {
     fn cloud_prefs_round_trip_and_trim() {
         let prefs = CloudPrefs {
             lichess_token: Some("lip_abc123".to_string()),
+            explorer_source: crate::cloud::ExplorerSource::Lichess,
         };
         assert_eq!(CloudPrefs::from_json(&prefs.to_json()), prefs);
 
         let parsed = CloudPrefs::from_json(r#"{"lichess_token":"  lip_trim  "}"#);
         assert_eq!(parsed.lichess_token.as_deref(), Some("lip_trim"));
+        assert_eq!(
+            parsed.explorer_source,
+            crate::cloud::ExplorerSource::Masters
+        );
+        assert_eq!(
+            CloudPrefs::from_json(r#"{"explorer_source":"lichess"}"#).explorer_source,
+            crate::cloud::ExplorerSource::Lichess
+        );
         assert_eq!(
             CloudPrefs::from_json(r#"{"lichess_token":"   "}"#).lichess_token,
             None

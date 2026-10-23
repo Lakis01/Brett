@@ -18,11 +18,52 @@ use serde_json::Value;
 const USER_AGENT: &str = "Brett/0.1 (native Linux chess preparation app)";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Which Lichess opening-explorer corpus is queried.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ExplorerSource {
+    /// Lichess Masters: strong over-the-board games, the useful default.
+    #[default]
+    Masters,
+    /// The complete Lichess database, including online and correspondence games.
+    Lichess,
+}
+
+impl ExplorerSource {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Masters => "Masters",
+            Self::Lichess => "Lichess (all games)",
+        }
+    }
+
+    pub fn config_value(self) -> &'static str {
+        match self {
+            Self::Masters => "masters",
+            Self::Lichess => "lichess",
+        }
+    }
+
+    pub fn from_config(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "lichess" | "all" | "full" => Self::Lichess,
+            _ => Self::Masters,
+        }
+    }
+
+    fn endpoint(self) -> &'static str {
+        match self {
+            Self::Masters => "https://explorer.lichess.org/masters",
+            Self::Lichess => "https://explorer.lichess.org/lichess",
+        }
+    }
+}
+
 /// All references for one FEN. Each source is independent so one timeout or
 /// authentication failure does not hide the other two.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Snapshot {
     pub fen: String,
+    pub explorer_source: ExplorerSource,
     pub chessdb: Result<ChessDb, String>,
     pub explorer: Result<Explorer, String>,
     pub cloud_eval: Result<CloudEval, String>,
@@ -128,9 +169,10 @@ pub struct CloudPv {
 
 /// Fetch all three references synchronously. Call this from a worker thread.
 ///
-/// `lichess_token` is optional; without it the opening explorer reports a
-/// useful error while chessdb and the cloud evaluation still work.
-pub fn fetch(fen: &str, lichess_token: Option<&str>) -> Snapshot {
+/// The Masters explorer is public and is the default. The full Lichess
+/// database requires a token; without one it reports a useful error while
+/// chessdb and the cloud evaluation still work.
+pub fn fetch(fen: &str, lichess_token: Option<&str>, explorer_source: ExplorerSource) -> Snapshot {
     let agent = ureq::AgentBuilder::new()
         .user_agent(USER_AGENT)
         .timeout_connect(Duration::from_secs(10))
@@ -138,16 +180,23 @@ pub fn fetch(fen: &str, lichess_token: Option<&str>) -> Snapshot {
         .build();
 
     let chessdb = fetch_chessdb(&agent, fen);
-    let explorer = match lichess_token {
-        Some(token) if !token.trim().is_empty() => fetch_explorer(&agent, fen, token.trim()),
-        _ => Err(anyhow!(
-            "Lichess explorer needs an API token. Put \"lichess_token\" in the Brett references config, or set BRETT_LICHESS_TOKEN."
+    let token = lichess_token
+        .map(str::trim)
+        .filter(|token| !token.is_empty());
+    let explorer = match explorer_source {
+        ExplorerSource::Masters => fetch_explorer(&agent, fen, token, explorer_source),
+        ExplorerSource::Lichess if token.is_some() => {
+            fetch_explorer(&agent, fen, token, explorer_source)
+        }
+        ExplorerSource::Lichess => Err(anyhow!(
+            "The full Lichess explorer needs an API token. Put \"lichess_token\" in the Brett references config, or set BRETT_LICHESS_TOKEN. Masters works without one."
         )),
     };
     let cloud_eval = fetch_cloud_eval(&agent, fen);
 
     Snapshot {
         fen: fen.to_string(),
+        explorer_source,
         chessdb: chessdb.map_err(|err| format!("{err:#}")),
         explorer: explorer.map_err(|err| format!("{err:#}")),
         cloud_eval: cloud_eval.map_err(|err| format!("{err:#}")),
@@ -163,14 +212,23 @@ fn fetch_chessdb(agent: &ureq::Agent, fen: &str) -> Result<ChessDb> {
     parse_chessdb(&text)
 }
 
-fn fetch_explorer(agent: &ureq::Agent, fen: &str, token: &str) -> Result<Explorer> {
+fn fetch_explorer(
+    agent: &ureq::Agent,
+    fen: &str,
+    token: Option<&str>,
+    source: ExplorerSource,
+) -> Result<Explorer> {
     let url = format!(
-        "https://explorer.lichess.org/lichess?variant=standard&fen={}&moves=12&topGames=4&recentGames=0",
+        "{}?variant=standard&fen={}&moves=12&topGames=4&recentGames=0",
+        source.endpoint(),
         encode_component(fen)
     );
-    let text = get_text(agent, &url, Some(token)).context(
-        "querying the Lichess opening explorer (the token may be missing, expired, or lack access)",
-    )?;
+    let text = get_text(agent, &url, token).with_context(|| {
+        format!(
+            "querying the Lichess {} opening explorer (the token may be missing, expired, or lack access)",
+            source.label()
+        )
+    })?;
     parse_explorer(&text)
 }
 
@@ -447,6 +505,25 @@ pub fn uci_san(pos: &shakmaty::Chess, uci: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explorer_source_defaults_to_masters_and_accepts_the_full_database() {
+        assert_eq!(ExplorerSource::default(), ExplorerSource::Masters);
+        assert_eq!(
+            ExplorerSource::from_config("masters"),
+            ExplorerSource::Masters
+        );
+        assert_eq!(
+            ExplorerSource::from_config("lichess"),
+            ExplorerSource::Lichess
+        );
+        assert_eq!(
+            ExplorerSource::from_config(" FULL "),
+            ExplorerSource::Lichess
+        );
+        assert_eq!(ExplorerSource::Masters.label(), "Masters");
+        assert_eq!(ExplorerSource::Lichess.config_value(), "lichess");
+    }
 
     #[test]
     fn chessdb_response_parses_and_orders_moves() {

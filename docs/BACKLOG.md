@@ -215,16 +215,18 @@ part of the roadmap.
 - **M2b mega-scale ingest:** external sorting, on-disk header table, incremental
   position-index updates.
 - **Cloud references (done):** chessdb.cn `queryall`, the Lichess opening
-  explorer (OAuth token), and Lichess cloud evaluation, shown in the **Refs**
-  tab with asynchronous requests and per-FEN caching. See `src/cloud.rs`.
+  explorer (Masters by default; full Lichess with an OAuth token), and Lichess
+  cloud evaluation, shown in the **Refs** tab with asynchronous requests and
+  per-FEN caching. See `src/cloud.rs`.
 - **Reference merging:** combine several databases into one opening tree
   without rebuilding unrelated caches.
 
 ## 9. Database editing, copy/merge, and export
 
-**Status:** design and clarification pending. The in-memory game tree, PGN tag
-editor, and per-game edit overlay already exist, but there is no database
-writer or persistent mutation layer.
+**Status:** the editable ordered session (`src/session.rs`) now provides stable
+row IDs, lazy primary/external/local slots, reordering, and duplicate matching.
+The game list still needs drag payload/drop wiring, and there is no database
+writer or persistent mutation layer yet.
 
 - Save the current database (including in-memory edits) as PGN. Warn before a
   PGN export that would be very large.

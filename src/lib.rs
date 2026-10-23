@@ -15,5 +15,6 @@ pub mod players;
 pub mod position;
 pub mod review;
 pub mod scid;
+pub mod session;
 pub mod settings;
 pub mod ui;
