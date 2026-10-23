@@ -264,9 +264,9 @@ never writes to the source database.
   multi-file format, including modes 0/4/5/10, variations, comments, NAGs,
   drawing tokens, custom starts, and Chess960. See
   [docs/CBH.md](docs/CBH.md).
-- **Cloud references (done).** chessdb.cn, the Lichess opening explorer, and
-  Lichess cloud evaluation in the **Refs** tab, with asynchronous requests and
-  per-position caching.
+- **Cloud references (done).** chessdb.cn, the Lichess opening explorer
+  (Masters by default, full Lichess optional), and Lichess cloud evaluation in
+  the **Refs** tab, with asynchronous requests and per-position caching.
 - **M2b — Mega-scale ingest.** External sorting, an on-disk header table, and
   incremental updates for multi-million-game databases.
 - **Database editing and export.** Copy/merge on drag and drop, plus PGN, SCID,

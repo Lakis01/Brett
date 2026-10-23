@@ -223,10 +223,12 @@ part of the roadmap.
 
 ## 9. Database editing, copy/merge, and export
 
-**Status:** the editable ordered session (`src/session.rs`) now provides stable
-row IDs, lazy primary/external/local slots, reordering, and duplicate matching.
-The game list still needs drag payload/drop wiring, and there is no database
-writer or persistent mutation layer yet.
+**Status:** the editable ordered session (`src/session.rs`) provides stable row
+IDs, lazy primary/external/local slots, reordering, and duplicate matching.
+Games can be reordered by dragging rows in the **Games** list; dropping on the
+upper or lower half of a row inserts before or after it. Cross-database copy
+and merge still need a multi-database view, and there is no database writer or
+persistent mutation layer yet.
 
 - Save the current database (including in-memory edits) as PGN. Warn before a
   PGN export that would be very large.

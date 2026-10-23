@@ -1962,6 +1962,7 @@ impl App {
 
         let row_h = 42.0;
         let mut select = None;
+        let mut reorder = None;
         egui::ScrollArea::vertical()
             .id_salt("game-list")
             .auto_shrink([false, false])
@@ -1974,11 +1975,44 @@ impl App {
                     let subtitle = format!("{} · {}", slot.event(), slot.date());
                     let selected = self.current_slot == Some(id) && self.prep.is_none();
                     let width = ui.available_width();
-                    if game_row(ui, selected, &title, &subtitle, width, row_h - 2.0).clicked() {
+                    let response = game_row(ui, selected, &title, &subtitle, width, row_h - 2.0);
+                    response.dnd_set_drag_payload(GameRowDrag { id });
+
+                    let pointer = ui.ctx().pointer_interact_pos();
+                    let hovering_drag = response.dnd_hover_payload::<GameRowDrag>().is_some();
+                    let drop_before = hovering_drag
+                        && pointer.is_some_and(|pos| pos.y < response.rect.center().y);
+                    if hovering_drag {
+                        let y = if drop_before {
+                            response.rect.top()
+                        } else {
+                            response.rect.bottom()
+                        };
+                        ui.painter().line_segment(
+                            [
+                                egui::pos2(response.rect.left() + 4.0, y),
+                                egui::pos2(response.rect.right() - 4.0, y),
+                            ],
+                            egui::Stroke::new(2.0, ui.visuals().selection.bg_fill),
+                        );
+                    }
+                    if let Some(payload) = response.dnd_release_payload::<GameRowDrag>()
+                        && let Some(position) = self.session.position_of(id)
+                    {
+                        let insertion = if drop_before { position } else { position + 1 };
+                        reorder = Some((payload.id, insertion));
+                    }
+
+                    if response.clicked() {
                         select = Some(id);
                     }
                 }
             });
+        if let Some((id, insertion)) = reorder
+            && self.session.move_slot(id, insertion)
+        {
+            self.status = "Game moved in the current list.".to_string();
+        }
         if let Some(id) = select {
             self.select_slot(id);
         }
@@ -5681,6 +5715,11 @@ fn moves_label(n: usize) -> String {
     } else {
         format!("{n} moves")
     }
+}
+
+#[derive(Clone, Copy)]
+struct GameRowDrag {
+    id: usize,
 }
 
 /// Two-line, full-width selectable row for the game list.
