@@ -90,11 +90,21 @@ its UI, and not a Wine package.
   **chessdb.cn** known moves with score, rank, note, and win rate; the
   **Lichess opening explorer** with W/D/L statistics and top games; and the
   **Lichess cloud evaluation** with depth, nodes, and up to three PVs.
-- Clicking a reference move plays it on the board. Requests run off the UI
-  thread, are debounced while navigating, and are cached in memory per FEN.
+- Clicking a reference move plays it on the board. Hovering any candidate
+  move overlays the resulting position on the board without changing the
+  selected game node; removing the pointer restores the original position.
+  Engine and Lichess cloud PVs are rendered as full SAN move sequences, and
+  every move in the sequence can be hovered or clicked to play through it.
+  Requests run off the UI thread, are debounced while navigating, and are
+  cached in memory per FEN.
 - chessdb.cn and the Lichess cloud evaluation are public. The Lichess opening
   explorer now requires an OAuth bearer token (no additional scopes are
-  needed). Add `{"lichess_token": "lip_..."}` to
+  needed).
+- To create a token: sign in at <https://lichess.org>, open
+  <https://lichess.org/account/oauth/token/create>, give it a name such as
+  `Brett`, leave every scope unchecked, and press **Create**. Copy the
+  `lip_...` value immediately; Lichess shows it only once. Add
+  `{"lichess_token": "lip_..."}` to
   `$XDG_CONFIG_HOME/brett/references.json` (usually
   `~/.config/brett/references.json`) or set `BRETT_LICHESS_TOKEN`. The env
   variable takes precedence. Without a token, the explorer explains how to
@@ -112,8 +122,8 @@ its UI, and not a Wine package.
   `~/.config/brett/engine.json`), and reused at the next launch. Reference
   database settings are stored separately in `preparation.json` beside it.
 - Choose depth or time, 1–5 MultiPV lines, and auto-analysis on position change.
-  Clicking a PV line plays its first move. Results from an older position are
-  discarded.
+  Hovering a PV move previews its position; clicking a move plays the line up
+  to that point. Results from an older position are discarded.
 - The worker performs the UCI handshake off the UI thread, waits for `readyok`,
   kills the engine cleanly on exit, and reports protocol or process errors in
   the panel.

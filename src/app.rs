@@ -52,6 +52,21 @@ struct BoardMeta {
     show_clocks: bool,
 }
 
+/// A temporary position shown while the pointer rests on a candidate move.
+/// It never changes the game tree, the selected node, or the move list.
+#[derive(Clone, Debug)]
+struct HoverPreview {
+    pos: Chess,
+    last_move: Option<(Square, Square)>,
+}
+
+/// One move of a principal variation with the position after it.
+#[derive(Clone, Debug)]
+struct PvStep {
+    san: String,
+    preview: HoverPreview,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum LeftTab {
     #[default]
@@ -233,6 +248,9 @@ pub struct App {
     annotation_editor: Option<usize>,
     /// Request keyboard focus on the annotation comment box once.
     annotation_focus: bool,
+    /// Position temporarily overlaid on the board while a candidate move is
+    /// hovered in the tree, engine, or reference panels.
+    hover_preview: Option<HoverPreview>,
     online_open: bool,
     online_source: OnlineSource,
     online_username: String,
@@ -354,6 +372,7 @@ impl App {
             reference_status,
             annotation_editor: None,
             annotation_focus: false,
+            hover_preview: None,
             online_open: false,
             online_source: OnlineSource::Lichess,
             online_username: String::new(),
@@ -2291,6 +2310,8 @@ impl App {
         let token_configured = self.lichess_token.is_some();
         let config_path = crate::settings::cloud_path();
         let mut clicked_uci = None;
+        let mut clicked_line: Option<Vec<String>> = None;
+        let mut hover_preview = None;
         let mut refresh = false;
 
         egui::ScrollArea::vertical()
@@ -2360,7 +2381,15 @@ impl App {
                                                 .as_ref()
                                                 .and_then(|pos| cloud::uci_san(pos, &mv.uci))
                                                 .unwrap_or_else(|| mv.uci.clone());
-                                            if ui.selectable_label(false, label).clicked() {
+                                            let response = ui
+                                                .selectable_label(false, label)
+                                                .on_hover_text("Hover to preview · click to play");
+                                            if response.hovered() {
+                                                hover_preview = position.as_ref().and_then(|pos| {
+                                                    preview_after_uci(pos, &mv.uci)
+                                                });
+                                            }
+                                            if response.clicked() {
                                                 clicked_uci = Some(mv.uci.clone());
                                             }
                                             ui.label(format_cp(mv.score));
@@ -2430,10 +2459,16 @@ impl App {
                                             }
                                             ui.end_row();
                                             for mv in data.moves.iter().take(20) {
-                                                if ui
+                                                let response = ui
                                                     .selectable_label(false, &mv.san)
-                                                    .clicked()
-                                                {
+                                                    .on_hover_text("Hover to preview · click to play");
+                                                if response.hovered() {
+                                                    hover_preview =
+                                                        position.as_ref().and_then(|pos| {
+                                                            preview_after_uci(pos, &mv.uci)
+                                                        });
+                                                }
+                                                if response.clicked() {
                                                     clicked_uci = Some(mv.uci.clone());
                                                 }
                                                 ui.label(mv.total().to_string());
@@ -2531,29 +2566,40 @@ impl App {
                                     .weak(),
                                 );
                                 for (index, pv) in eval.pvs.iter().enumerate() {
-                                    let first = pv.moves.split_whitespace().next();
-                                    let san = first
-                                        .and_then(|uci| {
-                                            position
-                                                .as_ref()
-                                                .and_then(|pos| cloud::uci_san(pos, uci))
-                                        })
-                                        .unwrap_or_else(|| {
-                                            first.unwrap_or("—").to_string()
-                                        });
-                                    ui.horizontal(|ui| {
+                                    let moves: Vec<String> = pv
+                                        .moves
+                                        .split_whitespace()
+                                        .map(str::to_string)
+                                        .collect();
+                                    let steps = position
+                                        .as_ref()
+                                        .map(|pos| pv_steps(pos, &moves, 20))
+                                        .unwrap_or_default();
+                                    ui.horizontal_wrapped(|ui| {
                                         ui.label(
                                             RichText::new(format!("{}.", index + 1)).weak(),
                                         );
-                                        if let Some(uci) = first
-                                            && ui.selectable_label(false, san).clicked()
-                                        {
-                                            clicked_uci = Some(uci.to_string());
-                                        }
                                         ui.label(pv_score(pv.cp, pv.mate));
-                                        ui.label(
-                                            RichText::new(&pv.moves).small().weak(),
-                                        );
+                                        if steps.is_empty() {
+                                            ui.label(RichText::new("…").weak());
+                                        }
+                                        for (step_index, step) in steps.iter().enumerate() {
+                                            let response = ui
+                                                .selectable_label(
+                                                    false,
+                                                    RichText::new(&step.san).monospace(),
+                                                )
+                                                .on_hover_text(
+                                                    "Hover to preview · click to play up to here",
+                                                );
+                                            if response.hovered() {
+                                                hover_preview = Some(step.preview.clone());
+                                            }
+                                            if response.clicked() {
+                                                clicked_line =
+                                                    Some(moves[..=step_index].to_vec());
+                                            }
+                                        }
                                     });
                                 }
                             }
@@ -2579,8 +2625,12 @@ impl App {
         if refresh {
             self.refresh_cloud();
         }
-        if let Some(uci) = clicked_uci {
+        if let Some(line) = clicked_line {
+            self.play_uci_line(&line);
+        } else if let Some(uci) = clicked_uci {
             self.play_uci(&uci);
+        } else if let Some(preview) = hover_preview {
+            self.hover_preview = Some(preview);
         }
     }
 
@@ -2590,7 +2640,7 @@ impl App {
         let mut start = false;
         let mut stop = false;
         let mut settings_changed = false;
-        let mut clicked_uci = None;
+        let mut clicked_line: Option<Vec<String>> = None;
         let mut browse_engine = false;
         let mut apply_engine = false;
 
@@ -2834,6 +2884,7 @@ impl App {
         };
 
         let infos: Vec<EngineInfo> = self.engine_infos.values().cloned().collect();
+        let mut hover_preview = None;
         if infos.is_empty() {
             ui.label(
                 RichText::new(if self.engine_searching {
@@ -2848,20 +2899,23 @@ impl App {
             for info in infos {
                 let score = engine_score_label(info.score, pos.turn());
                 let color = engine_eval_color(info.score, pos.turn());
+                let steps = pv_steps(&pos, &info.pv, 14);
                 ui.horizontal_wrapped(|ui| {
                     ui.label(RichText::new(score).monospace().strong().color(color));
                     ui.label(RichText::new(format!("d{}", info.depth)).small().weak());
-                    let line = pv_san(&pos, &info.pv, 12);
-                    if ui
-                        .selectable_label(
-                            false,
-                            RichText::new(if line.is_empty() { "…" } else { &line }).monospace(),
-                        )
-                        .on_hover_text("Play the first move of this line")
-                        .clicked()
-                        && let Some(first) = info.pv.first()
-                    {
-                        clicked_uci = Some(first.clone());
+                    if steps.is_empty() {
+                        ui.label(RichText::new("…").weak());
+                    }
+                    for (step_index, step) in steps.iter().enumerate() {
+                        let response = ui
+                            .selectable_label(false, RichText::new(&step.san).monospace())
+                            .on_hover_text("Hover to preview · click to play up to here");
+                        if response.hovered() {
+                            hover_preview = Some(step.preview.clone());
+                        }
+                        if response.clicked() {
+                            clicked_line = Some(info.pv[..=step_index].to_vec());
+                        }
                     }
                 });
                 let mut stats = Vec::new();
@@ -2891,8 +2945,10 @@ impl App {
                     .weak(),
             );
         }
-        if let Some(uci) = clicked_uci {
-            self.play_uci(&uci);
+        if let Some(line) = clicked_line {
+            self.play_uci_line(&line);
+        } else if let Some(preview) = hover_preview {
+            self.hover_preview = Some(preview);
         }
     }
 
@@ -3457,6 +3513,7 @@ impl App {
         }
 
         let mut clicked = None;
+        let mut hover_preview = None;
         ui.add_space(4.0);
         egui::ScrollArea::vertical()
             .id_salt("opening-tree")
@@ -3469,11 +3526,14 @@ impl App {
                     key,
                     &pos,
                     "No indexed game reached this position.",
+                    &mut hover_preview,
                 );
             });
 
         if let Some(mv) = clicked {
             self.play_move(mv);
+        } else if let Some(preview) = hover_preview {
+            self.hover_preview = Some(preview);
         }
     }
 
@@ -3711,6 +3771,7 @@ impl App {
         let mut recent_limit = self.prep_recent_limit.clamp(1, 50);
         let mut clicked = None;
         let mut preview = None;
+        let mut hover_preview = None;
 
         egui::ScrollArea::vertical()
             .id_salt("prep-tree-scroll")
@@ -3895,11 +3956,13 @@ impl App {
                                 if row.player_games == 0 {
                                     text = text.weak();
                                 }
-                                if ui
+                                let response = ui
                                     .selectable_label(false, text)
-                                    .on_hover_text("Play this response")
-                                    .clicked()
-                                {
+                                    .on_hover_text("Hover to preview · click to play");
+                                if response.hovered() {
+                                    hover_preview = preview_after_move(pos, row.mv);
+                                }
+                                if response.clicked() {
                                     clicked = Some(row.mv);
                                 }
                                 probability_bar(
@@ -3996,6 +4059,7 @@ impl App {
                                 key,
                                 pos,
                                 "No indexed game reached this position.",
+                                &mut hover_preview,
                             )
                             .or(clicked);
                         } else {
@@ -4081,9 +4145,10 @@ impl App {
         self.prep_recent_limit = recent_limit;
         if let Some(mv) = clicked {
             self.play_move(mv);
-        }
-        if let Some(index) = preview {
+        } else if let Some(index) = preview {
             self.open_recent_preview(index);
+        } else if let Some(preview) = hover_preview {
+            self.hover_preview = Some(preview);
         }
     }
 
@@ -4276,6 +4341,14 @@ impl App {
             return;
         };
         self.play_move(mv);
+    }
+
+    /// Play a principal variation from the current node, reusing existing
+    /// children where possible and adding the rest to the game tree.
+    fn play_uci_line(&mut self, moves: &[String]) {
+        for uci in moves {
+            self.play_uci(uci);
+        }
     }
 
     fn bottom_bar(&mut self, root: &mut Ui) {
@@ -4477,6 +4550,11 @@ impl eframe::App for App {
             self.load_file(path);
         }
 
+        // Hover previews are re-established by whichever candidate is under
+        // the pointer during this frame. Clearing first makes the board snap
+        // back to the selected game node as soon as the pointer leaves.
+        self.hover_preview = None;
+
         self.handle_keys(&ctx);
         self.menu_bar(ui);
         self.database_panel(ui);
@@ -4488,6 +4566,7 @@ impl eframe::App for App {
             let side = (avail.x.min(avail.y - 64.0) - 24.0).max(120.0);
             ui.with_layout(Layout::top_down(Align::Center), |ui| {
                 ui.add_space(6.0);
+                let hover = self.hover_preview.as_ref();
                 let board_meta = self.game().map(|game| {
                     let node = &game.nodes[self.node];
                     let top_color = self.orientation.other();
@@ -4508,8 +4587,12 @@ impl eframe::App for App {
                         color,
                     };
                     BoardMeta {
-                        pos: node.pos.clone(),
-                        last_move: domain::last_move_squares(node),
+                        pos: hover
+                            .map(|preview| preview.pos.clone())
+                            .unwrap_or_else(|| node.pos.clone()),
+                        last_move: hover
+                            .map(|preview| preview.last_move)
+                            .unwrap_or_else(|| domain::last_move_squares(node)),
                         top: badge(top_color),
                         bottom: badge(bottom_color),
                         show_clocks,
@@ -4624,8 +4707,28 @@ fn player_strip(ui: &mut Ui, side: f32, player: &PlayerBadge, show_clock: bool) 
     ));
 }
 
-/// Convert an engine PV from UCI to a short figurine SAN line.
-fn pv_san(pos: &Chess, pv: &[String], limit: usize) -> String {
+/// Position after a single UCI move, together with the squares to highlight.
+fn preview_after_uci(pos: &Chess, text: &str) -> Option<HoverPreview> {
+    let uci = UciMove::from_ascii(text.as_bytes()).ok()?;
+    preview_after_uci_move(pos, uci)
+}
+
+fn preview_after_uci_move(pos: &Chess, uci: UciMove) -> Option<HoverPreview> {
+    let mv = uci.to_move(pos).ok()?;
+    let after = pos.clone().play(mv).ok()?;
+    Some(HoverPreview {
+        pos: after,
+        last_move: uci.from().zip(uci.to()),
+    })
+}
+
+fn preview_after_move(pos: &Chess, mv: Move) -> Option<HoverPreview> {
+    preview_after_uci_move(pos, UciMove::from_move(mv, CastlingMode::Standard))
+}
+
+/// Convert a UCI principal variation into figurine SAN moves, keeping the
+/// position after each prefix so the UI can preview deeper plies.
+fn pv_steps(pos: &Chess, pv: &[String], limit: usize) -> Vec<PvStep> {
     let mut pos = pos.clone();
     let mut out = Vec::new();
     for text in pv.iter().take(limit) {
@@ -4636,13 +4739,19 @@ fn pv_san(pos: &Chess, pv: &[String], limit: usize) -> String {
             break;
         };
         let san = SanPlus::from_move(pos.clone(), mv).to_string();
-        out.push(domain::figurine_san(&san));
         let Ok(next) = pos.clone().play(mv) else {
             break;
         };
+        out.push(PvStep {
+            san: domain::figurine_san(&san),
+            preview: HoverPreview {
+                pos: next.clone(),
+                last_move: uci.from().zip(uci.to()),
+            },
+        });
         pos = next;
     }
-    out.join(" ")
+    out
 }
 
 /// Rating shown beside a player's name. Elo wins over DWZ when both exist.
@@ -5640,6 +5749,7 @@ fn opening_tree_table(
     key: u64,
     pos: &Chess,
     empty_message: &str,
+    hover_preview: &mut Option<HoverPreview>,
 ) -> Option<Move> {
     let Some(index) = index else {
         ui.label(RichText::new(empty_message).weak());
@@ -5705,11 +5815,13 @@ fn opening_tree_table(
             ui.end_row();
 
             for (san, mv, stat) in rows {
-                if ui
+                let response = ui
                     .selectable_label(false, RichText::new(&san).monospace())
-                    .on_hover_text("Play this move")
-                    .clicked()
-                {
+                    .on_hover_text("Hover to preview · click to play");
+                if response.hovered() {
+                    *hover_preview = preview_after_move(pos, mv);
+                }
+                if response.clicked() {
                     clicked = Some(mv);
                 }
                 ui.label(stat.games.to_string());
@@ -5848,6 +5960,7 @@ mod tests {
             reference_status: String::new(),
             annotation_editor: None,
             annotation_focus: false,
+            hover_preview: None,
             online_open: false,
             online_source: OnlineSource::Lichess,
             online_username: String::new(),
@@ -5952,6 +6065,20 @@ mod tests {
             app.current.as_ref().unwrap().nodes[app.node].san(),
             Some("e4")
         );
+    }
+
+    #[test]
+    fn pv_steps_convert_uci_and_track_each_prefix() {
+        let pv = vec!["e2e4".to_string(), "e7e5".to_string(), "g1f3".to_string()];
+        let steps = pv_steps(&Chess::default(), &pv, 10);
+        assert_eq!(steps.len(), 3);
+        assert_eq!(steps[0].san, "e4");
+        assert_eq!(steps[1].san, "e5");
+        assert_eq!(steps[2].san, domain::figurine_san("Nf3"));
+        assert_eq!(steps[0].preview.last_move, Some((Square::E2, Square::E4)));
+        assert_eq!(steps[2].preview.last_move, Some((Square::G1, Square::F3)));
+        assert_eq!(steps[2].preview.pos.turn(), Color::Black);
+        assert!(preview_after_uci(&Chess::default(), "e2e5").is_none());
     }
 
     #[test]

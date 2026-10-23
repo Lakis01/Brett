@@ -259,7 +259,6 @@ impl CloudPrefs {
             }
         }
     }
-
 }
 
 /// `$XDG_CONFIG_HOME/brett/engine.json`, or `$HOME/.config/...`.
