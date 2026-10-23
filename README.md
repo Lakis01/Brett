@@ -84,6 +84,22 @@ its UI, and not a Wine package.
 - Imports are capped at 5,000 games and cached under
   `$XDG_CACHE_HOME/brett/online/`. Nothing is written next to a source database.
 
+### External references
+
+- The **Refs** tab queries three sources for the board position:
+  **chessdb.cn** known moves with score, rank, note, and win rate; the
+  **Lichess opening explorer** with W/D/L statistics and top games; and the
+  **Lichess cloud evaluation** with depth, nodes, and up to three PVs.
+- Clicking a reference move plays it on the board. Requests run off the UI
+  thread, are debounced while navigating, and are cached in memory per FEN.
+- chessdb.cn and the Lichess cloud evaluation are public. The Lichess opening
+  explorer now requires an OAuth bearer token (no additional scopes are
+  needed). Add `{"lichess_token": "lip_..."}` to
+  `$XDG_CONFIG_HOME/brett/references.json` (usually
+  `~/.config/brett/references.json`) or set `BRETT_LICHESS_TOKEN`. The env
+  variable takes precedence. Without a token, the explorer explains how to
+  configure one and the other two references still work.
+
 ### Engine analysis
 
 - The **Engine** tab works with any UCI engine: type its executable path or use
@@ -192,6 +208,7 @@ never writes to the source database.
 | `src/players.rs` | Player directory, per-player position books, Bayesian prediction |
 | `src/evaluation.rs` | Held-out log loss, Brier score, top-k accuracy, calibration |
 | `src/online.rs` | Public Lichess and Chess.com imports |
+| `src/cloud.rs` | chessdb.cn, Lichess opening explorer, and Lichess cloud eval |
 | `src/domain.rs` | Game tree, PGN parsing, move lines, figurines, NAG palette, clocks |
 | `src/engine.rs` | Asynchronous UCI process, handshake, options, parser, worker threads |
 | `src/settings.rs` | Persistent engine and reference-database settings |
@@ -232,10 +249,13 @@ never writes to the source database.
   multi-file format, including modes 0/4/5/10, variations, comments, NAGs,
   drawing tokens, custom starts, and Chess960. See
   [docs/CBH.md](docs/CBH.md).
+- **Cloud references (done).** chessdb.cn, the Lichess opening explorer, and
+  Lichess cloud evaluation in the **Refs** tab, with asynchronous requests and
+  per-position caching.
 - **M2b — Mega-scale ingest.** External sorting, an on-disk header table, and
   incremental updates for multi-million-game databases.
-- **Cloud evaluation** (Lichess cloud eval, ChessDB.cn) with local Stockfish
-  fallback.
+- **Database editing and export.** Copy/merge on drag and drop, plus PGN, SCID,
+  and classic CBH writers with a size warning for PGN.
 
 The detailed queue and acceptance criteria are in
 [docs/BACKLOG.md](docs/BACKLOG.md).
@@ -245,7 +265,9 @@ The detailed queue and acceptance criteria are in
 **`/home/gratis01/Chess Databases/` is treated as read-only.** Brett opens PGN,
 SCID, and classic CBH file sets for reading only. Derived indexes and imported
 games go to `$XDG_CACHE_HOME/brett/`, and engine/reference preferences go to
-`$XDG_CONFIG_HOME/brett/`; nothing is written next to a source database.
+`$XDG_CONFIG_HOME/brett/`; nothing is written next to a source database. The
+Lichess reference token, if configured, lives in `references.json` in that
+config directory (or in `BRETT_LICHESS_TOKEN`).
 See [docs/DATA_SAFETY.md](docs/DATA_SAFETY.md).
 
 ## Third-party assets and references

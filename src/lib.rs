@@ -5,6 +5,7 @@
 
 pub mod app;
 pub mod cbh;
+pub mod cloud;
 pub mod domain;
 pub mod engine;
 pub mod evaluation;

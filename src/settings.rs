@@ -208,9 +208,68 @@ impl PreparationPrefs {
     }
 }
 
+/// Optional credentials for the external reference tab.
+///
+/// Lichess opening-explorer requests are authenticated. A token with no
+/// additional scopes is enough. The environment variable
+/// `BRETT_LICHESS_TOKEN` takes precedence, which keeps the token out of the
+/// config file for users who prefer that.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CloudPrefs {
+    pub lichess_token: Option<String>,
+}
+
+impl CloudPrefs {
+    pub fn from_json(text: &str) -> Self {
+        let value: Value = serde_json::from_str(text).unwrap_or(Value::Null);
+        let lichess_token = value
+            .get("lichess_token")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+            .map(str::to_string);
+        Self { lichess_token }
+    }
+
+    pub fn to_json(&self) -> String {
+        serde_json::to_string_pretty(&json!({
+            "lichess_token": self.lichess_token,
+        }))
+        .unwrap_or_default()
+    }
+
+    pub fn load() -> Self {
+        let mut prefs = cloud_path().map_or_else(Self::default, |path| Self::load_from(&path));
+        if let Ok(token) = std::env::var("BRETT_LICHESS_TOKEN") {
+            let token = token.trim();
+            if !token.is_empty() {
+                prefs.lichess_token = Some(token.to_string());
+            }
+        }
+        prefs
+    }
+
+    fn load_from(path: &std::path::Path) -> Self {
+        match fs::read_to_string(path) {
+            Ok(text) => Self::from_json(&text),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Self::default(),
+            Err(err) => {
+                tracing::warn!("could not read {}: {err:#}", path.display());
+                Self::default()
+            }
+        }
+    }
+
+}
+
 /// `$XDG_CONFIG_HOME/brett/engine.json`, or `$HOME/.config/...`.
 pub fn config_path() -> Option<PathBuf> {
     config_dir().map(|path| path.join("engine.json"))
+}
+
+/// `$XDG_CONFIG_HOME/brett/references.json`, or `$HOME/.config/...`.
+pub fn cloud_path() -> Option<PathBuf> {
+    config_dir().map(|path| path.join("references.json"))
 }
 
 /// `$XDG_CONFIG_HOME/brett/preparation.json`, or `$HOME/.config/...`.
@@ -272,6 +331,21 @@ mod tests {
         assert_eq!(parsed.reference_path, Some(PathBuf::from("/tmp/ref.pgn")));
         assert_eq!(parsed.rating_band, 1_000);
         assert_eq!(parsed.rating_offset, -1_000);
+    }
+
+    #[test]
+    fn cloud_prefs_round_trip_and_trim() {
+        let prefs = CloudPrefs {
+            lichess_token: Some("lip_abc123".to_string()),
+        };
+        assert_eq!(CloudPrefs::from_json(&prefs.to_json()), prefs);
+
+        let parsed = CloudPrefs::from_json(r#"{"lichess_token":"  lip_trim  "}"#);
+        assert_eq!(parsed.lichess_token.as_deref(), Some("lip_trim"));
+        assert_eq!(
+            CloudPrefs::from_json(r#"{"lichess_token":"   "}"#).lichess_token,
+            None
+        );
     }
 
     #[test]

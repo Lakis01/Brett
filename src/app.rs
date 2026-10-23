@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::{self, TryRecvError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use eframe::egui::{
     self, Align, Align2, Color32, FontId, Key, Layout, RichText, Sense, Stroke, StrokeKind, Ui,
@@ -14,6 +14,7 @@ use shakmaty::uci::UciMove;
 use shakmaty::{CastlingMode, Chess, Color, EnPassantMode, Move, Position, Square};
 
 use crate::cbh::CbhLibrary;
+use crate::cloud;
 use crate::domain::{self, Clock, Game, Token};
 use crate::engine::{EngineEvent, EngineHandle, EngineInfo, EngineOptions, Score, SearchLimit};
 use crate::library::{GameLibrary, PgnLibrary};
@@ -24,7 +25,7 @@ use crate::position::{
 };
 use crate::review::{self, Quality, ReviewConfig, ReviewState};
 use crate::scid::ScidLibrary;
-use crate::settings::{EnginePrefs, PreparationPrefs};
+use crate::settings::{CloudPrefs, EnginePrefs, PreparationPrefs};
 use crate::ui::board::{self, BoardEvent, BoardState};
 use crate::ui::fonts;
 use crate::ui::pieces::PieceTextures;
@@ -65,6 +66,7 @@ enum RightTab {
     Tree,
     Engine,
     Review,
+    References,
 }
 
 enum IndexMessage {
@@ -115,6 +117,10 @@ enum ReferenceMessage {
 enum OnlineMessage {
     Progress(String),
     Done(Result<ImportResult, String>),
+}
+
+enum CloudMessage {
+    Done(cloud::Snapshot),
 }
 
 #[derive(Clone, Debug)]
@@ -233,6 +239,13 @@ pub struct App {
     online_max: usize,
     online_status: String,
     online_rx: Option<mpsc::Receiver<OnlineMessage>>,
+    cloud: Option<cloud::Snapshot>,
+    cloud_cache: BTreeMap<String, cloud::Snapshot>,
+    cloud_rx: Option<mpsc::Receiver<CloudMessage>>,
+    cloud_job: Option<String>,
+    cloud_pending: Option<(String, Instant)>,
+    cloud_status: String,
+    lichess_token: Option<String>,
     engine: Option<EngineHandle>,
     engine_status: String,
     engine_name: String,
@@ -278,6 +291,7 @@ impl App {
         fonts::install(&cc.egui_ctx);
         let engine_prefs = EnginePrefs::load();
         let preparation_prefs = PreparationPrefs::load();
+        let cloud_prefs = CloudPrefs::load();
         let reference_path = preparation_prefs
             .reference_path
             .as_ref()
@@ -346,6 +360,13 @@ impl App {
             online_max: 500,
             online_status: String::new(),
             online_rx: None,
+            cloud: None,
+            cloud_cache: BTreeMap::new(),
+            cloud_rx: None,
+            cloud_job: None,
+            cloud_pending: None,
+            cloud_status: "Open a game and select References.".to_string(),
+            lichess_token: cloud_prefs.lichess_token,
             engine: None,
             engine_status: "Engine not started.".to_string(),
             engine_name: String::new(),
@@ -467,6 +488,12 @@ impl App {
                     "Select a player to build their preparation book.".to_string();
                 self.prep = None;
                 self.recent_preview = None;
+                self.cloud = None;
+                self.cloud_cache.clear();
+                self.cloud_rx = None;
+                self.cloud_job = None;
+                self.cloud_pending = None;
+                self.cloud_status = "Open a game and select References.".to_string();
                 self.annotation_editor = None;
                 self.annotation_focus = false;
                 self.index_status = format!(
@@ -1429,6 +1456,117 @@ impl App {
         }
     }
 
+    fn poll_cloud(&mut self) {
+        let Some(rx) = self.cloud_rx.take() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(CloudMessage::Done(snapshot)) => {
+                let fen = snapshot.fen.clone();
+                if let Some(current) = self.current_fen()
+                    && current == fen
+                {
+                    self.cloud = Some(snapshot.clone());
+                    self.cloud_status = if snapshot.has_any_data() {
+                        "References loaded.".to_string()
+                    } else {
+                        "No external references found for this position.".to_string()
+                    };
+                }
+                self.cloud_job = None;
+                self.cloud_cache.insert(fen, snapshot);
+                if self.cloud_cache.len() > 128
+                    && let Some(key) = self.cloud_cache.keys().next().cloned()
+                {
+                    self.cloud_cache.remove(&key);
+                }
+            }
+            Err(TryRecvError::Empty) => {
+                self.cloud_rx = Some(rx);
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.cloud_job = None;
+                self.cloud_status =
+                    "Reference query stopped unexpectedly. Press Refresh to retry.".to_string();
+            }
+        }
+    }
+
+    /// Query the external references for the current position. Queries are
+    /// delayed briefly so holding an arrow key does not fire a request for
+    /// every intermediate position.
+    fn maybe_request_cloud(&mut self) {
+        if self.right_tab != RightTab::References {
+            return;
+        }
+        let Some(fen) = self.current_fen() else {
+            self.cloud = None;
+            self.cloud_status = "No game is open.".to_string();
+            return;
+        };
+        if self.cloud_rx.is_some() {
+            return;
+        }
+        if self
+            .cloud
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.fen == fen)
+        {
+            return;
+        }
+        if let Some(snapshot) = self.cloud_cache.get(&fen).cloned() {
+            self.cloud = Some(snapshot);
+            self.cloud_status = "References loaded from cache.".to_string();
+            self.cloud_pending = None;
+            return;
+        }
+        let now = Instant::now();
+        match self.cloud_pending.take() {
+            Some((pending, started)) if pending == fen => {
+                if now.duration_since(started) < Duration::from_millis(350) {
+                    self.cloud_pending = Some((pending, started));
+                    self.ctx.request_repaint_after(Duration::from_millis(50));
+                    return;
+                }
+                self.start_cloud(fen);
+            }
+            _ => {
+                self.cloud = None;
+                self.cloud_status = "Waiting to query references…".to_string();
+                self.cloud_pending = Some((fen, now));
+                self.ctx.request_repaint_after(Duration::from_millis(350));
+            }
+        }
+    }
+
+    fn start_cloud(&mut self, fen: String) {
+        if self.cloud_rx.is_some() {
+            return;
+        }
+        self.cloud_job = Some(fen.clone());
+        self.cloud_status = "Querying chessdb.cn and Lichess…".to_string();
+        let token = self.lichess_token.clone();
+        let (tx, rx) = mpsc::channel();
+        let ctx = self.ctx.clone();
+        std::thread::spawn(move || {
+            let snapshot = cloud::fetch(&fen, token.as_deref());
+            let _ = tx.send(CloudMessage::Done(snapshot));
+            ctx.request_repaint();
+        });
+        self.cloud_rx = Some(rx);
+    }
+
+    fn refresh_cloud(&mut self) {
+        if let Some(fen) = self.current_fen() {
+            self.cloud_cache.remove(&fen);
+            self.cloud = None;
+            self.cloud_pending = None;
+            self.cloud_job = None;
+            self.cloud_rx = None;
+            self.start_cloud(fen);
+        }
+    }
+
     /// Load one game tree from the index, replacing the current game.
     fn select_game(&mut self, index: usize) {
         if index == self.game_idx && self.current.is_some() && self.prep.is_none() {
@@ -2125,6 +2263,8 @@ impl App {
                         .on_hover_text("UCI engine (E)");
                     ui.selectable_value(&mut self.right_tab, RightTab::Review, "Review")
                         .on_hover_text("Game review (R)");
+                    ui.selectable_value(&mut self.right_tab, RightTab::References, "Refs")
+                        .on_hover_text("chessdb.cn and Lichess references for this position");
                 });
                 ui.separator();
                 match self.right_tab {
@@ -2133,8 +2273,315 @@ impl App {
                     RightTab::Tree => self.tree_content(ui),
                     RightTab::Engine => self.engine_content(ui),
                     RightTab::Review => self.review_content(ui),
+                    RightTab::References => self.references_content(ui),
                 }
             });
+    }
+
+    fn references_content(&mut self, ui: &mut Ui) {
+        self.maybe_request_cloud();
+
+        let snapshot = self.cloud.clone();
+        let position = self
+            .current
+            .as_ref()
+            .map(|game| game.nodes[self.node].pos.clone());
+        let status = self.cloud_status.clone();
+        let loading = self.cloud_rx.is_some();
+        let token_configured = self.lichess_token.is_some();
+        let config_path = crate::settings::cloud_path();
+        let mut clicked_uci = None;
+        let mut refresh = false;
+
+        egui::ScrollArea::vertical()
+            .id_salt("cloud-references")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.heading("References");
+                    if loading {
+                        ui.spinner();
+                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.button("Refresh").clicked() {
+                            refresh = true;
+                        }
+                    });
+                });
+                ui.label(RichText::new(&status).small().weak());
+                if let Some(position) = &position {
+                    ui.label(RichText::new(fen_string(position)).monospace().small().weak())
+                        .on_hover_text("Current FEN");
+                }
+                ui.add_space(6.0);
+
+                let Some(snapshot) = &snapshot else {
+                    ui.label(
+                        RichText::new(
+                            "Move the board or open a game; references are queried automatically.",
+                        )
+                        .weak(),
+                    );
+                    return;
+                };
+
+                egui::Frame::new()
+                    .fill(SURFACE)
+                    .corner_radius(10.0)
+                    .stroke(Stroke::new(1.0, BORDER))
+                    .inner_margin(10.0)
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.heading("chessdb.cn");
+                            ui.label(RichText::new("cloud database").small().weak());
+                        });
+                        match &snapshot.chessdb {
+                            Ok(data) => {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "{} known move{} · score from the side to move",
+                                        data.moves.len(),
+                                        if data.moves.len() == 1 { "" } else { "s" }
+                                    ))
+                                    .small()
+                                    .weak(),
+                                );
+                                ui.add_space(3.0);
+                                egui::Grid::new("references-chessdb-grid")
+                                    .num_columns(5)
+                                    .striped(true)
+                                    .show(ui, |ui| {
+                                        for heading in ["Move", "Score", "Winrate", "Rank", "Note"] {
+                                            ui.label(RichText::new(heading).strong().small());
+                                        }
+                                        ui.end_row();
+                                        for mv in data.moves.iter().take(30) {
+                                            let label = position
+                                                .as_ref()
+                                                .and_then(|pos| cloud::uci_san(pos, &mv.uci))
+                                                .unwrap_or_else(|| mv.uci.clone());
+                                            if ui.selectable_label(false, label).clicked() {
+                                                clicked_uci = Some(mv.uci.clone());
+                                            }
+                                            ui.label(format_cp(mv.score));
+                                            ui.label(format!("{:.1}%", mv.winrate));
+                                            ui.label(mv.rank.to_string());
+                                            ui.label(RichText::new(&mv.note).small().weak());
+                                            ui.end_row();
+                                        }
+                                    });
+                            }
+                            Err(err) => {
+                                ui.label(RichText::new(err).small().weak());
+                            }
+                        }
+                    });
+
+                ui.add_space(6.0);
+                egui::Frame::new()
+                    .fill(SURFACE)
+                    .corner_radius(10.0)
+                    .stroke(Stroke::new(1.0, BORDER))
+                    .inner_margin(10.0)
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.heading("Lichess");
+                            ui.label(RichText::new("opening explorer").small().weak());
+                        });
+                        match &snapshot.explorer {
+                            Ok(data) => {
+                                if let Some(opening) = &data.opening
+                                    && !opening.name.is_empty()
+                                {
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "{} · {}",
+                                            opening.eco, opening.name
+                                        ))
+                                        .small()
+                                        .weak(),
+                                    );
+                                }
+                                ui.label(
+                                    RichText::new(format!(
+                                        "{} games · White {} · Draw {} · Black {}",
+                                        data.total(),
+                                        format_percent(data.white, data.total()),
+                                        format_percent(data.draws, data.total()),
+                                        format_percent(data.black, data.total())
+                                    ))
+                                    .small()
+                                    .weak(),
+                                );
+                                ui.add_space(3.0);
+                                if data.moves.is_empty() {
+                                    ui.label(RichText::new("No Lichess games at this position.").weak());
+                                } else {
+                                    egui::Grid::new("references-lichess-grid")
+                                        .num_columns(5)
+                                        .striped(true)
+                                        .show(ui, |ui| {
+                                            for heading in
+                                                ["Move", "Games", "W / D / B", "Score", "Avg"]
+                                            {
+                                                ui.label(
+                                                    RichText::new(heading).strong().small(),
+                                                );
+                                            }
+                                            ui.end_row();
+                                            for mv in data.moves.iter().take(20) {
+                                                if ui
+                                                    .selectable_label(false, &mv.san)
+                                                    .clicked()
+                                                {
+                                                    clicked_uci = Some(mv.uci.clone());
+                                                }
+                                                ui.label(mv.total().to_string());
+                                                ui.label(format!(
+                                                    "{} / {} / {}",
+                                                    format_percent(mv.white, mv.total()),
+                                                    format_percent(mv.draws, mv.total()),
+                                                    format_percent(mv.black, mv.total())
+                                                ));
+                                                ui.label(format!(
+                                                    "{:.1}%",
+                                                    mv.score() * 100.0
+                                                ));
+                                                ui.label(
+                                                    mv.average_rating
+                                                        .map(|rating| rating.to_string())
+                                                        .unwrap_or_else(|| "—".to_string()),
+                                                );
+                                                ui.end_row();
+                                            }
+                                        });
+                                }
+                                if !data.top_games.is_empty() {
+                                    ui.add_space(4.0);
+                                    ui.label(RichText::new("Top games").strong().small());
+                                    for game in &data.top_games {
+                                        let date = match (game.year, game.month) {
+                                            (Some(year), Some(month)) => {
+                                                format!(" · {year}-{month:02}")
+                                            }
+                                            (Some(year), None) => format!(" · {year}"),
+                                            _ => String::new(),
+                                        };
+                                        let white = match game.white_rating {
+                                            Some(rating) => format!("{} ({rating})", game.white),
+                                            None => game.white.clone(),
+                                        };
+                                        let black = match game.black_rating {
+                                            Some(rating) => format!("{} ({rating})", game.black),
+                                            None => game.black.clone(),
+                                        };
+                                        ui.hyperlink_to(
+                                            format!("{white} – {black}{date}"),
+                                            format!("https://lichess.org/{}", game.id),
+                                        );
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                if token_configured {
+                                    ui.label(RichText::new(err).small().weak());
+                                } else {
+                                    ui.label(
+                                        RichText::new(
+                                            "Lichess opening-explorer requests need an API token. The public cloud evaluation below works without one.",
+                                        )
+                                        .small()
+                                        .weak(),
+                                    );
+                                    if let Some(path) = &config_path {
+                                        ui.label(
+                                            RichText::new(format!(
+                                                "Add \"lichess_token\" to {} or set BRETT_LICHESS_TOKEN.",
+                                                path.display()
+                                            ))
+                                            .small()
+                                            .weak(),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    });
+
+                ui.add_space(6.0);
+                egui::Frame::new()
+                    .fill(SURFACE)
+                    .corner_radius(10.0)
+                    .stroke(Stroke::new(1.0, BORDER))
+                    .inner_margin(10.0)
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.heading("Lichess cloud eval");
+                            ui.label(RichText::new("engine evaluation").small().weak());
+                        });
+                        match &snapshot.cloud_eval {
+                            Ok(eval) => {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "depth {} · {} knodes",
+                                        eval.depth,
+                                        eval.knodes
+                                    ))
+                                    .small()
+                                    .weak(),
+                                );
+                                for (index, pv) in eval.pvs.iter().enumerate() {
+                                    let first = pv.moves.split_whitespace().next();
+                                    let san = first
+                                        .and_then(|uci| {
+                                            position
+                                                .as_ref()
+                                                .and_then(|pos| cloud::uci_san(pos, uci))
+                                        })
+                                        .unwrap_or_else(|| {
+                                            first.unwrap_or("—").to_string()
+                                        });
+                                    ui.horizontal(|ui| {
+                                        ui.label(
+                                            RichText::new(format!("{}.", index + 1)).weak(),
+                                        );
+                                        if let Some(uci) = first
+                                            && ui.selectable_label(false, san).clicked()
+                                        {
+                                            clicked_uci = Some(uci.to_string());
+                                        }
+                                        ui.label(pv_score(pv.cp, pv.mate));
+                                        ui.label(
+                                            RichText::new(&pv.moves).small().weak(),
+                                        );
+                                    });
+                                }
+                            }
+                            Err(err) => {
+                                ui.label(RichText::new(err).small().weak());
+                            }
+                        }
+                    });
+
+                ui.add_space(8.0);
+                if let Some(path) = &config_path {
+                    ui.label(
+                        RichText::new(format!(
+                            "Lichess token: {} (or BRETT_LICHESS_TOKEN)",
+                            path.display()
+                        ))
+                        .small()
+                        .weak(),
+                    );
+                }
+            });
+
+        if refresh {
+            self.refresh_cloud();
+        }
+        if let Some(uci) = clicked_uci {
+            self.play_uci(&uci);
+        }
     }
 
     fn engine_content(&mut self, ui: &mut Ui) {
@@ -4000,6 +4447,7 @@ impl eframe::App for App {
         self.poll_player_book();
         self.poll_reference();
         self.poll_online();
+        self.poll_cloud();
         self.poll_engine();
         self.poll_review();
         self.maybe_engine_analysis();
@@ -4007,6 +4455,7 @@ impl eframe::App for App {
             || self.player_book_rx.is_some()
             || self.reference_rx.is_some()
             || self.online_rx.is_some()
+            || self.cloud_rx.is_some()
         {
             ctx.request_repaint_after(Duration::from_millis(150));
         }
@@ -4966,6 +5415,25 @@ fn fen_string(pos: &shakmaty::Chess) -> String {
     shakmaty::fen::Fen::from_position(pos, shakmaty::EnPassantMode::Legal).to_string()
 }
 
+fn format_cp(cp: i32) -> String {
+    format!("{:+.2}", cp as f64 / 100.0)
+}
+
+fn pv_score(cp: Option<i32>, mate: Option<i32>) -> String {
+    if let Some(mate) = mate {
+        return format!("M{mate}");
+    }
+    cp.map(format_cp).unwrap_or_else(|| "—".to_string())
+}
+
+fn format_percent(count: u64, total: u64) -> String {
+    if total == 0 {
+        "0.0%".to_string()
+    } else {
+        format!("{:.1}%", count as f64 * 100.0 / total as f64)
+    }
+}
+
 fn open_library(path: &std::path::Path) -> anyhow::Result<Arc<dyn GameLibrary>> {
     let extension = path
         .extension()
@@ -5386,6 +5854,13 @@ mod tests {
             online_max: 500,
             online_status: String::new(),
             online_rx: None,
+            cloud: None,
+            cloud_cache: BTreeMap::new(),
+            cloud_rx: None,
+            cloud_job: None,
+            cloud_pending: None,
+            cloud_status: String::new(),
+            lichess_token: None,
             engine: None,
             engine_status: "Engine not started.".to_string(),
             engine_name: String::new(),

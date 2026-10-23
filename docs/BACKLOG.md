@@ -214,7 +214,41 @@ part of the roadmap.
 
 - **M2b mega-scale ingest:** external sorting, on-disk header table, incremental
   position-index updates.
-- **Cloud evaluation:** Lichess cloud eval and ChessDB.cn with local Stockfish
-  fallback.
+- **Cloud references (done):** chessdb.cn `queryall`, the Lichess opening
+  explorer (OAuth token), and Lichess cloud evaluation, shown in the **Refs**
+  tab with asynchronous requests and per-FEN caching. See `src/cloud.rs`.
 - **Reference merging:** combine several databases into one opening tree
   without rebuilding unrelated caches.
+
+## 9. Database editing, copy/merge, and export
+
+**Status:** design and clarification pending. The in-memory game tree, PGN tag
+editor, and per-game edit overlay already exist, but there is no database
+writer or persistent mutation layer.
+
+- Save the current database (including in-memory edits) as PGN. Warn before a
+  PGN export that would be very large.
+- Add native SCID and classic CBH writers. The readers are independent and
+  validated; the writers must round-trip through the readers and, where
+  available, an independent implementation.
+- Decide and document drag-and-drop semantics:
+  - games dragged between database views are copied or moved to the drop
+    target;
+  - a database dropped onto an open database is merged;
+  - external file drops ask whether to open, copy, or merge.
+- Never write over a source database without an explicit Save As path. Keep
+  the `/home/gratis01/Chess Databases/` and `/home/gratis01/Downloads/CBH/`
+  sources read-only.
+- Rebuild player and position indexes after a persistent mutation.
+
+## 10. Correspondence database rebuild
+
+**Status:** blocked on source access and confirmation. See
+[CORRESPONDENCE_DATABASE.md](CORRESPONDENCE_DATABASE.md).
+
+- The 2016 sample is 24,865 games, dated 2009-02-15 through 2016-02-08.
+- Both sides have an inclusive `Elo >= 2400` filter; the minimum is exactly
+  2400 and there is no evidence of an upper cutoff.
+- The ICCF portion matches the official ICCF Games Archive. Older LSS, FICGS,
+  and Remote games are also present and need a source decision.
+- The current archive download requires a registered ICCF member.
