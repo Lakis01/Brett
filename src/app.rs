@@ -19,6 +19,7 @@ use crate::domain::{self, Clock, Game, Token};
 use crate::engine::{EngineEvent, EngineHandle, EngineInfo, EngineOptions, Score, SearchLimit};
 use crate::library::{GameLibrary, PgnLibrary};
 use crate::online::{self, ImportResult, OnlineSource};
+use crate::pgn;
 use crate::players::{self, PlayerBook, PlayerDirectory};
 use crate::position::{
     self, BuildOptions, BuildProgress, PositionIndex, PositionStats, RatingFilter,
@@ -36,6 +37,15 @@ const BORDER: Color32 = Color32::from_rgb(0x38, 0x3C, 0x40);
 const GOLD: Color32 = Color32::from_rgb(0xE8, 0xC4, 0x6A);
 const GOLD_SOFT: Color32 = Color32::from_rgb(0x4A, 0x3F, 0x24);
 const COMMENT_TEXT: Color32 = Color32::from_rgb(0x9E, 0xB0, 0xA9);
+/// Warn before writing a PGN larger than this. Plain-text exports are much
+/// larger than the compressed databases they come from.
+const LARGE_PGN_BYTES: u64 = 100 * 1024 * 1024;
+/// Source collections that Brett must never write into. Exports go to a new
+/// path chosen by the user, normally under their home directory.
+const READ_ONLY_ROOTS: [&str; 2] = [
+    "/home/gratis01/Chess Databases",
+    "/home/gratis01/Downloads/CBH",
+];
 
 struct PlayerBadge {
     name: String,
@@ -204,6 +214,13 @@ struct RecentPreview {
     return_tab: RightTab,
 }
 
+#[derive(Clone, Debug)]
+struct PendingPgnExport {
+    path: PathBuf,
+    games: usize,
+    estimate: u64,
+}
+
 pub struct App {
     library: Option<Arc<dyn GameLibrary>>,
     /// Ordered, editable view of the games currently shown in the Games tab.
@@ -292,6 +309,7 @@ pub struct App {
     review_use_time: bool,
     path_input: String,
     filter: String,
+    pending_pgn_export: Option<PendingPgnExport>,
     show_about: bool,
     textures: PieceTextures,
     ctx: egui::Context,
@@ -416,6 +434,7 @@ impl App {
             review_use_time: true,
             path_input: String::new(),
             filter: String::new(),
+            pending_pgn_export: None,
             show_about: false,
             textures: PieceTextures::load(&cc.egui_ctx),
             ctx: cc.egui_ctx.clone(),
@@ -535,6 +554,189 @@ impl App {
                 self.start_index();
             }
             Err(err) => self.status = format!("Could not read {}: {err}", path.display()),
+        }
+    }
+
+    fn start_pgn_export(&mut self) {
+        if self.session.is_empty() {
+            self.status = "There are no games to export.".to_string();
+            return;
+        }
+        let default = self.default_pgn_export_path();
+        let Some(mut path) = save_pgn_dialog(&default) else {
+            return;
+        };
+        if path.extension().is_none() {
+            path.set_extension("pgn");
+        }
+        if is_read_only_export_target(&path) {
+            self.status =
+                "That folder is read-only in Brett. Choose a path outside the source collection."
+                    .to_string();
+            return;
+        }
+        if self.pgn_export_would_overwrite_source(&path) {
+            self.status =
+                "Refusing to overwrite the open source database. Choose a new file.".to_string();
+            return;
+        }
+
+        let games = self.session.len();
+        let estimate = self.pgn_export_estimate();
+        if estimate >= LARGE_PGN_BYTES {
+            self.pending_pgn_export = Some(PendingPgnExport {
+                path,
+                games,
+                estimate,
+            });
+            self.status = format!("Confirm the export of {} games.", games_label(games));
+        } else {
+            self.write_pgn_export(&path);
+        }
+    }
+
+    fn default_pgn_export_path(&self) -> PathBuf {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let stem = self
+            .library
+            .as_ref()
+            .and_then(|library| library.path().file_stem())
+            .map(|stem| stem.to_string_lossy().trim().to_string())
+            .filter(|stem| !stem.is_empty())
+            .unwrap_or_else(|| "brett-export".to_string());
+        home.join(format!("{stem}-export.pgn"))
+    }
+
+    fn pgn_export_estimate(&self) -> u64 {
+        let source_size = self
+            .library
+            .as_ref()
+            .and_then(|library| std::fs::metadata(library.path()).ok())
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        let text_estimate = (self.session.len() as u64).saturating_mul(8_000);
+        source_size.max(text_estimate)
+    }
+
+    fn pgn_export_would_overwrite_source(&self, path: &std::path::Path) -> bool {
+        let Some(library) = &self.library else {
+            return false;
+        };
+        let source = library.path();
+        if path == source {
+            return true;
+        }
+        matches!(
+            (std::fs::canonicalize(path), std::fs::canonicalize(source)),
+            (Ok(target), Ok(source)) if target == source
+        )
+    }
+
+    fn write_pgn_export(&mut self, path: &std::path::Path) {
+        match self.try_write_pgn_export(path) {
+            Ok(games) => {
+                self.status = format!("Exported {} to {}.", games_label(games), path.display());
+            }
+            Err(err) => {
+                self.status = format!("PGN export failed: {err}");
+            }
+        }
+    }
+
+    fn try_write_pgn_export(&self, path: &std::path::Path) -> Result<usize, String> {
+        crate::session::ensure_unique_ids(&self.session)
+            .map_err(|err| format!("checking the session: {err:#}"))?;
+
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("brett-export.pgn");
+        let temp = path.with_file_name(format!(".{file_name}.tmp"));
+        let file = std::fs::File::create(&temp)
+            .map_err(|err| format!("creating {}: {err}", temp.display()))?;
+        let mut writer = std::io::BufWriter::new(file);
+        let ids: Vec<usize> = self.session.slots().iter().map(|slot| slot.id).collect();
+        let mut written = 0usize;
+
+        for id in ids {
+            let game = match self.session.load(id, &self.edited) {
+                Ok(game) => game,
+                Err(err) => {
+                    let _ = std::fs::remove_file(&temp);
+                    return Err(format!("loading game row {id}: {err:#}"));
+                }
+            };
+            if let Err(err) = pgn::write_game(&mut writer, &game) {
+                let _ = std::fs::remove_file(&temp);
+                return Err(format!("writing {}: {err}", path.display()));
+            }
+            written += 1;
+        }
+
+        if let Err(err) = std::io::Write::flush(&mut writer) {
+            let _ = std::fs::remove_file(&temp);
+            return Err(format!("flushing {}: {err}", temp.display()));
+        }
+        drop(writer);
+        if let Err(err) = std::fs::rename(&temp, path) {
+            let _ = std::fs::remove_file(&temp);
+            return Err(format!(
+                "moving the completed export to {}: {err}",
+                path.display()
+            ));
+        }
+        Ok(written)
+    }
+
+    fn pgn_export_dialog(&mut self, ctx: &egui::Context) {
+        let Some(pending) = self.pending_pgn_export.clone() else {
+            return;
+        };
+        let mut open = true;
+        let mut confirm = false;
+        let mut cancel = false;
+        egui::Window::new("Large PGN export")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.label(format!(
+                    "This will write {} to:",
+                    games_label(pending.games)
+                ));
+                ui.label(RichText::new(pending.path.display().to_string()).monospace());
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(format!(
+                        "Estimated size: {}.",
+                        human_bytes(pending.estimate)
+                    ))
+                    .strong(),
+                );
+                ui.label(
+                    RichText::new(
+                        "PGN is plain text and can be much larger than a compressed SCID or classic CBH database. The export may take a while.",
+                    )
+                    .weak(),
+                );
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Export anyway").clicked() {
+                        confirm = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        if confirm {
+            self.pending_pgn_export = None;
+            self.write_pgn_export(&pending.path);
+        } else if cancel || !open {
+            self.pending_pgn_export = None;
+            self.status = "PGN export cancelled.".to_string();
         }
     }
 
@@ -1852,6 +2054,16 @@ impl App {
                         if let Some(path) = open_dialog() {
                             self.load_file(&path);
                         }
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(
+                            !self.session.is_empty(),
+                            egui::Button::new("Save database as PGN…"),
+                        )
+                        .clicked()
+                    {
+                        self.start_pgn_export();
                         ui.close();
                     }
                     ui.separator();
@@ -4742,6 +4954,7 @@ impl eframe::App for App {
 
         self.about(&ctx);
         self.online_dialog(&ctx);
+        self.pgn_export_dialog(&ctx);
     }
 }
 
@@ -5693,6 +5906,34 @@ fn depth_of(game: &Game, mut node: usize) -> usize {
     d
 }
 
+fn is_read_only_export_target(path: &std::path::Path) -> bool {
+    READ_ONLY_ROOTS
+        .iter()
+        .any(|root| path_is_under(path, std::path::Path::new(root)))
+}
+
+fn path_is_under(path: &std::path::Path, root: &std::path::Path) -> bool {
+    let candidate = std::fs::canonicalize(path)
+        .or_else(|_| std::fs::canonicalize(path.parent().unwrap_or(std::path::Path::new("."))));
+    let root = std::fs::canonicalize(root);
+    matches!((candidate, root), (Ok(path), Ok(root)) if path.starts_with(&root))
+}
+
+fn human_bytes(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * KB;
+    const GB: u64 = 1024 * MB;
+    if bytes >= GB {
+        format!("{:.1} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.0} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.0} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{bytes} bytes")
+    }
+}
+
 fn games_label(n: usize) -> String {
     if n == 1 {
         "1 game".to_string()
@@ -6153,6 +6394,40 @@ fn open_dialog() -> Option<std::path::PathBuf> {
     None
 }
 
+/// Native Save As dialog for a PGN export.
+fn save_pgn_dialog(default_path: &std::path::Path) -> Option<std::path::PathBuf> {
+    use std::process::Command;
+
+    let zenity = vec![
+        "--file-selection".to_string(),
+        "--save".to_string(),
+        "--confirm-overwrite".to_string(),
+        "--title=Save database as PGN".to_string(),
+        format!("--filename={}", default_path.display()),
+        "--file-filter=PGN files | *.pgn".to_string(),
+        "--file-filter=All files | *".to_string(),
+    ];
+    match Command::new("zenity").args(&zenity).output() {
+        Ok(out) if out.status.success() => {
+            let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            return (!path.is_empty()).then(|| std::path::PathBuf::from(path));
+        }
+        Ok(_) => return None,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return None,
+    }
+
+    let default = default_path.display().to_string();
+    let kdialog = ["--getsavefilename", default.as_str(), "*.pgn|PGN files"];
+    match Command::new("kdialog").args(kdialog).output() {
+        Ok(out) if out.status.success() => {
+            let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            (!path.is_empty()).then(|| std::path::PathBuf::from(path))
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6240,10 +6515,57 @@ mod tests {
             review_use_time: true,
             path_input: String::new(),
             filter: String::new(),
+            pending_pgn_export: None,
             show_about: false,
             textures: PieceTextures::load(&ctx),
             ctx,
         }
+    }
+
+    #[test]
+    fn detects_export_targets_under_a_root() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("brett-ro-{stamp}"));
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        let target = root.join("sub").join("export.pgn");
+        assert!(path_is_under(&target, &root));
+        assert!(!path_is_under(
+            &std::env::temp_dir().join(format!("outside-{stamp}.pgn")),
+            &root
+        ));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn exports_session_games_in_order() {
+        let mut app = test_app();
+        let game = app.current.clone().unwrap();
+        let mut first = game.clone();
+        first.set_header("White", "First".to_string());
+        let mut second = game;
+        second.set_header("White", "Second".to_string());
+        app.session.insert_game(first, None);
+        app.session.insert_game(second, None);
+
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "brett-pgn-export-{}-{stamp}.pgn",
+            std::process::id()
+        ));
+        let written = app.try_write_pgn_export(&path).unwrap();
+        assert_eq!(written, 2);
+
+        let games = domain::parse_pgn_file(&path).unwrap();
+        assert_eq!(games.len(), 2);
+        assert_eq!(games[0].white(), "First");
+        assert_eq!(games[1].white(), "Second");
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

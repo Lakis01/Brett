@@ -269,20 +269,26 @@ never writes to the source database.
   the **Refs** tab, with asynchronous requests and per-position caching.
 - **M2b — Mega-scale ingest.** External sorting, an on-disk header table, and
   incremental updates for multi-million-game databases.
-- **Database editing and export.** Copy/merge on drag and drop, plus PGN, SCID,
-  and classic CBH writers with a size warning for PGN.
+- **Database editing and export (in progress).** Drag rows to reorder the
+  current list. **File → Save database as PGN…** writes the session in its
+  current order, preserving headers, comments, clocks, NAGs, and variations;
+  exports estimated at 100 MB or more ask for confirmation first.
+  Cross-database copy/merge and the SCID and classic CBH writers remain.
 
 The detailed queue and acceptance criteria are in
 [docs/BACKLOG.md](docs/BACKLOG.md).
 
 ## Data safety
 
-**`/home/gratis01/Chess Databases/` is treated as read-only.** Brett opens PGN,
-SCID, and classic CBH file sets for reading only. Derived indexes and imported
-games go to `$XDG_CACHE_HOME/brett/`, and engine/reference preferences go to
-`$XDG_CONFIG_HOME/brett/`; nothing is written next to a source database. The
-Lichess reference token, if configured, lives in `references.json` in that
-config directory (or in `BRETT_LICHESS_TOKEN`).
+**`/home/gratis01/Chess Databases/` and `/home/gratis01/Downloads/CBH/` are
+treated as read-only.** Brett opens PGN, SCID, and classic CBH file sets for
+reading only. Derived indexes and imported games go to
+`$XDG_CACHE_HOME/brett/`, and engine/reference preferences go to
+`$XDG_CONFIG_HOME/brett/`; nothing is written next to a source database. PGN
+exports default to the home directory, refuse to overwrite the open source
+file, and refuse targets inside either source collection. The Lichess
+reference token, if configured, lives in `references.json` in the config
+directory (or in `BRETT_LICHESS_TOKEN`).
 See [docs/DATA_SAFETY.md](docs/DATA_SAFETY.md).
 
 ## Third-party assets and references

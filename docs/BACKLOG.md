@@ -226,12 +226,11 @@ part of the roadmap.
 **Status:** the editable ordered session (`src/session.rs`) provides stable row
 IDs, lazy primary/external/local slots, reordering, and duplicate matching.
 Games can be reordered by dragging rows in the **Games** list; dropping on the
-upper or lower half of a row inserts before or after it. Cross-database copy
-and merge still need a multi-database view, and there is no database writer or
-persistent mutation layer yet.
+upper or lower half of a row inserts before or after it. **File → Save database
+as PGN…** streams the session in order, preserves comments, clocks, NAGs, and
+variations, and asks for confirmation before exports estimated at 100 MB or
+more. Cross-database copy and merge still need a multi-database view.
 
-- Save the current database (including in-memory edits) as PGN. Warn before a
-  PGN export that would be very large.
 - Add native SCID and classic CBH writers. The readers are independent and
   validated; the writers must round-trip through the readers and, where
   available, an independent implementation.

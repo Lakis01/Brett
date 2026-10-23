@@ -11,6 +11,7 @@ pub mod engine;
 pub mod evaluation;
 pub mod library;
 pub mod online;
+pub mod pgn;
 pub mod players;
 pub mod position;
 pub mod review;
