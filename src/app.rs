@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{self, TryRecvError};
@@ -358,6 +358,13 @@ struct PendingPgnExport {
     estimate: u64,
 }
 
+#[derive(Clone, Debug)]
+struct PendingScidExport {
+    path: PathBuf,
+    games: usize,
+    existing: Vec<PathBuf>,
+}
+
 /// Small dependency-free calendar used by the Date PGN tag.
 #[derive(Clone, Debug)]
 struct DatePicker {
@@ -516,6 +523,15 @@ pub struct App {
     branch_clock: u64,
     /// Preview moves on the board when hovering the open game's move list.
     hover_moves: bool,
+    /// Optional player-photo pack, memory-mapped at startup.
+    photos: Option<crate::photos::PhotoLibrary>,
+    /// Decoded portraits, kept small so browsing many games cannot exhaust GPU
+    /// memory.
+    photo_textures: std::collections::HashMap<String, egui::TextureHandle>,
+    photo_order: VecDeque<String>,
+    show_player_photos: bool,
+    show_nav_buttons: bool,
+    show_pgn_tags: bool,
     /// Open calendar for the Date tag.
     date_picker: Option<DatePicker>,
     /// Screen position of the date field that opened the calendar.
@@ -587,6 +603,7 @@ pub struct App {
     path_input: String,
     filter: String,
     pending_pgn_export: Option<PendingPgnExport>,
+    pending_scid_export: Option<PendingScidExport>,
     show_about: bool,
     show_settings: bool,
     settings_rating_priority: RatingPriority,
@@ -751,6 +768,20 @@ impl App {
             branch_recency: std::collections::HashMap::new(),
             branch_clock: 0,
             hover_moves: display_prefs.hover_moves,
+            photos: crate::photos::default_path().and_then(|path| {
+                match crate::photos::PhotoLibrary::open(&path) {
+                    Ok(library) => Some(library),
+                    Err(err) => {
+                        tracing::warn!("player photos unavailable: {err:#}");
+                        None
+                    }
+                }
+            }),
+            photo_textures: std::collections::HashMap::new(),
+            photo_order: VecDeque::new(),
+            show_player_photos: display_prefs.show_player_photos,
+            show_nav_buttons: display_prefs.show_nav_buttons,
+            show_pgn_tags: display_prefs.show_pgn_tags,
             date_picker: None,
             date_picker_anchor: None,
             rating_priority: display_prefs.rating_priority,
@@ -816,6 +847,7 @@ impl App {
             path_input: String::new(),
             filter: String::new(),
             pending_pgn_export: None,
+            pending_scid_export: None,
             show_about: false,
             show_settings: false,
             settings_rating_priority: display_prefs.rating_priority,
@@ -1185,20 +1217,6 @@ impl App {
             && let Some(parent) = g.nodes[self.node].parent
         {
             self.goto(parent);
-        }
-    }
-
-    fn next_variation(&mut self) {
-        if let Some(g) = self.game()
-            && let Some(p) = g.nodes[self.node].parent
-        {
-            let siblings = &g.nodes[p].children;
-            if let Some(pos) = siblings.iter().position(|&c| c == self.node)
-                && pos + 1 < siblings.len()
-            {
-                let next = siblings[pos + 1];
-                self.goto(next);
-            }
         }
     }
 
@@ -1698,6 +1716,175 @@ impl App {
         }
     }
 
+    fn scid_export_dialog(&mut self, ctx: &egui::Context) {
+        let Some(pending) = self.pending_scid_export.clone() else {
+            return;
+        };
+        let mut open = true;
+        let mut confirm = false;
+        let mut cancel = false;
+        egui::Window::new("Replace SCID database")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.label(format!(
+                    "This will write {} to:",
+                    games_label(pending.games)
+                ));
+                ui.label(RichText::new(pending.path.display().to_string()).monospace());
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(
+                        "A SCID database is three files. These existing files will be replaced together:",
+                    )
+                    .strong(),
+                );
+                for path in &pending.existing {
+                    ui.label(RichText::new(path.display().to_string()).monospace());
+                }
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(
+                        "The old triple is kept aside until the new one is complete, then removed.",
+                    )
+                    .weak(),
+                );
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Replace database").clicked() {
+                        confirm = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        if confirm {
+            self.pending_scid_export = None;
+            self.write_scid_export(&pending.path);
+        } else if cancel || !open {
+            self.pending_scid_export = None;
+            self.status = "SCID export cancelled.".to_string();
+        }
+    }
+
+    fn start_scid_export(&mut self) {
+        if self.session.is_empty() {
+            self.status = "There are no games to export.".to_string();
+            return;
+        }
+        let default = self.default_scid_export_path();
+        let Some(mut path) = save_scid_dialog(&default) else {
+            return;
+        };
+        if !path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("si4"))
+        {
+            path.set_extension("si4");
+        }
+        if is_read_only_export_target(&path) {
+            self.status =
+                "That folder is read-only in Brett. Choose a path outside the source collection."
+                    .to_string();
+            return;
+        }
+        if self.scid_export_would_overwrite_source(&path) {
+            self.status =
+                "Refusing to overwrite the open source database. Choose a new file.".to_string();
+            return;
+        }
+
+        let existing: Vec<PathBuf> = scid_triple(&path)
+            .into_iter()
+            .filter(|candidate| candidate.exists())
+            .collect();
+        let games = self.session.len();
+        if existing.is_empty() {
+            self.write_scid_export(&path);
+        } else {
+            self.pending_scid_export = Some(PendingScidExport {
+                path,
+                games,
+                existing,
+            });
+            self.status = format!(
+                "Confirm replacing the existing SCID database for {}.",
+                games_label(games)
+            );
+        }
+    }
+
+    fn default_scid_export_path(&self) -> PathBuf {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let stem = self
+            .library
+            .as_ref()
+            .and_then(|library| library.path().file_stem())
+            .map(|stem| stem.to_string_lossy().trim().to_string())
+            .filter(|stem| !stem.is_empty())
+            .unwrap_or_else(|| "brett-export".to_string());
+        home.join(format!("{stem}-export.si4"))
+    }
+
+    fn scid_export_would_overwrite_source(&self, path: &std::path::Path) -> bool {
+        let Some(library) = &self.library else {
+            return false;
+        };
+        let source = library.path();
+        let mut protected = vec![source.to_path_buf()];
+        for extension in ["si4", "sn4", "sg4", "si3", "sn3", "sg3"] {
+            protected.push(source.with_extension(extension));
+        }
+        scid_triple(path).iter().any(|target| {
+            protected
+                .iter()
+                .any(|source| same_file_path(target, source))
+        })
+    }
+
+    fn write_scid_export(&mut self, path: &std::path::Path) {
+        match self.try_write_scid_export(path) {
+            Ok(report) => {
+                self.status = format!(
+                    "Exported {} to {} ({}).",
+                    games_label(report.games),
+                    path.display(),
+                    human_bytes(report.bytes)
+                );
+            }
+            Err(err) => {
+                self.status = format!("SCID export failed: {err}");
+            }
+        }
+    }
+
+    fn try_write_scid_export(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<crate::scid::ScidWriteReport, String> {
+        crate::session::ensure_unique_ids(&self.session)
+            .map_err(|err| format!("checking the session: {err:#}"))?;
+
+        let ids: Vec<usize> = self.session.slots().iter().map(|slot| slot.id).collect();
+        let stem = path
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().to_string())
+            .unwrap_or_else(|| "Brett export".to_string());
+        let description = format!("Brett export: {stem}");
+        crate::scid::write_database(
+            path,
+            &description,
+            ids.into_iter()
+                .map(|id| self.session.load(id, &self.edited)),
+        )
+        .map_err(|err| format!("{err:#}"))
+    }
+
     /// Load a cached position index, or build one in the background.
     fn start_index(&mut self) {
         let Some(library) = self.library.clone() else {
@@ -2126,10 +2313,42 @@ impl App {
             prep_recent_limit: self.prep_recent_limit.clamp(1, 50),
             show_empty_pgn_tags: self.show_empty_pgn_tags,
             hover_moves: self.hover_moves,
+            show_player_photos: self.show_player_photos,
+            show_nav_buttons: self.show_nav_buttons,
+            show_pgn_tags: self.show_pgn_tags,
         };
         if let Err(err) = prefs.save() {
             self.status = format!("Could not save display settings: {err:#}");
         }
+    }
+
+    fn photo_texture(&mut self, ctx: &egui::Context, name: &str) -> Option<egui::TextureHandle> {
+        const PHOTO_CACHE_LIMIT: usize = 12;
+        if !self.show_player_photos {
+            return None;
+        }
+        let key = crate::players::player_key(name)?;
+        if let Some(texture) = self.photo_textures.get(&key) {
+            return Some(texture.clone());
+        }
+        let image = {
+            let photos = self.photos.as_ref()?;
+            let bytes = photos.bytes_for_key(&key)?;
+            crate::photos::decode_webp(bytes).ok()?
+        };
+        let texture = ctx.load_texture(
+            format!("player-photo:{key}"),
+            image,
+            egui::TextureOptions::LINEAR,
+        );
+        while self.photo_order.len() >= PHOTO_CACHE_LIMIT {
+            if let Some(oldest) = self.photo_order.pop_front() {
+                self.photo_textures.remove(&oldest);
+            }
+        }
+        self.photo_order.push_back(key.clone());
+        self.photo_textures.insert(key, texture.clone());
+        Some(texture)
     }
 
     fn save_reference_prefs(&mut self) {
@@ -3816,6 +4035,8 @@ impl App {
             up,
             home,
             end,
+            page_up,
+            page_down,
             flip,
             tree,
             moves,
@@ -3835,6 +4056,8 @@ impl App {
                 i.key_pressed(Key::ArrowUp),
                 i.key_pressed(Key::Home),
                 i.key_pressed(Key::End),
+                i.key_pressed(Key::PageUp),
+                i.key_pressed(Key::PageDown),
                 i.key_pressed(Key::F),
                 i.key_pressed(Key::T),
                 i.key_pressed(Key::M),
@@ -3859,6 +4082,12 @@ impl App {
             self.goto(0);
         }
         if end {
+            self.go_end();
+        }
+        if page_up {
+            self.goto(0);
+        }
+        if page_down {
             self.go_end();
         }
         if up || down {
@@ -3961,6 +4190,19 @@ impl App {
                     }
                     if ui
                         .add_enabled(
+                            !self.session.is_empty(),
+                            egui::Button::new("Save database as SCID…"),
+                        )
+                        .on_hover_text(
+                            "Write a SCID4 .si4 database with its .sn4 and .sg4 companions",
+                        )
+                        .clicked()
+                    {
+                        self.start_scid_export();
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(
                             self.library.is_some(),
                             egui::Button::new("Set current database as default reference"),
                         )
@@ -4032,6 +4274,38 @@ impl App {
                         .on_hover_text(
                             "Show the position after a move while hovering it in the open game's move list. Off by default; tree, engine, and reference previews stay enabled.",
                         )
+                        .changed()
+                    {
+                        self.save_display_prefs();
+                    }
+                    ui.separator();
+                    if ui
+                        .add_enabled(
+                            self.photos.is_some(),
+                            egui::Checkbox::new(
+                                &mut self.show_player_photos,
+                                "Show player photos",
+                            ),
+                        )
+                        .on_hover_text(
+                            "Portraits come from the optional Scid Player_photos pack, derived from scid/PlayerData/Player_photos.zip. The photo data is not part of Brett's MIT-licensed source and is not redistributed with Brett.",
+                        )
+                        .changed()
+                    {
+                        self.save_display_prefs();
+                    }
+                    if ui
+                        .checkbox(&mut self.show_nav_buttons, "Show navigation buttons")
+                        .on_hover_text(
+                            "Show Start, Previous, Next, and End beside the board. Keyboard navigation always works.",
+                        )
+                        .changed()
+                    {
+                        self.save_display_prefs();
+                    }
+                    if ui
+                        .checkbox(&mut self.show_pgn_tags, "Show PGN tags")
+                        .on_hover_text("Show the editable PGN-tags card above the move list.")
                         .changed()
                     {
                         self.save_display_prefs();
@@ -4904,7 +5178,12 @@ impl App {
     fn section_content(&mut self, tab: RightTab, ui: &mut Ui) {
         match tab {
             RightTab::Moves if self.recent_preview.is_some() => self.preview_content(ui),
-            RightTab::Moves => self.moves_content(ui),
+            RightTab::Moves => {
+                egui::ScrollArea::vertical()
+                    .id_salt("moves-tab-scroll")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| self.moves_content(ui));
+            }
             RightTab::Tree => self.tree_content(ui),
             RightTab::Engine => self.engine_content(ui),
             RightTab::References => self.references_content(ui),
@@ -5853,24 +6132,26 @@ impl App {
         );
         ui.add_space(6.0);
         let mut show_empty = self.show_empty_pgn_tags;
-        game_tags_card(
-            ui,
-            &game,
-            &mut tag_update,
-            &mut tag_delete,
-            &mut tag_add,
-            &mut tag_add_value,
-            &mut self.tags_expanded,
-            &mut show_empty,
-            &mut self.board_tag_visible,
-            &self.forced_tag_visibility,
-            &mut date_clicked,
-        );
-        if show_empty != self.show_empty_pgn_tags {
-            self.show_empty_pgn_tags = show_empty;
-            self.save_display_prefs();
+        if self.show_pgn_tags {
+            game_tags_card(
+                ui,
+                &game,
+                &mut tag_update,
+                &mut tag_delete,
+                &mut tag_add,
+                &mut tag_add_value,
+                &mut self.tags_expanded,
+                &mut show_empty,
+                &mut self.board_tag_visible,
+                &self.forced_tag_visibility,
+                &mut date_clicked,
+            );
+            if show_empty != self.show_empty_pgn_tags {
+                self.show_empty_pgn_tags = show_empty;
+                self.save_display_prefs();
+            }
+            ui.add_space(8.0);
         }
-        ui.add_space(8.0);
 
         let tokens = domain::tokens(&game);
         egui::Frame::new()
@@ -7573,31 +7854,34 @@ impl App {
         egui::Panel::bottom("nav").show(root, |ui| {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                if ui.button("|<").on_hover_text("Start (Home)").clicked() {
-                    self.goto(0);
-                }
-                if ui.button("<").on_hover_text("Previous move (←)").clicked() {
-                    self.prev_move();
-                }
-                if ui.button(">").on_hover_text("Next move (→)").clicked() {
-                    self.next_move();
-                }
-                if ui.button(">|").on_hover_text("End (End)").clicked() {
-                    self.go_end();
-                }
-                ui.separator();
-                if ui.button("Flip").on_hover_text("Flip board (F)").clicked() {
-                    self.orientation = self.orientation.other();
+                if self.show_nav_buttons {
+                    if ui
+                        .button("|<")
+                        .on_hover_text("Start (Home / PageUp)")
+                        .clicked()
+                    {
+                        self.goto(0);
+                    }
+                    if ui.button("<").on_hover_text("Previous move (←)").clicked() {
+                        self.prev_move();
+                    }
+                    if ui.button(">").on_hover_text("Next move (→)").clicked() {
+                        self.next_move();
+                    }
+                    if ui
+                        .button(">|")
+                        .on_hover_text("End (End / PageDown)")
+                        .clicked()
+                    {
+                        self.go_end();
+                    }
+                    ui.separator();
                 }
                 if self.current.as_ref().is_some_and(|game| game.has_clocks()) {
                     ui.toggle_value(&mut self.show_clocks, "Clocks")
                         .on_hover_text("Show PGN clock times beside the board");
                 }
-                if ui.button("Var").on_hover_text("Next variation").clicked() {
-                    self.next_variation();
-                }
 
-                ui.separator();
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if ui.button("Load").clicked() {
                         let path = std::path::PathBuf::from(self.path_input.trim());
@@ -7614,6 +7898,50 @@ impl App {
                         && let Some(path) = open_dialog()
                     {
                         self.load_file(&path);
+                    }
+
+                    if let Some(game) = self.current.as_ref() {
+                        let fen = fen_string(&game.nodes[self.node].pos);
+                        let width = (ui.available_width() - 8.0).max(80.0);
+                        let frame = egui::Frame::new()
+                            .fill(Color32::from_rgb(0x18, 0x1A, 0x1C))
+                            .corner_radius(6.0)
+                            .inner_margin(egui::Margin::symmetric(7, 3))
+                            .show(ui, |ui| {
+                                ui.set_width(width);
+                                ui.horizontal(|ui| {
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(&fen)
+                                                .monospace()
+                                                .size(10.5)
+                                                .color(Color32::from_gray(200)),
+                                        )
+                                        .truncate(),
+                                    );
+                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                        ui.label(
+                                            RichText::new(format!(
+                                                "move {} / {}",
+                                                full_moves(depth_of(game, self.node)),
+                                                full_moves(game.mainline_len())
+                                            ))
+                                            .weak()
+                                            .size(10.5),
+                                        );
+                                    });
+                                });
+                            });
+                        let response = ui.interact(
+                            frame.response.rect,
+                            ui.scope_id().with("bottom-fen-copy"),
+                            Sense::click(),
+                        );
+                        if response.clicked() {
+                            ui.ctx().copy_text(fen);
+                            self.status = "FEN copied to clipboard.".to_string();
+                        }
+                        response.on_hover_text("Click to copy FEN");
                     }
                 });
             });
@@ -8448,6 +8776,11 @@ impl App {
                 ui.label("Piece set: cburnett by Colin M. L. Burnett, CC BY-SA 3.0.");
                 ui.label("Rules and SAN: shakmaty. PGN: pgn-reader.");
                 ui.label("SCID and classic CBH readers: independent native implementations.");
+                ui.label(
+                    "Player photos: optional Scid Player_photos pack derived from \
+                     scid/PlayerData/Player_photos.zip; not part of Brett's MIT source \
+                     and not redistributed with Brett.",
+                );
                 ui.label("Chess symbols: DejaVu Sans, Bitstream Vera / public-domain licence.");
                 ui.add_space(6.0);
                 if ui.button("Close").clicked() {
@@ -8531,13 +8864,6 @@ impl eframe::App for App {
             ui.with_layout(Layout::top_down(Align::Center), |ui| {
                 ui.add_space(6.0);
                 let hover = self.hover_preview.as_ref();
-                let (moves, total_moves) = match self.game() {
-                    Some(game) => (
-                        full_moves(depth_of(game, self.node)),
-                        full_moves(game.mainline_len()),
-                    ),
-                    None => (0, 0),
-                };
                 let board_meta = self.game().map(|game| {
                     let node = &game.nodes[self.node];
                     let top_color = self.orientation.other();
@@ -8584,7 +8910,10 @@ impl eframe::App for App {
                     }
                 });
                 if let Some(meta) = board_meta {
-                    player_strip(ui, side, &meta.top, meta.show_clocks);
+                    let ctx = ui.ctx().clone();
+                    let top_photo = self.photo_texture(&ctx, &meta.top.name);
+                    let bottom_photo = self.photo_texture(&ctx, &meta.bottom.name);
+                    player_strip(ui, side, &meta.top, meta.show_clocks, top_photo.as_ref());
                     ui.add_space(2.0);
                     let event = board::draw(
                         ui,
@@ -8600,50 +8929,14 @@ impl eframe::App for App {
                         side,
                     );
                     ui.add_space(2.0);
-                    player_strip(ui, side, &meta.bottom, meta.show_clocks);
-                    ui.add_space(4.0);
-                    let fen = fen_string(&meta.pos);
-                    let fen_frame = egui::Frame::new()
-                        .fill(Color32::from_rgb(0x18, 0x1A, 0x1C))
-                        .corner_radius(6.0)
-                        .inner_margin(egui::Margin::symmetric(7, 3))
-                        .show(ui, |ui| {
-                            ui.set_width((side - 14.0).max(80.0));
-                            ui.horizontal(|ui| {
-                                let fen_width = (side - 14.0 - 92.0).max(100.0);
-                                ui.allocate_ui_with_layout(
-                                    vec2(fen_width, 32.0),
-                                    Layout::left_to_right(Align::Center),
-                                    |ui| {
-                                        ui.add(
-                                            egui::Label::new(
-                                                RichText::new(&fen)
-                                                    .monospace()
-                                                    .size(10.5)
-                                                    .color(Color32::from_gray(200)),
-                                            )
-                                            .wrap(),
-                                        );
-                                    },
-                                );
-                                ui.add_space(4.0);
-                                ui.label(
-                                    RichText::new(format!("move {moves} / {total_moves}"))
-                                        .weak()
-                                        .size(10.5),
-                                );
-                            });
-                        });
-                    let fen_response = ui.interact(
-                        fen_frame.response.rect,
-                        ui.scope_id().with("board-fen-copy"),
-                        Sense::click(),
+                    player_strip(
+                        ui,
+                        side,
+                        &meta.bottom,
+                        meta.show_clocks,
+                        bottom_photo.as_ref(),
                     );
-                    if fen_response.clicked() {
-                        ui.ctx().copy_text(fen.clone());
-                        self.status = "FEN copied to clipboard.".to_string();
-                    }
-                    fen_response.on_hover_text("Click to copy FEN");
+                    ui.add_space(4.0);
                     if let Some(event) = event {
                         self.handle_board_event(event);
                     }
@@ -8664,6 +8957,7 @@ impl eframe::App for App {
         self.settings_dialog(&ctx);
         self.online_dialog(&ctx);
         self.pgn_export_dialog(&ctx);
+        self.scid_export_dialog(&ctx);
         self.index_confirmation_dialog(&ctx);
         self.branch_choice_dialog(&ctx);
         self.date_picker_dialog(&ctx);
@@ -8675,23 +8969,56 @@ impl eframe::App for App {
 }
 
 /// Player name, rating and (optionally) clock above/below the board.
-fn player_strip(ui: &mut Ui, side: f32, player: &PlayerBadge, show_clock: bool) {
+fn player_strip(
+    ui: &mut Ui,
+    side: f32,
+    player: &PlayerBadge,
+    show_clock: bool,
+    photo: Option<&egui::TextureHandle>,
+) {
     let has_team = player
         .team
         .as_ref()
         .is_some_and(|team| !team.trim().is_empty());
-    let height = if has_team { 34.0 } else { 27.0 };
+    let has_photo = photo.is_some();
+    let height = if has_photo {
+        46.0
+    } else if has_team {
+        34.0
+    } else {
+        27.0
+    };
     let (rect, response) = ui.allocate_exact_size(vec2(side, height), Sense::hover());
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 6.0, Color32::from_rgb(0x1F, 0x22, 0x25));
 
-    let dot = pos2(rect.left() + 12.0, rect.center().y);
-    let fill = match player.color {
-        Color::White => Color32::from_gray(235),
-        Color::Black => Color32::from_gray(35),
+    let text_left = if let Some(texture) = photo {
+        let avatar =
+            egui::Rect::from_min_size(pos2(rect.left() + 4.0, rect.top() + 4.0), vec2(38.0, 38.0));
+        painter.rect_filled(avatar, 5.0, Color32::from_rgb(0x2C, 0x30, 0x34));
+        painter.image(
+            texture.id(),
+            avatar,
+            egui::Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+            Color32::WHITE,
+        );
+        painter.rect_stroke(
+            avatar,
+            5.0,
+            Stroke::new(1.0, Color32::from_gray(95)),
+            StrokeKind::Inside,
+        );
+        rect.left() + 50.0
+    } else {
+        let dot = pos2(rect.left() + 12.0, rect.center().y);
+        let fill = match player.color {
+            Color::White => Color32::from_gray(235),
+            Color::Black => Color32::from_gray(35),
+        };
+        painter.circle_filled(dot, 4.5, fill);
+        painter.circle_stroke(dot, 4.5, Stroke::new(1.0, Color32::from_gray(135)));
+        rect.left() + 23.0
     };
-    painter.circle_filled(dot, 4.5, fill);
-    painter.circle_stroke(dot, 4.5, Stroke::new(1.0, Color32::from_gray(135)));
 
     let mut label = LayoutJob::default();
     if let Some(title) = &player.title {
@@ -8743,13 +9070,13 @@ fn player_strip(ui: &mut Ui, side: f32, player: &PlayerBadge, show_clock: bool) 
     );
     let name_painter = ui.painter_at(name_clip);
     let name_galley = name_painter.layout_job(label);
-    let name_y = if has_team {
+    let name_y = if has_team || has_photo {
         rect.top() + 5.0
     } else {
         rect.center().y - name_galley.size().y / 2.0
     };
     name_painter.galley(
-        pos2(rect.left() + 23.0, name_y),
+        pos2(text_left, name_y),
         name_galley,
         Color32::from_gray(226),
     );
@@ -8759,8 +9086,13 @@ fn player_strip(ui: &mut Ui, side: f32, player: &PlayerBadge, show_clock: bool) 
             FontId::proportional(10.5),
             Color32::from_gray(145),
         );
+        let team_y = if has_photo {
+            rect.top() + 25.0
+        } else {
+            rect.top() + 20.0
+        };
         name_painter.galley(
-            pos2(rect.left() + 23.0, rect.top() + 20.0),
+            pos2(text_left, team_y),
             team_galley,
             Color32::from_gray(145),
         );
@@ -10732,6 +11064,25 @@ fn is_read_only_export_target(path: &std::path::Path) -> bool {
         .any(|root| path_is_under(path, root))
 }
 
+/// The three files that make up one SCID4 database.
+fn scid_triple(path: &std::path::Path) -> [PathBuf; 3] {
+    [
+        path.to_path_buf(),
+        path.with_extension("sn4"),
+        path.with_extension("sg4"),
+    ]
+}
+
+fn same_file_path(left: &std::path::Path, right: &std::path::Path) -> bool {
+    if left == right {
+        return true;
+    }
+    matches!(
+        (std::fs::canonicalize(left), std::fs::canonicalize(right)),
+        (Ok(left), Ok(right)) if left == right
+    )
+}
+
 fn path_is_under(path: &std::path::Path, root: &std::path::Path) -> bool {
     let candidate = std::fs::canonicalize(path)
         .or_else(|_| std::fs::canonicalize(path.parent().unwrap_or(std::path::Path::new("."))));
@@ -11904,17 +12255,47 @@ fn open_dialog() -> Option<std::path::PathBuf> {
 
 /// Native Save As dialog for a PGN export.
 fn save_pgn_dialog(default_path: &std::path::Path) -> Option<std::path::PathBuf> {
+    save_database_dialog(
+        default_path,
+        "Save database as PGN",
+        "PGN files",
+        "*.pgn",
+        true,
+    )
+}
+
+/// Native Save As dialog for a SCID4 export. Overwriting is confirmed in-app
+/// because all three companion files must be replaced together.
+fn save_scid_dialog(default_path: &std::path::Path) -> Option<std::path::PathBuf> {
+    save_database_dialog(
+        default_path,
+        "Save database as SCID",
+        "SCID4 database",
+        "*.si4",
+        false,
+    )
+}
+
+fn save_database_dialog(
+    default_path: &std::path::Path,
+    title: &str,
+    filter_name: &str,
+    filter_glob: &str,
+    confirm_overwrite: bool,
+) -> Option<std::path::PathBuf> {
     use std::process::Command;
 
-    let zenity = vec![
+    let mut zenity = vec![
         "--file-selection".to_string(),
         "--save".to_string(),
-        "--confirm-overwrite".to_string(),
-        "--title=Save database as PGN".to_string(),
+        format!("--title={title}"),
         format!("--filename={}", default_path.display()),
-        "--file-filter=PGN files | *.pgn".to_string(),
+        format!("--file-filter={filter_name} | {filter_glob}"),
         "--file-filter=All files | *".to_string(),
     ];
+    if confirm_overwrite {
+        zenity.insert(2, "--confirm-overwrite".to_string());
+    }
     match Command::new("zenity").args(&zenity).output() {
         Ok(out) if out.status.success() => {
             let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
@@ -11926,7 +12307,8 @@ fn save_pgn_dialog(default_path: &std::path::Path) -> Option<std::path::PathBuf>
     }
 
     let default = default_path.display().to_string();
-    let kdialog = ["--getsavefilename", default.as_str(), "*.pgn|PGN files"];
+    let filter = format!("{filter_glob}|{filter_name}");
+    let kdialog = ["--getsavefilename", default.as_str(), filter.as_str()];
     match Command::new("kdialog").args(kdialog).output() {
         Ok(out) if out.status.success() => {
             let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
@@ -12035,6 +12417,12 @@ mod tests {
             branch_recency: std::collections::HashMap::new(),
             branch_clock: 0,
             hover_moves: false,
+            photos: None,
+            photo_textures: std::collections::HashMap::new(),
+            photo_order: VecDeque::new(),
+            show_player_photos: true,
+            show_nav_buttons: false,
+            show_pgn_tags: true,
             date_picker: None,
             date_picker_anchor: None,
             rating_priority: RatingPriority::Elo,
@@ -12099,6 +12487,7 @@ mod tests {
             path_input: String::new(),
             filter: String::new(),
             pending_pgn_export: None,
+            pending_scid_export: None,
             show_about: false,
             show_settings: false,
             settings_rating_priority: RatingPriority::Elo,
@@ -12159,6 +12548,56 @@ mod tests {
         assert_eq!(games[0].white(), "First");
         assert_eq!(games[1].white(), "Second");
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn exports_session_games_as_scid_triple() {
+        let mut app = test_app();
+        let game = app.current.clone().unwrap();
+        let mut first = game.clone();
+        first.set_header("White", "First".to_string());
+        let mut second = game;
+        second.set_header("White", "Second".to_string());
+        app.session.insert_game(first, None);
+        app.session.insert_game(second, None);
+
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "brett-scid-export-{}-{stamp}.si4",
+            std::process::id()
+        ));
+        let report = app.try_write_scid_export(&path).unwrap();
+        assert_eq!(report.games, 2);
+        assert!(path.exists());
+        assert!(path.with_extension("sn4").exists());
+        assert!(path.with_extension("sg4").exists());
+
+        let library = ScidLibrary::open(&path).unwrap();
+        assert_eq!(library.len(), 2);
+        assert_eq!(library.load(0).unwrap().white(), "First");
+        assert_eq!(library.load(1).unwrap().white(), "Second");
+
+        for path in scid_triple(&path) {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn scid_export_normalizes_and_lists_the_triple() {
+        let base = PathBuf::from("/tmp/example.si4");
+        assert_eq!(
+            scid_triple(&base),
+            [
+                PathBuf::from("/tmp/example.si4"),
+                PathBuf::from("/tmp/example.sn4"),
+                PathBuf::from("/tmp/example.sg4"),
+            ]
+        );
+        assert!(same_file_path(&base, &base));
+        assert!(!same_file_path(&base, &PathBuf::from("/tmp/other.si4")));
     }
 
     #[test]

@@ -14,6 +14,7 @@ pub mod evaluation;
 pub mod library;
 pub mod online;
 pub mod pgn;
+pub mod photos;
 pub mod players;
 pub mod position;
 pub mod recent;

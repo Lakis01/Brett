@@ -351,6 +351,13 @@ pub struct DisplayPrefs {
     /// Preview a move on the board when hovering it in the open game's move
     /// list. Other previews (tree, engine, references) are always enabled.
     pub hover_moves: bool,
+    /// Show player portraits in the board strips when a photo pack is present.
+    pub show_player_photos: bool,
+    /// Show the start/previous/next/end buttons. Keyboard navigation always
+    /// remains available.
+    pub show_nav_buttons: bool,
+    /// Show the editable PGN-tags card above the move list.
+    pub show_pgn_tags: bool,
 }
 
 impl Default for DisplayPrefs {
@@ -365,6 +372,9 @@ impl Default for DisplayPrefs {
             prep_recent_limit: 10,
             show_empty_pgn_tags: false,
             hover_moves: false,
+            show_player_photos: true,
+            show_nav_buttons: false,
+            show_pgn_tags: true,
         }
     }
 }
@@ -422,6 +432,18 @@ impl DisplayPrefs {
             .get("hover_moves")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        let show_player_photos = value
+            .get("show_player_photos")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        let show_nav_buttons = value
+            .get("show_nav_buttons")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let show_pgn_tags = value
+            .get("show_pgn_tags")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
         Self {
             rating_priority,
             show_all_ratings,
@@ -432,6 +454,9 @@ impl DisplayPrefs {
             prep_recent_limit,
             show_empty_pgn_tags,
             hover_moves,
+            show_player_photos,
+            show_nav_buttons,
+            show_pgn_tags,
         }
     }
 
@@ -446,6 +471,9 @@ impl DisplayPrefs {
             "prep_recent_limit": self.prep_recent_limit,
             "show_empty_pgn_tags": self.show_empty_pgn_tags,
             "hover_moves": self.hover_moves,
+            "show_player_photos": self.show_player_photos,
+            "show_nav_buttons": self.show_nav_buttons,
+            "show_pgn_tags": self.show_pgn_tags,
         }))
         .unwrap_or_default()
     }
@@ -713,6 +741,9 @@ mod tests {
             prep_recent_limit: 25,
             show_empty_pgn_tags: true,
             hover_moves: true,
+            show_player_photos: false,
+            show_nav_buttons: true,
+            show_pgn_tags: false,
         };
         assert_eq!(DisplayPrefs::from_json(&prefs.to_json()), prefs);
         assert_eq!(DisplayPrefs::from_json("not json"), DisplayPrefs::default());
@@ -722,6 +753,9 @@ mod tests {
         );
         assert!(!DisplayPrefs::default().show_empty_pgn_tags);
         assert!(!DisplayPrefs::default().hover_moves);
+        assert!(DisplayPrefs::default().show_player_photos);
+        assert!(!DisplayPrefs::default().show_nav_buttons);
+        assert!(DisplayPrefs::default().show_pgn_tags);
         assert!(!DisplayPrefs::default().show_all_ratings);
         assert!(DisplayPrefs::default().engine_auto);
         assert!(!DisplayPrefs::from_json(r#"{"engine_auto":false}"#).engine_auto);

@@ -16,7 +16,7 @@ eframe = { version = "0.37", default-features = false, features = [
 egui = "0.37"
 shakmaty = "0.30"
 pgn-reader = "0.29"
-image = { version = "0.25", default-features = false, features = ["png"] }
+image = { version = "0.25", default-features = false, features = ["png", "webp"] }
 memmap2 = "0.9"
 cbvault-format = "0.1.4"
 anyhow = "1"

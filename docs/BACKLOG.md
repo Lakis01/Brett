@@ -9,11 +9,12 @@ moves-panel interaction polish is complete. Item 8's cloud, opening-tree,
 reference-source, and native-book parts are done; M2b mega-scale ingest remains,
 with the first safety pass now keeping huge archives responsive and avoiding
 automatic full indexing. Item 9's editable session, database views,
-reorder/merge, and PGN export are done; native SCID and classic CBH writers
-remain. Item 10 is no longer blocked: the current ICCF SCID source is available
+reorder/merge, PGN export, and native SCID writer are done; the classic CBH
+writer remains. Item 10 is no longer blocked: the current ICCF SCID source is available
 and the automatic correspondence reference is integrated; only an optional
 refresh remains. Deferred predictor refinements are recorded under item 6, and
-native player-title display is queued as item 15.
+native player-title display is queued as item 15. Item 18 records the
+recently-trending move-popularity idea, including its graphical display.
 
 Game review follow-ups that are intentionally deferred: position-index book
 marking and review caching. Clock display currently lives in the board player
@@ -264,17 +265,19 @@ first-move verification. External file drops ask whether to open, merge into
 the current database, or open in a view. **File → Save database as PGN…**
 streams the session in order, preserves comments, clocks, NAGs, and
 variations, and asks for confirmation before exports estimated at 100 MB or
-more. The native SCID and classic CBH writers remain.
+more. The native SCID4 writer is implemented and validated against SCID 4.27;
+the classic CBH writer remains.
 
-- Add native SCID and classic CBH writers. The readers are independent and
-  validated; the writers must round-trip through the readers and, where
-  available, an independent implementation.
-  - The SCID writer must build the compressed namebase and stable IDs, encode
-    index flags/offsets, invert the compact move stream, preserve
-    comments/NAGs/variations and custom starts, and atomically replace the
-    `.si`/`.sn`/`.sg` triple. Validate by round-tripping through `ScidLibrary`
-    and opening the output in SCID 4.x. SCID 4.27 is available locally for that
-    check; no GPL source is needed or copied.
+- Add the native classic CBH writer. The readers are independent and validated;
+  the writer must round-trip through the reader and, where available, an
+  independent implementation.
+- **SCID writer (done):** native SCID4 export from **File → Save database as
+  SCID…** builds the compressed namebase and stable IDs, encodes index
+  flags/offsets, inverts the compact move stream, preserves
+  comments/NAGs/variations and custom starts, and atomically replaces the
+  `.si4`/`.sn4`/`.sg4` triple with rollback. Round-trips through `ScidLibrary`
+  and opens in SCID vs. PC 4.27 (`scidt`, `scidpgn`) with all moves and
+  annotations intact.
 - Keep the documented drag-and-drop semantics:
   - games dragged between database views are copied to the drop target;
   - a game dropped at a list position asks whether to insert there or append;
@@ -495,3 +498,59 @@ built binary is a combined GPL work. See `THIRD_PARTY_NOTICES.md`.
 
 **Depends on:** `src/domain.rs`, `src/pgn.rs`, `src/position.rs`, and
 `src/library.rs`.
+
+## 18. Recently trending move popularity
+
+**Status:** planned.
+
+**Goal:** surface opening ideas whose popularity has recently picked up, rather
+than only showing all-time frequency, and make the trend visible at a glance.
+
+- Compute move popularity in rolling time windows from game dates (for example
+  the last 6, 12, and 24 months) and compare each move's recent share against
+  its longer-term baseline at the same position.
+- Use a statistically honest trend signal: require a minimum recent sample,
+  shrink small samples toward the baseline, and show the sample counts beside
+  the trend so a 2-game spike is never presented as a trend. Prefer a
+  score/percentage-point delta plus a confidence indication over a bare
+  "up/down" arrow.
+- Distinguish a genuinely new idea (recent share high, historical share near
+  zero) from a revival (historical share meaningful, recent share rising).
+- Show the trend graphically in the Tree and moves panels: a compact sparkline
+  of share by time bucket per move, plus a trend column/badge (rising, steady,
+  falling, new). Hovering or expanding a row should reveal the bucket values and
+  counts. Keep the existing all-time games/W-D-L/score columns intact.
+- Make the time window, minimum sample, and baseline period configurable, with
+  sensible defaults; persist them with the other tree/display settings.
+- Use the position index (including game dates) and, when configured, the
+  reference database, so trends are computed from a stable corpus rather than
+  only the currently loaded player database.
+- Handle sparse data explicitly: no trend badge when there is insufficient
+  history, and a clear "recent" vs "baseline" explanation in the tooltip.
+- Add unit tests with synthetic dated games covering a new idea, a revival, a
+  declining move, a small-sample false positive, and transpositions.
+
+**Depends on:** the position index and game-date plumbing; related to item 6
+(predictor/reference distribution) and the Tree panel. **Unblocks:** trend-aware
+preparation and repertoire review.
+
+## 19. Player-photo pack redistribution
+
+**Status:** local loading implemented; redistribution blocked on permission.
+
+- The optional BPF1 reader (`src/photos.rs`), WebP decoding, 38 px board-strip
+  avatars, texture cache, and **Settings → Show player photos** toggle are
+  implemented.
+- The pack is derived from Scid's `Player_photos.zip`
+  (`scid/PlayerData/Player_photos.zip`). The archive has no explicit
+  redistribution licence; Scid's `COPYING` identifies database files as
+  copyright Pascal Georges and asks users to contact the authors first.
+- `assets/photos.bin` is git-ignored and must not be committed or bundled in a
+  release, installer, or AppImage without written permission.
+- If permission is granted, record it in `THIRD_PARTY_NOTICES.md` and
+  `docs/PHOTOS.md`, then decide whether to ship a pack. Until then, keep the
+  `BRETT_PHOTOS`/`assets/photos.bin` discovery path and the graceful
+  no-pack fallback.
+
+**Depends on:** `src/photos.rs`, `src/app.rs`, and the photo-pack provenance in
+`docs/PHOTOS.md`.

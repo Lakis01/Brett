@@ -1,12 +1,13 @@
 # Native SCID support
 
-Brett reads SCID databases directly. Opening a `.si4` or `.si3` file does not
-require SCID to be installed, does not convert the database to PGN, and never
-writes to the source files.
+Brett reads and writes SCID databases directly. Opening a `.si4` or `.si3` file
+does not require SCID to be installed, does not convert the database to PGN,
+and never writes to the source files. Exporting creates a new SCID4 triple; the
+writer is a separate, explicit **Save database as SCID…** action.
 
-The implementation is independent: it was written from the published on-disk
-layout and the SCID project's format documentation. No SCID source code is
-linked or copied. See [THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md).
+Both implementations are independent: they were written from the published
+on-disk layout and the SCID project's format documentation. No SCID source code
+is linked or copied. See [THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md).
 
 ## Files and versions
 
@@ -54,6 +55,38 @@ Custom starting positions are reconstructed from the record's FEN tag. The
 piece list used by SCID's compact move encoding is rebuilt from that position,
 so games that do not start from the standard array decode correctly.
 
+## Writing a SCID database
+
+**File → Save database as SCID…** writes the current session, in its current
+order, as a new SCID4 triple. The writer is native Rust in
+[`src/scid/writer.rs`](../src/scid/writer.rs); it does not invoke SCID, link
+SCID code, or convert through PGN.
+
+- The target must end in `.si4`. Brett writes the matching `.sn4` and `.sg4`
+  companions beside it.
+- Headers, custom tags, comments, clocks, NAGs, recursive variations, custom
+  start FENs, castling, en passant, promotions, under-promotions, and null
+  moves are preserved.
+- The namebase is built with dense, byte-sorted IDs and front-coded names. The
+  index records the standard flags, offsets, results, dates, Elos, ECO codes,
+  final material signatures, half-move counts, and home-pawn data.
+- Game records are streamed to a temporary file, with a compact provisional
+  index. The completed triple is installed by renaming the companions first and
+  the index last.
+- If an existing triple is present, Brett asks for confirmation, moves the old
+  files aside, and restores them if any step of the replacement fails.
+- The source database cannot be selected as the export target. Exporting is
+  disabled while no database is open.
+- A single record is limited to 131,071 bytes, the game file to 4 GiB, and a
+  database to 16,777,214 games. Chess960 and other non-standard variants are
+  rejected instead of being written incorrectly.
+
+For diagnostics and format work, the helper exports any PGN file:
+
+```sh
+cargo run --example scid_export -- input.pgn /tmp/opencode/output.si4
+```
+
 ## Validation
 
 The committed fixture is generated from the public-domain Opera Game in
@@ -75,6 +108,19 @@ All local `.si4` databases decoded with zero errors. SCID3 is implemented from
 the older 46-byte entry layout and 128-byte header, but there is no real SCID3
 database in the local corpus yet, so that path is structurally tested rather
 than corpus-tested.
+
+The writer is validated in two independent ways:
+
+- every writer test round-trips through `ScidLibrary` and compares the decoded
+  mainline SAN, headers, comments, NAGs, variations, clocks, and custom starts;
+- a five-game rich fixture (comments, clocks, a NAG, a variation, custom FEN,
+  castling, en passant, under-promotion, and a null move) was exported with
+  `scid_export`, then read by SCID vs. PC **4.27** `scidt` and `scidpgn` with
+  all five games and all moves intact. Brett's reader decoded the same file
+  with zero errors.
+
+The SCID executables are used only as external validation oracles; Brett never
+invokes them at runtime.
 
 Use the report helper after changing the decoder:
 
@@ -101,19 +147,17 @@ stored beside the database.
 ## Limits
 
 - **Chess960 is not supported.** Games with a `Variant` tag containing `960` or
-  `chess960` are rejected with a clear error instead of being decoded
-  incorrectly.
+  `chess960` are rejected with a clear error instead of being decoded or
+  written incorrectly.
 - **SCID5 and newer layouts are not supported.**
-- Brett is a reader. Editing games, adding annotations to the source database,
-  deleting games, and compacting databases are out of scope.
-- A native SCID writer is not blocked by format access, but it is not
-  implemented. It must build the namebase and its IDs, set the index flags and
-  offsets, invert the compact move encoding, preserve comments/NAGs/variations
-  and custom starts, and write all three files atomically. Validation should
-  include a round-trip through this reader and opening the result in an
-  independent SCID 4.x build.
-- Clock/evaluation annotations are not separately modelled; only textual
-  comments and standard NAGs are represented in the game tree.
+- Brett reads existing databases and exports a new SCID4 triple. It does not
+  edit games in place, add annotations to a source database, delete games, or
+  compact databases.
+- The writer currently targets the SCID4 (version 400) layout only. It does not
+  write SCID3, and it does not implement Chess960.
+- Clock/evaluation annotations are not separately modelled; clocks are
+  preserved as `[%clk]` text inside comments, and only textual comments and
+  standard NAGs are represented in the game tree.
 - A malformed game can fail individually; it does not prevent the rest of the
   database from opening. The game list still shows its headers, and selecting
   the game reports the decode error.
@@ -123,8 +167,10 @@ stored beside the database.
 The conventional `$HOME/Chess Databases/` tree and every directory below it
 are strictly read-only, as are extra roots in `BRETT_READ_ONLY_ROOTS`. Brett
 opens the source triple directly for reading, and derived indexes are written
-only under the user's cache directory. If you need to run SCID's own tools for
-comparison, copy the triple to `/tmp/opencode` first; see
+only under the user's cache directory. **Save database as SCID…** writes a new
+triple at an explicit path; the app refuses to overwrite the open source
+database and asks before replacing an existing triple. If you need to run
+SCID's own tools for comparison, copy the triple to `/tmp/opencode` first; see
 [`scripts/scid-to-pgn.sh`](../scripts/scid-to-pgn.sh) and
 [DATA_SAFETY.md](DATA_SAFETY.md).
 
@@ -133,6 +179,7 @@ comparison, copy the triple to `/tmp/opencode` first; see
 | Path | Purpose |
 | --- | --- |
 | `src/scid.rs` | Index/namebase/record parsing, `ScidLibrary`, `PieceLists` |
+| `src/scid/writer.rs` | Native SCID4 writer, namebase/index construction, rollback-safe triple commit |
 | `src/library.rs` | `GameLibrary`, `IndexedGame`, source metadata |
 | `src/position.rs` | Generic position-index builder and cache fingerprint |
 | `src/players.rs` | Player directory and preparation books |

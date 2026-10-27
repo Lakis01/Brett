@@ -19,6 +19,10 @@ use shakmaty::{CastlingMode, Chess, Color, File as ChessFile, Move, Position, Ro
 use crate::domain::{Game, Node, Ply};
 use crate::library::{GameLibrary, IndexedGame, SourceMeta, StringPool, intern_headers};
 
+mod writer;
+
+pub use writer::{ScidWriteReport, write_database};
+
 const INDEX_MAGIC: &[u8; 8] = b"Scid.si\0";
 const NAME_MAGIC: &[u8; 8] = b"Scid.sn\0";
 
@@ -1134,6 +1138,11 @@ impl PieceLists {
             return None;
         }
         Some(Square::new(u32::from(self.squares[color][index])))
+    }
+
+    fn slot(&self, square: Square) -> Option<usize> {
+        let slot = usize::from(self.pos[usize::from(square)]);
+        (slot < 16).then_some(slot)
     }
 
     fn relocate(&mut self, color: usize, from: Square, to: Square) {

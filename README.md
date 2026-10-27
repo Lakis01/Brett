@@ -65,6 +65,11 @@ ICCF server games under ICCF's terms, and comply with ICCF's terms. See
   (`src/scid.rs`). Brett reads the `.si4`/`.sn4`/`.sg4` triple directly; no SCID
   installation, conversion step, or SCID code is involved. Legacy SCID3
   (`.si3`/`.sn3`/`.sg3`) uses the same reader.
+- **SCID4 export** through a native writer (`src/scid/writer.rs`).
+  **File → Save database as SCID…** writes a new `.si4`/`.sn4`/`.sg4` triple
+  with headers, comments, clocks, NAGs, variations, and custom starts. Existing
+  triples are backed up and restored if the replacement fails; source databases
+  are never overwritten.
 - **Classic ChessBase CBH** databases through a native, read-only reader
   (`src/cbh/`). Brett opens the `.cbh` header file and its `.cbg` moves,
   `.cba` annotations, and `.cbp`/`.cbt`/`.cbc`/`.cbs` names directly. This is
@@ -269,12 +274,18 @@ ICCF server games under ICCF's terms, and comply with ICCF's terms. See
   a king dragged to its destination square (`g1`/`c1`/`g8`/`c8`) as well as to
   the rook.
 - Player names, optional title badges (`WhiteTitle`/`BlackTitle`), and ratings
-  are shown above and below the board on their playing side. **Settings →
-  Player ratings** chooses the Elo/DWZ/USCF priority and can show every
-  available rating instead of only the preferred one.
-- A persistent FEN strip under the board always shows the current position;
-  clicking the field copies the FEN. The move counter beside it counts full
-  moves, not plies.
+  are shown above and below the board on their playing side. When an optional
+  local Scid photo pack is available, a compact portrait appears beside each
+  player; **Settings → Show player photos** hides or shows it. No photo data is
+  redistributed with Brett — see [docs/PHOTOS.md](docs/PHOTOS.md).
+  **Settings → Player ratings** chooses the Elo/DWZ/USCF priority and can show
+  every available rating instead of only the preferred one.
+- Start, Previous, Next, and End buttons sit beside the board and are hidden by
+  default; **Settings → Show navigation buttons** reveals them. The keyboard
+  shortcuts work either way.
+- The FEN field lives in the bottom bar to the left of **Open…** and **Load**;
+  clicking it copies the FEN. The move counter beside it counts full moves, not
+  plies.
 - The Moves header keeps one metadata line: compact `R`/`B` chips, the event
   truncated rather than wrapped or squeezed, and the result right-aligned.
   When the game has an `Opening` tag, its bare ECO code (for example `A07`)
@@ -282,18 +293,23 @@ ICCF server games under ICCF's terms, and comply with ICCF's terms. See
   in the top bar as before.
 - The right-side PGN panel has a styled game header, an editable tag table,
   result badge, move cards, selected-move highlighting, variation cards, and
-  clickable comment previews. WhiteElo and BlackElo are separate editable
-  fields to the right of the White/Black name boxes; Elo is not appended to the
-  name and there is no derived rating chip. Fields that are absent or empty are
-  hidden by default; **Show empty** reveals the usual metadata fields so a new
-  game can be filled in without adding each tag by hand. Board is hidden when
-  empty unless **Show empty** is on or it was added with **+ Add tag → Board**,
-  and it is written as `round.board` inside the Round tag. The Date field can
-  be typed directly or opened as a calendar anchored to the field.
+  clickable comment previews. **Settings → Show PGN tags** hides the whole
+  editable tag card when you want more room for the move list. WhiteElo and
+  BlackElo are separate editable fields to the right of the White/Black name
+  boxes; Elo is not appended to the name and there is no derived rating chip.
+  Fields that are absent or empty are hidden by default; **Show empty** reveals
+  the usual metadata fields so a new game can be filled in without adding each
+  tag by hand. Board is hidden when empty unless **Show empty** is on or it was
+  added with **+ Add tag → Board**, and it is written as `round.board` inside
+  the Round tag. The Date field can be typed directly or opened as a calendar
+  anchored to the field.
 - **More tags (N)** / **Fewer tags** replaces the old arrow expanders. The
   additional-tag list is capped in height and scrolls, so a game with many
   tags does not push the move list off the panel. Tag names are fixed; values
   can be edited, tags can be removed, and common missing tags can be added.
+- The whole Moves tab scrolls vertically, while the move list keeps its own
+  bounded scroll area. Long annotations, comments, and tag cards therefore stay
+  reachable instead of running past the bottom of the window.
 - PGN clock comments (`[%clk ...]`) are parsed separately from human comments
   and hidden by default. The **Clocks** toggle in the bottom bar displays the
   latest remaining time for each side at the right of its board strip.
@@ -308,9 +324,9 @@ ICCF server games under ICCF's terms, and comply with ICCF's terms. See
   `∞`, `□`, and the other standard symbols. Comments are editable in the same
   panel.
 - Keyboard: `←`/`→` previous/next move, `↑`/`↓` previous/next game,
-  `Home`/`End` start/end, `F` flip board, `T` tree, `M` moves,
-  `E` engine, `R` review (under Engine), `C` references, `P` players,
-  `A` annotate the selected move, `O` online opponent panel, `D` date
+  `Home`/`End` or `PageUp`/`PageDown` start/end, `F` flip board, `T` tree,
+  `M` moves, `E` engine, `R` review (under Engine), `C` references, `P`
+  players, `A` annotate the selected move, `O` online opponent panel, `D` date
   calendar, `V` database views, `Escape` closes the calendar, annotation
   editor, or board selection.
 - At a position with more than one continuation, `→` opens a branch popup
@@ -327,6 +343,10 @@ ICCF server games under ICCF's terms, and comply with ICCF's terms. See
   alias is labelled **You** in the Players tab, replaces the literal `You` in
   preparation tag fields, and drives auto-orientation when a game contains one
   of the aliases.
+- **Display** — **Show player photos** (enabled when a local pack is present),
+  **Show navigation buttons** (off by default), **Show PGN tags** (on by
+  default), and **Preview moves on hover** (off by default). Photo data is not
+  redistributed with Brett; see [docs/PHOTOS.md](docs/PHOTOS.md).
 - **Correspondence database** — include or exclude the local correspondence
   database in the Engine tab, choose its file, or restore the conventional
   location. This section is no longer duplicated in Refs.
@@ -380,6 +400,7 @@ never writes to the source database.
 | --- | --- |
 | `src/library.rs` | `GameLibrary` interface, streaming PGN index, shared source metadata |
 | `src/scid.rs` | Native SCID3/SCID4 reader and `ScidLibrary` |
+| `src/scid/writer.rs` | Native SCID4 writer, namebase/index construction, rollback-safe export |
 | `src/cbh/` | Native classic ChessBase CBH reader and `CbhLibrary` |
 | `src/position.rs` | Position index, opening-tree statistics, shared library builder |
 | `src/players.rs` | Player directory, per-player position books, Bayesian prediction |
@@ -392,12 +413,13 @@ never writes to the source database.
 | `src/book/` | Shredder `.bkt` reader implementation |
 | `src/cbv.rs` | ChessBase `.cbv` container extraction into a classic CBH library |
 | `src/recent.rs` | In-memory recent-game trees and move-trend statistics |
+| `src/photos.rs` | Optional BPF1 player-photo pack reader and WebP decoding |
 | `src/session.rs` | Editable ordered session, database views, reorder/merge, PGN export |
 | `src/settings.rs` | Persistent engine, cloud, reference-database, display, and preparation settings |
 | `src/review.rs` | Sequential game review, move grading, accuracy, eval chart data |
 | `src/app.rs` | egui application, tabs, preparation flow, annotation editor |
 | `src/ui/fonts.rs` | Embedded DejaVu Sans fallback for chess symbols |
-| `docs/` | Data safety, position-index format, preparation model, SCID/CBH readers, backlog |
+| `docs/` | Data safety, position-index format, preparation model, SCID/CBH readers, photo provenance, backlog |
 
 ## Roadmap
 
@@ -406,7 +428,8 @@ never writes to the source database.
 - **M2a — position index and opening tree (done).** Zobrist keys, on-disk
   sorted/mmap store, W/D/L, Elo and date aggregates, clickable tree.
 - **Native SCID (done).** SCID4/SCID3 reader, namebase, tags, variations,
-  comments, NAGs, custom FEN, null moves, and position indexing.
+  comments, NAGs, custom FEN, null moves, position indexing, and a native
+  SCID4 writer with rollback-safe export.
 - **Preparation stage (done).** Player directory, player books, prediction,
   Prepare as White/Black, online imports, annotation editing, PGN panel.
 - **UCI engine (done).** Any UCI executable, persistent Threads/Hash settings,
@@ -458,7 +481,8 @@ never writes to the source database.
   database onto another to merge it. **File → Save database as PGN…** writes
   the session in its current order, preserving headers, comments, clocks,
   NAGs, and variations; exports estimated at 100 MB or more ask for
-  confirmation first. The SCID and classic CBH writers remain.
+  confirmation first. **File → Save database as SCID…** writes the same
+  session as a native SCID4 triple. The classic CBH writer remains.
 - **Opening-tree files and reference sources (done).** A separate PGN, SCID,
   or classic CBH opening-tree database can be indexed for the Tree tab and
   saved as the default. The Refs tab can point preparation at the current
@@ -501,6 +525,12 @@ The SCID and classic CBH readers are independent implementations written from
 published on-disk formats. The SCID source tree and the AGPL ChessBase bridge
 were used as format references only; no code from either is linked or copied.
 See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+The optional player-photo pack is derived from Scid's `Player_photos.zip`
+(`scid/PlayerData/Player_photos.zip`). It has no explicit redistribution
+licence, so no photo data is committed or bundled with Brett; see
+[docs/PHOTOS.md](docs/PHOTOS.md) and
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md#scid-player-photos-optional-not-distributed).
 
 ## Licence
 
