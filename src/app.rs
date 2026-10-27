@@ -11080,14 +11080,19 @@ fn cloud_engine_section(
                 let lichess_heading = snapshot
                     .cloud_eval
                     .as_ref()
-                    .map(|eval| format!("Lichess d{}", eval.depth))
-                    .unwrap_or_else(|_| "Lichess".to_string());
+                    .map(|eval| format!("Lichess eval (d{})", eval.depth))
+                    .unwrap_or_else(|_| "Lichess eval".to_string());
                 ui.horizontal(|ui| {
-                    left_sized_label(ui, 52.0, 18.0, RichText::new("chessdb").strong().small())
-                        .on_hover_text("chessdb.cn evaluation, White POV");
                     left_sized_label(
                         ui,
-                        66.0,
+                        64.0,
+                        18.0,
+                        RichText::new("chessdb eval").strong().small(),
+                    )
+                    .on_hover_text("chessdb.cn evaluation, White POV");
+                    left_sized_label(
+                        ui,
+                        86.0,
                         18.0,
                         RichText::new(lichess_heading).strong().small(),
                     )
@@ -11326,7 +11331,7 @@ fn cloud_row_ui(
     ui.horizontal(|ui| {
         left_sized_label(
             ui,
-            52.0,
+            64.0,
             20.0,
             RichText::new(
                 row.chessdb
@@ -11344,7 +11349,7 @@ fn cloud_row_ui(
         .on_hover_text(eval_hint.as_str());
         left_sized_label(
             ui,
-            66.0,
+            86.0,
             20.0,
             RichText::new(
                 row.lichess
