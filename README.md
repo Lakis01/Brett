@@ -24,14 +24,19 @@ settings, caches, and secrets live outside the repository; see
 
 ## Platform support
 
-Linux is the supported and tested platform. Development and visual checks run
-on KDE Plasma Wayland with Xwayland, and the binary is built with both the X11
-and Wayland backends. **Windows and macOS are not currently supported or
-tested.** The file dialogs shell out to `zenity`/`kdialog`, configuration uses
-XDG directories, and the windowing/rendering stack has not been validated on
-either platform. A port would need a native dialog backend, platform-specific
-config/cache paths, and a fresh build-and-test pass; do not assume the current
-source compiles or runs there.
+Linux is the supported and tested platform. Brett has been built and visually
+tested on **Arch Linux with KDE Plasma Wayland plus Xwayland**; the binary is
+built with both the X11 and Wayland backends. Other mainstream Linux
+distributions should work when the Rust/X11/Wayland build dependencies and
+`zenity` or `kdialog` are installed, but they have not been validated here.
+Package names and desktop integration vary by distribution.
+
+**Windows and macOS are not currently supported or tested.** The file dialogs
+shell out to `zenity`/`kdialog`, configuration uses XDG directories, and the
+windowing/rendering stack has not been validated on either platform. A port
+would need a native dialog backend, platform-specific config/cache paths, and a
+fresh build-and-test pass; do not assume the current source compiles or runs
+there.
 
 ## ICCF database notice
 

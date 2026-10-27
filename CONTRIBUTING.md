@@ -7,12 +7,14 @@ readers for PGN, SCID, and classic ChessBase CBH databases.
 ## Platform status
 
 Linux is the supported and tested platform. Development and visual checks run
-on KDE Plasma Wayland with Xwayland, and the binary is built with both the X11
-and Wayland backends. Windows and macOS are **not currently supported or
-tested**: the file dialogs shell out to `zenity`/`kdialog`, configuration uses
-XDG directories, and the windowing/rendering stack has not been validated
-there. A port is possible, but treat it as new work rather than an assumed
-build.
+on Arch Linux with KDE Plasma Wayland plus Xwayland, and the binary is built
+with both the X11 and Wayland backends. Other mainstream distributions should
+work with the prerequisites below, but they have not been validated; package
+names and desktop integration vary. Windows and macOS are **not currently
+supported or tested**: the file dialogs shell out to `zenity`/`kdialog`,
+configuration uses XDG directories, and the windowing/rendering stack has not
+been validated there. A port is possible, but treat it as new work rather than
+an assumed build.
 
 ## Prerequisites
 
