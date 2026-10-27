@@ -26,6 +26,9 @@ pub enum ExplorerSource {
     Masters,
     /// The complete Lichess database, including online and correspondence games.
     Lichess,
+    /// Masters and the full Lichess database combined. A missing Lichess token
+    /// leaves the Masters half available and records a note.
+    Both,
 }
 
 impl ExplorerSource {
@@ -33,6 +36,16 @@ impl ExplorerSource {
         match self {
             Self::Masters => "Masters",
             Self::Lichess => "Lichess (all games)",
+            Self::Both => "Masters + Lichess",
+        }
+    }
+
+    /// Short label for clickable source selectors.
+    pub fn short_label(self) -> &'static str {
+        match self {
+            Self::Masters => "Masters",
+            Self::Lichess => "Lichess",
+            Self::Both => "Both",
         }
     }
 
@@ -40,19 +53,21 @@ impl ExplorerSource {
         match self {
             Self::Masters => "masters",
             Self::Lichess => "lichess",
+            Self::Both => "both",
         }
     }
 
     pub fn from_config(value: &str) -> Self {
         match value.trim().to_ascii_lowercase().as_str() {
             "lichess" | "all" | "full" => Self::Lichess,
+            "both" | "masters+lichess" | "combined" => Self::Both,
             _ => Self::Masters,
         }
     }
 
     fn endpoint(self) -> &'static str {
         match self {
-            Self::Masters => "https://explorer.lichess.org/masters",
+            Self::Masters | Self::Both => "https://explorer.lichess.org/masters",
             Self::Lichess => "https://explorer.lichess.org/lichess",
         }
     }
@@ -83,11 +98,25 @@ pub struct ChessDb {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ChessDbMove {
     pub uci: String,
-    /// Centipawn score from the side-to-move's point of view.
+    /// Centipawn score from the side-to-move's point of view, as returned by
+    /// chessdb.cn. Use [`Self::white_score`] for display.
     pub score: i32,
     pub rank: u8,
     pub note: String,
     pub winrate: f32,
+}
+
+impl ChessDbMove {
+    /// Normalize chessdb.cn's side-to-move score to White's point of view.
+    /// The service flips the sign for Black, which would otherwise make the
+    /// same advantage look negative in the Cloud Engine table.
+    pub fn white_score(&self, turn: shakmaty::Color) -> i32 {
+        if turn == shakmaty::Color::White {
+            self.score
+        } else {
+            -self.score
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -98,6 +127,8 @@ pub struct Explorer {
     pub opening: Option<ExplorerOpening>,
     pub moves: Vec<ExplorerMove>,
     pub top_games: Vec<ExplorerGame>,
+    /// A non-fatal explanation when a combined source is only partly available.
+    pub note: Option<String>,
 }
 
 impl Explorer {
@@ -172,6 +203,34 @@ pub struct CloudPv {
 /// The Masters explorer is public and is the default. The full Lichess
 /// database requires a token; without one it reports a useful error while
 /// chessdb and the cloud evaluation still work.
+/// Refresh only the Lichess opening explorer. The chessdb.cn and cloud-eval
+/// results for the same position stay on screen while the corpus changes.
+pub fn fetch_explorer_only(
+    fen: &str,
+    lichess_token: Option<&str>,
+    explorer_source: ExplorerSource,
+) -> Result<Explorer, String> {
+    let agent = ureq::AgentBuilder::new()
+        .user_agent(USER_AGENT)
+        .timeout_connect(Duration::from_secs(10))
+        .timeout(REQUEST_TIMEOUT)
+        .build();
+    let token = lichess_token
+        .map(str::trim)
+        .filter(|token| !token.is_empty());
+    match explorer_source {
+        ExplorerSource::Masters => fetch_explorer(&agent, fen, token, explorer_source),
+        ExplorerSource::Lichess if token.is_some() => {
+            fetch_explorer(&agent, fen, token, explorer_source)
+        }
+        ExplorerSource::Lichess => Err(anyhow!(
+            "The full Lichess explorer needs an API token. Put \"lichess_token\" in the Brett references config, or set BRETT_LICHESS_TOKEN. Masters works without one."
+        )),
+        ExplorerSource::Both => fetch_both_explorers(&agent, fen, token),
+    }
+    .map_err(|err| format!("{err:#}"))
+}
+
 pub fn fetch(fen: &str, lichess_token: Option<&str>, explorer_source: ExplorerSource) -> Snapshot {
     let agent = ureq::AgentBuilder::new()
         .user_agent(USER_AGENT)
@@ -191,6 +250,7 @@ pub fn fetch(fen: &str, lichess_token: Option<&str>, explorer_source: ExplorerSo
         ExplorerSource::Lichess => Err(anyhow!(
             "The full Lichess explorer needs an API token. Put \"lichess_token\" in the Brett references config, or set BRETT_LICHESS_TOKEN. Masters works without one."
         )),
+        ExplorerSource::Both => fetch_both_explorers(&agent, fen, token),
     };
     let cloud_eval = fetch_cloud_eval(&agent, fen);
 
@@ -201,6 +261,100 @@ pub fn fetch(fen: &str, lichess_token: Option<&str>, explorer_source: ExplorerSo
         explorer: explorer.map_err(|err| format!("{err:#}")),
         cloud_eval: cloud_eval.map_err(|err| format!("{err:#}")),
     }
+}
+
+fn fetch_both_explorers(agent: &ureq::Agent, fen: &str, token: Option<&str>) -> Result<Explorer> {
+    let masters = fetch_explorer(agent, fen, token, ExplorerSource::Masters);
+    let lichess = if token.is_some() {
+        fetch_explorer(agent, fen, token, ExplorerSource::Lichess)
+    } else {
+        Err(anyhow!(
+            "the full Lichess half needs an API token; showing Masters only"
+        ))
+    };
+    match (masters, lichess) {
+        (Ok(masters), Ok(lichess)) => Ok(merge_explorers(masters, lichess, None)),
+        (Ok(masters), Err(err)) => Ok(merge_explorers(
+            masters,
+            empty_explorer(),
+            Some(format!("Lichess unavailable: {err}")),
+        )),
+        (Err(err), Ok(lichess)) => Ok(merge_explorers(
+            empty_explorer(),
+            lichess,
+            Some(format!("Masters unavailable: {err}")),
+        )),
+        (Err(masters), Err(lichess)) => Err(anyhow!("Masters: {masters:#}; Lichess: {lichess:#}")),
+    }
+}
+
+fn empty_explorer() -> Explorer {
+    Explorer {
+        white: 0,
+        draws: 0,
+        black: 0,
+        opening: None,
+        moves: Vec::new(),
+        top_games: Vec::new(),
+        note: None,
+    }
+}
+
+fn merge_explorers(mut masters: Explorer, lichess: Explorer, note: Option<String>) -> Explorer {
+    let mut merged = empty_explorer();
+    merged.white = masters.white.saturating_add(lichess.white);
+    merged.draws = masters.draws.saturating_add(lichess.draws);
+    merged.black = masters.black.saturating_add(lichess.black);
+    merged.opening = masters.opening.take().or(lichess.opening);
+    merged.note = note;
+
+    let mut moves: std::collections::BTreeMap<String, ExplorerMove> =
+        std::collections::BTreeMap::new();
+    for source in [masters.moves, lichess.moves] {
+        for mv in source {
+            if let Some(existing) = moves.get_mut(&mv.uci) {
+                let old_total = existing.total();
+                let new_total = mv.total();
+                let combined = old_total.saturating_add(new_total);
+                existing.white = existing.white.saturating_add(mv.white);
+                existing.draws = existing.draws.saturating_add(mv.draws);
+                existing.black = existing.black.saturating_add(mv.black);
+                existing.average_rating = match (existing.average_rating, mv.average_rating) {
+                    (Some(a), Some(b)) => {
+                        let weighted = u64::from(a) * old_total + u64::from(b) * new_total;
+                        Some(
+                            weighted
+                                .checked_div(combined)
+                                .map_or(a, |value| value as u32),
+                        )
+                    }
+                    (Some(a), None) => Some(a),
+                    (None, Some(b)) => Some(b),
+                    (None, None) => None,
+                };
+            } else {
+                moves.insert(mv.uci.clone(), mv);
+            }
+        }
+    }
+    merged.moves = moves.into_values().collect();
+    merged.moves.sort_by(|a, b| {
+        b.total()
+            .cmp(&a.total())
+            .then_with(|| b.score().total_cmp(&a.score()))
+            .then_with(|| a.uci.cmp(&b.uci))
+    });
+
+    let mut seen = std::collections::HashSet::new();
+    for game in masters.top_games.into_iter().chain(lichess.top_games) {
+        if seen.insert(game.id.clone()) {
+            merged.top_games.push(game);
+        }
+        if merged.top_games.len() >= 8 {
+            break;
+        }
+    }
+    merged
 }
 
 fn fetch_chessdb(agent: &ureq::Agent, fen: &str) -> Result<ChessDb> {
@@ -234,7 +388,7 @@ fn fetch_explorer(
 
 fn fetch_cloud_eval(agent: &ureq::Agent, fen: &str) -> Result<CloudEval> {
     let url = format!(
-        "https://lichess.org/api/cloud-eval?fen={}&multiPv=3",
+        "https://lichess.org/api/cloud-eval?fen={}&multiPv=5",
         encode_component(fen)
     );
     match agent.get(&url).set("Accept", "application/json").call() {
@@ -427,6 +581,7 @@ fn parse_explorer(text: &str) -> Result<Explorer> {
         opening,
         moves,
         top_games,
+        note: None,
     })
 }
 
@@ -521,8 +676,11 @@ mod tests {
             ExplorerSource::from_config(" FULL "),
             ExplorerSource::Lichess
         );
+        assert_eq!(ExplorerSource::from_config("both"), ExplorerSource::Both);
         assert_eq!(ExplorerSource::Masters.label(), "Masters");
         assert_eq!(ExplorerSource::Lichess.config_value(), "lichess");
+        assert_eq!(ExplorerSource::Both.config_value(), "both");
+        assert_eq!(ExplorerSource::Both.short_label(), "Both");
     }
 
     #[test]
@@ -535,6 +693,8 @@ mod tests {
         assert_eq!(parsed.moves[0].score, 1);
         assert!((parsed.moves[0].winrate - 50.08).abs() < 0.001);
         assert_eq!(parsed.moves[1].uci, "d2d4");
+        assert_eq!(parsed.moves[0].white_score(shakmaty::Color::White), 1);
+        assert_eq!(parsed.moves[0].white_score(shakmaty::Color::Black), -1);
     }
 
     #[test]
@@ -569,6 +729,95 @@ mod tests {
         assert!((parsed.moves[0].score() - 0.6818181818).abs() < 0.0001);
         assert_eq!(parsed.top_games[0].id, "abcd1234");
         assert_eq!(parsed.top_games[0].white_rating, Some(2500));
+    }
+
+    #[test]
+    fn both_explorer_merges_counts_ratings_and_games() {
+        let masters = Explorer {
+            white: 10,
+            draws: 5,
+            black: 5,
+            opening: Some(ExplorerOpening {
+                eco: "B00".to_string(),
+                name: "King's Pawn".to_string(),
+            }),
+            moves: vec![ExplorerMove {
+                uci: "e2e4".to_string(),
+                san: "e4".to_string(),
+                white: 8,
+                draws: 4,
+                black: 2,
+                average_rating: Some(2500),
+            }],
+            top_games: vec![ExplorerGame {
+                id: "masters-game".to_string(),
+                winner: Some("white".to_string()),
+                white: "A".to_string(),
+                white_rating: Some(2500),
+                black: "B".to_string(),
+                black_rating: Some(2400),
+                year: Some(2024),
+                month: Some(1),
+            }],
+            note: None,
+        };
+        let lichess = Explorer {
+            white: 20,
+            draws: 10,
+            black: 10,
+            opening: None,
+            moves: vec![
+                ExplorerMove {
+                    uci: "e2e4".to_string(),
+                    san: "e4".to_string(),
+                    white: 10,
+                    draws: 5,
+                    black: 5,
+                    average_rating: Some(2200),
+                },
+                ExplorerMove {
+                    uci: "d2d4".to_string(),
+                    san: "d4".to_string(),
+                    white: 12,
+                    draws: 4,
+                    black: 4,
+                    average_rating: None,
+                },
+            ],
+            top_games: vec![
+                ExplorerGame {
+                    id: "masters-game".to_string(),
+                    winner: None,
+                    white: "A".to_string(),
+                    white_rating: None,
+                    black: "B".to_string(),
+                    black_rating: None,
+                    year: Some(2024),
+                    month: Some(1),
+                },
+                ExplorerGame {
+                    id: "lichess-game".to_string(),
+                    winner: Some("black".to_string()),
+                    white: "C".to_string(),
+                    white_rating: None,
+                    black: "D".to_string(),
+                    black_rating: None,
+                    year: Some(2025),
+                    month: Some(2),
+                },
+            ],
+            note: None,
+        };
+        let merged = merge_explorers(masters, lichess, None);
+        assert_eq!(merged.total(), 60);
+        assert_eq!(merged.opening.unwrap().name, "King's Pawn");
+        assert_eq!(merged.moves.len(), 2);
+        let e4 = merged.moves.iter().find(|mv| mv.uci == "e2e4").unwrap();
+        assert_eq!(e4.total(), 34);
+        assert_eq!(e4.average_rating, Some(2323));
+        assert_eq!(merged.top_games.len(), 2);
+        assert_eq!(merged.top_games[0].id, "masters-game");
+        assert_eq!(merged.top_games[1].id, "lichess-game");
     }
 
     #[test]

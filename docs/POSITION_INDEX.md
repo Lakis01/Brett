@@ -1,8 +1,9 @@
 # Position index
 
 Brett's opening tree is backed by a position index derived from the currently
-loaded PGN, SCID, or classic CBH database. This document describes what is
-counted, the on-disk format, cache invalidation, and current limits.
+loaded PGN, SCID, or classic CBH database, or from a separately configured
+opening-tree file. This document describes what is counted, the on-disk
+format, cache invalidation, and current limits.
 
 ## What is counted
 
@@ -96,6 +97,16 @@ The fingerprint is metadata-based. Replacing a source with one of exactly the
 same total length while also preserving its modification time would not be
 detected; normal edits change at least one of those values.
 
+The cache is already the persistent index: reopening a database calls
+`PositionIndex::open_cached_for`, memory-maps the existing `.brettpos` file,
+and does **not** re-index it. Re-indexing happens only when the cache is
+missing, stale, or corrupt. The large-database bottleneck is therefore the
+**first** build, not repeated startup: the builder currently aggregates every
+edge in an in-memory `HashMap` and keeps the full header table in RAM. M2b
+addresses those two costs with external sorting and an on-disk header table;
+incremental updates are a further optimization, not a prerequisite for using
+the cache.
+
 ## Performance
 
 On the native 49,780-game `Frese Sammlung` SCID database (8,047,585 bytes,
@@ -114,11 +125,18 @@ there.
 
 - The build aggregates in `HashMap`s in memory. That is comfortable for 50k
   games, but a multi-million-game Mega Database will need external sorting or a
-  chunked merge.
-- The header table for PGN, SCID, and classic CBH is still in RAM. Moving it
-  on disk is tracked as M2b.
-- An index is built for one database at a time. Reference-database merging
-  (several files into one opening tree) and a static, rating-matched
-  background distribution for preparation are future work.
+  chunked merge. Automatic indexing therefore stops at 250,000 games; the Tree
+  tab offers a warned manual build up to 1,000,000 games and refuses a full
+  build above that until the external-sort indexer exists.
+- The header table for PGN, SCID, and classic CBH is still in RAM. Repeated
+  header strings are interned and primary/external session rows resolve their
+  headers lazily from the source library. Opening the 11,151,119-game Mega
+  Database 2025 in the development profile now stabilizes around 6.4 GiB RSS
+  instead of exhausting RAM, and does not start a position index
+  automatically. A compact/on-disk header table is still tracked as M2b.
+- An index is built for one database at a time. The Tree tab can point at a
+  separate opening-tree file, but merging several files into one opening tree
+  and a static, rating-matched background distribution for preparation are
+  future work.
 - Chess960 SCID games are rejected by the reader before indexing. Classic CBH
   mode-10 Chess960 games are supported.

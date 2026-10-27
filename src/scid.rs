@@ -17,7 +17,7 @@ use shakmaty::fen::Fen;
 use shakmaty::{CastlingMode, Chess, Color, File as ChessFile, Move, Position, Role, Square};
 
 use crate::domain::{Game, Node, Ply};
-use crate::library::{GameLibrary, IndexedGame, SourceMeta};
+use crate::library::{GameLibrary, IndexedGame, SourceMeta, StringPool, intern_headers};
 
 const INDEX_MAGIC: &[u8; 8] = b"Scid.si\0";
 const NAME_MAGIC: &[u8; 8] = b"Scid.sn\0";
@@ -156,8 +156,9 @@ impl ScidLibrary {
         let name_len = fs::metadata(&name_path)?.len();
 
         let mut games = Vec::with_capacity(entries.len());
+        let mut strings = StringPool::default();
         for entry in &entries {
-            let headers = base_headers(entry, &names);
+            let headers = intern_headers(base_headers(entry, &names), &mut strings);
             games.push(IndexedGame::scid(headers, entry.offset, entry.length));
         }
 
@@ -240,7 +241,12 @@ impl ScidLibrary {
         let headers = self
             .games
             .get(index)
-            .map(|game| game.headers().to_vec())
+            .map(|game| {
+                game.headers()
+                    .iter()
+                    .map(|(key, value)| (key.to_string(), value.to_string()))
+                    .collect()
+            })
             .unwrap_or_default();
         decode_record(&bytes, headers).with_context(|| format!("decoding SCID game {index}"))
     }

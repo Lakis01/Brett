@@ -651,6 +651,21 @@ impl PlayerBook {
         };
         games.iter().take(limit).copied().collect()
     }
+
+    /// Most recent games that reached `key` with the prepared player on
+    /// `color`. Preparation shows only the games from the side the opponent
+    /// will play, so irrelevant colors must not consume the display limit.
+    pub fn recent_games_for(&self, key: u64, color: Color, limit: usize) -> Vec<PlayerGameRef> {
+        let Some(games) = self.game_refs.get(&key) else {
+            return Vec::new();
+        };
+        games
+            .iter()
+            .filter(|game| game.color == color)
+            .take(limit)
+            .copied()
+            .collect()
+    }
 }
 
 /// A predicted move in the next game.
@@ -955,7 +970,7 @@ pub fn today() -> u32 {
     year as u32 * 10_000 + month * 100 + day
 }
 
-fn date_to_days(date: u32) -> Option<i64> {
+pub(crate) fn date_to_days(date: u32) -> Option<i64> {
     let year = (date / 10_000) as i32;
     let month = (date / 100) % 100;
     let day = date % 100;
@@ -1163,6 +1178,13 @@ mod tests {
         assert_eq!(recent[2].date, 2025_0601);
         assert!(recent.iter().all(|game| game.color == Color::Black));
         assert_eq!(recent[0].index, 7);
+        assert!(
+            book.recent_games_for(key, Color::White, 10).is_empty(),
+            "the prepared player only has Black games in this fixture"
+        );
+        let black = book.recent_games_for(key, Color::Black, 2);
+        assert_eq!(black.len(), 2);
+        assert_eq!(black[0].index, 7);
 
         // The final position has no outgoing move, but the game still reached
         // it and must appear in recent-game lookups.

@@ -11,51 +11,93 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 
 use crate::domain::Game;
-use crate::library::{GameLibrary, IndexedGame};
+use crate::library::{GameLibrary, SharedStr};
+
+struct LocalSlot {
+    game: Game,
+    headers: Vec<(SharedStr, SharedStr)>,
+    search: String,
+}
+
+struct HeaderOverride {
+    headers: Vec<(SharedStr, SharedStr)>,
+    search: String,
+}
 
 enum SlotSource {
-    Primary(usize),
+    Primary {
+        library: Arc<dyn GameLibrary>,
+        index: usize,
+    },
     External {
         library: Arc<dyn GameLibrary>,
         index: usize,
     },
-    Local(Box<Game>),
+    Local(Box<LocalSlot>),
 }
 
+const EMPTY_HEADERS: &[(SharedStr, SharedStr)] = &[];
+
 /// One game row in the editable session.
+///
+/// Primary and merged database rows point at the source index instead of
+/// copying their headers. A multi-million-game ChessBase database would
+/// otherwise duplicate every tag pair (and its search text) in memory.
 pub struct GameSlot {
     pub id: usize,
-    headers: Vec<(String, String)>,
-    search: String,
     source: SlotSource,
+    edited: Option<Box<HeaderOverride>>,
 }
 
 impl GameSlot {
-    fn primary(id: usize, indexed: &IndexedGame) -> Self {
-        let headers = indexed.headers().to_vec();
+    fn primary(id: usize, library: Arc<dyn GameLibrary>, index: usize) -> Self {
         Self {
             id,
-            search: search_text(&headers),
-            headers,
-            source: SlotSource::Primary(0),
+            source: SlotSource::Primary { library, index },
+            edited: None,
         }
     }
 
-    fn with_source(id: usize, headers: Vec<(String, String)>, source: SlotSource) -> Self {
+    fn external(id: usize, library: Arc<dyn GameLibrary>, index: usize) -> Self {
         Self {
             id,
-            search: search_text(&headers),
-            headers,
-            source,
+            source: SlotSource::External { library, index },
+            edited: None,
         }
     }
 
-    pub fn headers(&self) -> &[(String, String)] {
-        &self.headers
+    fn local(id: usize, game: Game) -> Self {
+        let headers = shared_headers(&game.headers);
+        let search = search_text(&headers);
+        Self {
+            id,
+            source: SlotSource::Local(Box::new(LocalSlot {
+                game,
+                headers,
+                search,
+            })),
+            edited: None,
+        }
+    }
+
+    pub fn headers(&self) -> &[(SharedStr, SharedStr)] {
+        if let Some(edited) = &self.edited {
+            return &edited.headers;
+        }
+        match &self.source {
+            SlotSource::Primary { library, index } | SlotSource::External { library, index } => {
+                library
+                    .games()
+                    .get(*index)
+                    .map(|game| game.headers())
+                    .unwrap_or(EMPTY_HEADERS)
+            }
+            SlotSource::Local(local) => &local.headers,
+        }
     }
 
     pub fn header(&self, key: &str) -> Option<&str> {
-        self.headers
+        self.headers()
             .iter()
             .find(|(name, _)| name.eq_ignore_ascii_case(key))
             .map(|(_, value)| value.as_str())
@@ -82,26 +124,67 @@ impl GameSlot {
     }
 
     pub fn source_index(&self) -> Option<usize> {
-        match self.source {
-            SlotSource::Primary(index) => Some(index),
+        match &self.source {
+            SlotSource::Primary { index, .. } => Some(*index),
             _ => None,
         }
     }
 
     fn matches(&self, needle: &str) -> bool {
-        self.search.contains(needle)
+        if let Some(edited) = &self.edited {
+            return edited.search.contains(needle);
+        }
+        match &self.source {
+            SlotSource::Primary { library, index } | SlotSource::External { library, index } => {
+                library
+                    .games()
+                    .get(*index)
+                    .is_some_and(|game| game.matches(needle))
+            }
+            SlotSource::Local(local) => local.search.contains(needle),
+        }
     }
 
     fn refresh_headers(&mut self, game: &Game) {
-        self.headers = game.headers.clone();
-        self.search = search_text(&self.headers);
+        let headers = shared_headers(&game.headers);
+        let search = search_text(&headers);
+        if let SlotSource::Local(local) = &mut self.source {
+            local.headers = headers;
+            local.search = search;
+            self.edited = None;
+        } else {
+            self.edited = Some(Box::new(HeaderOverride { headers, search }));
+        }
     }
+}
+
+fn shared_headers(headers: &[(String, String)]) -> Vec<(SharedStr, SharedStr)> {
+    headers
+        .iter()
+        .map(|(key, value)| {
+            (
+                SharedStr::from(key.as_str()),
+                SharedStr::from(value.as_str()),
+            )
+        })
+        .collect()
+}
+
+/// Result of merging one database into another.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MergeReport {
+    pub added: usize,
+    pub skipped: usize,
 }
 
 /// The ordered list of rows currently shown in the Games tab.
 pub struct GameList {
     primary: Option<Arc<dyn GameLibrary>>,
     slots: Vec<GameSlot>,
+    /// Stable slot id -> current position. `usize::MAX` marks a removed row.
+    /// A multi-million-game database cannot afford a linear id search on every
+    /// board click.
+    positions: Vec<usize>,
     /// Primary source index -> stable slot id.
     source_slots: Vec<usize>,
     next_id: usize,
@@ -112,6 +195,7 @@ impl GameList {
         Self {
             primary: None,
             slots: Vec::new(),
+            positions: Vec::new(),
             source_slots: Vec::new(),
             next_id: 0,
         }
@@ -121,13 +205,13 @@ impl GameList {
         let mut list = Self {
             primary: Some(library.clone()),
             slots: Vec::with_capacity(library.len()),
+            positions: (0..library.len()).collect(),
             source_slots: (0..library.len()).collect(),
             next_id: library.len(),
         };
-        for (index, indexed) in library.games().iter().enumerate() {
-            let mut slot = GameSlot::primary(index, indexed);
-            slot.source = SlotSource::Primary(index);
-            list.slots.push(slot);
+        for index in 0..library.len() {
+            list.slots
+                .push(GameSlot::primary(index, library.clone(), index));
         }
         list
     }
@@ -145,15 +229,26 @@ impl GameList {
     }
 
     pub fn slot(&self, id: usize) -> Option<&GameSlot> {
-        self.slots.iter().find(|slot| slot.id == id)
+        let position = *self.positions.get(id)?;
+        if position == usize::MAX {
+            return None;
+        }
+        self.slots.get(position)
     }
 
     pub fn slot_mut(&mut self, id: usize) -> Option<&mut GameSlot> {
-        self.slots.iter_mut().find(|slot| slot.id == id)
+        let position = *self.positions.get(id)?;
+        if position == usize::MAX {
+            return None;
+        }
+        self.slots.get_mut(position)
     }
 
     pub fn position_of(&self, id: usize) -> Option<usize> {
-        self.slots.iter().position(|slot| slot.id == id)
+        self.positions
+            .get(id)
+            .copied()
+            .filter(|position| *position != usize::MAX)
     }
 
     pub fn id_at(&self, position: usize) -> Option<usize> {
@@ -185,7 +280,7 @@ impl GameList {
             .slot(id)
             .with_context(|| format!("game row {id} is gone"))?;
         match &slot.source {
-            SlotSource::Primary(index) => self
+            SlotSource::Primary { index, .. } => self
                 .primary
                 .as_ref()
                 .context("no primary database is open")?
@@ -194,7 +289,7 @@ impl GameList {
             SlotSource::External { library, index } => library
                 .load(*index)
                 .with_context(|| format!("loading merged game {}", index + 1)),
-            SlotSource::Local(game) => Ok((**game).clone()),
+            SlotSource::Local(local) => Ok(local.game.clone()),
         }
     }
 
@@ -203,9 +298,7 @@ impl GameList {
     pub fn insert_game(&mut self, game: Game, insert_at: Option<usize>) -> usize {
         let id = self.next_id;
         self.next_id += 1;
-        let slot =
-            GameSlot::with_source(id, game.headers.clone(), SlotSource::Local(Box::new(game)));
-        self.insert_slot(slot, insert_at);
+        self.insert_slot(GameSlot::local(id, game), insert_at);
         id
     }
 
@@ -217,27 +310,56 @@ impl GameList {
         insert_at: Option<usize>,
     ) -> Result<usize> {
         let game = self.load(source_id, edited)?;
-        let id = self.insert_game(game, insert_at);
-        edited.remove(&source_id);
-        Ok(id)
+        // Keep the edited copy attached to the source row. Removing it here
+        // used to discard the user's changes as soon as a row was duplicated.
+        Ok(self.insert_game(game, insert_at))
+    }
+
+    /// Append every distinct game from another database. Header candidates are
+    /// checked first, then the first moves are compared so two different games
+    /// between the same players on the same date are both retained.
+    pub fn merge_library(
+        &mut self,
+        library: Arc<dyn GameLibrary>,
+        edited: &HashMap<usize, Game>,
+    ) -> Result<MergeReport> {
+        let mut report = MergeReport::default();
+        for (index, indexed) in library.games().iter().enumerate() {
+            let headers = indexed.headers();
+            let candidates = duplicate_candidates(&self.slots, headers);
+            if !candidates.is_empty() {
+                let incoming = library
+                    .load(index)
+                    .with_context(|| format!("loading merged game {}", index + 1))?;
+                let mut duplicate = false;
+                for id in candidates {
+                    let existing = self.load(id, edited)?;
+                    if same_game(&existing, &incoming) {
+                        duplicate = true;
+                        break;
+                    }
+                }
+                if duplicate {
+                    report.skipped += 1;
+                    continue;
+                }
+            }
+            let id = self.next_id;
+            self.next_id += 1;
+            self.push_slot(GameSlot::external(id, library.clone(), index));
+            report.added += 1;
+        }
+        Ok(report)
     }
 
     /// Append every game from another database lazily. The returned ids are in
     /// source order and can be checked for duplicates by the caller.
     pub fn append_library(&mut self, library: Arc<dyn GameLibrary>) -> Vec<usize> {
         let mut ids = Vec::with_capacity(library.len());
-        for (index, indexed) in library.games().iter().enumerate() {
+        for index in 0..library.len() {
             let id = self.next_id;
             self.next_id += 1;
-            let slot = GameSlot::with_source(
-                id,
-                indexed.headers().to_vec(),
-                SlotSource::External {
-                    library: library.clone(),
-                    index,
-                },
-            );
-            self.slots.push(slot);
+            self.push_slot(GameSlot::external(id, library.clone(), index));
             ids.push(id);
         }
         ids
@@ -257,13 +379,28 @@ impl GameList {
             return false;
         }
         let slot = self.slots.remove(from);
-        self.slots.insert(target.min(self.slots.len()), slot);
+        let target = target.min(self.slots.len());
+        self.slots.insert(target, slot);
+        let (start, end) = if from < target {
+            (from, target)
+        } else {
+            (target, from)
+        };
+        for position in start..=end {
+            if let Some(slot) = self.slots.get(position) {
+                self.positions[slot.id] = position;
+            }
+        }
         true
     }
 
     pub fn remove(&mut self, id: usize) -> Option<GameSlot> {
         let position = self.position_of(id)?;
         let slot = self.slots.remove(position);
+        self.positions[id] = usize::MAX;
+        for (position, slot) in self.slots.iter().enumerate().skip(position) {
+            self.positions[slot.id] = position;
+        }
         if let Some(source) = slot.source_index()
             && let Some(mapped) = self.source_slots.get_mut(source)
             && *mapped == id
@@ -280,8 +417,20 @@ impl GameList {
     }
 
     fn insert_slot(&mut self, slot: GameSlot, insert_at: Option<usize>) {
+        let id = slot.id;
         let at = insert_at.unwrap_or(self.slots.len()).min(self.slots.len());
+        self.positions.resize(self.next_id.max(id + 1), usize::MAX);
         self.slots.insert(at, slot);
+        for (position, slot) in self.slots.iter().enumerate().skip(at) {
+            self.positions[slot.id] = position;
+        }
+    }
+
+    fn push_slot(&mut self, slot: GameSlot) {
+        let id = slot.id;
+        self.positions.resize(self.next_id.max(id + 1), usize::MAX);
+        self.slots.push(slot);
+        self.positions[id] = self.slots.len() - 1;
     }
 }
 
@@ -289,7 +438,7 @@ impl GameList {
 /// and transliterated so `Müller, Jörg` matches `Joerg Mueller`, and a Cyrillic
 /// spelling can match its Latin transliteration. Date and result must also
 /// agree; callers can verify the moves before rejecting a game.
-pub fn duplicate_candidates(slots: &[GameSlot], headers: &[(String, String)]) -> Vec<usize> {
+pub fn duplicate_candidates(slots: &[GameSlot], headers: &[(SharedStr, SharedStr)]) -> Vec<usize> {
     let key = duplicate_key(headers);
     slots
         .iter()
@@ -298,7 +447,7 @@ pub fn duplicate_candidates(slots: &[GameSlot], headers: &[(String, String)]) ->
         .collect()
 }
 
-fn duplicate_key(headers: &[(String, String)]) -> String {
+fn duplicate_key(headers: &[(SharedStr, SharedStr)]) -> String {
     let header = |key: &str| {
         headers
             .iter()
@@ -393,7 +542,7 @@ fn normalize_word(word: &str) -> String {
     out
 }
 
-fn search_text(headers: &[(String, String)]) -> String {
+fn search_text(headers: &[(SharedStr, SharedStr)]) -> String {
     let mut search = String::with_capacity(128);
     for key in ["White", "Black", "Event", "Site", "Date", "ECO", "Opening"] {
         if let Some((_, value)) = headers
@@ -436,7 +585,7 @@ fn mainline(game: &Game, limit: usize) -> Vec<String> {
 /// duplicate, or `None` when all candidate rows are distinct.
 pub fn find_duplicate(
     list: &GameList,
-    headers: &[(String, String)],
+    headers: &[(SharedStr, SharedStr)],
     game: &Game,
     edited: &HashMap<usize, Game>,
 ) -> Result<Option<usize>> {
@@ -463,6 +612,7 @@ pub fn ensure_unique_ids(list: &GameList) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::library::PgnLibrary;
 
     fn game(white: &str, black: &str, date: &str, san: &str) -> Game {
         let pgn = format!(
@@ -504,7 +654,7 @@ mod tests {
             None,
         );
         let other = game("Other", "Player", "1970.01.01", "1. c4 c5");
-        let mut candidates = duplicate_candidates(list.slots(), &other.headers);
+        let mut candidates = duplicate_candidates(list.slots(), &shared_headers(&other.headers));
         assert!(candidates.is_empty());
         candidates = duplicate_candidates(list.slots(), list.slot(first).unwrap().headers());
         assert_eq!(candidates, vec![first, second]);
@@ -543,5 +693,110 @@ mod tests {
         assert_eq!(list.slot(c).unwrap().white(), "E");
         assert!(list.remove(a).is_some());
         assert_eq!(list.len(), 2);
+    }
+
+    #[test]
+    fn source_backed_slots_keep_headers_and_positions_after_reordering() {
+        let path = std::env::temp_dir().join(format!(
+            "brett-session-lazy-{}-{}.pgn",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let pgn = concat!(
+            "[Event \"Test\"]\n[White \"Alpha\"]\n[Black \"Beta\"]\n",
+            "[Date \"2020.01.01\"]\n[Result \"1-0\"]\n\n1. e4 e5 1-0\n\n",
+            "[Event \"Test\"]\n[White \"Gamma\"]\n[Black \"Delta\"]\n",
+            "[Date \"2020.01.02\"]\n[Result \"0-1\"]\n\n1. d4 d5 0-1\n\n",
+            "[Event \"Test\"]\n[White \"Epsilon\"]\n[Black \"Zeta\"]\n",
+            "[Date \"2020.01.03\"]\n[Result \"1/2-1/2\"]\n\n1. c4 c5 1/2-1/2\n"
+        );
+        std::fs::write(&path, pgn).unwrap();
+        let library: Arc<dyn GameLibrary> = Arc::new(PgnLibrary::build(&path).unwrap());
+        let mut list = GameList::from_library(library);
+
+        assert_eq!(list.slot(0).unwrap().white(), "Alpha");
+        assert_eq!(list.source_slot(1), Some(1));
+
+        assert!(list.move_slot(2, 0));
+        assert_eq!(list.position_of(2), Some(0));
+        assert_eq!(list.slot(2).unwrap().white(), "Epsilon");
+        assert_eq!(list.slot(0).unwrap().white(), "Alpha");
+        assert_eq!(list.source_slot(0), Some(0));
+        assert_eq!(list.source_slot(2), Some(2));
+
+        assert!(list.remove(1).is_some());
+        assert!(list.slot(1).is_none());
+        assert!(list.source_slot(1).is_none());
+        assert_eq!(list.slot(2).unwrap().white(), "Epsilon");
+
+        let inserted = list.insert_game(game("Local", "Row", "2020.01.04", "1. e4"), Some(0));
+        assert_eq!(list.position_of(inserted), Some(0));
+        assert_eq!(list.slot(inserted).unwrap().white(), "Local");
+        assert_eq!(list.slot(2).unwrap().white(), "Epsilon");
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn duplicating_an_edited_row_keeps_the_source_edits() {
+        let mut list = GameList::empty();
+        let source = list.insert_game(
+            game("Müller, Jörg", "Tal, Mikhail", "1970.01.01", "1. e4 e5"),
+            None,
+        );
+        let mut edited = HashMap::new();
+        let mut changed = list.load(source, &HashMap::new()).unwrap();
+        changed
+            .headers
+            .iter_mut()
+            .find(|(name, _)| name.eq_ignore_ascii_case("Event"))
+            .unwrap()
+            .1 = "Edited event".to_string();
+        edited.insert(source, changed);
+
+        let duplicate = list.duplicate_game(source, &mut edited, None).unwrap();
+        assert!(edited.contains_key(&source));
+        assert_eq!(
+            list.load(source, &edited).unwrap().header("Event"),
+            Some("Edited event")
+        );
+        assert_eq!(
+            list.load(duplicate, &edited).unwrap().header("Event"),
+            Some("Edited event")
+        );
+        assert_ne!(source, duplicate);
+    }
+
+    #[test]
+    fn merge_library_skips_duplicates_but_keeps_distinct_games() {
+        let path = std::env::temp_dir().join(format!(
+            "brett-session-merge-{}-{}.pgn",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let source_pgn = concat!(
+            "[Event \"Test\"]\n[White \"Joerg Mueller\"]\n[Black \"Mikhail Tal\"]\n",
+            "[Date \"1970.01.01\"]\n[Result \"1-0\"]\n\n1. e4 e5 1-0\n\n",
+            "[Event \"Test\"]\n[White \"Müller, Jörg\"]\n[Black \"Tal, Mikhail\"]\n",
+            "[Date \"1970.01.01\"]\n[Result \"1-0\"]\n\n1. d4 d5 1-0\n"
+        );
+        std::fs::write(&path, source_pgn).unwrap();
+        let library: Arc<dyn GameLibrary> = Arc::new(PgnLibrary::build(&path).unwrap());
+
+        let mut list = GameList::empty();
+        list.insert_game(
+            game("Müller, Jörg", "Tal, Mikhail", "1970.01.01", "1. e4 e5"),
+            None,
+        );
+        let report = list.merge_library(library, &HashMap::new()).unwrap();
+        assert_eq!(
+            report,
+            MergeReport {
+                added: 1,
+                skipped: 1
+            }
+        );
+        assert_eq!(list.len(), 2);
+        let _ = std::fs::remove_file(path);
     }
 }

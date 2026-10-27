@@ -29,7 +29,8 @@ what is this opponent likely to play next?**
    current position. Set the limit (default **10**) in the section. Clicking a
    row opens a read-only game view; **Close preview** or Escape restores the
    same preparation position and tab.
-9. **Exit prep** returns to the game that was open before preparation started.
+9. **Exit prep** returns to the game that was open before preparation started,
+   including the board side that was active before preparation.
 
 An optional **Reference database prior** section on the selected-player page
 configures a separate PGN, SCID, or classic CBH corpus for the background
@@ -40,6 +41,23 @@ panel uses the current database prior and labels it as potentially skewed.
 Preparation moves are ordinary game-tree edits. They stay in memory for the
 session and are kept when switching between database games; they are not
 written back to the source database.
+
+## My player names and orientation
+
+**Settings → My player names** stores the aliases you use, one per line,
+highest priority first. Names are matched with the same normalisation as player
+identity: punctuation and word order do not matter.
+
+- The first alias is labelled **You** in the Players tab.
+- In preparation, the first alias replaces the literal `You` in the PGN tag
+  fields, so exported preparation games carry your real name. The board strip
+  still labels your side **You** when no alias is configured; with an alias it
+  shows the alias.
+- When you open a game that contains one of the aliases, the board opens from
+  that side. The first matching alias in list order wins. If no alias matches,
+  the current orientation is kept.
+- **Exit prep** and closing a recent-game preview restore the orientation that
+  was active before the temporary view, not just the game and node.
 
 ## Preparation view
 

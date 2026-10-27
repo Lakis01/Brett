@@ -106,6 +106,12 @@ stored beside the database.
 - **SCID5 and newer layouts are not supported.**
 - Brett is a reader. Editing games, adding annotations to the source database,
   deleting games, and compacting databases are out of scope.
+- A native SCID writer is not blocked by format access, but it is not
+  implemented. It must build the namebase and its IDs, set the index flags and
+  offsets, invert the compact move encoding, preserve comments/NAGs/variations
+  and custom starts, and write all three files atomically. Validation should
+  include a round-trip through this reader and opening the result in an
+  independent SCID 4.x build.
 - Clock/evaluation annotations are not separately modelled; only textual
   comments and standard NAGs are represented in the game tree.
 - A malformed game can fail individually; it does not prevent the rest of the
@@ -114,10 +120,11 @@ stored beside the database.
 
 ## Data safety
 
-`/home/gratis01/Chess Databases/` and every directory below it are strictly
-read-only. Brett opens the source triple directly for reading, and derived
-indexes are written only under the user's cache directory. If you need to run
-SCID's own tools for comparison, copy the triple to `/tmp/opencode` first; see
+The conventional `$HOME/Chess Databases/` tree and every directory below it
+are strictly read-only, as are extra roots in `BRETT_READ_ONLY_ROOTS`. Brett
+opens the source triple directly for reading, and derived indexes are written
+only under the user's cache directory. If you need to run SCID's own tools for
+comparison, copy the triple to `/tmp/opencode` first; see
 [`scripts/scid-to-pgn.sh`](../scripts/scid-to-pgn.sh) and
 [DATA_SAFETY.md](DATA_SAFETY.md).
 

@@ -171,6 +171,8 @@ name = "brett"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "cbvault-format",
+ "deunicode",
  "eframe",
  "egui",
  "image",
@@ -254,6 +256,15 @@ dependencies = [
  "rustix 0.38.44",
  "wayland-backend",
  "wayland-client",
+]
+
+[[package]]
+name = "cbvault-format"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7dc8ef4a6949d52f38977bf6d708823f8b6b584915c5b86f694f221abf42c54"
+dependencies = [
+ "memmap2",
 ]
 
 [[package]]
@@ -401,6 +412,12 @@ name = "cursor-icon"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f27ae1dd37df86211c42e150270f82743308803d90a6f6e6651cd730d5e1732f"
+
+[[package]]
+name = "deunicode"
+version = "1.6.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "abd57806937c9cc163efc8ea3910e00a62e2aeb0b8119f1793a978088f8f6b04"
 
 [[package]]
 name = "dispatch"

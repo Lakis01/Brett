@@ -25,7 +25,11 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 
 use crate::domain::Game;
-use crate::library::{GameLibrary, IndexedGame, SourceMeta};
+use crate::library::{GameLibrary, IndexedGame, SharedStr, SourceMeta, StringPool};
+
+/// Above this size the per-game lowercase search cache costs more memory than
+/// it saves. Searches then inspect the interned headers on demand.
+const SEARCH_CACHE_MAX_GAMES: usize = 1_000_000;
 
 const RECORD_SIZE: usize = 46;
 const ENTITY_MAGIC: i32 = 1_234_567_890;
@@ -47,7 +51,10 @@ struct Entry {
 
 /// A classic multi-file database opened through [`GameLibrary`].
 pub struct CbhLibrary {
+    /// The path shown to the user.  For a `.cbv` archive this is the archive
+    /// itself; for a classic database it is the `.cbh`.
     path: PathBuf,
+    cbh_path: PathBuf,
     cbg_path: PathBuf,
     cba_path: Option<PathBuf>,
     entity_paths: Vec<PathBuf>,
@@ -121,8 +128,10 @@ impl CbhLibrary {
         let wide = Wide::open_if_needed(&stem, cbg_len, cba_len)?;
 
         let total = cbh.len() / RECORD_SIZE - 1;
+        let build_search = total <= SEARCH_CACHE_MAX_GAMES;
         let mut entries = Vec::with_capacity(total);
         let mut games = Vec::with_capacity(total);
+        let mut strings = StringPool::default();
         for index in 0..total {
             let id = u32::try_from(index + 1).context("ChessBase record count is too large")?;
             let at = (index + 1) * RECORD_SIZE;
@@ -137,7 +146,7 @@ impl CbhLibrary {
             let moves_offset = be_u32(&record[1..5]);
             let annotations_offset = be_u32(&record[5..9]);
             let deleted = flags & 0x80 != 0;
-            let headers = base_headers(record, &entities);
+            let headers = base_headers(record, &entities, &mut strings);
             entries.push(Entry {
                 id,
                 moves_offset,
@@ -150,6 +159,7 @@ impl CbhLibrary {
                 u64::from(moves_offset),
                 u64::from(annotations_offset),
                 deleted,
+                build_search,
             ));
         }
 
@@ -178,7 +188,8 @@ impl CbhLibrary {
         }
 
         Ok(Self {
-            path: cbh_path,
+            path: cbh_path.clone(),
+            cbh_path,
             cbg_path,
             cba_path,
             entity_paths,
@@ -188,6 +199,24 @@ impl CbhLibrary {
             games,
             indexed_in: started.elapsed(),
         })
+    }
+
+    /// Open a `.cbv` archive by materialising its database members into a
+    /// cache.  The library keeps the archive path for display and cache keys,
+    /// while all reads go to the extracted classic files.
+    pub fn open_cbv(archive: impl AsRef<Path>) -> Result<Self> {
+        Self::open_cbv_with_progress(archive, |_| {})
+    }
+
+    pub fn open_cbv_with_progress(
+        archive: impl AsRef<Path>,
+        progress: impl FnMut(&str),
+    ) -> Result<Self> {
+        let archive = archive.as_ref();
+        let extracted = crate::cbv::materialize_with_progress(archive, progress)?;
+        let mut library = Self::open(&extracted)?;
+        library.path = archive.to_path_buf();
+        Ok(library)
     }
 
     pub fn path(&self) -> &Path {
@@ -246,7 +275,11 @@ impl CbhLibrary {
             entry.id,
             MIN_CBG_HEADER,
         )?;
-        let headers = self.games[index].headers().to_vec();
+        let headers = self.games[index]
+            .headers()
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect();
         let (start, consumed) = moves::decode_start(record.head[0], &record.bytes)
             .with_context(|| format!("decoding start of ChessBase game {}", entry.id))?;
         let mut game = Game {
@@ -344,10 +377,13 @@ impl GameLibrary for CbhLibrary {
     }
 
     fn source_meta(&self) -> Result<SourceMeta> {
-        let mut parts = vec![
-            SourceMeta::read(&self.path)?,
-            SourceMeta::read(&self.cbg_path)?,
-        ];
+        let mut parts = vec![SourceMeta::read(&self.cbh_path)?];
+        if self.path != self.cbh_path {
+            // Include the archive itself so replacing a `.cbv` invalidates the
+            // position cache even when an old extraction happens to survive.
+            parts.push(SourceMeta::read(&self.path)?);
+        }
+        parts.push(SourceMeta::read(&self.cbg_path)?);
         for path in &self.entity_paths {
             parts.push(SourceMeta::read(path)?);
         }
@@ -425,7 +461,11 @@ fn read_record(
     })
 }
 
-fn base_headers(record: &[u8], entities: &Entities) -> Vec<(String, String)> {
+fn base_headers(
+    record: &[u8],
+    entities: &Entities,
+    strings: &mut StringPool,
+) -> Vec<(SharedStr, SharedStr)> {
     let white_id = be_u24(&record[9..12]);
     let black_id = be_u24(&record[12..15]);
     let tournament_id = be_u24(&record[15..18]);
@@ -446,29 +486,47 @@ fn base_headers(record: &[u8], entities: &Entities) -> Vec<(String, String)> {
 
     let mut headers = Vec::with_capacity(12);
     headers.push((
-        "Event".to_string(),
-        entities.tournament_title(tournament_id),
+        strings.intern("Event"),
+        strings.intern(entities.tournament_title(tournament_id)),
     ));
-    headers.push(("Site".to_string(), entities.tournament_place(tournament_id)));
-    headers.push(("Date".to_string(), date_string(date)));
-    headers.push(("Round".to_string(), round_string(round, subround)));
-    headers.push(("White".to_string(), entities.player_name(white_id)));
-    headers.push(("Black".to_string(), entities.player_name(black_id)));
-    headers.push(("Result".to_string(), result.to_string()));
+    headers.push((
+        strings.intern("Site"),
+        strings.intern(entities.tournament_place(tournament_id)),
+    ));
+    headers.push((strings.intern("Date"), strings.intern(date_string(date))));
+    headers.push((
+        strings.intern("Round"),
+        strings.intern(round_string(round, subround)),
+    ));
+    headers.push((
+        strings.intern("White"),
+        strings.intern(entities.player_name(white_id)),
+    ));
+    headers.push((
+        strings.intern("Black"),
+        strings.intern(entities.player_name(black_id)),
+    ));
+    headers.push((strings.intern("Result"), strings.intern(result)));
     if let Some(eco) = eco_string(eco) {
-        headers.push(("ECO".to_string(), eco));
+        headers.push((strings.intern("ECO"), strings.intern(eco)));
     }
     if white_elo > 0 {
-        headers.push(("WhiteElo".to_string(), white_elo.to_string()));
+        headers.push((
+            strings.intern("WhiteElo"),
+            strings.intern(white_elo.to_string()),
+        ));
     }
     if black_elo > 0 {
-        headers.push(("BlackElo".to_string(), black_elo.to_string()));
+        headers.push((
+            strings.intern("BlackElo"),
+            strings.intern(black_elo.to_string()),
+        ));
     }
     if let Some(annotator) = entities.annotator_name(annotator_id) {
-        headers.push(("Annotator".to_string(), annotator));
+        headers.push((strings.intern("Annotator"), strings.intern(annotator)));
     }
     if let Some(source) = entities.source_name(source_id) {
-        headers.push(("Source".to_string(), source));
+        headers.push((strings.intern("Source"), strings.intern(source)));
     }
     headers
 }

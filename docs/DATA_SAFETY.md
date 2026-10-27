@@ -2,10 +2,11 @@
 
 ## The rule
 
-`/home/gratis01/Chess Databases/` — and every database directory inside it — is
-**read-only** for this project and for every agent session working on it. The
-classic CBH sample under `/home/gratis01/Downloads/CBH/` is also strictly
-read-only.
+The local source collections — conventionally `$HOME/Chess Databases/` and
+`$HOME/Downloads/CBH/` — are **read-only** for this project and for every agent
+session working on them. Brett protects those two locations automatically when
+they exist. Add extra roots with `BRETT_READ_ONLY_ROOTS`, a platform-separated
+path list.
 
 Allowed:
 
@@ -70,12 +71,20 @@ $XDG_CACHE_HOME/brett/online/      (or ~/.cache/brett/online/)
 ```
 
 User preferences, including the selected UCI engine path, thread count, hash
-size, and reference-database settings, live under:
+size, display choices, reference-database settings, correspondence-database
+settings, and the optional Lichess token, live under:
 
 ```text
 $XDG_CONFIG_HOME/brett/engine.json       (or ~/.config/brett/engine.json)
+$XDG_CONFIG_HOME/brett/display.json      (or ~/.config/brett/display.json)
 $XDG_CONFIG_HOME/brett/preparation.json  (or ~/.config/brett/preparation.json)
+$XDG_CONFIG_HOME/brett/references.json   (or ~/.config/brett/references.json)
 ```
+
+`references.json` can contain a Lichess token and account names. Never commit
+it. Prefer `BRETT_LICHESS_TOKEN` for the token so it never reaches the file.
+The repository's `.gitignore` covers these filenames, but it cannot untrack a
+file that is already tracked; check `git status` before committing.
 
 Nothing is written beside a source database. A cache index is keyed by the
 canonical source path and validated against the PGN file's length/mtime, the

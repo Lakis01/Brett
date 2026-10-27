@@ -4,3 +4,29 @@
 
 # Local test data: never redistributed, may be copyrighted
 fixtures/local/
+
+# Brett stores personal settings and API secrets here. They are outside the
+# repository by default; these rules catch copies made while developing.
+references.json
+display.json
+preparation.json
+engine.json
+brett*.json
+.config/brett/
+config/brett/
+
+# Environment files and credentials. Use BRETT_LICHESS_TOKEN instead of
+# writing a token into a tracked file.
+.env
+.env.*
+!.env.example
+*.token
+*.secret
+lip_*
+*.pem
+*.key
+
+# Editor and agent scratch files
+.opencode/
+.idea/
+.vscode/

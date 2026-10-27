@@ -4,7 +4,9 @@
 //! starting a window. The binary is a thin wrapper around [`app::App`].
 
 pub mod app;
+pub mod book;
 pub mod cbh;
+pub mod cbv;
 pub mod cloud;
 pub mod domain;
 pub mod engine;
@@ -14,6 +16,7 @@ pub mod online;
 pub mod pgn;
 pub mod players;
 pub mod position;
+pub mod recent;
 pub mod review;
 pub mod scid;
 pub mod session;

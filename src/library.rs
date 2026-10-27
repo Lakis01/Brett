@@ -13,10 +13,14 @@
 //! The byte ranges are obtained from `pgn-reader`'s [`Seek`] implementation,
 //! which reports the logical stream position (excluding buffered lookahead).
 
+use std::borrow::Borrow;
+use std::collections::HashSet;
+use std::fmt;
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
-use std::ops::ControlFlow;
+use std::ops::{ControlFlow, Deref};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
@@ -83,28 +87,119 @@ enum GameLocation {
     },
 }
 
+/// An immutable string shared by many indexed games.
+///
+/// A large classic ChessBase database repeats the same player, event, date and
+/// result strings millions of times. Storing one `String` per tag made the
+/// Mega Database alone consume many gigabytes; interning turns each repeated
+/// value into a cheap reference-counted pointer instead.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SharedStr(Arc<str>);
+
+impl SharedStr {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Deref for SharedStr {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl AsRef<str> for SharedStr {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Borrow<str> for SharedStr {
+    fn borrow(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for SharedStr {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl From<String> for SharedStr {
+    fn from(value: String) -> Self {
+        Self(Arc::from(value))
+    }
+}
+
+impl From<&str> for SharedStr {
+    fn from(value: &str) -> Self {
+        Self(Arc::from(value))
+    }
+}
+
+/// Deduplicates header strings while a database index is being built.
+#[derive(Debug, Default)]
+pub struct StringPool {
+    values: HashSet<Arc<str>>,
+}
+
+impl StringPool {
+    pub fn intern(&mut self, value: impl AsRef<str>) -> SharedStr {
+        let value = value.as_ref();
+        if let Some(existing) = self.values.get(value) {
+            return SharedStr(existing.clone());
+        }
+        let shared: Arc<str> = Arc::from(value);
+        self.values.insert(shared.clone());
+        SharedStr(shared)
+    }
+}
+
+pub(crate) fn intern_headers(
+    headers: Vec<(String, String)>,
+    pool: &mut StringPool,
+) -> Vec<(SharedStr, SharedStr)> {
+    headers
+        .into_iter()
+        .map(|(key, value)| (pool.intern(key), pool.intern(value)))
+        .collect()
+}
+
 /// One indexed game: its headers and where its data lives in the source.
 #[derive(Clone, Debug)]
 pub struct IndexedGame {
-    headers: Vec<(String, String)>,
+    headers: Vec<(SharedStr, SharedStr)>,
     /// Lowercase concatenation of the searchable header values.
-    search: String,
+    ///
+    /// Very large databases skip this cache to avoid hundreds of megabytes of
+    /// duplicate text; searches fall back to inspecting the headers directly.
+    search: Option<Box<str>>,
     location: GameLocation,
 }
 
 impl IndexedGame {
-    fn with_location(headers: Vec<(String, String)>, location: GameLocation) -> Self {
-        let mut search = String::with_capacity(128);
-        for key in ["White", "Black", "Event", "Site", "Date", "ECO", "Opening"] {
-            if let Some(value) = headers
-                .iter()
-                .find(|(k, _)| k.eq_ignore_ascii_case(key))
-                .map(|(_, v)| v)
-            {
-                search.push_str(&value.to_lowercase());
-                search.push(' ');
+    fn with_location(
+        headers: Vec<(SharedStr, SharedStr)>,
+        location: GameLocation,
+        build_search: bool,
+    ) -> Self {
+        let search = build_search.then(|| {
+            let mut search = String::with_capacity(128);
+            for key in SEARCH_HEADER_KEYS {
+                if let Some(value) = headers
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case(key))
+                    .map(|(_, v)| v)
+                {
+                    search.push_str(&value.to_lowercase());
+                    search.push(' ');
+                }
             }
-        }
+            search.into_boxed_str()
+        });
         Self {
             headers,
             search,
@@ -112,20 +207,21 @@ impl IndexedGame {
         }
     }
 
-    fn pgn(headers: Vec<(String, String)>, start: u64, end: u64) -> Self {
-        Self::with_location(headers, GameLocation::Pgn { start, end })
+    fn pgn(headers: Vec<(SharedStr, SharedStr)>, start: u64, end: u64) -> Self {
+        Self::with_location(headers, GameLocation::Pgn { start, end }, true)
     }
 
-    pub(crate) fn scid(headers: Vec<(String, String)>, offset: u64, length: u32) -> Self {
-        Self::with_location(headers, GameLocation::Scid { offset, length })
+    pub(crate) fn scid(headers: Vec<(SharedStr, SharedStr)>, offset: u64, length: u32) -> Self {
+        Self::with_location(headers, GameLocation::Scid { offset, length }, true)
     }
 
     pub(crate) fn cbh(
-        headers: Vec<(String, String)>,
+        headers: Vec<(SharedStr, SharedStr)>,
         id: u32,
         moves_offset: u64,
         annotations_offset: u64,
         deleted: bool,
+        build_search: bool,
     ) -> Self {
         Self::with_location(
             headers,
@@ -135,10 +231,11 @@ impl IndexedGame {
                 annotations_offset,
                 deleted,
             },
+            build_search,
         )
     }
 
-    pub fn headers(&self) -> &[(String, String)] {
+    pub fn headers(&self) -> &[(SharedStr, SharedStr)] {
         &self.headers
     }
 
@@ -204,10 +301,18 @@ impl IndexedGame {
         }
     }
 
-    fn matches(&self, needle_lower: &str) -> bool {
-        self.search.contains(needle_lower)
+    pub fn matches(&self, needle_lower: &str) -> bool {
+        if let Some(search) = &self.search {
+            return search.contains(needle_lower);
+        }
+        SEARCH_HEADER_KEYS.iter().any(|key| {
+            self.header(key)
+                .is_some_and(|value| value.to_lowercase().contains(needle_lower))
+        })
     }
 }
+
+const SEARCH_HEADER_KEYS: [&str; 7] = ["White", "Black", "Event", "Site", "Date", "ECO", "Opening"];
 
 /// A database whose games can be listed and loaded lazily.
 ///
@@ -272,6 +377,7 @@ impl PgnLibrary {
         let mut reader = Reader::new(BufReader::new(file));
         let mut visitor = HeaderVisitor;
         let mut games = Vec::new();
+        let mut strings = StringPool::default();
 
         loop {
             let start = reader
@@ -293,7 +399,11 @@ impl PgnLibrary {
                     path.display()
                 );
             }
-            games.push(IndexedGame::pgn(headers, start, end));
+            games.push(IndexedGame::pgn(
+                intern_headers(headers, &mut strings),
+                start,
+                end,
+            ));
         }
 
         Ok(Self {

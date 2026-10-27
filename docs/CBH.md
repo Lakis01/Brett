@@ -143,8 +143,9 @@ header, move, annotation, name, and wide-offset files under the base name.
 
 ## Data safety
 
-The `/home/gratis01/Downloads/CBH/` sample and the user's chess database tree
-are strictly read-only. Brett opens every source file with `File::open` and
-writes only derived position indexes under `$XDG_CACHE_HOME/brett/index/`.
-For external comparisons, copy the database to `/tmp/opencode/` first; see
-[DATA_SAFETY.md](DATA_SAFETY.md).
+The conventional `$HOME/Downloads/CBH/` sample directory and the user's chess
+database tree are strictly read-only. Brett opens every source file with
+`File::open` and writes only derived position indexes under
+`$XDG_CACHE_HOME/brett/index/`. Add extra protected roots with
+`BRETT_READ_ONLY_ROOTS`. For external comparisons, copy the database to
+`/tmp/opencode/` first; see [DATA_SAFETY.md](DATA_SAFETY.md).

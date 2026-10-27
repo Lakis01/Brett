@@ -4,15 +4,25 @@ This is the working backlog after the preparation stage. Items are ordered by
 dependency and user value, not by estimated effort. Completed work is recorded
 in `README.md`; this file tracks what is next.
 
-**Status (2026-10-23):** items 1 (UCI panel and engine settings), 2 (game
-review), 3 (PGN clocks beside the board), 4 (castling drag), 5 (preparation
-view v2 and recent games), 6 (predictor v2 and the static reference
-distribution), and 7 (classic CBH support) are implemented. Deferred predictor
-refinements are recorded under item 6.
+**Status (2026-10-26):** items 1–7 and 11–14 are implemented, and the latest
+moves-panel interaction polish is complete. Item 8's cloud, opening-tree,
+reference-source, and native-book parts are done; M2b mega-scale ingest remains,
+with the first safety pass now keeping huge archives responsive and avoiding
+automatic full indexing. Item 9's editable session, database views,
+reorder/merge, and PGN export are done; native SCID and classic CBH writers
+remain. Item 10 is no longer blocked: the current ICCF SCID source is available
+and the automatic correspondence reference is integrated; only an optional
+refresh remains. Deferred predictor refinements are recorded under item 6, and
+native player-title display is queued as item 15.
 
 Game review follow-ups that are intentionally deferred: position-index book
 marking and review caching. Clock display currently lives in the board player
 strips rather than move-list/header chips.
+
+The latest interaction pass hides absent or empty PGN fields by default, adds
+**Show empty** and a virtual **Board** field written as `round.board`, opens a
+mainline-first branch chooser at every multi-move position, numbers engine and
+cloud analysis lines, and makes open-game move hover an opt-in setting.
 
 ## 1. UCI engine foundation
 
@@ -164,13 +174,9 @@ UI. Format details and validation results are in [CBH.md](CBH.md).
 
 **Goal:** read the older multi-file ChessBase CBH format (not CBH2/2CBH).
 
-A sample is available at:
-
-```text
-/home/gratis01/Downloads/CBH/Pimped Correspondence Database.*
-```
-
-It is a classic multi-file database (`.cba`, `.cbb`, `.cbc`, `.cbe`, `.cbg`,
+A local sample classic multi-file database was used during development (under
+the git-ignored `fixtures/local/` tree; never redistributed). It is a classic
+multi-file database (`.cba`, `.cbb`, `.cbc`, `.cbe`, `.cbg`,
 `.cbgi`, `.cbh`, `.cbj`, `.cbm`, `.cbp`, `.cbs`, `.cbt`, `.cbtt`, `.flags`,
 `.ini`), not a 2CBH container.
 
@@ -213,45 +219,254 @@ part of the roadmap.
 ## 8. Larger infrastructure
 
 - **M2b mega-scale ingest:** external sorting, on-disk header table, incremental
-  position-index updates.
+  position-index updates. The Mega Database 2025 test (11,151,119 games) exposed
+  the current limits: eager header/session/player work used roughly 23 GiB,
+  the automatic position index ran at about 2,000 games/sec, and the desktop
+  became unresponsive. Immediate safety work now interns repeated CBH header
+  strings, keeps primary/external session slots lazy, moves the player
+  directory off the UI thread above 500,000 games, and refuses automatic full
+  indexing above 250,000 games (manual full indexing is disabled above
+  1,000,000). The remaining work is a true on-disk header table, external-sort
+  position index, and incremental updates so a multi-million-game archive can
+  be indexed without a multi-gigabyte RAM spike.
 - **Cloud references (done):** chessdb.cn `queryall`, the Lichess opening
   explorer (Masters by default; full Lichess with an OAuth token), and Lichess
-  cloud evaluation, shown in the **Refs** tab with asynchronous requests and
-  per-FEN caching. See `src/cloud.rs`.
+  cloud evaluation, with asynchronous requests and per-FEN caching. The Tree
+  tab shows the explorer table and Lichess top games; the Cloud Engine in the
+  Engine tab shows cloud variations. The Refs tab configures sources rather
+  than duplicating either table. See `src/cloud.rs`.
+- **Cloud Engine (done):** the Engine tab switches between **Local**,
+  **Cloud**, and **Both**. The Cloud Engine table combines chessdb.cn and the
+  Lichess cloud evaluation, includes Lichess variations, and supports clickable
+  SAN prefixes. The Tree tab shows a Lichess Masters/full reference table.
+- **Opening-tree files (done):** the Tree tab can index a separate PGN, SCID,
+  or classic CBH database and persist it as the default opening-tree source.
+  Native Polyglot `.bin`, ChessBase `.ctg`, Arena `.abk`, and Shredder `.bkt`
+  readers now live in `src/book.rs` and `src/book/`.
+- **Reference sources (done):** the Refs tab exposes the current database and
+  a Mega-style reference database path, plus Lichess/Chess.com/ChessABC
+  opponent lookups (each service listed once). Importing is **File → Import**.
+  The correspondence database is configured in **Settings**, not Refs.
 - **Reference merging:** combine several databases into one opening tree
   without rebuilding unrelated caches.
 
 ## 9. Database editing, copy/merge, and export
 
 **Status:** the editable ordered session (`src/session.rs`) provides stable row
-IDs, lazy primary/external/local slots, reordering, and duplicate matching.
-Games can be reordered by dragging rows in the **Games** list; dropping on the
-upper or lower half of a row inserts before or after it. **File → Save database
-as PGN…** streams the session in order, preserves comments, clocks, NAGs, and
+IDs, lazy primary/external/local slots, reordering, duplicate matching, and
+merging. Games can be reordered by dragging rows in the **Games** list;
+dropping on the upper or lower half of a row inserts before or after it. Extra
+databases open in the floating **Database views** window. Games can be dragged
+between the main list and a view, with an **Insert here** / **Append** prompt;
+dragging a database handle onto another database merges it. Merge rejects
+duplicates with order-insensitive, transliterated player-name matching plus
+first-move verification. External file drops ask whether to open, merge into
+the current database, or open in a view. **File → Save database as PGN…**
+streams the session in order, preserves comments, clocks, NAGs, and
 variations, and asks for confirmation before exports estimated at 100 MB or
-more. Cross-database copy and merge still need a multi-database view.
+more. The native SCID and classic CBH writers remain.
 
 - Add native SCID and classic CBH writers. The readers are independent and
   validated; the writers must round-trip through the readers and, where
   available, an independent implementation.
-- Decide and document drag-and-drop semantics:
-  - games dragged between database views are copied or moved to the drop
-    target;
+  - The SCID writer must build the compressed namebase and stable IDs, encode
+    index flags/offsets, invert the compact move stream, preserve
+    comments/NAGs/variations and custom starts, and atomically replace the
+    `.si`/`.sn`/`.sg` triple. Validate by round-tripping through `ScidLibrary`
+    and opening the output in SCID 4.x. SCID 4.27 is available locally for that
+    check; no GPL source is needed or copied.
+- Keep the documented drag-and-drop semantics:
+  - games dragged between database views are copied to the drop target;
+  - a game dropped at a list position asks whether to insert there or append;
   - a database dropped onto an open database is merged;
-  - external file drops ask whether to open, copy, or merge.
+  - external file drops ask whether to open, merge, or open in a view.
 - Never write over a source database without an explicit Save As path. Keep
-  the `/home/gratis01/Chess Databases/` and `/home/gratis01/Downloads/CBH/`
-  sources read-only.
+  the conventional `$HOME/Chess Databases/` and `$HOME/Downloads/CBH/` sources
+  read-only (and any extra roots in `BRETT_READ_ONLY_ROOTS`).
 - Rebuild player and position indexes after a persistent mutation.
 
-## 10. Correspondence database rebuild
+## 10. Correspondence database refresh
 
-**Status:** blocked on source access and confirmation. See
+**Status:** source available and integrated. The current ICCF SCID database is
+in `~/Downloads/Brett Resources/Correspondence Database/Correspondence_2350.si4`;
+the automatic Engine-tab correspondence reference is implemented, and the file
+decodes with zero errors. No source-access blocker remains. See
 [CORRESPONDENCE_DATABASE.md](CORRESPONDENCE_DATABASE.md).
 
-- The 2016 sample is 24,865 games, dated 2009-02-15 through 2016-02-08.
-- Both sides have an inclusive `Elo >= 2400` filter; the minimum is exactly
-  2400 and there is no evidence of an upper cutoff.
-- The ICCF portion matches the official ICCF Games Archive. Older LSS, FICGS,
-  and Remote games are also present and need a source decision.
-- The current archive download requires a registered ICCF member.
+- Current source: **99,606 games**, **6,924,478 mainline moves**, dated
+  2015-12-30 through 2026-09-25, all `Site "ICCF"`. Both Elo fields range from
+  **2350 to 2724**; 27 games have no moves. The accompanying note says the
+  ICCF January–March 2026 compilation is still missing.
+- The current filter is inclusive `WhiteElo >= 2350` and `BlackElo >= 2350`;
+  there is no evidence of an upper cutoff.
+- The older 2016 sample is 24,865 games (2009-02-15 through 2016-02-08) with an
+  inclusive `Elo >= 2400` filter and a mix of ICCF, LSS, FICGS, and Remote
+  games. It is retained as historical provenance, not as the active reference.
+- A future refresh only needs a newer ICCF export, the same two-sided 2350
+  filter, de-duplication by players/date/result/move sequence, and a new output
+  triple. Never overwrite the source or the old 2016 sample.
+
+## 11. Native opening-book formats and Tree integration
+
+**Status:** Polyglot `.bin`, ChessBase `.ctg`, Arena `.abk`, and Shredder
+`.bkt` readers are implemented and validated against the sample books. The Tree
+tab exposes all four formats through the opening-book path, including BKT
+move-quality letters in the Note column. Env-gated fixture tests cover every
+format at the start position, including legal moves and W/D/L consistency.
+
+Development used local `.ctg`, `.bin`, `.abk`, and `.bkt` samples from the
+user's book collection. They are not part of the repository and must not be
+committed; point the Tree/opening-book picker at your own copies.
+
+- Read Arena `.abk` entries (28-byte little-endian records, root index 900,
+  `nextMove`/`nextSibling` tree links) and build a position-indexed move map.
+  Preserve `ngames`, `nwon`, `nlost`, priority, and promotion.
+- Read Shredder `.bkt` as a 256-bucket Zobrist hash table plus appended
+  overflow buckets. Each 1,552-byte bucket has 32 slots of 48 bytes and a
+  16-byte footer. Decode the two hash words, packed move (from/to/piece/
+  capture/promotion), quality nibble, rating/year sums, and White-perspective
+  W/D/L totals. Use the format's fixed a1-first Zobrist tables.
+- Open `.bin`, `.ctg`, `.abk`, and `.bkt` through the Tree tab’s book path.
+  Show move, SAN, games/weight, score, and book-specific annotations. Keep the
+  local database tree and Lichess references available beside the book.
+- Add a native “Book” section to the Tree tab with Load/Choose/Current DB
+  controls, persisted path, and a clear empty-book state. Do not block the UI
+  while a large book is mapped or indexed.
+- Add fixture tests for every format and a legal-move/score sanity check at the
+  start position and at least one transposition.
+
+**Depends on:** `src/book.rs`. **Unblocks:** book-based preparation and
+position-index book marking.
+
+## 12. Preparation mode refinements
+
+**Status:** implemented. Preparation starts with the board oriented to the
+prepared player's side, with the name-priority list taking precedence. The
+left-hand game list filters to the prepared player's relevant color, the
+right-hand recent-games panel follows the current position and persists a
+1–50 limit, and ChessABC's latest games can be loaded on demand. Recent-game
+rows remain read-only previews and preserve the preparation node, tab, and
+orientation.
+
+- **Board orientation:** when preparation starts, flip the board to the side the
+  prepared player will play (or the user’s side, per the explicit setting). Do
+  not inherit the previous game’s orientation.
+- **Player-name priority list:** add a SCID-like ordered list of player names in
+  settings. When a prepared player matches an entry, always orient the board to
+  that player’s side; earlier entries win ties. Persist the list with
+  preparation settings and show the resolved orientation in the prep header.
+- **Left-hand game list:** while preparing as Black, show only the prepared
+  player’s White games in the player’s game list. While preparing as White,
+  show only their Black games. Outside preparation mode, keep both colors.
+- **Current-position recent games:** make the right-hand “Recent games” list
+  reliably show games that reached the current position. Record the position
+  after every move as well as before it, handle transpositions/repetitions, and
+  add a regression test using a real `PlayerBook`.
+- **Configurable maximum:** persist the maximum number of recent games (default
+  10, range 1–50) in display settings and apply it to both the list and the
+  “showing x of y” label. The list must be newest-first and filter to the
+  prepared player’s color.
+- Keep recent-game rows read-only and preserve the preparation node, tab, and
+  board orientation when the preview closes.
+
+**Depends on:** `PlayerBook` and preparation settings.
+
+## 13. Cloud analysis depth and ChessABC
+
+**Status:** Lichess depth/full-line display, ChessABC import/reference search,
+and the ChessABC preparation list are implemented.
+
+- **Lichess depth:** show the Lichess cloud-evaluation depth as part of the
+  analysis itself, not only as a separate caption. Include it in the Cloud
+  Engine header/rows and in the Lichess variation block so a line is never
+  presented as an unqualified evaluation. Keep chessdb and Lichess scores
+  visibly distinct.
+- **Full Lichess line:** display the complete principal variation in Engine →
+  Cloud Analysis → Lichess Line, with hover previews and click-to-play for each
+  prefix. Do not truncate to six plies.
+- **ChessABC API (investigated):** ChessABC exposes a public JSON API at
+  `https://api.chessabc.com`. Relevant endpoints found in the web client:
+  - `GET /players/search?name=...` — player search, returns FIDE id, name,
+    country, title, rating, and slug.
+  - `GET /games/player/paginated?fideId=...&page=N&size=M` — a player’s games.
+  - `GET /games/paginated?page=N&size=M` — recent games across the database.
+  - `GET /games/{id}` — one game, including PGN-like `moves`.
+  Responses include event, site, round, players, titles, FIDE ids, Elo, result,
+  ECO, date, and a SAN move string. The corpus is very current (sample response
+  dated October 2026). There is no authentication requirement for these reads.
+- **ChessABC import/reference (done):** `OnlineSource::ChessAbc` searches by
+  player name (comma-normalized for the API) or FIDE id, picks an exact name
+  match or the highest-rated candidate, pages through the latest games, and
+  converts them to PGN with Elo, title, FIDE-id, ECO, date, and FEN tags.
+- **ChessABC preparation (done):** Prep Mode can load the prepared player’s
+  latest ChessABC games on demand, filters them to the side being prepared,
+  respects the recent-game limit, and opens them as read-only previews.
+- Keep Lichess and Chess.com behavior unchanged. Do not scrape the web client
+  when the JSON API is available.
+
+**Depends on:** `src/online.rs` and `src/cloud.rs`.
+
+## 14. Moves-panel interaction polish
+
+**Status:** implemented and covered by tests.
+
+- **PGN tag visibility:** absent and empty fields are hidden by default. The
+  **Show empty** toggle reveals Event, Site, Date, Round, Board, White,
+  WhiteElo, WhiteTeam, Black, BlackElo, BlackTeam, Result, ECO, and Opening.
+  Empty placeholders (`""`, `"?"`, and `"????.??.??"`) count as absent.
+- **Board field:** Board is hidden when the Round tag has no board part. It
+  appears after **+ Add tag → Board**, stays visible while empty, and is
+  written into the Round tag as `round.board`; a separate Board header is
+  folded back into Round on save.
+- **Branch chooser:** `→` at a position with more than one continuation opens
+  a popup instead of silently following the mainline. The mainline is selected
+  first and variations follow by most recent use in the session. `↑`/`↓`
+  choose, `Enter`/`→` play, `1`–`9` pick directly, and `Esc`/`←` cancel. The
+  chooser also works inside variations.
+- **Numbered analysis lines:** engine, Lichess, and cloud variations show real
+  move numbers such as `25... e5 26. Nf3 Nc6` and are labelled **Engine PV**,
+  **Lichess PV**, or **Lichess line**, so line numbering cannot be mistaken for
+  a chess move number.
+- **Move-hover setting:** **Settings → Preview moves on hover** controls only
+  the open game's move list and is off by default. Tree, engine, reference, and
+  read-only preview hovers remain enabled.
+
+**Depends on:** `src/app.rs`, `src/pgn.rs`, and `src/settings.rs`.
+
+## 15. Native player titles
+
+**Status:** planned.
+
+- Decode the PGN `WhiteTitle`/`BlackTitle` tags and classic CBH/SCID title
+  fields natively, including FIDE titles (GM, IM, FM, CM, WGM, WIM, WFM, WCM)
+  and common historical or correspondence abbreviations.
+- Show the title as a compact badge immediately before the player name in the
+  board strips, game list, player directory, preparation header, and exported
+  display contexts, using the same visual hierarchy as chess.com.
+- Keep the raw title tag intact when editing and exporting; display decoding
+  must not rewrite the stored value.
+- Fall back to no badge when the title is absent, empty, or unknown, and do not
+  infer a title from an Elo rating.
+- Cover PGN, SCID, and classic CBH sources with unit tests, including women's
+  titles and abbreviated/unusual spellings.
+
+**Depends on:** `src/domain.rs`, `src/cbh/`, `src/scid.rs`, and the shared
+player-name rendering helpers. **Unblocks:** consistent titled-player display
+across preparation and game browsing.
+
+## 16. FIDE ID presentation
+
+**Status:** planned.
+
+- Find a pretty, compact way to show a player's FIDE ID beside their name when
+  the database or import provides a `WhiteFideId`/`BlackFideId` tag.
+- Keep the ID secondary to the name and title: prefer a small muted suffix or
+  hover/expanded detail rather than a second full-width column in the game
+  list and board strips.
+- Use the same presentation in preparation, ChessABC game lists, imported-game
+  previews, and database views. Preserve the raw tag when editing/exporting.
+- Do not fabricate an ID when the source only supplies a name; FIDE IDs must
+  come from a real tag or resolved ChessABC/FIDE lookup.
+
+**Depends on:** `src/domain.rs`, `src/online.rs`, and the shared player-name
+rendering helpers. **Related:** item 15 (native player titles).

@@ -37,6 +37,7 @@ pub fn write_game(mut writer: impl Write, game: &Game) -> io::Result<()> {
 
 fn write_headers(out: &mut String, game: &Game) {
     let mut headers = game.headers.clone();
+    normalize_round_board(&mut headers);
     let has = |headers: &[(String, String)], name: &str| {
         headers
             .iter()
@@ -67,6 +68,41 @@ fn write_headers(out: &mut String, game: &Game) {
         out.push_str(" \"");
         out.push_str(&escape_tag_value(&value));
         out.push_str("\"]\n");
+    }
+}
+
+/// ChessBase and other PGN writers encode the board as `round.board` inside
+/// the Round tag. If an imported or manually added `Board` tag is present,
+/// fold it into Round and drop the separate header.
+fn normalize_round_board(headers: &mut Vec<(String, String)>) {
+    let Some(board_index) = headers
+        .iter()
+        .position(|(name, _)| name.eq_ignore_ascii_case("Board"))
+    else {
+        return;
+    };
+    let (_, board) = headers.remove(board_index);
+    let board = board.trim();
+    if board.is_empty() {
+        return;
+    }
+    if let Some((_, round)) = headers
+        .iter_mut()
+        .find(|(name, _)| name.eq_ignore_ascii_case("Round"))
+    {
+        let base = round
+            .split_once('.')
+            .map(|(round, _)| round)
+            .unwrap_or(round)
+            .trim()
+            .to_string();
+        *round = if base.is_empty() {
+            format!("?.{board}")
+        } else {
+            format!("{base}.{board}")
+        };
+    } else {
+        headers.push(("Round".to_string(), format!("?.{board}")));
     }
 }
 
@@ -314,6 +350,21 @@ mod tests {
             assert_eq!(before.nags, after.nags);
             assert_eq!(before.children.len(), after.children.len());
         }
+    }
+
+    #[test]
+    fn writes_a_board_tag_as_round_dot_board() {
+        let game = parse_one(
+            "[Event \"Board\"]\n[Site \"?\"]\n[Date \"2026.10.25\"]\n[Round \"3\"]\n[Board \"4\"]\n[White \"White\"]\n[Black \"Black\"]\n[Result \"*\"]\n\n*\n",
+        );
+        let text = game_to_pgn(&game);
+        assert!(text.contains("[Round \"3.4\"]"));
+        assert!(!text.contains("[Board "));
+
+        let mut game = game;
+        game.set_header("Round", "?".to_string());
+        let text = game_to_pgn(&game);
+        assert!(text.contains("[Round \"?.4\"]"));
     }
 
     #[test]

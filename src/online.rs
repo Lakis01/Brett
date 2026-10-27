@@ -1,9 +1,11 @@
-//! Public Lichess and Chess.com game imports.
+//! Public Lichess, Chess.com, and ChessABC game imports.
 //!
-//! Both sites expose unauthenticated public APIs. Games are downloaded in the
-//! background by the UI and written to Brett's cache, never next to a source
+//! All three sites expose unauthenticated public APIs. Games are downloaded in
+//! the background by the UI and written to Brett's cache, never next to a source
 //! database. Chess.com has no bulk PGN endpoint, so recent monthly archives are
 //! concatenated; Lichess exposes the whole requested export in one request.
+//! ChessABC is searched by player name or FIDE id and paged through its public
+//! JSON game API.
 
 use std::fs;
 use std::io::Read;
@@ -24,6 +26,7 @@ pub enum OnlineSource {
     #[default]
     Lichess,
     ChessCom,
+    ChessAbc,
 }
 
 impl OnlineSource {
@@ -31,6 +34,7 @@ impl OnlineSource {
         match self {
             Self::Lichess => "Lichess",
             Self::ChessCom => "Chess.com",
+            Self::ChessAbc => "ChessABC",
         }
     }
 
@@ -38,6 +42,15 @@ impl OnlineSource {
         match self {
             Self::Lichess => "lichess",
             Self::ChessCom => "chesscom",
+            Self::ChessAbc => "chessabc",
+        }
+    }
+
+    /// ChessABC accepts a player name or FIDE id rather than an account name.
+    pub fn input_hint(self) -> &'static str {
+        match self {
+            Self::ChessAbc => "player name or FIDE id",
+            _ => "username",
         }
     }
 }
@@ -59,7 +72,7 @@ pub fn import(
     max_games: usize,
     mut progress: impl FnMut(String),
 ) -> Result<ImportResult> {
-    let username = validate_username(username)?;
+    let username = validate_query(source, username)?;
     let max_games = max_games.clamp(1, 5000);
     let agent = ureq::AgentBuilder::new()
         .user_agent(USER_AGENT)
@@ -67,57 +80,7 @@ pub fn import(
         .timeout(Duration::from_secs(180))
         .build();
 
-    let (body, games) = match source {
-        OnlineSource::Lichess => {
-            progress(format!("Downloading {username}'s Lichess games…"));
-            let url = format!(
-                "https://lichess.org/api/games/user/{username}?max={max_games}&clocks=false&evals=false&opening=false&tags=true&sort=dateDesc"
-            );
-            let body = get_text(&agent, &url, Some("application/x-chess-pgn"))?;
-            if body.trim().is_empty() {
-                bail!("Lichess returned no games for {username}");
-            }
-            (body, None)
-        }
-        OnlineSource::ChessCom => {
-            progress(format!("Finding {username}'s Chess.com archives…"));
-            let archives_url =
-                format!("https://api.chess.com/pub/player/{username}/games/archives");
-            let archives_body = get_text(&agent, &archives_url, Some("application/json"))?;
-            let archives: Value = serde_json::from_str(&archives_body)
-                .context("Chess.com returned invalid archive metadata")?;
-            let urls = archive_urls(&archives)?;
-            if urls.is_empty() {
-                bail!("Chess.com returned no game archives for {username}");
-            }
-
-            let mut pgns = Vec::new();
-            for (number, archive_url) in urls.iter().rev().take(MAX_ARCHIVES).enumerate() {
-                progress(format!(
-                    "Downloading Chess.com archive {} · {} games so far…",
-                    number + 1,
-                    pgns.len()
-                ));
-                let body = get_text(&agent, archive_url, Some("application/json"))?;
-                let archive: Value = serde_json::from_str(&body).with_context(|| {
-                    format!("Chess.com archive {archive_url} was not valid JSON")
-                })?;
-                pgns.extend(chesscom_pgns(&archive, max_games - pgns.len()));
-                if pgns.len() >= max_games {
-                    break;
-                }
-                // Be polite to Chess.com's public API.
-                std::thread::sleep(Duration::from_millis(120));
-            }
-            if pgns.is_empty() {
-                bail!("Chess.com returned no standard games for {username}");
-            }
-            let count = pgns.len();
-            let mut body = pgns.join("\n\n");
-            body.push('\n');
-            (body, Some(count))
-        }
-    };
+    let (body, games) = download_player_pgn(&agent, source, username, max_games, &mut progress)?;
 
     // A cheap sanity check catches HTML error pages and truncated exports
     // before they become a "database" in the UI.
@@ -140,6 +103,198 @@ pub fn import(
         games: games.or(Some(parsed.len())),
         path,
     })
+}
+
+/// Download one public Lichess game by its 8-character game id. This is used
+/// by the opening-explorer top-games list so a click can load the game onto
+/// the board instead of opening a browser tab.
+pub fn fetch_lichess_game(id: &str) -> Result<domain::Game> {
+    let id = id.trim();
+    if id.is_empty() || id.len() > 16 || !id.chars().all(|c| c.is_ascii_alphanumeric()) {
+        bail!("invalid Lichess game id");
+    }
+    let agent = ureq::AgentBuilder::new()
+        .user_agent(USER_AGENT)
+        .timeout_connect(Duration::from_secs(15))
+        .timeout(Duration::from_secs(60))
+        .build();
+    let url =
+        format!("https://lichess.org/game/export/{id}?clocks=false&evals=false&opening=false");
+    let body = get_text(&agent, &url, Some("application/x-chess-pgn"))?;
+    let mut games = domain::parse_pgn(body.as_bytes()).context("parsing the Lichess game")?;
+    if games.is_empty() {
+        bail!("Lichess returned an empty game");
+    }
+    Ok(games.remove(0))
+}
+
+/// Download a player's recent public games without writing them to disk.
+pub fn fetch_player_games(
+    source: OnlineSource,
+    username: &str,
+    max_games: usize,
+) -> Result<Vec<domain::Game>> {
+    let username = validate_query(source, username)?;
+    let max_games = max_games.clamp(1, 5000);
+    let agent = ureq::AgentBuilder::new()
+        .user_agent(USER_AGENT)
+        .timeout_connect(Duration::from_secs(20))
+        .timeout(Duration::from_secs(180))
+        .build();
+    let (body, _) = download_player_pgn(&agent, source, username, max_games, &mut |_message| {})?;
+    let games = domain::parse_pgn(body.as_bytes()).context("parsing downloaded games")?;
+    if games.is_empty() {
+        bail!(
+            "{} returned no parseable games for {username}",
+            source.label()
+        );
+    }
+    Ok(games)
+}
+
+/// Resolve a ChessABC player and download their latest games. The resolved
+/// FIDE id is returned with the games so preparation can filter by identity
+/// instead of relying on abbreviated names such as `Hinterreiter,M`.
+pub fn fetch_chessabc_player_games(
+    query: &str,
+    max_games: usize,
+) -> Result<(ChessAbcPlayer, Vec<domain::Game>)> {
+    let query = validate_query(OnlineSource::ChessAbc, query)?;
+    let max_games = max_games.clamp(1, 5000);
+    let agent = ureq::AgentBuilder::new()
+        .user_agent(USER_AGENT)
+        .timeout_connect(Duration::from_secs(20))
+        .timeout(Duration::from_secs(180))
+        .build();
+    let player = resolve_chessabc_player(&agent, query)?;
+    let (body, _) =
+        download_chessabc_games(&agent, &player.fide_id, max_games, &mut |_message| {})?;
+    let games = domain::parse_pgn(body.as_bytes()).context("parsing downloaded games")?;
+    if games.is_empty() {
+        bail!("ChessABC returned no parseable games for {}", player.name);
+    }
+    Ok((player, games))
+}
+
+/// Download the newest games across the whole ChessABC database. This is the
+/// sample used for recent-popularity trends when no prepared player is loaded.
+pub fn fetch_recent_chessabc_games(max_games: usize) -> Result<Vec<domain::Game>> {
+    const PAGE_SIZE: usize = 100;
+    let max_games = max_games.clamp(1, 5_000);
+    let agent = ureq::AgentBuilder::new()
+        .user_agent(USER_AGENT)
+        .timeout_connect(Duration::from_secs(20))
+        .timeout(Duration::from_secs(180))
+        .build();
+    let mut pgns = Vec::new();
+    let mut page = 0usize;
+    loop {
+        let url = format!("https://api.chessabc.com/games/paginated?page={page}&size={PAGE_SIZE}");
+        let body = get_text(&agent, &url, Some("application/json"))?;
+        let value: Value =
+            serde_json::from_str(&body).context("ChessABC returned invalid game data")?;
+        let content = value
+            .get("content")
+            .and_then(Value::as_array)
+            .context("ChessABC response has no content array")?;
+        if content.is_empty() {
+            break;
+        }
+        for game in content {
+            if let Some(pgn) = chessabc_pgn(game) {
+                pgns.push(pgn);
+                if pgns.len() >= max_games {
+                    break;
+                }
+            }
+        }
+        if pgns.len() >= max_games {
+            break;
+        }
+        let total_pages = value.get("totalPages").and_then(Value::as_u64).unwrap_or(1);
+        if (page as u64) + 1 >= total_pages {
+            break;
+        }
+        page += 1;
+        std::thread::sleep(Duration::from_millis(60));
+    }
+    if pgns.is_empty() {
+        bail!("ChessABC returned no recent standard games");
+    }
+    let mut body = pgns.join("\n\n");
+    body.push('\n');
+    let games = domain::parse_pgn(body.as_bytes()).context("parsing recent ChessABC games")?;
+    if games.is_empty() {
+        bail!("ChessABC returned no parseable recent games");
+    }
+    Ok(games)
+}
+
+fn download_player_pgn(
+    agent: &ureq::Agent,
+    source: OnlineSource,
+    username: &str,
+    max_games: usize,
+    progress: &mut dyn FnMut(String),
+) -> Result<(String, Option<usize>)> {
+    match source {
+        OnlineSource::Lichess => {
+            progress(format!("Downloading {username}'s Lichess games…"));
+            let url = format!(
+                "https://lichess.org/api/games/user/{username}?max={max_games}&clocks=false&evals=false&opening=false&tags=true&sort=dateDesc"
+            );
+            let body = get_text(agent, &url, Some("application/x-chess-pgn"))?;
+            if body.trim().is_empty() {
+                bail!("Lichess returned no games for {username}");
+            }
+            Ok((body, None))
+        }
+        OnlineSource::ChessCom => {
+            progress(format!("Finding {username}'s Chess.com archives…"));
+            let archives_url =
+                format!("https://api.chess.com/pub/player/{username}/games/archives");
+            let archives_body = get_text(agent, &archives_url, Some("application/json"))?;
+            let archives: Value = serde_json::from_str(&archives_body)
+                .context("Chess.com returned invalid archive metadata")?;
+            let urls = archive_urls(&archives)?;
+            if urls.is_empty() {
+                bail!("Chess.com returned no game archives for {username}");
+            }
+
+            let mut pgns = Vec::new();
+            for (number, archive_url) in urls.iter().rev().take(MAX_ARCHIVES).enumerate() {
+                progress(format!(
+                    "Downloading Chess.com archive {} · {} games so far…",
+                    number + 1,
+                    pgns.len()
+                ));
+                let body = get_text(agent, archive_url, Some("application/json"))?;
+                let archive: Value = serde_json::from_str(&body).with_context(|| {
+                    format!("Chess.com archive {archive_url} was not valid JSON")
+                })?;
+                pgns.extend(chesscom_pgns(&archive, max_games - pgns.len()));
+                if pgns.len() >= max_games {
+                    break;
+                }
+                // Be polite to Chess.com's public API.
+                std::thread::sleep(Duration::from_millis(120));
+            }
+            if pgns.is_empty() {
+                bail!("Chess.com returned no standard games for {username}");
+            }
+            let count = pgns.len();
+            let mut body = pgns.join("\n\n");
+            body.push('\n');
+            Ok((body, Some(count)))
+        }
+        OnlineSource::ChessAbc => {
+            let player = resolve_chessabc_player(agent, username)?;
+            progress(format!("Downloading {}'s ChessABC games…", player.name));
+            let (body, count) =
+                download_chessabc_games(agent, &player.fide_id, max_games, progress)?;
+            Ok((body, Some(count)))
+        }
+    }
 }
 
 fn get_text(agent: &ureq::Agent, url: &str, accept: Option<&str>) -> Result<String> {
@@ -200,21 +355,561 @@ fn chesscom_pgns(archive: &Value, remaining: usize) -> Vec<String> {
     pgns
 }
 
-fn validate_username(raw: &str) -> Result<&str> {
-    let username = raw.trim();
-    if username.is_empty() {
-        bail!("enter a username");
+fn validate_query(source: OnlineSource, raw: &str) -> Result<&str> {
+    let query = raw.trim();
+    if query.is_empty() {
+        bail!(
+            "enter {}",
+            if source == OnlineSource::ChessAbc {
+                "a player name or FIDE id"
+            } else {
+                "a username"
+            }
+        );
     }
-    if username.len() > 64 {
-        bail!("username is too long");
+    if query.len() > 128 {
+        bail!("query is too long");
     }
-    if !username
+    if source == OnlineSource::ChessAbc {
+        if !query.chars().all(|c| {
+            c.is_alphanumeric() || c.is_whitespace() || matches!(c, ',' | '.' | '-' | '\'' | '_')
+        }) {
+            bail!(
+                "player names may only contain letters, digits, spaces, commas, dots, apostrophes and hyphens"
+            );
+        }
+    } else if !query
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
     {
         bail!("username may only contain letters, digits, '_' and '-'");
     }
-    Ok(username)
+    Ok(query)
+}
+
+fn encode_query(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            use std::fmt::Write;
+            let _ = write!(encoded, "%{byte:02X}");
+        }
+    }
+    encoded
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChessAbcPlayer {
+    pub fide_id: String,
+    pub name: String,
+    pub rating: u64,
+}
+
+fn resolve_chessabc_player(agent: &ureq::Agent, query: &str) -> Result<ChessAbcPlayer> {
+    if query.chars().all(|c| c.is_ascii_digit()) {
+        return Ok(ChessAbcPlayer {
+            fide_id: query.to_string(),
+            name: query.to_string(),
+            rating: 0,
+        });
+    }
+
+    let mut players = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for variant in chessabc_search_queries(query) {
+        fetch_chessabc_search(agent, &variant, &mut players, &mut seen)?;
+    }
+    // Names that have been transliterated differently by the source often
+    // still share a long surname prefix. Retry with that prefix and the given
+    // name, for example "Nepomniaschi Ian" -> "Nepomni Ian".
+    if !players
+        .iter()
+        .any(|player| name_match_score(query, &player.name).is_some_and(|score| score >= 0.55))
+    {
+        for variant in chessabc_prefix_queries(query) {
+            fetch_chessabc_search(agent, &variant, &mut players, &mut seen)?;
+        }
+    }
+    if players.is_empty() {
+        bail!("ChessABC found no player matching {query}");
+    }
+    Ok(choose_chessabc_player(&players, query).expect("non-empty player list"))
+}
+
+fn fetch_chessabc_search(
+    agent: &ureq::Agent,
+    query: &str,
+    players: &mut Vec<ChessAbcPlayer>,
+    seen: &mut std::collections::HashSet<String>,
+) -> Result<()> {
+    let url = format!(
+        "https://api.chessabc.com/players/search?name={}",
+        encode_query(query)
+    );
+    let body = get_text(agent, &url, Some("application/json"))?;
+    let values: Vec<Value> =
+        serde_json::from_str(&body).context("ChessABC returned invalid player data")?;
+    for value in values {
+        let fide_id = match value.get("id") {
+            Some(Value::Number(number)) => number.to_string(),
+            Some(Value::String(id)) => id.clone(),
+            _ => continue,
+        };
+        let name = value
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_string);
+        let Some(name) = name else {
+            continue;
+        };
+        if seen.insert(fide_id.clone()) {
+            players.push(ChessAbcPlayer {
+                fide_id,
+                name,
+                rating: value.get("rating").and_then(Value::as_u64).unwrap_or(0),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn choose_chessabc_player(players: &[ChessAbcPlayer], query: &str) -> Option<ChessAbcPlayer> {
+    players
+        .iter()
+        .filter_map(|player| name_match_score(query, &player.name).map(|score| (score, player)))
+        .max_by(|(a_score, a), (b_score, b)| {
+            a_score
+                .total_cmp(b_score)
+                .then(a.rating.cmp(&b.rating))
+                .then(b.fide_id.cmp(&a.fide_id))
+        })
+        .map(|(_, player)| player.clone())
+        .or_else(|| players.iter().max_by_key(|player| player.rating).cloned())
+}
+
+/// Query spellings that cope with ChessABC's exact substring search. The API
+/// treats a comma as an empty query and does not find hyphens, so punctuation
+/// is removed first. Accent folding, German umlaut expansion, and a small
+/// phonetic transliteration pass cover common name variants.
+fn chessabc_search_queries(query: &str) -> Vec<String> {
+    let base = clean_search_name(query);
+    if base.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    push_unique(&mut out, base.clone());
+    push_unique(&mut out, deunicode::deunicode(&base));
+    push_unique(&mut out, deunicode::deunicode(&expand_german(&base)));
+    push_unique(&mut out, phonetic_query(&base));
+    out
+}
+
+fn chessabc_prefix_queries(query: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for variant in chessabc_search_queries(query).into_iter().take(3) {
+        let tokens: Vec<&str> = variant.split_whitespace().collect();
+        if tokens.len() < 2 {
+            continue;
+        }
+        let Some((longest, token)) = tokens
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, token)| token.chars().count())
+        else {
+            continue;
+        };
+        if token.chars().count() <= 5 {
+            continue;
+        }
+        let prefix: String = token.chars().take(6).collect();
+        let mut parts: Vec<String> = tokens.iter().map(|token| (*token).to_string()).collect();
+        parts[longest] = prefix;
+        push_unique(&mut out, parts.join(" "));
+    }
+    out
+}
+
+fn clean_search_name(query: &str) -> String {
+    let mut cleaned = String::with_capacity(query.len());
+    for ch in query.chars() {
+        if ch.is_alphanumeric() {
+            cleaned.push(ch);
+        } else if ch.is_whitespace() || matches!(ch, ',' | '.' | '-' | '\'' | '_' | '/') {
+            cleaned.push(' ');
+        }
+    }
+    cleaned.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn expand_german(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            'ä' | 'Ä' => out.push_str("ae"),
+            'ö' | 'Ö' => out.push_str("oe"),
+            'ü' | 'Ü' => out.push_str("ue"),
+            'ß' | 'ẞ' => out.push_str("ss"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+fn phonetic_query(value: &str) -> String {
+    value
+        .split_whitespace()
+        .map(phonetic_token)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn phonetic_token(token: &str) -> String {
+    let mut text = token.to_ascii_lowercase();
+    for (from, to) in [
+        ("sch", "s"),
+        ("sh", "s"),
+        ("ph", "f"),
+        ("ck", "k"),
+        ("ch", "k"),
+        ("kh", "k"),
+        ("gh", "g"),
+        ("th", "t"),
+        ("zh", "j"),
+        ("tz", "c"),
+        ("ts", "c"),
+        ("x", "ks"),
+    ] {
+        text = text.replace(from, to);
+    }
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        let mapped = match ch {
+            'w' => 'v',
+            'j' => 'i',
+            'y' => 'i',
+            'z' => 's',
+            'q' => 'k',
+            'c' => 'k',
+            'v' => 'f',
+            _ => ch,
+        };
+        if !out.ends_with(mapped) {
+            out.push(mapped);
+        }
+    }
+    out
+}
+
+fn push_unique(values: &mut Vec<String>, value: String) {
+    let value = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if !value.is_empty() && !values.iter().any(|existing| existing == &value) {
+        values.push(value);
+    }
+}
+
+fn normalized_name_tokens(name: &str) -> Vec<String> {
+    deunicode::deunicode(name)
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect()
+}
+
+fn name_match_score(query: &str, candidate: &str) -> Option<f64> {
+    let query_tokens = normalized_name_tokens(query);
+    let candidate_tokens = normalized_name_tokens(candidate);
+    if query_tokens.is_empty() || candidate_tokens.is_empty() {
+        return None;
+    }
+    // A single surname is ambiguous by design; score every candidate that
+    // contains it equally and let rating break the tie. This preserves the
+    // useful "search by surname" behavior without letting a long extra given
+    // name bury the well-known player.
+    if query_tokens.len() == 1 {
+        return candidate_tokens
+            .iter()
+            .any(|token| token_match(&query_tokens[0], token).is_some())
+            .then_some(1.0);
+    }
+    if candidate_tokens.len() == 1 {
+        return query_tokens
+            .iter()
+            .any(|token| token_match(token, &candidate_tokens[0]).is_some())
+            .then_some(1.0);
+    }
+    let (score, matched) = best_token_match(&query_tokens, &candidate_tokens)?;
+    if matched < query_tokens.len().min(candidate_tokens.len()) {
+        return None;
+    }
+    Some(score)
+}
+
+fn best_token_match(query: &[String], candidate: &[String]) -> Option<(f64, usize)> {
+    let mut pairs = Vec::new();
+    for (query_index, query_token) in query.iter().enumerate() {
+        for (candidate_index, candidate_token) in candidate.iter().enumerate() {
+            if let Some(score) = token_match(query_token, candidate_token) {
+                pairs.push((score, query_index, candidate_index));
+            }
+        }
+    }
+    pairs.sort_by(|a, b| b.0.total_cmp(&a.0));
+    let mut used_query = vec![false; query.len()];
+    let mut used_candidate = vec![false; candidate.len()];
+    let mut sum = 0.0;
+    let mut matched = 0usize;
+    for (score, query_index, candidate_index) in pairs {
+        if used_query[query_index] || used_candidate[candidate_index] {
+            continue;
+        }
+        used_query[query_index] = true;
+        used_candidate[candidate_index] = true;
+        sum += score;
+        matched += 1;
+    }
+    if matched == 0 {
+        None
+    } else {
+        Some((sum / query.len().max(candidate.len()) as f64, matched))
+    }
+}
+
+fn token_match(left: &str, right: &str) -> Option<f64> {
+    if left == right {
+        return Some(1.0);
+    }
+    if (left.chars().count() == 1 && right.starts_with(left))
+        || (right.chars().count() == 1 && left.starts_with(right))
+    {
+        return Some(0.9);
+    }
+    if phonetic_token(left) == phonetic_token(right) {
+        return Some(0.8);
+    }
+    if name_alias(left, right) {
+        return Some(0.78);
+    }
+    let distance = levenshtein(left, right);
+    let longest = left.chars().count().max(right.chars().count());
+    if longest >= 8 && distance <= 3 {
+        Some(0.55)
+    } else if longest >= 6 && distance <= 2 {
+        Some(0.6)
+    } else if longest >= 4 && distance <= 1 {
+        Some(0.75)
+    } else {
+        None
+    }
+}
+
+/// Common given-name transliterations/anglizations. These are deliberately
+/// conservative and only supplement the surname match.
+fn name_alias(left: &str, right: &str) -> bool {
+    const ALIASES: &[(&str, &str)] = &[
+        ("alexei", "alexey"),
+        ("alexei", "alexi"),
+        ("alexey", "alexi"),
+        ("andrei", "andrey"),
+        ("dmitri", "dmitry"),
+        ("evgeni", "evgeny"),
+        ("evgeni", "eugene"),
+        ("fyodor", "theodore"),
+        ("mikhail", "michael"),
+        ("nikolai", "nicholas"),
+        ("pyotr", "peter"),
+        ("petr", "peter"),
+        ("sergei", "sergey"),
+        ("yakov", "jacob"),
+        ("yuri", "juri"),
+        ("yuri", "jurij"),
+    ];
+    ALIASES
+        .iter()
+        .any(|&(a, b)| (left == a && right == b) || (left == b && right == a))
+}
+
+fn levenshtein(left: &str, right: &str) -> usize {
+    let left: Vec<char> = left.chars().collect();
+    let right: Vec<char> = right.chars().collect();
+    if left.is_empty() {
+        return right.len();
+    }
+    if right.is_empty() {
+        return left.len();
+    }
+    let mut previous: Vec<usize> = (0..=right.len()).collect();
+    let mut current = vec![0usize; right.len() + 1];
+    for (i, left_char) in left.iter().enumerate() {
+        current[0] = i + 1;
+        for (j, right_char) in right.iter().enumerate() {
+            let substitution = previous[j] + usize::from(left_char != right_char);
+            current[j + 1] = (previous[j + 1] + 1).min(current[j] + 1).min(substitution);
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    previous[right.len()]
+}
+
+fn download_chessabc_games(
+    agent: &ureq::Agent,
+    fide_id: &str,
+    max_games: usize,
+    progress: &mut dyn FnMut(String),
+) -> Result<(String, usize)> {
+    const PAGE_SIZE: usize = 100;
+    let mut page = 0usize;
+    let mut pgns = Vec::new();
+    loop {
+        progress(format!(
+            "Downloading ChessABC page {} · {} games so far…",
+            page + 1,
+            pgns.len()
+        ));
+        let url = format!(
+            "https://api.chessabc.com/games/player/paginated?fideId={fide_id}&page={page}&size={PAGE_SIZE}"
+        );
+        let body = get_text(agent, &url, Some("application/json"))?;
+        let value: Value =
+            serde_json::from_str(&body).context("ChessABC returned invalid game data")?;
+        let content = value
+            .get("content")
+            .and_then(Value::as_array)
+            .context("ChessABC response has no content array")?;
+        if content.is_empty() {
+            break;
+        }
+        for game in content {
+            if let Some(pgn) = chessabc_pgn(game) {
+                pgns.push(pgn);
+                if pgns.len() >= max_games {
+                    break;
+                }
+            }
+        }
+        if pgns.len() >= max_games {
+            break;
+        }
+        let total_pages = value.get("totalPages").and_then(Value::as_u64).unwrap_or(1);
+        if (page as u64) + 1 >= total_pages {
+            break;
+        }
+        page += 1;
+        std::thread::sleep(Duration::from_millis(80));
+    }
+    if pgns.is_empty() {
+        bail!("ChessABC returned no standard games for FIDE id {fide_id}");
+    }
+    let count = pgns.len();
+    let mut body = pgns.join("\n\n");
+    body.push('\n');
+    Ok((body, count))
+}
+
+fn chessabc_pgn(game: &Value) -> Option<String> {
+    let moves = game.get("moves")?.as_str()?.trim();
+    if moves.is_empty() {
+        return None;
+    }
+    let result = match game.get("result").and_then(Value::as_str).unwrap_or("") {
+        "WHITE_WINS" => "1-0",
+        "BLACK_WINS" => "0-1",
+        "DRAW" => "1/2-1/2",
+        _ => "*",
+    };
+    let date = game
+        .get("gameDate")
+        .and_then(Value::as_str)
+        .map(short_pgn_date)
+        .unwrap_or_else(|| "????.??.??".to_string());
+    let mut headers = vec![
+        ("Event", text_field(game, "event", "?")),
+        ("Site", text_field(game, "site", "?")),
+        ("Date", date),
+        ("Round", text_field(game, "round", "?")),
+        ("White", text_field(game, "whitePlayer", "?")),
+        ("Black", text_field(game, "blackPlayer", "?")),
+        ("Result", result.to_string()),
+    ];
+    for (tag, field) in [
+        ("WhiteElo", "whiteElo"),
+        ("BlackElo", "blackElo"),
+        ("WhiteTitle", "whiteTitle"),
+        ("BlackTitle", "blackTitle"),
+        ("WhiteFideId", "whiteFideId"),
+        ("BlackFideId", "blackFideId"),
+        ("ECO", "eco"),
+    ] {
+        if let Some(value) = game.get(field) {
+            let text = match value {
+                Value::String(text) => text.trim().to_string(),
+                Value::Number(number) => number.to_string(),
+                _ => continue,
+            };
+            if !text.is_empty() {
+                headers.push((tag, text));
+            }
+        }
+    }
+    if let Some(fen) = game.get("fen").and_then(Value::as_str).map(str::trim)
+        && !fen.is_empty()
+    {
+        headers.push(("SetUp", "1".to_string()));
+        headers.push(("FEN", fen.to_string()));
+    }
+
+    let mut pgn = String::new();
+    for (tag, value) in headers {
+        pgn.push('[');
+        pgn.push_str(tag);
+        pgn.push_str(" \"");
+        pgn.push_str(&escape_tag(&value));
+        pgn.push_str("\"]\n");
+    }
+    pgn.push('\n');
+    pgn.push_str(moves);
+    if !moves
+        .split_whitespace()
+        .last()
+        .is_some_and(|token| token == result)
+    {
+        pgn.push(' ');
+        pgn.push_str(result);
+    }
+    pgn.push('\n');
+    Some(pgn)
+}
+
+fn text_field(game: &Value, key: &str, fallback: &str) -> String {
+    game.get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .unwrap_or(fallback)
+        .to_string()
+}
+
+fn short_pgn_date(raw: &str) -> String {
+    let date = raw.get(..10).unwrap_or(raw);
+    if date.len() == 10
+        && date.as_bytes()[4] == b'-'
+        && date.as_bytes()[7] == b'-'
+        && date
+            .bytes()
+            .enumerate()
+            .all(|(index, byte)| index == 4 || index == 7 || byte.is_ascii_digit())
+    {
+        date.replace('-', ".")
+    } else {
+        "????.??.??".to_string()
+    }
+}
+
+fn escape_tag(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 fn output_path(source: OnlineSource, username: &str) -> PathBuf {
@@ -246,12 +941,82 @@ mod tests {
     #[test]
     fn usernames_are_restricted_to_safe_url_characters() {
         assert_eq!(
-            validate_username(" DrNykterstein ").unwrap(),
+            validate_query(OnlineSource::Lichess, " DrNykterstein ").unwrap(),
             "DrNykterstein"
         );
-        assert!(validate_username("Magnus Carlsen").is_err());
-        assert!(validate_username("name/../other").is_err());
-        assert!(validate_username("").is_err());
+        assert!(validate_query(OnlineSource::Lichess, "Magnus Carlsen").is_err());
+        assert!(validate_query(OnlineSource::ChessCom, "name/../other").is_err());
+        assert!(validate_query(OnlineSource::Lichess, "").is_err());
+        assert_eq!(
+            validate_query(OnlineSource::ChessAbc, " Carlsen, Magnus ").unwrap(),
+            "Carlsen, Magnus"
+        );
+        assert!(validate_query(OnlineSource::ChessAbc, "name/../other").is_err());
+    }
+
+    #[test]
+    fn chessabc_player_search_prefers_an_exact_name_then_rating() {
+        let players = vec![
+            ChessAbcPlayer {
+                fide_id: "1".to_string(),
+                name: "Carlsen, Magnus".to_string(),
+                rating: 2823,
+            },
+            ChessAbcPlayer {
+                fide_id: "2".to_string(),
+                name: "Carlsen, Magnus Junior".to_string(),
+                rating: 2900,
+            },
+            ChessAbcPlayer {
+                fide_id: "3".to_string(),
+                name: "Carlsen, Christian".to_string(),
+                rating: 1626,
+            },
+        ];
+        assert_eq!(
+            choose_chessabc_player(&players, "Magnus Carlsen")
+                .unwrap()
+                .fide_id,
+            "1"
+        );
+        assert_eq!(
+            choose_chessabc_player(&players, "Carlsen").unwrap().fide_id,
+            "2"
+        );
+    }
+
+    #[test]
+    fn chessabc_games_are_converted_to_valid_pgn() {
+        let game: Value = serde_json::from_str(
+            r#"{
+                "event":"Test Open",
+                "site":"chess.com INT",
+                "round":"3",
+                "whitePlayer":"Carlsen,M",
+                "blackPlayer":"Nakamura,H",
+                "whiteTitle":"GM",
+                "blackTitle":"GM",
+                "whiteFideId":1503014,
+                "blackFideId":2016192,
+                "whiteElo":2823,
+                "blackElo":2802,
+                "result":"WHITE_WINS",
+                "eco":"A01",
+                "moves":"1. b3 d5 2. Bb2 c6 1-0",
+                "fen":null,
+                "gameDate":"2026-09-24T00:00:00"
+            }"#,
+        )
+        .unwrap();
+        let pgn = chessabc_pgn(&game).unwrap();
+        assert!(pgn.contains("[White \"Carlsen,M\"]"));
+        assert!(pgn.contains("[WhiteFideId \"1503014\"]"));
+        assert!(pgn.contains("[Date \"2026.09.24\"]"));
+        assert!(pgn.contains("[Result \"1-0\"]"));
+        let parsed = domain::parse_pgn(pgn.as_bytes()).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].result(), "1-0");
+        assert_eq!(parsed[0].mainline_len(), 4);
     }
 
     #[test]

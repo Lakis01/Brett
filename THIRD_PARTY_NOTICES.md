@@ -104,3 +104,23 @@ Brett depends on third-party Rust crates (including `eframe`, `egui`,
 `shakmaty`, `pgn-reader`, `image`, `memmap2`, `serde_json`, and `ureq`). Their
 licences are listed in the crate metadata and in `Cargo.lock`; redistributed
 binaries should include the licence texts required by those crates.
+
+### GPL-licensed chess and PGN crates
+
+Two direct dependencies are **GPL-3.0-or-later**, not permissive:
+
+- **shakmaty** 0.30 — chess rules, move generation, FEN, and SAN.
+  <https://github.com/niklasf/shakmaty>
+- **pgn-reader** 0.29 — streaming PGN tokenizer.
+  <https://github.com/niklasf/shakmaty>
+
+Brett's original application code remains MIT-licensed (see `LICENSE`), but a
+binary built from this repository links these crates and is therefore a
+combined work under **GPL-3.0-or-later**. If you redistribute a Brett binary,
+comply with the GPL: include the corresponding source and the GPL licence text.
+The source repository itself is distributed under the licences of its parts.
+
+This is a known licensing limitation, not an intentional choice to ship a
+permissive binary. Replacing these two crates with permissively licensed
+implementations is tracked in `docs/BACKLOG.md`; until then, do not describe a
+built Brett binary as MIT-only.
