@@ -435,7 +435,9 @@ and the ChessABC preparation list are implemented.
 
 ## 15. Native player titles
 
-**Status:** planned.
+**Status:** PGN `WhiteTitle`/`BlackTitle` badges are implemented in the board
+strips and the Moves header. CBH/SCID title-field decoding and the wider
+surfaces below remain.
 
 - Decode the PGN `WhiteTitle`/`BlackTitle` tags and classic CBH/SCID title
   fields natively, including FIDE titles (GM, IM, FM, CM, WGM, WIM, WFM, WCM)
@@ -470,3 +472,23 @@ across preparation and game browsing.
 
 **Depends on:** `src/domain.rs`, `src/online.rs`, and the shared player-name
 rendering helpers. **Related:** item 15 (native player titles).
+
+## 17. Permissive chess and PGN stack
+
+**Status:** open; licensing limitation documented.
+
+Brett currently links `shakmaty` (chess rules, SAN, FEN) and `pgn-reader`
+(streaming PGN) under GPL-3.0-or-later. The original Brett code is MIT, but a
+built binary is a combined GPL work. See `THIRD_PARTY_NOTICES.md`.
+
+- Replace both crates with permissively licensed implementations, or make a
+  deliberate project-wide GPL-3.0-or-later decision and update `LICENSE`,
+  `Cargo.toml`, and the README.
+- Preserve legal-move correctness, SAN/FEN round-tripping, Chess960/custom
+  starts, streaming PGN performance, and the existing large-database guards.
+- Keep the replacement behind the current domain types so the UI and database
+  readers do not depend on a particular chess crate.
+- Add regression tests against the public fixtures and the SCID/CBH readers.
+
+**Depends on:** `src/domain.rs`, `src/pgn.rs`, `src/position.rs`, and
+`src/library.rs`.
