@@ -288,15 +288,18 @@ more. The native SCID and classic CBH writers remain.
 ## 10. Correspondence database refresh
 
 **Status:** source available and integrated. The current ICCF SCID database is
-in `~/Downloads/Brett Resources/Correspondence Database/Correspondence_2350.si4`;
-the automatic Engine-tab correspondence reference is implemented, and the file
-decodes with zero errors. No source-access blocker remains. See
+redistributed in `databases/iccf/Correspondence_2350.si4` (with its `.sn4` and
+`.sg4` companions); the automatic Engine-tab correspondence reference is
+implemented, and the file decodes with zero errors. See
 [CORRESPONDENCE_DATABASE.md](CORRESPONDENCE_DATABASE.md).
 
-- Current source: **99,606 games**, **6,924,478 mainline moves**, dated
-  2015-12-30 through 2026-09-25, all `Site "ICCF"`. Both Elo fields range from
-  **2350 to 2724**; 27 games have no moves. The accompanying note says the
+- Current source: **87,927 games**, **6,187,801 mainline moves**, dated
+  2021-01-01 through 2026-09-25, all `Site "ICCF"`. Both Elo fields range from
+  **2350 to 2724**; every game has both ratings and at least one move. The accompanying note says the
   ICCF January–March 2026 compilation is still missing.
+- The snapshot is optional but encouraged, carries the ICCF non-sale notice,
+  and is refreshed between releases. The three files must always be replaced
+  together.
 - The current filter is inclusive `WhiteElo >= 2350` and `BlackElo >= 2350`;
   there is no evidence of an upper cutoff.
 - The older 2016 sample is 24,865 games (2009-02-15 through 2016-02-08) with an

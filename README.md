@@ -41,13 +41,18 @@ there.
 ## ICCF database notice
 
 Brett can use an optional ICCF correspondence database as a local, read-only
-reference. Brett does not bundle or redistribute that database.
+reference. A compiled snapshot is redistributed in this repository under
+[`databases/iccf/`](databases/iccf/). Downloading or using it is optional, but
+encouraged for correspondence preparation. The snapshot is refreshed between
+releases.
 
 > **The ICCF database is provided for personal use only and may not be sold or
 > re-sold to any third party.**
 
-Obtain the database from ICCF, or compile it from ICCF server games under
-ICCF's terms, and comply with ICCF's terms. See
+This notice applies to the ICCF database, the copy in `databases/iccf/`, and
+any copy or derived data made from it. It does not change the MIT licence of
+Brett's source code. Obtain newer snapshots from ICCF, or compile them from
+ICCF server games under ICCF's terms, and comply with ICCF's terms. See
 [ICCF_NOTICE.md](ICCF_NOTICE.md).
 
 ## What works
@@ -184,10 +189,12 @@ ICCF's terms, and comply with ICCF's terms. See
   read-only preview.
 - A configured local correspondence SCID database is used automatically as an
   Engine-tab reference. Its inclusion and path are set in **Settings →
-  Correspondence database** (not in Refs). The default location is
-  `~/Downloads/Brett Resources/Correspondence Database/Correspondence_2350.si4`;
-  `BRETT_CORRESPONDENCE` overrides it. The first open builds a cached position
-  index in the background, and later opens reuse the memory-mapped cache. See
+  Correspondence database** (not in Refs). The bundled snapshot is
+  `databases/iccf/Correspondence_2350.si4` in a source checkout; a copy at
+  `~/Downloads/Brett Resources/Correspondence Database/Correspondence_2350.si4`
+  is also found, and `BRETT_CORRESPONDENCE` overrides both. The first open
+  builds a cached position index in the background, and later opens reuse the
+  memory-mapped cache. See
   [docs/CORRESPONDENCE_DATABASE.md](docs/CORRESPONDENCE_DATABASE.md).
 - Requests run off the UI thread, are debounced while navigating, and are
   cached in memory per FEN. Hovering a candidate move overlays the resulting
@@ -475,7 +482,8 @@ automatically when they exist; add more with `BRETT_READ_ONLY_ROOTS`.
 
 The Lichess reference token, if configured, lives in `references.json` in the
 config directory, or in `BRETT_LICHESS_TOKEN`. Do not commit either. The ICCF
-database is not redistributed by Brett; see [ICCF_NOTICE.md](ICCF_NOTICE.md).
+database is redistributed under its non-sale notice; see
+[ICCF_NOTICE.md](ICCF_NOTICE.md).
 See [docs/DATA_SAFETY.md](docs/DATA_SAFETY.md) and
 [CONTRIBUTING.md](CONTRIBUTING.md#secrets-and-personal-settings).
 

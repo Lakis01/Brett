@@ -118,9 +118,11 @@ inspect copies in `/tmp/opencode/`, never in place. See
 
 ## ICCF database
 
-Brett does not redistribute the ICCF correspondence database. If you use one,
-read [ICCF_NOTICE.md](ICCF_NOTICE.md). The database is for personal use and may
-not be sold or re-sold to a third party.
+Brett redistributes a compiled ICCF correspondence snapshot under
+[`databases/iccf/`](databases/iccf/). Read [ICCF_NOTICE.md](ICCF_NOTICE.md).
+The database is for personal use and may not be sold or re-sold to a third
+party. Keep the three SCID files together when refreshing or copying the
+snapshot.
 
 ## Pull-request checklist
 

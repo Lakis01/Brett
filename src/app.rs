@@ -11837,13 +11837,21 @@ fn default_reference_path() -> Option<PathBuf> {
 }
 
 /// The correspondence database used automatically in the Engine tab.
-/// `BRETT_CORRESPONDENCE` wins, then the conventional Brett Resources
-/// location. The file remains read-only; only a position-index cache is built.
+/// `BRETT_CORRESPONDENCE` wins, then the snapshot bundled in a source
+/// checkout, then the conventional Brett Resources location. The file remains
+/// read-only; only a position-index cache is built.
 fn default_correspondence_path() -> Option<PathBuf> {
     let env = std::env::var_os("BRETT_CORRESPONDENCE")
         .map(PathBuf::from)
         .filter(|path| !path.as_os_str().is_empty());
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("databases/iccf");
+    let executable = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf));
     let candidates = [
+        Some(PathBuf::from("databases/iccf/Correspondence_2350.si4")),
+        Some(manifest.join("Correspondence_2350.si4")),
+        executable.map(|dir| dir.join("databases/iccf/Correspondence_2350.si4")),
         home_path("Downloads/Brett Resources/Correspondence Database/Correspondence_2350.si4"),
         home_path("Downloads/CBH/Pimped Correspondence Database.cbh"),
     ];

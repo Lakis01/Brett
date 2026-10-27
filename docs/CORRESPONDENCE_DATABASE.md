@@ -9,13 +9,28 @@ writes only derived position indexes under its cache directory.
 > **The ICCF database is provided for personal use only and may not be sold or
 > re-sold to any third party.**
 
-Brett does not bundle or redistribute the ICCF database. Obtain it from ICCF,
-or compile it from ICCF server games under ICCF's terms, and comply with ICCF's
-terms. This notice applies to the database and to any copy or derived data made
-from it; it does not change the MIT licence of Brett's source code. See
-[../ICCF_NOTICE.md](../ICCF_NOTICE.md).
+A compiled snapshot is redistributed in this repository under
+[`../databases/iccf/`](../databases/iccf/). Downloading or using it is optional,
+but encouraged for correspondence preparation. The snapshot is refreshed
+between releases. This notice applies to the database and to any copy or
+derived data made from it; it does not change the MIT licence of Brett's source
+code. See [../ICCF_NOTICE.md](../ICCF_NOTICE.md).
+
+The database is not sold as part of Brett and must not be sold or re-sold to a
+third party. Obtain newer snapshots from ICCF, or compile them from ICCF server
+games under ICCF's terms, and comply with ICCF's terms.
 
 ## Active source
+
+The redistributed snapshot is a SCID triple:
+
+```text
+databases/iccf/Correspondence_2350.si4
+databases/iccf/Correspondence_2350.sn4
+databases/iccf/Correspondence_2350.sg4
+```
+
+A local working copy may also live at:
 
 ```text
 ~/Downloads/Brett Resources/Correspondence Database/Correspondence_2350.si4
@@ -25,11 +40,11 @@ from it; it does not change the MIT licence of Brett's source code. See
 
 The native SCID reader opens the triple with zero decode errors:
 
-- **99,606 games**, **6,924,478 mainline moves**;
-- dates from **2015-12-30** through **2026-09-25**;
+- **87,927 games**, **6,187,801 mainline moves**;
+- dates from **2021-01-01** through **2026-09-25**;
 - every game has `Site "ICCF"`;
 - `WhiteElo` and `BlackElo` both range from **2350 to 2724**;
-- **27** games have no moves;
+- every game has both ratings and at least one move;
 - no ECO or annotation records are present in this export.
 
 The accompanying ICCF note says the January–March 2026 compilation is missing
@@ -40,14 +55,16 @@ than a database-wide cut-off.
 The active database is used by the Engine tab as a local correspondence
 reference. Inclusion and the path are configured in **Settings → Correspondence
 database**; the setting is stored in `preparation.json` beside the other
-preparation preferences. `BRETT_CORRESPONDENCE` overrides the saved path. The
-first open builds a position index in the background and caches it under
-`$XDG_CACHE_HOME/brett/index/`; later opens memory-map the cached `.brettpos`
-file. The source triple is never modified.
+preparation preferences. `BRETT_CORRESPONDENCE` overrides the saved path. With
+no saved choice, Brett looks for the bundled snapshot in a source checkout and
+then for the conventional local copy. The first open builds a position index in
+the background and caches it under `$XDG_CACHE_HOME/brett/index/`; later opens
+memory-map the cached `.brettpos` file. The source triple is never modified.
 
-The database is not part of the repository. Keep it in the local Brett
-Resources directory (or another local path) and never commit it; the repository
-ships only the notice and the code that reads a user-supplied copy.
+The database is optional: Brett and every other format work without it. The
+snapshot is committed so a clone or repository download includes it; release
+packages may omit it to keep the download small, in which case users can copy
+the triple from the repository or obtain a newer ICCF export.
 
 ## Historical 2016 sample
 
@@ -72,8 +89,8 @@ What the older sample contains:
   `Elo >= 2400` filter for each side independently.
 - There is no evidence of an upper cutoff. If one existed, it was at least
   2733 and therefore had no effect on this snapshot.
-- 17,943 games have an `ECO` tag. The 6,922 without one are concentrated in
-  the newer ICCF server games (2015 and early 2016).
+- 17,943 games have an `ECO` tag. The 6,922 without one are concentrated in the
+  newer ICCF server games (2015 and early 2016).
 - 298 games have no moves (`PlyCount "0"`), two games are Chess960, and 168
   games carry annotations.
 
@@ -116,19 +133,24 @@ download plus one or more earlier correspondence-server collections.
 2. Apply the inclusive filter `WhiteElo >= 2350` and `BlackElo >= 2350` on
    both sides. No upper bound is currently applied.
 3. Decide the end date and whether to keep unfinished/zero-move games. The
-   current export keeps 27 zero-move games.
+   current export has no zero-move games.
 4. De-duplicate by player names, date, result, and move sequence rather than
    by file position.
-5. Write a new `.si4`/`.sn4`/`.sg4` triple to a new path under
-   `~/Downloads/Brett Resources/Correspondence Database/`. Never overwrite the
+5. Write a new `.si4`/`.sn4`/`.sg4` triple to a new path. Never overwrite the
    source or the historical 2016 database.
-6. Open the new triple in Brett, verify that it decodes with zero errors, and
-   let the position index rebuild. The cache key is the canonical `.si4` path,
-   so a new filename gets a new cache entry automatically.
+6. Replace all three files under `databases/iccf/` together, then open the new
+   triple in Brett, verify that it decodes with zero errors, and let the
+   position index rebuild. The cache key includes the canonical `.si4` path and
+   the combined file metadata, so a replaced triple invalidates the old cache.
+7. Update the snapshot facts in this file, `databases/iccf/README.md`, and the
+   counts in the README if they are mentioned there.
+
+Do not refresh only one file of the triple, and do not rewrite a snapshot in
+place while a Brett instance has it open.
 
 ## Remaining questions
 
-- How often should the ICCF reference be refreshed?
+- How often should the ICCF reference be refreshed between releases?
 - Should the historical mixed 2016 database be kept as a separate optional
   reference, or archived?
 - Should future exports retain zero-move games?
