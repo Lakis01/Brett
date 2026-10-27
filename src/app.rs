@@ -11092,7 +11092,7 @@ fn cloud_engine_section(
                     .on_hover_text("chessdb.cn evaluation, White POV");
                     left_sized_label(
                         ui,
-                        86.0,
+                        100.0,
                         18.0,
                         RichText::new(lichess_heading).strong().small(),
                     )
@@ -11349,7 +11349,7 @@ fn cloud_row_ui(
         .on_hover_text(eval_hint.as_str());
         left_sized_label(
             ui,
-            86.0,
+            100.0,
             20.0,
             RichText::new(
                 row.lichess
