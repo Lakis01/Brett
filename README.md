@@ -53,7 +53,7 @@ ICCF's terms, and comply with ICCF's terms. See
   headers and byte ranges, then builds a full tree only for the selected game.
 - **SCID4 and SCID3** databases through an independent native reader
   (`src/scid.rs`). Brett reads the `.si4`/`.sn4`/`.sg4` triple directly; no SCID
-  installation, conversion step, or GPL code is involved. Legacy SCID3
+  installation, conversion step, or SCID code is involved. Legacy SCID3
   (`.si3`/`.sn3`/`.sg3`) uses the same reader.
 - **Classic ChessBase CBH** databases through a native, read-only reader
   (`src/cbh/`). Brett opens the `.cbh` header file and its `.cbg` moves,
