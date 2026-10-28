@@ -145,7 +145,6 @@ fn start_position(start: &[u8], extra: Option<&[u8]>, chess960: bool) -> Result<
         ep_square,
         halfmoves: 0,
         fullmoves: NonZeroU32::new(u32::from(move_number).max(1)).unwrap(),
-        ..Setup::empty()
     };
     Chess::from_setup(setup, mode)
         .map_err(|error| anyhow::anyhow!("illegal start position: {error}"))

@@ -2,10 +2,10 @@
 
 use std::cell::RefCell;
 
+use brett::chess::{Chess, Color, Square};
 use brett::ui::board::{self, BoardEvent, BoardState};
 use brett::ui::pieces::PieceTextures;
 use egui::{Context, Event, Modifiers, PointerButton, Pos2, RawInput, Rect, vec2};
-use shakmaty::{Chess, Color, Square};
 
 const SIDE: f32 = 800.0;
 

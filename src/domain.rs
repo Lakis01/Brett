@@ -390,13 +390,17 @@ impl Visitor for TreeVisitor {
         // A variation replaces the move that was just played, so it starts
         // from the position before that move.
         let before = mt.nodes[mt.current].parent.unwrap_or(0);
-        mt.stack.push(mt.current);
-        mt.current = before;
+        mt.stack.push((mt.current, mt.broken));
+        if !mt.broken {
+            mt.current = before;
+        }
         ControlFlow::Continue(())
     }
 
     fn end_variation(&mut self, mt: &mut Builder) -> ControlFlow<Game> {
-        mt.current = mt.stack.pop().unwrap_or(0);
+        let (current, broken) = mt.stack.pop().unwrap_or((0, false));
+        mt.current = current;
+        mt.broken = broken;
         ControlFlow::Continue(())
     }
 
@@ -409,7 +413,8 @@ struct Builder {
     headers: Vec<(String, String)>,
     nodes: Vec<Node>,
     current: usize,
-    stack: Vec<usize>,
+    broken: bool,
+    stack: Vec<(usize, bool)>,
     errors: Vec<String>,
 }
 
@@ -444,12 +449,16 @@ impl Builder {
                 pos,
             }],
             current: 0,
+            broken: false,
             stack: Vec::new(),
             errors,
         }
     }
 
     fn push(&mut self, san_plus: SanPlus) {
+        if self.broken {
+            return;
+        }
         let parent = self.current;
         let pos = self.nodes[parent].pos.clone();
         let number = pos.fullmoves().get();
@@ -479,6 +488,7 @@ impl Builder {
                 Err(err) => {
                     self.errors
                         .push(format!("cannot apply null move in {}: {err}", fen()));
+                    self.broken = true;
                 }
             }
             return;
@@ -489,6 +499,7 @@ impl Builder {
             Err(err) => {
                 self.errors
                     .push(format!("illegal move {} in {}: {err}", san_plus, fen()));
+                self.broken = true;
                 return;
             }
         };
@@ -498,6 +509,7 @@ impl Builder {
             Err(err) => {
                 self.errors
                     .push(format!("illegal move {} in {}: {err}", san_plus, fen()));
+                self.broken = true;
                 return;
             }
         };

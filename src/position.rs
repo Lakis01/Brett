@@ -22,7 +22,8 @@ use anyhow::{Context, Result, bail};
 use memmap2::{Mmap, MmapOptions};
 
 use crate::chess::{
-    CastlingMode, Chess, Fen, File, Move, Position, Role, San, SanPlus, Square, UciMove,
+    CastlingMode, Chess, Fen, File as ChessFile, Move, Position, Role, San, SanPlus, Square,
+    UciMove,
 };
 use crate::library::{GameLibrary, SourceMeta};
 use crate::pgn::reader::{Reader, Visitor};
@@ -676,9 +677,9 @@ fn move_destination(mv: Move) -> Square {
 
 fn castle_destination(king: Square, rook: Square) -> Square {
     let file = if rook.file() > king.file() {
-        File::G
+        ChessFile::G
     } else {
-        File::C
+        ChessFile::C
     };
     Square::from_coords(file, king.rank())
 }

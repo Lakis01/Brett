@@ -4,16 +4,15 @@ use std::sync::Arc;
 use std::sync::mpsc::{self, TryRecvError};
 use std::time::{Duration, Instant};
 
+use crate::chess::{
+    CastlingMode, Chess, Color, EnPassantMode, Fen, Move, Position, SanPlus, Square, UciMove,
+};
 use eframe::egui::{
     self, Align, Align2, Color32, FontId, Key, Layout, RichText, Sense, Stroke, StrokeKind, Ui,
     pos2,
     text::{LayoutJob, TextFormat},
     vec2,
 };
-use shakmaty::fen::Fen;
-use shakmaty::san::SanPlus;
-use shakmaty::uci::UciMove;
-use shakmaty::{CastlingMode, Chess, Color, EnPassantMode, Move, Position, Square};
 
 use crate::book::Book;
 use crate::cbh::CbhLibrary;
@@ -7190,7 +7189,7 @@ impl App {
             .collect()
     }
 
-    fn prep_tree(&mut self, ui: &mut Ui, prep: &PrepSession, pos: &shakmaty::Chess, key: u64) {
+    fn prep_tree(&mut self, ui: &mut Ui, prep: &PrepSession, pos: &crate::chess::Chess, key: u64) {
         let mut exit = false;
         ui.horizontal(|ui| {
             ui.heading("Player tree");
@@ -8965,7 +8964,7 @@ impl App {
                 ui.label("A native Linux chess preparation workspace.");
                 ui.add_space(6.0);
                 ui.label("Piece set: cburnett by Colin M. L. Burnett, CC BY-SA 3.0.");
-                ui.label("Rules and SAN: shakmaty. PGN: pgn-reader.");
+                ui.label("Rules and SAN: cozy-chess. PGN: Brett's own streaming parser.");
                 ui.label("SCID and classic CBH readers: independent native implementations.");
                 ui.label(
                     "Player photos: optional Scid Player_photos pack derived from \
@@ -11607,8 +11606,8 @@ fn game_row(
     response
 }
 
-fn fen_string(pos: &shakmaty::Chess) -> String {
-    shakmaty::fen::Fen::from_position(pos, shakmaty::EnPassantMode::Legal).to_string()
+fn fen_string(pos: &crate::chess::Chess) -> String {
+    Fen::from_position(pos, EnPassantMode::Legal).to_string()
 }
 
 fn format_cp(cp: i32) -> String {
@@ -13537,7 +13536,7 @@ mod tests {
                 offset: 0,
             },
         });
-        let key = position::position_key(&shakmaty::Chess::default());
+        let key = position::position_key(&Chess::default());
 
         app.reference_enabled = false;
         let (moves, source) = app.prior_for_position(key);

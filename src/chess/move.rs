@@ -130,6 +130,43 @@ impl Move {
     }
 }
 
+impl fmt::Display for Move {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            Move::Normal {
+                role,
+                from,
+                capture,
+                to,
+                promotion,
+            } => {
+                if role != Role::Pawn {
+                    write!(f, "{}", role.char())?;
+                }
+                write!(f, "{from}{}{to}", if capture.is_some() { 'x' } else { '-' })?;
+                if let Some(p) = promotion {
+                    write!(f, "={}", p.char())?;
+                }
+                Ok(())
+            }
+            Move::EnPassant { from, to } => write!(f, "{from}x{to}"),
+            Move::Castle { king, rook } => {
+                if king < rook {
+                    f.write_str("O-O")
+                } else {
+                    f.write_str("O-O-O")
+                }
+            }
+            Move::Put { role, to } => {
+                if role != Role::Pawn {
+                    write!(f, "{}", role.char())?;
+                }
+                write!(f, "@{to}")
+            }
+        }
+    }
+}
+
 /// A move in the Universal Chess Interface representation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum UciMove {

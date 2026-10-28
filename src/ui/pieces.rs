@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
+use crate::chess::{Color, Piece, Role};
 use egui::{ColorImage, Context, TextureHandle, TextureOptions};
-use shakmaty::{Color, Piece, Role};
 
 /// Textures for the twelve pieces, loaded once per `egui::Context`.
 pub struct PieceTextures {

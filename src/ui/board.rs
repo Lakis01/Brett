@@ -1,5 +1,5 @@
+use crate::chess::{Chess, Color, File, Position, Rank, Square};
 use egui::{Color32, Pos2, Rect, Sense, Stroke, StrokeKind, Ui, Vec2, pos2};
-use shakmaty::{Chess, Color, File, Position, Rank, Square};
 
 use crate::ui::pieces::PieceTextures;
 
