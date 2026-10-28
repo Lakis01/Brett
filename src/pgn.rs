@@ -10,8 +10,7 @@ use std::io::{self, Write};
 pub mod reader;
 pub use reader::{Reader, Visitor};
 
-use shakmaty::fen::Fen;
-use shakmaty::{Chess, Color, EnPassantMode};
+use crate::chess::{Chess, Color, EnPassantMode, Fen};
 
 use crate::domain::{Clock, Game};
 

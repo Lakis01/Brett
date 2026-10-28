@@ -8,7 +8,7 @@
 
 use std::time::Instant;
 
-use shakmaty::{Color, Position};
+use crate::chess::{Color, EnPassantMode, Fen, Position};
 
 use crate::domain::Game;
 use crate::engine::{EngineHandle, EngineInfo, Score, SearchLimit};
@@ -143,11 +143,7 @@ impl ReviewState {
             .map(|&node| {
                 let position = &game.nodes[node].pos;
                 ReviewPosition {
-                    fen: shakmaty::fen::Fen::from_position(
-                        position,
-                        shakmaty::EnPassantMode::Legal,
-                    )
-                    .to_string(),
+                    fen: Fen::from_position(position, EnPassantMode::Legal).to_string(),
                     turn: position.turn(),
                 }
             })

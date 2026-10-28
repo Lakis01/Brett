@@ -290,34 +290,34 @@ impl RatingPriority {
     }
 
     /// Rating tags in fallback order, together with the label shown for each.
-    pub fn tags(self, color: shakmaty::Color) -> [(&'static str, &'static str); 3] {
+    pub fn tags(self, color: crate::chess::Color) -> [(&'static str, &'static str); 3] {
         match (self, color) {
-            (Self::Elo, shakmaty::Color::White) => [
+            (Self::Elo, crate::chess::Color::White) => [
                 ("WhiteElo", "Elo"),
                 ("WhiteDWZ", "DWZ"),
                 ("WhiteUSCF", "USCF"),
             ],
-            (Self::Elo, shakmaty::Color::Black) => [
+            (Self::Elo, crate::chess::Color::Black) => [
                 ("BlackElo", "Elo"),
                 ("BlackDWZ", "DWZ"),
                 ("BlackUSCF", "USCF"),
             ],
-            (Self::Dwz, shakmaty::Color::White) => [
+            (Self::Dwz, crate::chess::Color::White) => [
                 ("WhiteDWZ", "DWZ"),
                 ("WhiteElo", "Elo"),
                 ("WhiteUSCF", "USCF"),
             ],
-            (Self::Dwz, shakmaty::Color::Black) => [
+            (Self::Dwz, crate::chess::Color::Black) => [
                 ("BlackDWZ", "DWZ"),
                 ("BlackElo", "Elo"),
                 ("BlackUSCF", "USCF"),
             ],
-            (Self::Uscf, shakmaty::Color::White) => [
+            (Self::Uscf, crate::chess::Color::White) => [
                 ("WhiteUSCF", "USCF"),
                 ("WhiteElo", "Elo"),
                 ("WhiteDWZ", "DWZ"),
             ],
-            (Self::Uscf, shakmaty::Color::Black) => [
+            (Self::Uscf, crate::chess::Color::Black) => [
                 ("BlackUSCF", "USCF"),
                 ("BlackElo", "Elo"),
                 ("BlackDWZ", "DWZ"),

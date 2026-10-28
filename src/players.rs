@@ -17,9 +17,8 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::chess::{Color, UciMove};
 use anyhow::Result;
-use shakmaty::Color;
-use shakmaty::uci::UciMove;
 
 use crate::domain::Game;
 use crate::library::GameLibrary;
@@ -1013,8 +1012,8 @@ fn civil_from_days(days: i64) -> (i32, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chess::{Chess, Position, SanPlus};
     use crate::domain;
-    use shakmaty::Position;
 
     const TREND_GAMES: &str = r#"[Event "Old"]
 [Site "Test"]
@@ -1169,7 +1168,7 @@ mod tests {
         )
         .unwrap();
 
-        let start = shakmaty::Chess::default();
+        let start = Chess::default();
         let key = position::position_key(&start);
         let recent = book.recent_games(key, 3);
         assert_eq!(recent.len(), 3);
@@ -1203,11 +1202,11 @@ mod tests {
     #[test]
     fn recent_switch_beats_large_old_sample() {
         let book = trend_book();
-        let start = shakmaty::Chess::default();
+        let start = Chess::default();
         let after_e4 = start
             .clone()
             .play(
-                shakmaty::san::SanPlus::from_ascii(b"e4")
+                SanPlus::from_ascii(b"e4")
                     .unwrap()
                     .san
                     .to_move(&start)
@@ -1229,7 +1228,7 @@ mod tests {
             .iter()
             .find(|mv| {
                 position::decode_move(&after_e4, mv.mv)
-                    .map(|mv| shakmaty::san::SanPlus::from_move(after_e4.clone(), mv).to_string())
+                    .map(|mv| SanPlus::from_move(after_e4.clone(), mv).to_string())
                     .as_deref()
                     == Some("c5")
             })
@@ -1239,7 +1238,7 @@ mod tests {
             .iter()
             .find(|mv| {
                 position::decode_move(&after_e4, mv.mv)
-                    .map(|mv| shakmaty::san::SanPlus::from_move(after_e4.clone(), mv).to_string())
+                    .map(|mv| SanPlus::from_move(after_e4.clone(), mv).to_string())
                     .as_deref()
                     == Some("e6")
             })
@@ -1257,13 +1256,13 @@ mod tests {
     #[test]
     fn database_prior_is_used_when_player_has_no_games_here() {
         let book = trend_book();
-        let start = shakmaty::Chess::default();
+        let start = Chess::default();
         let key = position::position_key(&start);
         let global = vec![
             MoveStat {
                 key,
                 mv: position::encode_move(
-                    shakmaty::san::SanPlus::from_ascii(b"e4")
+                    SanPlus::from_ascii(b"e4")
                         .unwrap()
                         .san
                         .to_move(&start)
@@ -1276,7 +1275,7 @@ mod tests {
             MoveStat {
                 key,
                 mv: position::encode_move(
-                    shakmaty::san::SanPlus::from_ascii(b"d4")
+                    SanPlus::from_ascii(b"d4")
                         .unwrap()
                         .san
                         .to_move(&start)
@@ -1331,11 +1330,11 @@ mod tests {
             PredictionConfig::default(),
             2025_0301,
         );
-        let start = shakmaty::Chess::default();
+        let start = Chess::default();
         let after_e4 = start
             .clone()
             .play(
-                shakmaty::san::SanPlus::from_ascii(b"e4")
+                SanPlus::from_ascii(b"e4")
                     .unwrap()
                     .san
                     .to_move(&start)

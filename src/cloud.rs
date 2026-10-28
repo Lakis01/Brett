@@ -15,6 +15,8 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::Value;
 
+use crate::chess::{Chess, Color, SanPlus, UciMove};
+
 const USER_AGENT: &str = "Brett/0.1 (native Linux chess preparation app)";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -110,8 +112,8 @@ impl ChessDbMove {
     /// Normalize chessdb.cn's side-to-move score to White's point of view.
     /// The service flips the sign for Black, which would otherwise make the
     /// same advantage look negative in the Cloud Engine table.
-    pub fn white_score(&self, turn: shakmaty::Color) -> i32 {
-        if turn == shakmaty::Color::White {
+    pub fn white_score(&self, turn: Color) -> i32 {
+        if turn == Color::White {
             self.score
         } else {
             -self.score
@@ -643,18 +645,18 @@ fn hex_digit(value: u8) -> char {
 }
 
 /// Convert the first move of a UCI principal variation to SAN for display.
-pub fn first_move_san(pos: &shakmaty::Chess, pv: &str) -> Option<String> {
+pub fn first_move_san(pos: &Chess, pv: &str) -> Option<String> {
     let uci = pv.split_whitespace().next()?;
-    let uci = shakmaty::uci::UciMove::from_ascii(uci.as_bytes()).ok()?;
+    let uci = UciMove::from_ascii(uci.as_bytes()).ok()?;
     let mv = uci.to_move(pos).ok()?;
-    Some(shakmaty::san::SanPlus::from_move(pos.clone(), mv).to_string())
+    Some(SanPlus::from_move(pos.clone(), mv).to_string())
 }
 
 /// Convert a UCI move to SAN for display.
-pub fn uci_san(pos: &shakmaty::Chess, uci: &str) -> Option<String> {
-    let uci = shakmaty::uci::UciMove::from_ascii(uci.as_bytes()).ok()?;
+pub fn uci_san(pos: &Chess, uci: &str) -> Option<String> {
+    let uci = UciMove::from_ascii(uci.as_bytes()).ok()?;
     let mv = uci.to_move(pos).ok()?;
-    Some(shakmaty::san::SanPlus::from_move(pos.clone(), mv).to_string())
+    Some(SanPlus::from_move(pos.clone(), mv).to_string())
 }
 
 #[cfg(test)]
@@ -693,8 +695,8 @@ mod tests {
         assert_eq!(parsed.moves[0].score, 1);
         assert!((parsed.moves[0].winrate - 50.08).abs() < 0.001);
         assert_eq!(parsed.moves[1].uci, "d2d4");
-        assert_eq!(parsed.moves[0].white_score(shakmaty::Color::White), 1);
-        assert_eq!(parsed.moves[0].white_score(shakmaty::Color::Black), -1);
+        assert_eq!(parsed.moves[0].white_score(Color::White), 1);
+        assert_eq!(parsed.moves[0].white_score(Color::Black), -1);
     }
 
     #[test]

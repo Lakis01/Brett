@@ -14,7 +14,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use shakmaty::uci::UciMove;
+use crate::chess::UciMove;
 
 use crate::domain::Game;
 use crate::players;
@@ -340,7 +340,7 @@ mod tests {
 1. e4 c5 1/2-1/2
 "#);
         let tree = RecentTree::from_games(&games, 20260301, 60);
-        let root = position::position_key(&shakmaty::Chess::default());
+        let root = position::position_key(&crate::chess::Chess::default());
         let moves = tree.moves(root);
         assert_eq!(moves.len(), 1);
         let e4 = moves.iter().find(|mv| mv.games == 2).unwrap();
@@ -379,7 +379,7 @@ mod tests {
 1. d4 d5 1-0
 "#);
         let tree = RecentTree::from_games(&games, 20260301, 60);
-        let root = position::position_key(&shakmaty::Chess::default());
+        let root = position::position_key(&crate::chess::Chess::default());
         let baseline = tree.moves(root);
         let rows = trends(&tree, root, &baseline);
         assert_eq!(rows.len(), 2);
