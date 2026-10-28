@@ -29,6 +29,31 @@ figurines and annotation symbols.
 The font is not covered by the project's MIT licence; redistribute it only with
 the accompanying licence text. See `assets/fonts/README.md`.
 
+## Noto Emoji font
+
+The `egui/monochrome_emoji_fonts` feature bundles
+`NotoEmoji-Regular.ttf` from the `epaint_default_fonts` crate so the gold
+world-champion crown (👑, U+1F451) renders without a system emoji font.
+
+- **Source:** <https://github.com/googlefonts/noto-emoji>
+- **Licence:** SIL Open Font License 1.1 (OFL-1.1).
+- **Modifications:** none. The upstream TrueType file is embedded by
+  `epaint_default_fonts` and used after the primary UI fonts.
+
+## emoji-icon-font
+
+The same feature bundles `emoji-icon-font.ttf` from `epaint_default_fonts` as
+an additional monochrome emoji fallback.
+
+- **Source:** <https://github.com/jslegers/emoji-icon-font>
+- **Author:** Copyright (c) 2014 John Slegers.
+- **Licence:** MIT.
+- **Modifications:** none. The upstream TrueType file is embedded by
+  `epaint_default_fonts` and used after the primary UI fonts.
+
+Both fonts are not covered by the project's MIT licence; they remain under
+their own licences. See `assets/fonts/README.md`.
+
 ## SCID format reference
 
 The native SCID reader in `src/scid.rs` is an independent implementation

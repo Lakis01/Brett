@@ -15,6 +15,7 @@
 //! The photo data is **not** part of Brett's MIT-licensed source. See
 //! `docs/PHOTOS.md` and `THIRD_PARTY_NOTICES.md`.
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
@@ -37,6 +38,10 @@ struct PhotoEntry {
 pub struct PhotoLibrary {
     mmap: Mmap,
     entries: Vec<PhotoEntry>,
+    /// Accent-folded key to entry index. The pack and the database can spell
+    /// the same player differently (`José` vs `Jose`), so exact lookup alone
+    /// would miss many portraits.
+    folded: HashMap<String, usize>,
     path: PathBuf,
 }
 
@@ -97,10 +102,15 @@ impl PhotoLibrary {
         if !entries.windows(2).all(|pair| pair[0].key <= pair[1].key) {
             entries.sort_by(|left, right| left.key.cmp(&right.key));
         }
+        let mut folded = HashMap::with_capacity(entries.len());
+        for (index, entry) in entries.iter().enumerate() {
+            folded.entry(folded_key(&entry.key)).or_insert(index);
+        }
 
         Ok(Self {
             mmap,
             entries,
+            folded,
             path,
         })
     }
@@ -118,9 +128,25 @@ impl PhotoLibrary {
     }
 
     /// Find a player's encoded WebP bytes by display name.
+    ///
+    /// Exact canonical keys are tried first, then accent-folded keys, then a
+    /// conservative short-name match. The last step handles packs that store
+    /// `Capablanca, Jose` or `Gukesh D` while the database spells out middle
+    /// names. A surname must match exactly and every pack token must be
+    /// accounted for, so `Magnus Carlsen Jr` does not borrow Carlsen's photo.
     pub fn bytes(&self, name: &str) -> Option<&[u8]> {
         let key = player_key(name)?;
-        self.bytes_for_key(&key)
+        if let Some(bytes) = self.bytes_for_key(&key) {
+            return Some(bytes);
+        }
+        if let Some(&index) = self.folded.get(&folded_key(name)) {
+            return self.bytes_at(index);
+        }
+        let index = self
+            .entries
+            .iter()
+            .position(|entry| entry_matches_name(&entry.key, name))?;
+        self.bytes_at(index)
     }
 
     /// Find a player's encoded WebP bytes by canonical key.
@@ -129,9 +155,72 @@ impl PhotoLibrary {
             .entries
             .binary_search_by(|entry| entry.key.as_str().cmp(key))
             .ok()?;
-        let entry = &self.entries[index];
+        self.bytes_at(index)
+    }
+
+    fn bytes_at(&self, index: usize) -> Option<&[u8]> {
+        let entry = self.entries.get(index)?;
         self.mmap.get(entry.offset..entry.offset + entry.len)
     }
+}
+
+fn folded_key(key: &str) -> String {
+    player_key(&deunicode::deunicode(key)).unwrap_or_default()
+}
+
+fn name_tokens(name: &str) -> Vec<String> {
+    name.split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(|word| deunicode::deunicode(word).to_lowercase())
+        .collect()
+}
+
+/// Surname of a display name, honouring `Surname, Given` and `Given Surname`.
+fn surname(name: &str) -> Option<String> {
+    if let Some((surname, _)) = name.split_once(',') {
+        name_tokens(surname).into_iter().next()
+    } else {
+        name_tokens(name).into_iter().last()
+    }
+}
+
+fn common_prefix(left: &str, right: &str) -> usize {
+    left.chars()
+        .zip(right.chars())
+        .take_while(|(left, right)| left == right)
+        .count()
+}
+
+fn entry_matches_name(entry_key: &str, name: &str) -> bool {
+    let Some(surname) = surname(name) else {
+        return false;
+    };
+    let display = name_tokens(name);
+    let entry: Vec<&str> = entry_key.split_whitespace().collect();
+    let Some(surname_index) = entry
+        .iter()
+        .position(|token| *token == surname || (token.len() == 1 && surname.starts_with(token)))
+    else {
+        return false;
+    };
+
+    let mut matched_other = false;
+    for (index, token) in entry.iter().enumerate() {
+        if index == surname_index {
+            continue;
+        }
+        let matched = display.iter().any(|display_token| {
+            *display_token == *token
+                || (token.len() == 1 && display_token.starts_with(token))
+                || (display_token.len() == 1 && token.starts_with(display_token))
+                || common_prefix(display_token, token) >= 3
+        });
+        if !matched {
+            return false;
+        }
+        matched_other = true;
+    }
+    matched_other
 }
 
 fn read_u32(bytes: &[u8], cursor: &mut usize, index: usize) -> Result<u32> {
@@ -238,6 +327,43 @@ mod tests {
         assert_eq!(library.bytes("Magnus Carlsen"), Some(&b"first"[..]));
         assert_eq!(library.bytes("Hikaru Nakamura"), Some(&b"second"[..]));
         assert!(library.bytes("Nobody").is_none());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn matches_folded_and_short_pack_keys_without_false_positives() {
+        let path = std::env::temp_dir().join(format!(
+            "brett-photos-folded-{}-{}.bin",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        write_pack(
+            &path,
+            &[
+                ("capablanca jose", b"capablanca"),
+                ("carlsen magnus", b"carlsen"),
+                ("d gukesh", b"gukesh"),
+                ("nakamura hikaru", b"nakamura"),
+            ],
+        );
+        let library = PhotoLibrary::open(&path).unwrap();
+        assert_eq!(
+            library.bytes("José Raúl Capablanca"),
+            Some(&b"capablanca"[..])
+        );
+        assert_eq!(
+            library.bytes("Capablanca, Jose Raul"),
+            Some(&b"capablanca"[..])
+        );
+        assert_eq!(library.bytes("Gukesh Dommaraju"), Some(&b"gukesh"[..]));
+        assert_eq!(library.bytes("D Gukesh"), Some(&b"gukesh"[..]));
+        assert_eq!(library.bytes("Magnus Carlsen"), Some(&b"carlsen"[..]));
+        assert_eq!(library.bytes("Magnus Carlsen Jr"), None);
+        assert_eq!(library.bytes("Ding Liren Fan"), None);
+        assert_eq!(library.bytes("Hikaru Nakamura"), Some(&b"nakamura"[..]));
         let _ = std::fs::remove_file(path);
     }
 

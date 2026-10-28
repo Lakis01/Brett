@@ -326,6 +326,89 @@ impl RatingPriority {
     }
 }
 
+/// Portrait size used by the board strips and the selected-player header.
+///
+/// The Players list keeps a fixed small thumbnail so rows stay uniform.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PhotoSize {
+    #[default]
+    Small,
+    Medium,
+    Large,
+}
+
+impl PhotoSize {
+    pub const ALL: [Self; 3] = [Self::Small, Self::Medium, Self::Large];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Small => "Small",
+            Self::Medium => "Medium",
+            Self::Large => "Large",
+        }
+    }
+
+    /// Avatar edge length in logical pixels.
+    pub fn pixels(self) -> f32 {
+        match self {
+            Self::Small => 38.0,
+            Self::Medium => 54.0,
+            Self::Large => 72.0,
+        }
+    }
+
+    pub fn config_value(self) -> &'static str {
+        match self {
+            Self::Small => "small",
+            Self::Medium => "medium",
+            Self::Large => "large",
+        }
+    }
+
+    pub fn from_config(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "medium" => Self::Medium,
+            "large" => Self::Large,
+            _ => Self::Small,
+        }
+    }
+}
+
+/// Which championship lineage counts for the crown badge.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ChampionLineage {
+    /// The uninterrupted classical line from Steinitz to the present.
+    Classical,
+    /// The classical line plus the FIDE knockout champions from 1999–2006.
+    #[default]
+    Fide,
+}
+
+impl ChampionLineage {
+    pub const ALL: [Self; 2] = [Self::Fide, Self::Classical];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Classical => "Classical/PCA",
+            Self::Fide => "FIDE/inclusive",
+        }
+    }
+
+    pub fn config_value(self) -> &'static str {
+        match self {
+            Self::Classical => "classical",
+            Self::Fide => "fide",
+        }
+    }
+
+    pub fn from_config(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "classical" | "pca" => Self::Classical,
+            _ => Self::Fide,
+        }
+    }
+}
+
 /// Display preferences that do not affect database contents.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DisplayPrefs {
@@ -353,6 +436,10 @@ pub struct DisplayPrefs {
     pub hover_moves: bool,
     /// Show player portraits in the board strips when a photo pack is present.
     pub show_player_photos: bool,
+    /// Portrait size for board strips and the selected-player header.
+    pub photo_size: PhotoSize,
+    /// Championship lineage used for the world-champion crown.
+    pub champion_lineage: ChampionLineage,
     /// Show the start/previous/next/end buttons. Keyboard navigation always
     /// remains available.
     pub show_nav_buttons: bool,
@@ -373,6 +460,8 @@ impl Default for DisplayPrefs {
             show_empty_pgn_tags: false,
             hover_moves: false,
             show_player_photos: true,
+            photo_size: PhotoSize::default(),
+            champion_lineage: ChampionLineage::default(),
             show_nav_buttons: false,
             show_pgn_tags: true,
         }
@@ -436,6 +525,16 @@ impl DisplayPrefs {
             .get("show_player_photos")
             .and_then(Value::as_bool)
             .unwrap_or(true);
+        let photo_size = value
+            .get("photo_size")
+            .and_then(Value::as_str)
+            .map(PhotoSize::from_config)
+            .unwrap_or_default();
+        let champion_lineage = value
+            .get("champion_lineage")
+            .and_then(Value::as_str)
+            .map(ChampionLineage::from_config)
+            .unwrap_or_default();
         let show_nav_buttons = value
             .get("show_nav_buttons")
             .and_then(Value::as_bool)
@@ -455,6 +554,8 @@ impl DisplayPrefs {
             show_empty_pgn_tags,
             hover_moves,
             show_player_photos,
+            photo_size,
+            champion_lineage,
             show_nav_buttons,
             show_pgn_tags,
         }
@@ -472,6 +573,8 @@ impl DisplayPrefs {
             "show_empty_pgn_tags": self.show_empty_pgn_tags,
             "hover_moves": self.hover_moves,
             "show_player_photos": self.show_player_photos,
+            "photo_size": self.photo_size.config_value(),
+            "champion_lineage": self.champion_lineage.config_value(),
             "show_nav_buttons": self.show_nav_buttons,
             "show_pgn_tags": self.show_pgn_tags,
         }))
@@ -742,6 +845,8 @@ mod tests {
             show_empty_pgn_tags: true,
             hover_moves: true,
             show_player_photos: false,
+            photo_size: PhotoSize::Medium,
+            champion_lineage: ChampionLineage::Classical,
             show_nav_buttons: true,
             show_pgn_tags: false,
         };
@@ -767,6 +872,43 @@ mod tests {
         assert_eq!(
             DisplayPrefs::from_json(r#"{"engine_view":"nonsense"}"#).engine_view,
             "both"
+        );
+    }
+
+    #[test]
+    fn display_prefs_photo_size_and_champion_lineage() {
+        let prefs = DisplayPrefs {
+            photo_size: PhotoSize::Large,
+            champion_lineage: ChampionLineage::Classical,
+            ..DisplayPrefs::default()
+        };
+        assert_eq!(DisplayPrefs::from_json(&prefs.to_json()), prefs);
+
+        assert_eq!(DisplayPrefs::default().photo_size, PhotoSize::Small);
+        assert_eq!(
+            DisplayPrefs::default().champion_lineage,
+            ChampionLineage::Fide
+        );
+        assert_eq!(PhotoSize::Small.pixels(), 38.0);
+        assert_eq!(PhotoSize::Medium.pixels(), 54.0);
+        assert_eq!(PhotoSize::Large.pixels(), 72.0);
+        assert_eq!(PhotoSize::from_config("MEDIUM"), PhotoSize::Medium);
+        assert_eq!(PhotoSize::from_config("nonsense"), PhotoSize::Small);
+        assert_eq!(
+            ChampionLineage::from_config("classical"),
+            ChampionLineage::Classical
+        );
+        assert_eq!(
+            ChampionLineage::from_config("nonsense"),
+            ChampionLineage::Fide
+        );
+        assert_eq!(
+            DisplayPrefs::from_json(r#"{"photo_size":"large"}"#).photo_size,
+            PhotoSize::Large
+        );
+        assert_eq!(
+            DisplayPrefs::from_json(r#"{"champion_lineage":"classical"}"#).champion_lineage,
+            ChampionLineage::Classical
         );
     }
 

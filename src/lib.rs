@@ -7,6 +7,7 @@ pub mod app;
 pub mod book;
 pub mod cbh;
 pub mod cbv;
+pub mod champions;
 pub mod cloud;
 pub mod domain;
 pub mod engine;

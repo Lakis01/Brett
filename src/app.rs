@@ -17,6 +17,7 @@ use shakmaty::{CastlingMode, Chess, Color, EnPassantMode, Move, Position, Square
 
 use crate::book::Book;
 use crate::cbh::CbhLibrary;
+use crate::champions;
 use crate::cloud;
 use crate::domain::{self, Clock, Game, Token};
 use crate::engine::{EngineEvent, EngineHandle, EngineInfo, EngineOptions, Score, SearchLimit};
@@ -29,7 +30,10 @@ use crate::position::{
 };
 use crate::review::{self, Quality, ReviewConfig, ReviewState};
 use crate::scid::ScidLibrary;
-use crate::settings::{CloudPrefs, DisplayPrefs, EnginePrefs, PreparationPrefs, RatingPriority};
+use crate::settings::{
+    ChampionLineage, CloudPrefs, DisplayPrefs, EnginePrefs, PhotoSize, PreparationPrefs,
+    RatingPriority,
+};
 use crate::ui::board::{self, BoardEvent, BoardState};
 use crate::ui::fonts;
 use crate::ui::pieces::PieceTextures;
@@ -530,6 +534,12 @@ pub struct App {
     photo_textures: std::collections::HashMap<String, egui::TextureHandle>,
     photo_order: VecDeque<String>,
     show_player_photos: bool,
+    /// Avatar size for board strips and the selected-player header.
+    photo_size: PhotoSize,
+    /// Championship lineage used for the gold crown.
+    champion_lineage: ChampionLineage,
+    /// Player whose portrait is open in the standalone viewer.
+    photo_viewer: Option<String>,
     show_nav_buttons: bool,
     show_pgn_tags: bool,
     /// Open calendar for the Date tag.
@@ -608,6 +618,8 @@ pub struct App {
     show_settings: bool,
     settings_rating_priority: RatingPriority,
     settings_show_all_ratings: bool,
+    settings_photo_size: PhotoSize,
+    settings_champion_lineage: ChampionLineage,
     settings_my_player_names: String,
     settings_correspondence_enabled: bool,
     settings_correspondence_path: String,
@@ -780,6 +792,9 @@ impl App {
             photo_textures: std::collections::HashMap::new(),
             photo_order: VecDeque::new(),
             show_player_photos: display_prefs.show_player_photos,
+            photo_size: display_prefs.photo_size,
+            champion_lineage: display_prefs.champion_lineage,
+            photo_viewer: None,
             show_nav_buttons: display_prefs.show_nav_buttons,
             show_pgn_tags: display_prefs.show_pgn_tags,
             date_picker: None,
@@ -852,6 +867,8 @@ impl App {
             show_settings: false,
             settings_rating_priority: display_prefs.rating_priority,
             settings_show_all_ratings: display_prefs.show_all_ratings,
+            settings_photo_size: display_prefs.photo_size,
+            settings_champion_lineage: display_prefs.champion_lineage,
             settings_my_player_names: String::new(),
             settings_correspondence_enabled: preparation_prefs.correspondence_enabled,
             settings_correspondence_path: String::new(),
@@ -2314,6 +2331,8 @@ impl App {
             show_empty_pgn_tags: self.show_empty_pgn_tags,
             hover_moves: self.hover_moves,
             show_player_photos: self.show_player_photos,
+            photo_size: self.photo_size,
+            champion_lineage: self.champion_lineage,
             show_nav_buttons: self.show_nav_buttons,
             show_pgn_tags: self.show_pgn_tags,
         };
@@ -2333,7 +2352,7 @@ impl App {
         }
         let image = {
             let photos = self.photos.as_ref()?;
-            let bytes = photos.bytes_for_key(&key)?;
+            let bytes = photos.bytes(name)?;
             crate::photos::decode_webp(bytes).ok()?
         };
         let texture = ctx.load_texture(
@@ -2376,6 +2395,8 @@ impl App {
         self.show_settings = true;
         self.settings_rating_priority = self.rating_priority;
         self.settings_show_all_ratings = self.show_all_ratings;
+        self.settings_photo_size = self.photo_size;
+        self.settings_champion_lineage = self.champion_lineage;
         self.settings_my_player_names = self.prep_player_names.join("\n");
         self.settings_correspondence_enabled = self.correspondence_enabled;
         self.settings_correspondence_path = if self.correspondence_path.trim().is_empty() {
@@ -2417,6 +2438,8 @@ impl App {
 
         self.rating_priority = self.settings_rating_priority;
         self.show_all_ratings = self.settings_show_all_ratings;
+        self.photo_size = self.settings_photo_size;
+        self.champion_lineage = self.settings_champion_lineage;
         self.prep_player_names = self
             .settings_my_player_names
             .lines()
@@ -4294,6 +4317,50 @@ impl App {
                     {
                         self.save_display_prefs();
                     }
+                    let mut photo_size = self.photo_size;
+                    let mut champion_lineage = self.champion_lineage;
+                    let mut display_changed = false;
+                    ui.add_enabled_ui(self.photos.is_some(), |ui| {
+                        ui.menu_button(
+                            format!("Photo size: {}", photo_size.label()),
+                            |ui| {
+                                for size in PhotoSize::ALL {
+                                    if ui
+                                        .radio_value(&mut photo_size, size, size.label())
+                                        .changed()
+                                    {
+                                        display_changed = true;
+                                    }
+                                }
+                            },
+                        )
+                        .response
+                        .on_hover_text(
+                            "Small is 38 px, Medium is 54 px, Large is 72 px. The Players list keeps a fixed 34 px thumbnail.",
+                        );
+                    });
+                    ui.menu_button(
+                        format!("Champion lineage: {}", champion_lineage.label()),
+                        |ui| {
+                            for lineage in ChampionLineage::ALL {
+                                if ui
+                                    .radio_value(&mut champion_lineage, lineage, lineage.label())
+                                    .changed()
+                                {
+                                    display_changed = true;
+                                }
+                            }
+                        },
+                    )
+                    .response
+                    .on_hover_text(
+                        "FIDE/inclusive includes the four knockout champions from 1999–2006. Classical/PCA follows the uninterrupted line from Steinitz onward.",
+                    );
+                    if display_changed {
+                        self.photo_size = photo_size;
+                        self.champion_lineage = champion_lineage;
+                        self.save_display_prefs();
+                    }
                     if ui
                         .checkbox(&mut self.show_nav_buttons, "Show navigation buttons")
                         .on_hover_text(
@@ -4693,6 +4760,10 @@ impl App {
             self.selected_player = None;
             return;
         };
+        let ctx = ui.ctx().clone();
+        let portrait = self.photo_texture(&ctx, &player.name);
+        let champion = champions::champion(&player.name, self.champion_lineage);
+        let mut open_photo = false;
 
         let prep_color = self
             .prep
@@ -4732,7 +4803,26 @@ impl App {
             if ui.button("←").on_hover_text("All players").clicked() {
                 back = true;
             }
+            if let Some(texture) = portrait.as_ref() {
+                let response = ui
+                    .add(
+                        egui::Image::from_texture(texture)
+                            .fit_to_exact_size(vec2(
+                                self.photo_size.pixels(),
+                                self.photo_size.pixels(),
+                            ))
+                            .sense(Sense::click()),
+                    )
+                    .on_hover_text("Open larger photo");
+                if response.clicked() {
+                    open_photo = true;
+                }
+            }
             ui.heading(&player.name);
+            if let Some(champion) = champion {
+                ui.label(RichText::new("👑").size(20.0).color(GOLD))
+                    .on_hover_text(champion.tooltip());
+            }
             if top_priority_player_key(&self.prep_player_names).as_deref()
                 == Some(player.key.as_str())
             {
@@ -4974,6 +5064,9 @@ impl App {
                 });
         }
 
+        if open_photo {
+            self.photo_viewer = Some(player.name.clone());
+        }
         if back {
             if prep_matches(self, &player.key) {
                 exit = true;
@@ -5025,7 +5118,9 @@ impl App {
 
         let you_key = top_priority_player_key(&self.prep_player_names);
         let row_h = 46.0;
+        let ctx = ui.ctx().clone();
         let mut select = None;
+        let mut view_photo = None;
         egui::ScrollArea::vertical()
             .id_salt("player-list")
             .auto_shrink([false, false])
@@ -5034,16 +5129,18 @@ impl App {
                     let Some(player) = self.players.get(index) else {
                         continue;
                     };
-                    let is_you = you_key.as_deref() == Some(player.key.as_str());
+                    let name = player.name.clone();
+                    let key = player.key.clone();
+                    let is_you = you_key.as_deref() == Some(key.as_str());
                     let title = if is_you {
                         "You".to_string()
                     } else {
-                        player.name.clone()
+                        name.clone()
                     };
                     let subtitle = format!(
                         "{}{} · score {:.0}% · Elo {} · {}",
                         if is_you {
-                            format!("{} · ", player.name)
+                            format!("{name} · ")
                         } else {
                             String::new()
                         },
@@ -5056,12 +5153,28 @@ impl App {
                         player.years_label()
                     );
                     let selected = self.selected_player == Some(index);
+                    let champion = champions::champion(&name, self.champion_lineage);
+                    let photo = self.photo_texture(&ctx, &name);
                     let width = ui.available_width();
-                    if game_row(ui, selected, &title, &subtitle, width, row_h - 2.0).clicked() {
+                    let (response, photo_clicked) = player_row(
+                        ui,
+                        selected,
+                        &title,
+                        &subtitle,
+                        width,
+                        photo.as_ref(),
+                        champion,
+                    );
+                    if photo_clicked {
+                        view_photo = Some(name);
+                    } else if response.clicked() {
                         select = Some(index);
                     }
                 }
             });
+        if let Some(name) = view_photo {
+            self.photo_viewer = Some(name);
+        }
         if let Some(index) = select {
             self.select_player(index);
         }
@@ -8598,6 +8711,33 @@ impl App {
 
                 ui.add_space(8.0);
                 ui.separator();
+                ui.heading("Display");
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Photo size");
+                    for size in PhotoSize::ALL {
+                        ui.radio_value(&mut self.settings_photo_size, size, size.label());
+                    }
+                });
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Champion lineage");
+                    for lineage in ChampionLineage::ALL {
+                        ui.radio_value(
+                            &mut self.settings_champion_lineage,
+                            lineage,
+                            lineage.label(),
+                        );
+                    }
+                });
+                ui.label(
+                    RichText::new(
+                        "Photo size affects the board strips and the selected-player header; the Players list keeps a fixed thumbnail. FIDE/inclusive adds the four FIDE knockout champions from 1999–2006.",
+                    )
+                    .small()
+                    .weak(),
+                );
+
+                ui.add_space(8.0);
+                ui.separator();
                 ui.heading("My player names");
                 ui.label(
                     RichText::new(
@@ -8763,6 +8903,43 @@ impl App {
         }
     }
 
+    /// Standalone, larger view of a player portrait. The source pack stores
+    /// 80×100 images, so 240×300 is a deliberate 3× enlargement rather than a
+    /// claim of extra detail.
+    fn photo_viewer_window(&mut self, ctx: &egui::Context) {
+        let Some(name) = self.photo_viewer.clone() else {
+            return;
+        };
+        let mut open = true;
+        egui::Window::new("Player photo")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(264.0)
+            .show(ctx, |ui| {
+                if let Some(texture) = self.photo_texture(ctx, &name) {
+                    ui.add(
+                        egui::Image::from_texture(&texture).fit_to_exact_size(vec2(240.0, 300.0)),
+                    );
+                } else {
+                    ui.label(
+                        RichText::new("No photo is available for this player.")
+                            .weak()
+                            .italics(),
+                    );
+                }
+                ui.add_space(4.0);
+                ui.label(RichText::new(&name).strong());
+                if let Some(champion) = champions::champion(&name, self.champion_lineage) {
+                    ui.label(RichText::new("👑 World champion").color(GOLD))
+                        .on_hover_text(champion.tooltip());
+                }
+            });
+        if !open {
+            self.photo_viewer = None;
+        }
+    }
+
     fn about(&mut self, ctx: &egui::Context) {
         if !self.show_about {
             return;
@@ -8860,7 +9037,15 @@ impl eframe::App for App {
 
         egui::CentralPanel::default_margins().show(ui, |ui| {
             let avail = ui.available_size();
-            let side = (avail.x.min(avail.y - 140.0) - 24.0).max(120.0);
+            // The 140 px reserve covers the two player strips and spacing at
+            // the default 38 px avatar. Larger portraits need proportionally
+            // more room, otherwise the board is clipped at the bottom.
+            let photo_extra = if self.show_player_photos && self.photos.is_some() {
+                2.0 * (self.photo_size.pixels() - 38.0)
+            } else {
+                0.0
+            };
+            let side = (avail.x.min(avail.y - 140.0 - photo_extra) - 24.0).max(120.0);
             ui.with_layout(Layout::top_down(Align::Center), |ui| {
                 ui.add_space(6.0);
                 let hover = self.hover_preview.as_ref();
@@ -8913,7 +9098,18 @@ impl eframe::App for App {
                     let ctx = ui.ctx().clone();
                     let top_photo = self.photo_texture(&ctx, &meta.top.name);
                     let bottom_photo = self.photo_texture(&ctx, &meta.bottom.name);
-                    player_strip(ui, side, &meta.top, meta.show_clocks, top_photo.as_ref());
+                    let top_champion = champions::champion(&meta.top.name, self.champion_lineage);
+                    let bottom_champion =
+                        champions::champion(&meta.bottom.name, self.champion_lineage);
+                    let top_clicked = player_strip(
+                        ui,
+                        side,
+                        &meta.top,
+                        meta.show_clocks,
+                        top_photo.as_ref(),
+                        self.photo_size,
+                        top_champion,
+                    );
                     ui.add_space(2.0);
                     let event = board::draw(
                         ui,
@@ -8929,13 +9125,21 @@ impl eframe::App for App {
                         side,
                     );
                     ui.add_space(2.0);
-                    player_strip(
+                    let bottom_clicked = player_strip(
                         ui,
                         side,
                         &meta.bottom,
                         meta.show_clocks,
                         bottom_photo.as_ref(),
+                        self.photo_size,
+                        bottom_champion,
                     );
+                    if top_clicked {
+                        self.photo_viewer = Some(meta.top.name.clone());
+                    }
+                    if bottom_clicked {
+                        self.photo_viewer = Some(meta.bottom.name.clone());
+                    }
                     ui.add_space(4.0);
                     if let Some(event) = event {
                         self.handle_board_event(event);
@@ -8954,6 +9158,7 @@ impl eframe::App for App {
         });
 
         self.about(&ctx);
+        self.photo_viewer_window(&ctx);
         self.settings_dialog(&ctx);
         self.online_dialog(&ctx);
         self.pgn_export_dialog(&ctx);
@@ -8975,14 +9180,17 @@ fn player_strip(
     player: &PlayerBadge,
     show_clock: bool,
     photo: Option<&egui::TextureHandle>,
-) {
+    photo_size: PhotoSize,
+    champion: Option<&'static champions::Champion>,
+) -> bool {
     let has_team = player
         .team
         .as_ref()
         .is_some_and(|team| !team.trim().is_empty());
     let has_photo = photo.is_some();
+    let avatar_px = photo_size.pixels();
     let height = if has_photo {
-        46.0
+        avatar_px + 8.0
     } else if has_team {
         34.0
     } else {
@@ -8992,9 +9200,12 @@ fn player_strip(
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 6.0, Color32::from_rgb(0x1F, 0x22, 0x25));
 
+    let mut photo_clicked = false;
     let text_left = if let Some(texture) = photo {
-        let avatar =
-            egui::Rect::from_min_size(pos2(rect.left() + 4.0, rect.top() + 4.0), vec2(38.0, 38.0));
+        let avatar = egui::Rect::from_min_size(
+            pos2(rect.left() + 4.0, rect.top() + 4.0),
+            vec2(avatar_px, avatar_px),
+        );
         painter.rect_filled(avatar, 5.0, Color32::from_rgb(0x2C, 0x30, 0x34));
         painter.image(
             texture.id(),
@@ -9008,7 +9219,12 @@ fn player_strip(
             Stroke::new(1.0, Color32::from_gray(95)),
             StrokeKind::Inside,
         );
-        rect.left() + 50.0
+        let photo_response = ui.interact(avatar, response.id.with("photo"), Sense::click());
+        if photo_response.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        photo_clicked = photo_response.clicked();
+        rect.left() + avatar_px + 12.0
     } else {
         let dot = pos2(rect.left() + 12.0, rect.center().y);
         let fill = match player.color {
@@ -9050,6 +9266,17 @@ fn player_strip(
             ..Default::default()
         },
     );
+    if champion.is_some() {
+        label.append(
+            " 👑",
+            0.0,
+            TextFormat {
+                font_id: FontId::proportional(14.0),
+                color: GOLD,
+                ..Default::default()
+            },
+        );
+    }
     if let Some(rating) = &player.rating {
         label.append(
             &format!("  ({rating})"),
@@ -9070,11 +9297,22 @@ fn player_strip(
     );
     let name_painter = ui.painter_at(name_clip);
     let name_galley = name_painter.layout_job(label);
-    let name_y = if has_team || has_photo {
+    let name_y = if has_photo {
+        rect.center().y - 15.0
+    } else if has_team {
         rect.top() + 5.0
     } else {
         rect.center().y - name_galley.size().y / 2.0
     };
+    let crown_hovered = champion.is_some_and(|champion| {
+        crown_hover(
+            ui,
+            &name_galley,
+            pos2(text_left, name_y),
+            response.id.with("crown"),
+            champion,
+        )
+    });
     name_painter.galley(
         pos2(text_left, name_y),
         name_galley,
@@ -9087,7 +9325,7 @@ fn player_strip(
             Color32::from_gray(145),
         );
         let team_y = if has_photo {
-            rect.top() + 25.0
+            name_y + 20.0
         } else {
             rect.top() + 20.0
         };
@@ -9124,17 +9362,58 @@ fn player_strip(
         painter.galley(clock_rect.min, clock_galley, color);
     }
 
-    response.on_hover_text(format!(
-        "{} · {}{} · {}",
-        color_name(player.color),
-        player
-            .title
-            .as_deref()
-            .map(|title| format!("{title} "))
-            .unwrap_or_default(),
-        player.name,
-        player.rating.as_deref().unwrap_or("no rating")
-    ));
+    if !crown_hovered {
+        response.on_hover_text(format!(
+            "{} · {}{} · {}",
+            color_name(player.color),
+            player
+                .title
+                .as_deref()
+                .map(|title| format!("{title} "))
+                .unwrap_or_default(),
+            player.name,
+            player.rating.as_deref().unwrap_or("no rating")
+        ));
+    }
+    photo_clicked
+}
+
+/// Make a crown glyph painted as part of a larger text layout interactive, so
+/// the tooltip can explain the reign without splitting the player label into
+/// several widgets. Returns whether the pointer is over the crown.
+fn crown_hover(
+    ui: &Ui,
+    galley: &egui::Galley,
+    origin: egui::Pos2,
+    id: egui::Id,
+    champion: &champions::Champion,
+) -> bool {
+    let Some(rect) = crown_rect(galley, origin) else {
+        return false;
+    };
+    let response = ui.interact(rect, id, Sense::hover());
+    let hovered = response.hovered();
+    response.on_hover_text(champion.tooltip());
+    hovered
+}
+
+/// Bounding box of the crown glyph inside a laid-out player label.
+fn crown_rect(galley: &egui::Galley, origin: egui::Pos2) -> Option<egui::Rect> {
+    for placed in &galley.rows {
+        for glyph in &placed.row.glyphs {
+            if glyph.chr == '👑' {
+                return Some(
+                    egui::Rect::from_min_size(
+                        origin + placed.pos.to_vec2() + glyph.pos.to_vec2()
+                            - vec2(0.0, glyph.font_ascent),
+                        vec2(glyph.advance_width, glyph.font_height),
+                    )
+                    .expand(2.0),
+                );
+            }
+        }
+    }
+    None
 }
 
 /// Position after a single UCI move, together with the squares to highlight.
@@ -11146,6 +11425,100 @@ struct ViewDatabaseDrag {
 }
 
 /// Two-line, full-width selectable row for the game list.
+fn player_row(
+    ui: &mut Ui,
+    selected: bool,
+    title: &str,
+    subtitle: &str,
+    width: f32,
+    photo: Option<&egui::TextureHandle>,
+    champion: Option<&'static champions::Champion>,
+) -> (egui::Response, bool) {
+    let (rect, response) = ui.allocate_exact_size(vec2(width, 44.0), Sense::click());
+    let visuals = ui.visuals();
+    let bg = if selected {
+        visuals.selection.bg_fill
+    } else if response.hovered() {
+        visuals.widgets.hovered.bg_fill
+    } else {
+        Color32::TRANSPARENT
+    };
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 4.0, bg);
+
+    let mut photo_clicked = false;
+    let text_left = if let Some(texture) = photo {
+        let avatar =
+            egui::Rect::from_min_size(pos2(rect.left() + 6.0, rect.top() + 6.0), vec2(34.0, 34.0));
+        painter.rect_filled(avatar, 4.0, Color32::from_rgb(0x2C, 0x30, 0x34));
+        painter.image(
+            texture.id(),
+            avatar,
+            egui::Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+            Color32::WHITE,
+        );
+        painter.rect_stroke(
+            avatar,
+            4.0,
+            Stroke::new(1.0, Color32::from_gray(95)),
+            StrokeKind::Inside,
+        );
+        let photo_response = ui.interact(avatar, response.id.with("photo"), Sense::click());
+        if photo_response.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        photo_clicked = photo_response.clicked();
+        rect.left() + 48.0
+    } else {
+        rect.left() + 8.0
+    };
+
+    let mut job = LayoutJob::default();
+    job.append(
+        title,
+        0.0,
+        TextFormat {
+            font_id: FontId::proportional(14.0),
+            color: visuals.strong_text_color(),
+            ..Default::default()
+        },
+    );
+    if champion.is_some() {
+        job.append(
+            " 👑",
+            0.0,
+            TextFormat {
+                font_id: FontId::proportional(14.0),
+                color: GOLD,
+                ..Default::default()
+            },
+        );
+    }
+    let title_galley = painter.layout_job(job);
+    if let Some(champion) = champion {
+        crown_hover(
+            ui,
+            &title_galley,
+            pos2(text_left, rect.top() + 5.0),
+            response.id.with("crown"),
+            champion,
+        );
+    }
+    painter.galley(
+        pos2(text_left, rect.top() + 5.0),
+        title_galley,
+        visuals.strong_text_color(),
+    );
+    painter.text(
+        pos2(text_left, rect.top() + 23.0),
+        Align2::LEFT_TOP,
+        subtitle,
+        FontId::proportional(11.0),
+        visuals.weak_text_color(),
+    );
+    (response, photo_clicked)
+}
+
 fn game_row(
     ui: &mut Ui,
     selected: bool,
@@ -12421,6 +12794,9 @@ mod tests {
             photo_textures: std::collections::HashMap::new(),
             photo_order: VecDeque::new(),
             show_player_photos: true,
+            photo_size: PhotoSize::Small,
+            champion_lineage: ChampionLineage::Fide,
+            photo_viewer: None,
             show_nav_buttons: false,
             show_pgn_tags: true,
             date_picker: None,
@@ -12492,6 +12868,8 @@ mod tests {
             show_settings: false,
             settings_rating_priority: RatingPriority::Elo,
             settings_show_all_ratings: false,
+            settings_photo_size: PhotoSize::Small,
+            settings_champion_lineage: ChampionLineage::Fide,
             settings_my_player_names: String::new(),
             settings_correspondence_enabled: true,
             settings_correspondence_path: String::new(),
@@ -13218,5 +13596,36 @@ mod tests {
         assert_eq!(app.right_tab, RightTab::Tree);
 
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn crown_hit_rect_tracks_the_crown_glyph() {
+        let ctx = egui::Context::default();
+        let mut crowned = None;
+        let mut plain = None;
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let crowned_galley = ui.painter().layout_no_wrap(
+                "Magnus Carlsen 👑".to_owned(),
+                FontId::proportional(14.0),
+                Color32::WHITE,
+            );
+            crowned = crown_rect(&crowned_galley, pos2(10.0, 20.0));
+            let plain_galley = ui.painter().layout_no_wrap(
+                "Magnus Carlsen".to_owned(),
+                FontId::proportional(14.0),
+                Color32::WHITE,
+            );
+            plain = crown_rect(&plain_galley, pos2(10.0, 20.0));
+        });
+        output.textures_delta.clear();
+
+        let rect = crowned.expect("the crown glyph should have a hit rect");
+        assert!(rect.width() > 0.0);
+        assert!(rect.height() > 0.0);
+        assert!(rect.min.x >= 10.0);
+        assert!(rect.min.y >= 0.0);
+        assert!(rect.max.x <= 220.0);
+        assert!(rect.max.y <= 100.0);
+        assert!(plain.is_none(), "a label without a crown must not match");
     }
 }

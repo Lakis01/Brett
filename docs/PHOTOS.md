@@ -91,10 +91,21 @@ entry: u8 key length | key bytes | u32 offset | u32 length
 
 ## UI behaviour
 
-- Portraits appear as a compact 38 px avatar in each player strip; the strip
-  grows from 27/34 px to 46 px when a photo is present.
+- Portraits appear beside each player in the board strips and in the Players
+  tab. **Settings → Photo size** selects Small (38 px), Medium (54 px), or
+  Large (72 px); the strip grows by the same amount plus 8 px of padding.
+- The Players list keeps a fixed 34 px thumbnail so rows stay uniform. The
+  selected-player header uses the configured size.
+- Clicking any portrait — board strip, Players list, or player header — opens a
+  standalone 240×300 view. The pack's usual source image is 80×100, so this is
+  a deliberate enlargement, not additional detail.
 - **Settings → Show player photos** hides or shows them. The setting defaults
   to on when a pack is available.
+- Name lookup first tries the exact canonical key, then an accent-folded key,
+  then a conservative short-name match. The last step lets `Capablanca, Jose`
+  in the pack satisfy `José Raúl Capablanca` and `Gukesh D` satisfy `Gukesh
+  Dommaraju`; it requires a matching surname and accounts for every pack token,
+  so `Magnus Carlsen Jr` does not borrow Carlsen's portrait.
 - Missing players simply keep the colour dot and the normal strip height.
 - The pack is loaded once at startup. A corrupt or unreadable pack is ignored
   with a warning in the log; it never prevents a database from opening.

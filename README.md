@@ -275,11 +275,21 @@ ICCF server games under ICCF's terms, and comply with ICCF's terms. See
   the rook.
 - Player names, optional title badges (`WhiteTitle`/`BlackTitle`), and ratings
   are shown above and below the board on their playing side. When an optional
-  local Scid photo pack is available, a compact portrait appears beside each
-  player; **Settings → Show player photos** hides or shows it. No photo data is
-  redistributed with Brett — see [docs/PHOTOS.md](docs/PHOTOS.md).
+  local Scid photo pack is available, a portrait appears beside each player;
+  **Settings → Show player photos** hides or shows it, and **Settings → Photo
+  size** selects Small (38 px), Medium (54 px), or Large (72 px). Clicking a
+  portrait opens a standalone 240×300 view. The Players tab shows a fixed 34 px
+  thumbnail in the list and the selected size in the player header. No photo
+  data is redistributed with Brett — see [docs/PHOTOS.md](docs/PHOTOS.md).
   **Settings → Player ratings** chooses the Elo/DWZ/USCF priority and can show
   every available rating instead of only the preferred one.
+- Recognized world champions carry a gold crown (👑) in the board strips, the
+  Players list, and the selected-player header. Hovering the crown explains the
+  title line, reign, and one factual note (for example, Magnus Carlsen was
+  World Champion 2013–2023). **Settings → Champion lineage** selects
+  **FIDE/inclusive** (default; includes the four FIDE knockout champions from
+  1999–2006) or **Classical/PCA** (the uninterrupted line from Steinitz). See
+  [docs/CHAMPIONS.md](docs/CHAMPIONS.md).
 - Start, Previous, Next, and End buttons sit beside the board and are hidden by
   default; **Settings → Show navigation buttons** reveals them. The keyboard
   shortcuts work either way.
@@ -344,9 +354,12 @@ ICCF server games under ICCF's terms, and comply with ICCF's terms. See
   preparation tag fields, and drives auto-orientation when a game contains one
   of the aliases.
 - **Display** — **Show player photos** (enabled when a local pack is present),
-  **Show navigation buttons** (off by default), **Show PGN tags** (on by
-  default), and **Preview moves on hover** (off by default). Photo data is not
-  redistributed with Brett; see [docs/PHOTOS.md](docs/PHOTOS.md).
+  **Photo size** (Small/Medium/Large), **Champion lineage** (FIDE/inclusive by
+  default, or Classical/PCA), **Show navigation buttons** (off by default),
+  **Show PGN tags** (on by default), and **Preview moves on hover** (off by
+  default). Photo data is not redistributed with Brett; see
+  [docs/PHOTOS.md](docs/PHOTOS.md) and
+  [docs/CHAMPIONS.md](docs/CHAMPIONS.md).
 - **Correspondence database** — include or exclude the local correspondence
   database in the Engine tab, choose its file, or restore the conventional
   location. This section is no longer duplicated in Refs.
@@ -413,7 +426,8 @@ never writes to the source database.
 | `src/book/` | Shredder `.bkt` reader implementation |
 | `src/cbv.rs` | ChessBase `.cbv` container extraction into a classic CBH library |
 | `src/recent.rs` | In-memory recent-game trees and move-trend statistics |
-| `src/photos.rs` | Optional BPF1 player-photo pack reader and WebP decoding |
+| `src/photos.rs` | Optional BPF1 player-photo pack reader, folded/short-name lookup, and WebP decoding |
+| `src/champions.rs` | World-champion table and classical/FIDE lineage matching for the crown |
 | `src/session.rs` | Editable ordered session, database views, reorder/merge, PGN export |
 | `src/settings.rs` | Persistent engine, cloud, reference-database, display, and preparation settings |
 | `src/review.rs` | Sequential game review, move grading, accuracy, eval chart data |
@@ -540,5 +554,7 @@ piece artwork remains CC BY-SA 3.0, and the font remains under its own licence.
 **Important:** Brett currently links `shakmaty` and `pgn-reader`, both
 GPL-3.0-or-later. A built binary is therefore a combined work under
 GPL-3.0-or-later, even though the original Brett code is MIT. Do not describe
-a built binary as MIT-only. Replacing those crates is on the backlog; see
+a built binary as MIT-only. Replacing those crates is on the backlog; the
+options, effort, and trade-offs are analysed in
+[docs/GPL_OPTIONS.md](docs/GPL_OPTIONS.md). See also
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md#gpl-licensed-chess-and-pgn-crates).

@@ -485,7 +485,8 @@ rendering helpers. **Related:** item 15 (native player titles).
 
 Brett currently links `shakmaty` (chess rules, SAN, FEN) and `pgn-reader`
 (streaming PGN) under GPL-3.0-or-later. The original Brett code is MIT, but a
-built binary is a combined GPL work. See `THIRD_PARTY_NOTICES.md`.
+built binary is a combined GPL work. See `THIRD_PARTY_NOTICES.md` and the
+option-by-option analysis in [`GPL_OPTIONS.md`](GPL_OPTIONS.md).
 
 - Replace both crates with permissively licensed implementations, or make a
   deliberate project-wide GPL-3.0-or-later decision and update `LICENSE`,
@@ -538,9 +539,13 @@ preparation and repertoire review.
 
 **Status:** local loading implemented; redistribution blocked on permission.
 
-- The optional BPF1 reader (`src/photos.rs`), WebP decoding, 38 px board-strip
-  avatars, texture cache, and **Settings → Show player photos** toggle are
-  implemented.
+- The optional BPF1 reader (`src/photos.rs`), WebP decoding, texture cache,
+  **Settings → Show player photos**, **Settings → Photo size**
+  (Small/Medium/Large), Players-list thumbnails, selected-player portrait, and
+  the standalone 240×300 viewer are implemented. Name lookup also handles
+  accent-folded and short pack keys. The gold world-champion crown, its
+  classical/FIDE lineage setting, and the hover explanation of each reign are
+  implemented separately in [`CHAMPIONS.md`](CHAMPIONS.md).
 - The pack is derived from Scid's `Player_photos.zip`
   (`scid/PlayerData/Player_photos.zip`). The archive has no explicit
   redistribution licence; Scid's `COPYING` identifies database files as
