@@ -265,3 +265,111 @@ fn illegal_san_is_an_error() {
     assert!(SanPlus::from_ascii(b"").is_err());
     assert!(matches!(SanPlus::from_ascii(b"--").unwrap().san, San::Null));
 }
+
+/// An FRC position where both castles are legal: the White king on B1 with its
+/// rooks on A1 and H1, the Black king on E8, and rights only on those rook
+/// squares. Unlike the start position the king is not on the E file, so
+/// castling there can only round trip under `CastlingMode::Chess960`.
+fn frc_castling_setup() -> Setup {
+    let mut board = Board::empty();
+    board.set_piece_at(Square::A1, Piece::new(Color::White, Role::Rook));
+    board.set_piece_at(Square::B1, Piece::new(Color::White, Role::King));
+    board.set_piece_at(Square::H1, Piece::new(Color::White, Role::Rook));
+    board.set_piece_at(Square::E8, Piece::new(Color::Black, Role::King));
+    let mut rights = Bitboard::EMPTY;
+    rights |= Bitboard::from_square(Square::A1);
+    rights |= Bitboard::from_square(Square::H1);
+    Setup {
+        board,
+        turn: Color::White,
+        castling_rights: rights,
+        ep_square: None,
+        halfmoves: 0,
+        fullmoves: NonZeroU32::new(1).unwrap(),
+    }
+}
+
+#[test]
+fn chess960_castling_san_uci_round_trip() {
+    let pos = Chess::from_setup(frc_castling_setup(), CastlingMode::Chess960).unwrap();
+    assert_eq!(
+        pos.castles().rook(Color::White, CastlingSide::KingSide),
+        Some(Square::H1)
+    );
+    assert_eq!(
+        pos.castles().rook(Color::White, CastlingSide::QueenSide),
+        Some(Square::A1)
+    );
+
+    // Kingside: king B1 -> G1, h1 rook -> F1.
+    let oo = SanPlus::from_ascii(b"O-O")
+        .unwrap()
+        .san
+        .to_move(&pos)
+        .unwrap();
+    assert_eq!(
+        oo,
+        Move::Castle {
+            king: Square::B1,
+            rook: Square::H1
+        }
+    );
+    assert_eq!(
+        UciMove::from_move(oo, CastlingMode::Chess960).to_string(),
+        "b1h1"
+    );
+    assert_eq!(
+        UciMove::from_ascii(b"b1h1").unwrap().to_move(&pos).unwrap(),
+        oo
+    );
+    assert_eq!(
+        UciMove::from_move(oo, CastlingMode::Standard).to_string(),
+        "b1g1"
+    );
+    assert_eq!(SanPlus::from_move(pos.clone(), oo).to_string(), "O-O");
+    let after_oo = pos.clone().play(oo).unwrap();
+    assert_eq!(
+        after_oo.board().piece_at(Square::G1),
+        Some(Piece::new(Color::White, Role::King))
+    );
+    assert_eq!(
+        after_oo.board().piece_at(Square::F1),
+        Some(Piece::new(Color::White, Role::Rook))
+    );
+
+    // Queenside: king B1 -> C1, a1 rook -> D1.
+    let ooo = SanPlus::from_ascii(b"O-O-O")
+        .unwrap()
+        .san
+        .to_move(&pos)
+        .unwrap();
+    assert_eq!(
+        ooo,
+        Move::Castle {
+            king: Square::B1,
+            rook: Square::A1
+        }
+    );
+    assert_eq!(
+        UciMove::from_move(ooo, CastlingMode::Chess960).to_string(),
+        "b1a1"
+    );
+    assert_eq!(
+        UciMove::from_ascii(b"b1a1").unwrap().to_move(&pos).unwrap(),
+        ooo
+    );
+    assert_eq!(
+        UciMove::from_move(ooo, CastlingMode::Standard).to_string(),
+        "b1c1"
+    );
+    assert_eq!(SanPlus::from_move(pos.clone(), ooo).to_string(), "O-O-O");
+    let after_ooo = pos.play(ooo).unwrap();
+    assert_eq!(
+        after_ooo.board().piece_at(Square::C1),
+        Some(Piece::new(Color::White, Role::King))
+    );
+    assert_eq!(
+        after_ooo.board().piece_at(Square::D1),
+        Some(Piece::new(Color::White, Role::Rook))
+    );
+}
