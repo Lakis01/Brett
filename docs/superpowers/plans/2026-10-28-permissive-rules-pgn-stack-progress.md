@@ -12,7 +12,7 @@
 - Branch: `permissive-rules-pgn`; Task 4 complete at `25a0376`. Controller handed from DeepSeek 4.1 Flash (opencode quota exhausted) to Claude Opus 5.5 Medium in Antigravity on 2026-10-29.
 - Completed: Tasks 1–4, all reviews clean.
 - Next action: generate `task-5-brief.md` and dispatch Task 5 (PGN reader) with BASE = the ledger snapshot after `25a0376`.
-- Controller gate check at `25a0376` (chess_facade 17/17): `cargo test --all-targets` green (132 lib + 12 chess_facade + all integration suites; 1 pre-existing ignored), `cargo clippy --all-targets -- -D warnings` clean, `cargo fmt --all -- --check` clean.
+- Controller gate check at `25a0376` (chess_facade 17/17): `cargo test --all-targets` green (132 lib + 17 chess_facade + all integration suites; 1 pre-existing ignored), `cargo clippy --all-targets -- -D warnings` clean, `cargo fmt --all -- --check` clean.
 - Live artifacts in this directory: `progress.md`, `task-N-brief.md`, `task-N-report.md`, `review-<base>..<head>.diff`.
 - Recovery: `git log --oneline c696941..HEAD`; the plan is committed; briefs are regenerable with the skill's `task-brief` script.
 - Caveat: this directory is git-ignored (`.superpowers/sdd/.gitignore`). Copy it or commit a snapshot before moving the work to another machine.
