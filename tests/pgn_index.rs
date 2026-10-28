@@ -113,6 +113,17 @@ fn filter_is_case_insensitive_and_uses_headers() {
 }
 
 #[test]
+fn comment_with_fake_tag_does_not_split_games() {
+    let path = write_temp_pgn("fake-tag", THREE_GAMES);
+    let library = PgnLibrary::build(&path).unwrap();
+    assert_eq!(library.len(), 3);
+    assert_eq!(library.load(0).unwrap().white(), "Alice");
+    assert_eq!(library.load(1).unwrap().white(), "Carol");
+    assert_eq!(library.load(2).unwrap().white(), "Eve");
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn index_matches_full_parse_on_local_fixtures() {
     for name in [
         "fischer.pgn",

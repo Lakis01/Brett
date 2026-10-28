@@ -10,8 +10,8 @@
 //! position index all work against this interface rather than against a
 //! particular file format.
 //!
-//! The byte ranges are obtained from `pgn-reader`'s [`Seek`] implementation,
-//! which reports the logical stream position (excluding buffered lookahead).
+//! The byte ranges are obtained from the Brett PGN parser's logical
+//! [`Reader::stream_position`], which excludes buffered lookahead.
 
 use std::borrow::Borrow;
 use std::collections::HashSet;
@@ -24,9 +24,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
-use pgn_reader::{RawTag, Reader, Visitor};
 
 use crate::domain::{self, Game};
+use crate::pgn::reader::{Reader, Visitor};
 
 /// Metadata used to decide whether a cached position index is still current.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -380,18 +380,14 @@ impl PgnLibrary {
         let mut strings = StringPool::default();
 
         loop {
-            let start = reader
-                .stream_position()
-                .context("querying PGN stream position")?;
+            let start = reader.stream_position();
             let Some(headers) = reader
                 .read_game(&mut visitor)
                 .with_context(|| format!("indexing {}", path.display()))?
             else {
                 break;
             };
-            let end = reader
-                .stream_position()
-                .context("querying PGN stream position")?;
+            let end = reader.stream_position();
 
             if end <= start {
                 bail!(
@@ -533,13 +529,10 @@ impl Visitor for HeaderVisitor {
     fn tag(
         &mut self,
         tags: &mut Vec<(String, String)>,
-        name: &[u8],
-        value: RawTag<'_>,
+        name: &str,
+        value: &str,
     ) -> ControlFlow<Vec<(String, String)>> {
-        tags.push((
-            String::from_utf8_lossy(name).into_owned(),
-            value.decode_utf8_lossy().into_owned(),
-        ));
+        tags.push((name.to_string(), value.to_string()));
         ControlFlow::Continue(())
     }
 
@@ -548,6 +541,10 @@ impl Visitor for HeaderVisitor {
         tags: Vec<(String, String)>,
     ) -> ControlFlow<Vec<(String, String)>, Vec<(String, String)>> {
         ControlFlow::Continue(tags)
+    }
+
+    fn wants_movetext(&self) -> bool {
+        false
     }
 
     fn end_game(&mut self, headers: Vec<(String, String)>) -> Vec<(String, String)> {
