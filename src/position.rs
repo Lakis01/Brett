@@ -1,9 +1,10 @@
 //! On-disk position index and opening-tree statistics.
 //!
 //! The index is built from the **mainline** of every PGN game. Each entry is
-//! keyed by a Zobrist hash of the position *before* a move, plus the move that
-//! was played. Records are sorted by `(position, move)` and memory-mapped for
-//! lookup, so an index can be much larger than the process heap.
+//! keyed by Brett's stable `cozy-chess`-based hash of the position *before* a
+//! move, plus the move that was played. Records are sorted by `(position, move)`
+//! and memory-mapped for lookup, so an index can be much larger than the
+//! process heap. On-disk `VERSION` is `2`; older version-1 caches are ignored.
 //!
 //! Position totals are the sum of the outgoing move records. A game is counted
 //! at most once per position: if a game repeats a position, indexing stops at
@@ -19,17 +20,15 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use memmap2::{Mmap, MmapOptions};
-use pgn_reader::{RawTag, Reader, SanPlus, Visitor};
-use shakmaty::fen::Fen;
-use shakmaty::san::San;
-use shakmaty::uci::UciMove;
-use shakmaty::zobrist::Zobrist64;
-use shakmaty::{CastlingMode, Chess, EnPassantMode, Move, Position, Role, Square};
 
+use crate::chess::{
+    CastlingMode, Chess, Fen, File, Move, Position, Role, San, SanPlus, Square, UciMove,
+};
 use crate::library::{GameLibrary, SourceMeta};
+use crate::pgn::reader::{Reader, Visitor};
 
 const MAGIC: &[u8; 8] = b"BRETTPOS";
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 const HEADER_LEN: usize = 80;
 const EDGE_SIZE: usize = 48;
 const NO_PROMOTION: u32 = 7;
@@ -618,10 +617,10 @@ impl PositionIndex {
     }
 }
 
-/// Stable Zobrist key used by the index. The same position always maps to the
+/// Stable hash key used by the index. The same position always maps to the
 /// same key across runs and index rebuilds.
 pub fn position_key(pos: &Chess) -> u64 {
-    pos.zobrist_hash::<Zobrist64>(EnPassantMode::Legal).0
+    pos.position_hash()
 }
 
 /// Encode a legal chess move as 16 bits of squares plus a promotion code.
@@ -677,9 +676,9 @@ fn move_destination(mv: Move) -> Square {
 
 fn castle_destination(king: Square, rook: Square) -> Square {
     let file = if rook.file() > king.file() {
-        shakmaty::File::G
+        File::G
     } else {
-        shakmaty::File::C
+        File::C
     };
     Square::from_coords(file, king.rank())
 }
@@ -954,6 +953,7 @@ struct GameState {
     active: bool,
     included: bool,
     plies: u32,
+    variation_depth: usize,
 }
 
 impl GameState {
@@ -975,6 +975,7 @@ impl GameState {
             active: included,
             included,
             plies: 0,
+            variation_depth: 0,
         }
     }
 }
@@ -1034,13 +1035,10 @@ where
     fn tag(
         &mut self,
         tags: &mut Vec<(String, String)>,
-        name: &[u8],
-        value: RawTag<'_>,
+        name: &str,
+        value: &str,
     ) -> ControlFlow<()> {
-        tags.push((
-            String::from_utf8_lossy(name).into_owned(),
-            value.decode_utf8_lossy().into_owned(),
-        ));
+        tags.push((name.to_string(), value.to_string()));
         ControlFlow::Continue(())
     }
 
@@ -1048,8 +1046,18 @@ where
         ControlFlow::Continue(GameState::new(&tags, self.options))
     }
 
+    fn begin_variation(&mut self, state: &mut GameState) -> ControlFlow<()> {
+        state.variation_depth += 1;
+        ControlFlow::Continue(())
+    }
+
+    fn end_variation(&mut self, state: &mut GameState) -> ControlFlow<()> {
+        state.variation_depth = state.variation_depth.saturating_sub(1);
+        ControlFlow::Continue(())
+    }
+
     fn san(&mut self, state: &mut GameState, san_plus: SanPlus) -> ControlFlow<()> {
-        if !state.active {
+        if !state.active || state.variation_depth > 0 {
             return ControlFlow::Continue(());
         }
         if matches!(san_plus.san, San::Null) {
@@ -1106,7 +1114,7 @@ mod tests {
     use super::*;
 
     fn position_key_is_stable() {
-        assert_eq!(position_key(&Chess::default()), 0x463b_9618_1691_fc9c);
+        assert_eq!(position_key(&Chess::default()), 0x33ab_452b_8705_6e0f);
     }
 
     #[test]

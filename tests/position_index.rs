@@ -2,14 +2,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use brett::chess::{Chess, Position, SanPlus};
 use brett::domain;
 use brett::library::{GameLibrary, PgnLibrary};
 use brett::position::{
     BuildOptions, PositionIndex, RatingFilter, decode_move, encode_move, position_key,
     reference_cache_path,
 };
-use pgn_reader::SanPlus;
-use shakmaty::{Chess, Position};
 
 const FOUR_GAMES: &str = r#"[Event "Alpha"]
 [Site "Test"]
