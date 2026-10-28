@@ -8,12 +8,12 @@
 use std::num::NonZeroU32;
 use std::ops::ControlFlow;
 
+use crate::chess::{
+    CastlingMode, Chess, Color, EnPassantMode, Fen, File, Move, Position, Role, San, SanPlus,
+    Square, UciMove,
+};
+use crate::pgn::reader::{Reader, Visitor};
 use anyhow::{Context, Result};
-use pgn_reader::{Nag, RawComment, RawTag, Reader, SanPlus, Skip, Visitor};
-use shakmaty::fen::Fen;
-use shakmaty::san::San;
-use shakmaty::uci::UciMove;
-use shakmaty::{CastlingMode, Chess, Color, EnPassantMode, FromSetup, Position, Role, Square};
 
 /// One played move, with both notations and the move number it was played on.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -291,7 +291,7 @@ impl Game {
     /// If `parent` already has a mainline child, the new move becomes a
     /// variation; this matches how a user exploring a game expects the tree
     /// to grow.
-    pub fn add_move(&mut self, parent: usize, mv: shakmaty::Move) -> usize {
+    pub fn add_move(&mut self, parent: usize, mv: Move) -> usize {
         let uci = UciMove::from_move(mv, CastlingMode::Standard).to_string();
 
         let existing = self.nodes[parent]
@@ -360,13 +360,10 @@ impl Visitor for TreeVisitor {
     fn tag(
         &mut self,
         tags: &mut Vec<(String, String)>,
-        name: &[u8],
-        value: RawTag<'_>,
+        name: &str,
+        value: &str,
     ) -> ControlFlow<Game> {
-        tags.push((
-            String::from_utf8_lossy(name).into_owned(),
-            value.decode_utf8_lossy().into_owned(),
-        ));
+        tags.push((name.to_string(), value.to_string()));
         ControlFlow::Continue(())
     }
 
@@ -379,24 +376,23 @@ impl Visitor for TreeVisitor {
         ControlFlow::Continue(())
     }
 
-    fn nag(&mut self, mt: &mut Builder, nag: Nag) -> ControlFlow<Game> {
-        mt.nodes[mt.current].nags.push(nag.0);
+    fn nag(&mut self, mt: &mut Builder, nag: u8) -> ControlFlow<Game> {
+        mt.nodes[mt.current].nags.push(nag);
         ControlFlow::Continue(())
     }
 
-    fn comment(&mut self, mt: &mut Builder, comment: RawComment<'_>) -> ControlFlow<Game> {
-        let text = String::from_utf8_lossy(comment.0);
-        mt.nodes[mt.current].add_comment(&text);
+    fn comment(&mut self, mt: &mut Builder, comment: &str) -> ControlFlow<Game> {
+        mt.nodes[mt.current].add_comment(comment);
         ControlFlow::Continue(())
     }
 
-    fn begin_variation(&mut self, mt: &mut Builder) -> ControlFlow<Game, Skip> {
+    fn begin_variation(&mut self, mt: &mut Builder) -> ControlFlow<Game> {
         // A variation replaces the move that was just played, so it starts
         // from the position before that move.
         let before = mt.nodes[mt.current].parent.unwrap_or(0);
         mt.stack.push(mt.current);
         mt.current = before;
-        ControlFlow::Continue(Skip(false))
+        ControlFlow::Continue(())
     }
 
     fn end_variation(&mut self, mt: &mut Builder) -> ControlFlow<Game> {
@@ -961,17 +957,17 @@ pub fn last_move_squares(node: &Node) -> Option<(Square, Square)> {
 
 /// Destination of the king in a castling move.
 ///
-/// `shakmaty::Move::Castle::to()` is the rook's square, which is useful for
+/// [`Move::Castle`]'s `to()` is the rook's square, which is useful for
 /// UCI but not what a player drags the king onto. Standard chess puts the king
 /// on the G-file after kingside castling and the C-file after queenside.
-fn castle_king_destination(mv: &shakmaty::Move) -> Option<Square> {
-    let shakmaty::Move::Castle { king, rook } = mv else {
+fn castle_king_destination(mv: &Move) -> Option<Square> {
+    let Move::Castle { king, rook } = mv else {
         return None;
     };
     let file = if rook.file() > king.file() {
-        shakmaty::File::G
+        File::G
     } else {
-        shakmaty::File::C
+        File::C
     };
     Some(Square::from_coords(file, king.rank()))
 }
@@ -980,7 +976,7 @@ fn castle_king_destination(mv: &shakmaty::Move) -> Option<Square> {
 ///
 /// Castling exposes both the king's destination and the rook's square as
 /// targets, so a king can be clicked or dragged onto either one.
-pub fn legal_targets(pos: &Chess, from: Square) -> Vec<(Square, shakmaty::Move)> {
+pub fn legal_targets(pos: &Chess, from: Square) -> Vec<(Square, Move)> {
     let mut targets = Vec::new();
     for mv in pos.legal_moves().iter().filter(|m| m.from() == Some(from)) {
         targets.push((mv.to(), *mv));
@@ -996,9 +992,9 @@ pub fn legal_targets(pos: &Chess, from: Square) -> Vec<(Square, shakmaty::Move)>
 /// Choose a promotion piece when several moves share from/to (default: queen).
 ///
 /// For castling, `to` may be the king's destination (`g1`/`c1`) rather than
-/// the rook's square that shakmaty reports.
-pub fn pick_move(pos: &Chess, from: Square, to: Square) -> Option<shakmaty::Move> {
-    let candidates: Vec<shakmaty::Move> = pos
+/// the rook's square that `Move::to` reports.
+pub fn pick_move(pos: &Chess, from: Square, to: Square) -> Option<Move> {
+    let candidates: Vec<Move> = pos
         .legal_moves()
         .iter()
         .filter(|m| m.from() == Some(from) && m.to() == to)
@@ -1065,7 +1061,7 @@ mod tests {
         let kingside = pick_move(&pos, Square::E1, Square::G1).unwrap();
         assert_eq!(
             kingside,
-            shakmaty::Move::Castle {
+            Move::Castle {
                 king: Square::E1,
                 rook: Square::H1,
             }

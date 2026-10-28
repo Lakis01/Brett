@@ -1,5 +1,5 @@
+use brett::chess::{Color, Move, Position, Role, Square};
 use brett::domain::{self, Game, Token};
-use shakmaty::{Move, Position, Role, Square};
 
 fn opera() -> Game {
     let games = domain::parse_pgn(include_bytes!("../fixtures/opera.pgn")).unwrap();
@@ -50,10 +50,7 @@ fn variation_hangs_off_the_alternative_move() {
     assert_eq!(g.nodes[d4].children.len(), 2);
     assert_eq!(g.nodes[d4].children[0], bg4, "mainline must stay first");
     assert_eq!(g.nodes[d4].children[1], exd4);
-    assert_eq!(
-        g.nodes[exd4].mv.as_ref().unwrap().color,
-        shakmaty::Color::Black
-    );
+    assert_eq!(g.nodes[exd4].mv.as_ref().unwrap().color, Color::Black);
     assert_eq!(g.nodes[exd4].mv.as_ref().unwrap().number, 3);
 }
 
@@ -218,8 +215,8 @@ fn null_moves_are_accepted() {
     let ply = g.nodes[null].mv.as_ref().unwrap();
     assert_eq!(ply.uci, "0000");
     assert_eq!(ply.number, 2);
-    assert_eq!(ply.color, shakmaty::Color::Black);
-    assert_eq!(g.nodes[null].pos.turn(), shakmaty::Color::White);
+    assert_eq!(ply.color, Color::Black);
+    assert_eq!(g.nodes[null].pos.turn(), Color::White);
 
     let nxe5 = g
         .nodes
@@ -228,7 +225,7 @@ fn null_moves_are_accepted() {
         .unwrap();
     let ply = g.nodes[nxe5].mv.as_ref().unwrap();
     assert_eq!(ply.number, 3);
-    assert_eq!(ply.color, shakmaty::Color::White);
+    assert_eq!(ply.color, Color::White);
 }
 
 #[test]
@@ -246,4 +243,33 @@ fn illegal_moves_are_reported_not_fatal() {
     assert!(g.errors[0].contains("Kf3"));
     // The legal prefix is still imported.
     assert_eq!(g.mainline_len(), 2);
+}
+
+#[test]
+fn illegal_san_is_reported_without_aborting() {
+    let pgn = br#"[Event "Broken"]
+[White "A"]
+[Black "B"]
+[Result "*"]
+
+1. e4 e5 2. Kf3 Nc6 3. Bb5 *
+"#;
+    let games = domain::parse_pgn(pgn).unwrap();
+    let g = &games[0];
+    assert_eq!(g.errors.len(), 1);
+    assert!(g.errors[0].contains("Kf3"));
+    assert_eq!(g.mainline_len(), 2);
+}
+
+#[test]
+fn truncated_game_returns_at_eof() {
+    let pgn = br#"[Event "Trunc"]
+[White "A"]
+[Black "B"]
+[Result "*"]
+
+1. e4 e5 2. Nf3"#;
+    let games = domain::parse_pgn(pgn).unwrap();
+    assert_eq!(games.len(), 1);
+    assert_eq!(games[0].mainline_len(), 3);
 }
