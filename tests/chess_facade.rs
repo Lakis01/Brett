@@ -373,3 +373,106 @@ fn chess960_castling_san_uci_round_trip() {
         Some(Piece::new(Color::White, Role::Rook))
     );
 }
+
+use brett::chess::{EnPassantMode, Fen, Position};
+
+#[test]
+fn fen_round_trips_start_position() {
+    let start = Chess::default();
+    let fen = Fen::from_position(&start, EnPassantMode::Legal).to_string();
+    assert_eq!(
+        fen,
+        "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
+    );
+    let parsed = Fen::from_ascii(fen.as_bytes()).unwrap();
+    let pos = parsed.into_position(CastlingMode::Standard).unwrap();
+    assert_eq!(
+        pos.board().piece_at(Square::E1),
+        Some(Piece::new(Color::White, Role::King))
+    );
+}
+
+#[test]
+fn fen_resolves_xfen_kq_to_outermost_rooks() {
+    let fen = "bbqnnrkr/pppppppp/8/8/8/8/PPPPPPPP/BBQNNRKR w KQkq - 0 1";
+    let setup = Fen::from_ascii(fen.as_bytes()).unwrap().into_setup();
+    assert!(setup.castling_rights.contains(Square::F1));
+    assert!(setup.castling_rights.contains(Square::H1));
+    let pos = Fen::from_ascii(fen.as_bytes())
+        .unwrap()
+        .into_position(CastlingMode::Chess960)
+        .unwrap();
+    assert_eq!(
+        Fen::from_position(&pos, EnPassantMode::Legal).to_string(),
+        fen
+    );
+}
+
+#[test]
+fn fen_writes_file_letters_for_inner_rooks() {
+    let mut board = Board::empty();
+    board.set_piece_at(Square::G1, Piece::new(Color::White, Role::King));
+    board.set_piece_at(Square::A1, Piece::new(Color::White, Role::Rook));
+    board.set_piece_at(Square::D1, Piece::new(Color::White, Role::Rook));
+    board.set_piece_at(Square::E8, Piece::new(Color::Black, Role::King));
+    let mut rights = Bitboard::EMPTY;
+    rights |= Bitboard::from_square(Square::D1);
+    let setup = Setup {
+        board,
+        turn: Color::White,
+        castling_rights: rights,
+        ep_square: None,
+        halfmoves: 0,
+        fullmoves: NonZeroU32::new(1).unwrap(),
+    };
+    let pos = Chess::from_setup(setup, CastlingMode::Chess960).unwrap();
+    let fen = Fen::from_position(&pos, EnPassantMode::Legal).to_string();
+    assert!(
+        fen.contains(" w D "),
+        "expected inner-rook file letter, got {fen}"
+    );
+}
+
+#[test]
+fn position_hash_is_stable_and_uses_legal_ep_only() {
+    assert_eq!(Chess::default().position_hash(), 0x33ab_452b_8705_6e0f);
+
+    let legal = "rnbqkbnr/ppp1pppp/8/3pP3/8/8/PPPP1PPP/RNBQKBNR w KQkq d6 0 3";
+    let no_ep = "rnbqkbnr/ppp1pppp/8/3pP3/8/8/PPPP1PPP/RNBQKBNR w KQkq - 0 3";
+    let legal = Fen::from_ascii(legal.as_bytes())
+        .unwrap()
+        .into_position(CastlingMode::Standard)
+        .unwrap();
+    let no_ep = Fen::from_ascii(no_ep.as_bytes())
+        .unwrap()
+        .into_position(CastlingMode::Standard)
+        .unwrap();
+    assert_ne!(legal.position_hash(), no_ep.position_hash());
+
+    let pinned = "4r1k1/8/8/3pP3/8/8/8/4K3 w - d6 0 1";
+    let pinned_no_ep = "4r1k1/8/8/3pP3/8/8/8/4K3 w - - 0 1";
+    let pinned = Fen::from_ascii(pinned.as_bytes())
+        .unwrap()
+        .into_position(CastlingMode::Standard)
+        .unwrap();
+    let pinned_no_ep = Fen::from_ascii(pinned_no_ep.as_bytes())
+        .unwrap()
+        .into_position(CastlingMode::Standard)
+        .unwrap();
+    assert_eq!(pinned.ep_square(EnPassantMode::Legal), None);
+    assert_eq!(pinned.position_hash(), pinned_no_ep.position_hash());
+}
+
+#[test]
+fn swap_turn_clears_ep_and_keeps_clocks() {
+    let fen = "rnbqkbnr/ppp1pppp/8/3pP3/8/8/PPPP1PPP/RNBQKBNR w KQkq d6 0 3";
+    let pos = Fen::from_ascii(fen.as_bytes())
+        .unwrap()
+        .into_position(CastlingMode::Standard)
+        .unwrap();
+    let swapped = pos.swap_turn().unwrap();
+    assert_eq!(swapped.turn(), Color::Black);
+    assert_eq!(swapped.maybe_ep_square(), None);
+    assert_eq!(swapped.halfmoves(), 0);
+    assert_eq!(swapped.fullmoves(), NonZeroU32::new(3).unwrap());
+}

@@ -3,7 +3,7 @@
 
 use std::fmt;
 
-use crate::chess::chess::Chess;
+use crate::chess::chess::{Chess, Position};
 use crate::chess::r#move::Move;
 use crate::chess::types::Role;
 

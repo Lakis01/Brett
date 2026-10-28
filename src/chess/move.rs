@@ -8,7 +8,7 @@ use std::fmt;
 use std::str::FromStr;
 
 use crate::chess::board::CastlingMode;
-use crate::chess::chess::Chess;
+use crate::chess::chess::{Chess, Position};
 use crate::chess::types::{File, Role, Square};
 
 /// Error returned when a [`UciMove`] cannot be parsed or played.
