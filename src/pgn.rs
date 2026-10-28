@@ -7,6 +7,9 @@
 
 use std::io::{self, Write};
 
+pub mod reader;
+pub use reader::{Reader, Visitor};
+
 use shakmaty::fen::Fen;
 use shakmaty::{Chess, Color, EnPassantMode};
 
