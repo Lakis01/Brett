@@ -9,10 +9,10 @@
 
 ## Handover state
 
-- Branch: `permissive-rules-pgn`; HEAD `d85f267` (tracked ledger snapshot). Task 3 code at `dc86ad1`; Task 3 BASE `dd129ab`.
-- Completed: Tasks 1–2, both reviews clean.
-- In flight: Task 3 implemented at `dc86ad1`; task review not yet dispatched.
-- Next action: generate the review package for `dd129ab..dc86ad1`, dispatch the task reviewer, record the verdict here, then mark Task 3 complete and snapshot.
+- Branch: `permissive-rules-pgn`; Task 3 complete at `4f36598` (fix round 1 on top of `dc86ad1`). Controller handed from DeepSeek 4.1 Flash (opencode quota exhausted) to Claude Opus 5.5 Medium in Antigravity on 2026-10-29.
+- Completed: Tasks 1–3, all reviews clean.
+- Next action: dispatch Task 4 from `task-4-brief.md` with BASE = the ledger snapshot commit following `4f36598`.
+- Controller gate check at `4f36598`: `cargo test --all-targets` green (132 lib + 12 chess_facade + all integration suites; 1 pre-existing ignored), `cargo clippy --all-targets -- -D warnings` clean, `cargo fmt --all -- --check` clean.
 - Live artifacts in this directory: `progress.md`, `task-N-brief.md`, `task-N-report.md`, `review-<base>..<head>.diff`.
 - Recovery: `git log --oneline c696941..HEAD`; the plan is committed; briefs are regenerable with the skill's `task-brief` script.
 - Caveat: this directory is git-ignored (`.superpowers/sdd/.gitignore`). Copy it or commit a snapshot before moving the work to another machine.
@@ -112,12 +112,15 @@ Task priority if Argon quota is small: Argon Medium for Tasks 4, 5, 8, 10 (FEN/h
 
 - Task 1: complete (commits c696941..e6bc92b, review clean). Minor accepted: `pub mod types` widens the facade path; committed tests do not exercise the cozy conversion bridge; `Square::ALL` is hand-written beside the macro. None block; conversion correctness was verified by the reviewer against cozy 0.2.2's documented rank-major layout.
 - Task 2: complete (commits 21210ae..dd129ab, review clean). DONE_WITH_CONCERNS accepted: test `use` lines merged into the header (bodies verbatim) and `Chess::default` is an `impl Default` (clippy). Minor accepted: `to_setup_always`/`BoardRef::new` public surface, no direct EP-rank test, unreachable `NonZeroU32` fallback, `us_of` indirection. Reviewer verified Standard/Chess960 rights and EP mapping against cozy 0.3.4.
+- Task 3: review verdict spec ✅ / quality Needs fixes. Important: no committed Chess960 castling test — the scratch tests that covered DFRC `O-O`/`O-O-O` and rook-square UCI were deleted before commit. Fix round 1 dispatched. Minor (deferred): SAN resolution regenerates legal moves for the mandated membership check; illegal/drop moves render a plausible fallback SAN with no dev assertion; mid-file `use` in `tests/chess_facade.rs`; `Chess::castles()` re-derived per king move in `legal_moves()`.
+  - Controller note for the fix: the existing `dfrc_setup()` cannot exercise castling (D1/E1 knights block queenside; G1/H1 kingside is a no-op), so the fix uses a dedicated legal DFRC castling setup (king B1, rooks A1/H1).
+  - Fix round 1: `4f36598` adds `chess960_castling_san_uci_round_trip` (SAN `O-O`/`O-O-O` → `Move::Castle`, Chess960 UCI `b1h1`/`b1a1` round trip, Standard UCI `b1g1`/`b1c1`, SAN display, resulting king/rook squares). Re-review (Opus 5.5 Medium, controller): clean. The background GLM reviewer verdict was superseded. Task 3 complete (commits dd129ab..4f36598); Minor items above remain deferred.
 
 ## Tasks
 
 - [x] Task 1: add `cozy-chess` and facade scalars
 - [x] Task 2: board, setup, castling, `Chess`
-- [ ] Task 3: moves, SAN, UCI
+- [x] Task 3: moves, SAN, UCI
 - [ ] Task 4: FEN, position hash, `Position`
 - [ ] Task 5: Brett streaming PGN reader
 - [ ] Task 6: migrate `domain.rs`
