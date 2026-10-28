@@ -9,10 +9,14 @@
 
 ## Handover state
 
-- Branch: `permissive-rules-pgn`; Task 5 complete at `aed2c66`. Controller/implementer handed from Claude Opus 5.5 Medium (429 quota reached) to Gemini 4 Argon Medium in Antigravity on 2026-10-29.
-- Completed: Tasks 1–5, all reviews clean.
-- Next action: execute Task 6 (`src/domain.rs` migration) from `task-6-brief.md` with BASE = the ledger snapshot after `aed2c66`.
-- Controller gate check at `aed2c66`: `cargo test --all-targets` green (132 lib + 17 chess_facade + 8 pgn_reader + all integration suites; 1 pre-existing ignored), `cargo clippy --all-targets -- -D warnings` clean, `cargo fmt --all -- --check` clean.
+- Branch: `permissive-rules-pgn`; all 13 tasks complete (`fecdde1`).
+- Completed: Tasks 1–13, all reviews and final verification gates clean.
+- Final gate check at `fecdde1`:
+  - `cargo test --all-targets`: green (133 lib + 17 `chess_facade` + 8 `pgn_reader` + 13 `pgn_tree` + 5 `pgn_index` + 3 `polyglot` + 9 `position_index` + 3 `scid` + 3 `board_drag` + 3 `local_fixtures` + all bins/examples; 1 pre-existing ignored).
+  - `cargo clippy --all-targets -- -D warnings`: clean (0 warnings).
+  - `cargo fmt --all -- --check`: clean.
+  - `cargo tree -i shakmaty` & `cargo tree -i pgn-reader`: neither package present in the dependency graph.
+  - `grep -RIn "shakmaty\|pgn-reader\|pgn_reader"`: zero references in `Cargo.toml`, `Cargo.lock`, `src/`, `tests/`, or `examples/`.
 - Live artifacts in this directory: `progress.md`, `task-N-brief.md`, `task-N-report.md`, `review-<base>..<head>.diff`.
 - Recovery: `git log --oneline c696941..HEAD`; the plan is committed; briefs are regenerable with the skill's `task-brief` script.
 - Caveat: this directory is git-ignored (`.superpowers/sdd/.gitignore`). Copy it or commit a snapshot before moving the work to another machine.
@@ -117,6 +121,14 @@ Task priority if Argon quota is small: Argon Medium for Tasks 4, 5, 8, 10 (FEN/h
   - Fix round 1: `4f36598` adds `chess960_castling_san_uci_round_trip` (SAN `O-O`/`O-O-O` → `Move::Castle`, Chess960 UCI `b1h1`/`b1a1` round trip, Standard UCI `b1g1`/`b1c1`, SAN display, resulting king/rook squares). Re-review (Opus 5.5 Medium, controller): clean. The background GLM reviewer verdict was superseded. Task 3 complete (commits dd129ab..4f36598); Minor items above remain deferred.
 - Task 4: complete (commits e21eda4..25a0376, implementer Opus 5.5 Medium subagent, controller review clean). DONE_WITH_CONCERNS accepted: (1) `move.rs`/`san.rs` each gain `use …{Chess, Position}` because `legal_moves` is now a trait method; (2) inherent accessors/play moved into `impl Position for Chess` (shakmaty-style; callers need `use brett::chess::Position`; later tasks already import it); `from_setup`, `castling_mode`, `to_setup`, `to_setup_always`, `swap_turn`, `position_hash` stay inherent; (3) `Fen::from_ascii` accepts partial FEN (placement required, defaults `w - - 0 1`), matching shakmaty leniency for PGN `FEN` tags; >6 fields is an error; (4) test `use` line left where the brief placed it. Minor noted: `ep_square(Legal)` generates all legal moves, but only when an EP file exists, so the cost to `position_hash` is bounded.
 - Task 5: complete (commits 9f10212..aed2c66, Gemini 4 Argon Medium, review clean). DONE_WITH_CONCERNS accepted: (1) `Recorder` in `tests/pgn_reader.rs` retains `tags` in `begin_movetext` and returns them from `end_game` (the brief's `(Vec::new(), mt)` discarded tags that `tags_support_escaped_quotes_and_lossy_utf8` asserts on) and adds `type RecordedGame` for `clippy::type_complexity`; (2) `stream_positions_cover_each_game` uses `windows(4)` for 4-byte `b"One\""` / `b"Two\""` slices (`windows(5) == 4-byte slice` is unreachable in Rust); (3) added `castling_zeroes_glyph_nags_and_ep_markers` test.
+- Task 6: complete (commits 1145d52..a7daecc, review clean). Migrated `src/domain.rs` and `tests/pgn_tree.rs` to `crate::chess` and `crate::pgn::reader`, with `broken: bool` branch tracking in `Builder` so subsequent moves in a broken PGN branch are skipped.
+- Task 7: complete (commits a7daecc..4058c02, review clean). Migrated `src/library.rs` and `tests/pgn_index.rs` to `crate::pgn::reader` (`wants_movetext() -> false` header-only indexing + `stream_position()`); added `comment_with_fake_tag_does_not_split_games`.
+- Task 8: complete (commits 4058c02..4cfadba, review clean). Added `src/book/polyglot_keys.rs` (781-entry table from MIT `gigachess` 0.1.9) and `src/book/polyglot.rs` (`position_key(&Chess) -> u64` with Polyglot pseudo-legal adjacent-pawn EP semantics), migrated `src/book.rs` and `src/book/bkt.rs`, and verified all reference vectors in `tests/polyglot.rs`.
+- Task 9: complete (commits 4cfadba..9192684, review clean). Migrated `src/position.rs` and `tests/position_index.rs` to `crate::chess` and `crate::pgn::reader`, switched `position_key` to `pos.position_hash()`, updated start-position hash assertion (`0x33ab_452b_8705_6e0f`), and bumped `VERSION = 2`.
+- Task 10: complete (commits 9192684..d316d5c, review clean). Migrated `src/cbh/moves.rs`, `src/cbh/tests.rs`, `src/scid.rs`, `src/scid/writer.rs`, and `tests/scid.rs` to `crate::chess`; added `chess960_start_keeps_outer_rook_castling_rights` in `src/cbh/tests.rs`.
+- Task 11: complete (commits d316d5c..e310748, review clean). Migrated `src/pgn.rs`, `src/cloud.rs`, `src/recent.rs`, `src/players.rs`, `src/review.rs`, and `src/settings.rs` to `crate::chess`.
+- Task 12: complete (commits e310748..607fb54, review clean). Migrated `src/app.rs`, `src/ui/board.rs`, `src/ui/pieces.rs`, and `tests/board_drag.rs` to `crate::chess`, added `impl fmt::Display for Move` in `src/chess/move.rs`, and updated the About text in `src/app.rs`.
+- Task 13: complete (commits 607fb54..fecdde1, review clean). Removed `shakmaty` and `pgn-reader` from `Cargo.toml`/`Cargo.lock`, migrated `examples/position_report.rs` and `examples/predictor_eval.rs`, updated `THIRD_PARTY_NOTICES.md`, `README.md`, `CONTRIBUTING.md`, `docs/POSITION_INDEX.md`, `docs/GPL_OPTIONS.md`, and `docs/BACKLOG.md`, and passed the full verification gate.
 
 ## Tasks
 
@@ -125,11 +137,11 @@ Task priority if Argon quota is small: Argon Medium for Tasks 4, 5, 8, 10 (FEN/h
 - [x] Task 3: moves, SAN, UCI
 - [x] Task 4: FEN, position hash, `Position`
 - [x] Task 5: Brett streaming PGN reader
-- [ ] Task 6: migrate `domain.rs`
-- [ ] Task 7: migrate `library.rs`
-- [ ] Task 8: Polyglot hash and `.bin` book
-- [ ] Task 9: position index + `VERSION = 2`
-- [ ] Task 10: CBH and SCID
-- [ ] Task 11: remaining library modules
-- [ ] Task 12: app and UI
-- [ ] Task 13: remove GPL crates, notices, docs, full gate
+- [x] Task 6: migrate `domain.rs`
+- [x] Task 7: migrate `library.rs`
+- [x] Task 8: Polyglot hash and `.bin` book
+- [x] Task 9: position index + `VERSION = 2`
+- [x] Task 10: CBH and SCID
+- [x] Task 11: remaining library modules
+- [x] Task 12: app and UI
+- [x] Task 13: remove GPL crates, notices, docs, full gate
