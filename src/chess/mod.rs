@@ -8,8 +8,12 @@ pub mod board;
 // required, not accidental.
 #[allow(clippy::module_inception)]
 pub mod chess;
+pub mod r#move;
+pub mod san;
 pub mod types;
 
 pub use board::*;
 pub use chess::*;
+pub use r#move::*;
+pub use san::*;
 pub use types::*;

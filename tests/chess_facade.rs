@@ -158,3 +158,110 @@ fn standard_mode_drops_nonstandard_castling_rights() {
     );
     assert!(Chess::from_setup(Setup::empty(), CastlingMode::Standard).is_err());
 }
+
+use brett::chess::{Move, San, SanPlus, UciMove};
+
+fn play_san(pos: Chess, san: &str) -> Chess {
+    let san = SanPlus::from_ascii(san.as_bytes()).unwrap();
+    let mv = san.san.to_move(&pos).unwrap();
+    pos.play(mv).unwrap()
+}
+
+#[test]
+fn legal_moves_and_play_round_trip() {
+    let start = Chess::default();
+    assert_eq!(start.legal_moves().len(), 20);
+    let e4 = SanPlus::from_ascii(b"e4")
+        .unwrap()
+        .san
+        .to_move(&start)
+        .unwrap();
+    assert_eq!(
+        e4,
+        Move::Normal {
+            role: Role::Pawn,
+            from: Square::E2,
+            capture: None,
+            to: Square::E4,
+            promotion: None,
+        }
+    );
+    let after = start.clone().play(e4).unwrap();
+    assert_eq!(after.turn(), Color::Black);
+    assert_eq!(
+        after.board().piece_at(Square::E4),
+        Some(Piece::new(Color::White, Role::Pawn))
+    );
+}
+
+#[test]
+fn san_round_trip_and_checkmate_suffix() {
+    let start = Chess::default();
+    let e4 = SanPlus::from_ascii(b"e4")
+        .unwrap()
+        .san
+        .to_move(&start)
+        .unwrap();
+    assert_eq!(SanPlus::from_move(start.clone(), e4).to_string(), "e4");
+
+    let mut pos = start;
+    for san in ["e4", "e5", "Bc4", "Nc6", "Qh5", "Nf6"] {
+        pos = play_san(pos, san);
+    }
+    let mate = SanPlus::from_ascii(b"Qxf7#")
+        .unwrap()
+        .san
+        .to_move(&pos)
+        .unwrap();
+    assert_eq!(SanPlus::from_move(pos.clone(), mate).to_string(), "Qxf7#");
+    assert!(pos.clone().play(mate).unwrap().is_checkmate());
+}
+
+#[test]
+fn uci_standard_castling_round_trip() {
+    let mut pos = Chess::default();
+    for san in ["e4", "e5", "Nf3", "Nc6", "Bc4", "Bc5"] {
+        pos = play_san(pos, san);
+    }
+    let uci = UciMove::from_ascii(b"e1g1").unwrap();
+    let mv = uci.to_move(&pos).unwrap();
+    assert_eq!(
+        mv,
+        Move::Castle {
+            king: Square::E1,
+            rook: Square::H1
+        }
+    );
+    assert_eq!(
+        UciMove::from_move(mv, CastlingMode::Standard).to_string(),
+        "e1g1"
+    );
+    assert_eq!(SanPlus::from_move(pos, mv).to_string(), "O-O");
+}
+
+#[test]
+fn en_passant_move_is_recognized() {
+    let mut pos = Chess::default();
+    for san in ["e4", "a6", "e5", "d5"] {
+        pos = play_san(pos, san);
+    }
+    let mv = UciMove::from_ascii(b"e5d6").unwrap().to_move(&pos).unwrap();
+    assert_eq!(
+        mv,
+        Move::EnPassant {
+            from: Square::E5,
+            to: Square::D6
+        }
+    );
+    let after = pos.play(mv).unwrap();
+    assert!(after.board().piece_at(Square::D5).is_none());
+}
+
+#[test]
+fn illegal_san_is_an_error() {
+    let start = Chess::default();
+    let san = SanPlus::from_ascii(b"Kf3").unwrap();
+    assert!(san.san.to_move(&start).is_err());
+    assert!(SanPlus::from_ascii(b"").is_err());
+    assert!(matches!(SanPlus::from_ascii(b"--").unwrap().san, San::Null));
+}
