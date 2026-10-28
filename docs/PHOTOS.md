@@ -36,6 +36,13 @@ Therefore:
 - If permission is granted later, record it in
   [`THIRD_PARTY_NOTICES.md`](../THIRD_PARTY_NOTICES.md) before redistributing.
 
+**Decision (2026-10-28):** request written redistribution permission from the
+Scid authors, naming the derived BPF1/WebP pack, the intended distribution
+channel, and the required attribution. Keep the pack local-only and out of all
+release artefacts until a written answer is recorded here. A public-domain or
+CC-licensed alternative source is acceptable only after its licence and
+attribution requirements are audited.
+
 The feature remains useful without a pack: when no pack is found, the photo
 toggle is disabled and the board strips keep their normal compact layout.
 

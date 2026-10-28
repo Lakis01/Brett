@@ -247,6 +247,13 @@ impl Game {
         None
     }
 
+    /// Remaining time for the player whose turn it is at `node`, if the PGN
+    /// supplied a clock for that player's previous move.
+    pub fn side_to_move_clock(&self, node: usize) -> Option<(Color, Clock)> {
+        let turn = self.nodes.get(node)?.pos.turn();
+        self.clock_for(node, turn).map(|clock| (turn, clock))
+    }
+
     pub fn root(&self) -> &Node {
         &self.nodes[0]
     }
@@ -1042,6 +1049,11 @@ mod tests {
         assert_eq!(game.clock_for(2, Color::White).unwrap().display(), "5:00");
         assert_eq!(game.clock_for(2, Color::Black).unwrap().display(), "4:58");
         assert!(game.clock_for(1, Color::Black).is_none());
+        assert_eq!(
+            game.side_to_move_clock(2),
+            Some((Color::White, Clock { centis: 30_000 }))
+        );
+        assert!(game.side_to_move_clock(0).is_none());
     }
 
     #[test]

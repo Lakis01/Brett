@@ -4,6 +4,12 @@
 document. This is an engineering and licensing-risk assessment, not legal
 advice; a lawyer should confirm the distribution model before a release.
 
+**Decision (2026-10-28):** ask the upstream author for a permissive/dual
+licence first. Make no dependency or licence change until a written answer is
+recorded here. If granted, keep the permissive build and update the notices. If
+refused, choose between adopting GPL-3.0-or-later for the combined binary and
+funding the `cozy-chess` + streaming-PGN replacement described below.
+
 ## Current exposure
 
 Brett's original code is MIT. Two runtime dependencies are

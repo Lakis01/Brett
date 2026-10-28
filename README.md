@@ -322,7 +322,8 @@ ICCF server games under ICCF's terms, and comply with ICCF's terms. See
   reachable instead of running past the bottom of the window.
 - PGN clock comments (`[%clk ...]`) are parsed separately from human comments
   and hidden by default. The **Clocks** toggle in the bottom bar displays the
-  latest remaining time for each side at the right of its board strip.
+  remaining time after each move, the side-to-move time in the game header, and
+  the latest remaining time for each side at the right of its board strip.
 - Hovering a move in the open game's move list previews the resulting
   position. This is controlled by **Settings → Preview moves on hover** and is
   off by default; tree, engine, reference, and read-only preview hovers are
@@ -433,7 +434,7 @@ never writes to the source database.
 | `src/review.rs` | Sequential game review, move grading, accuracy, eval chart data |
 | `src/app.rs` | egui application, tabs, preparation flow, annotation editor |
 | `src/ui/fonts.rs` | Embedded DejaVu Sans fallback for chess symbols |
-| `docs/` | Data safety, position-index format, preparation model, SCID/CBH readers, photo provenance, backlog |
+| `docs/` | Data safety, position-index format, preparation model, SCID/CBH readers, provenance audit, photo provenance, backlog |
 
 ## Roadmap
 
@@ -450,7 +451,7 @@ never writes to the source database.
   MultiPV analysis, asynchronous worker, clickable principal variations,
   Stockfish default.
 - **Clock display (done).** PGN `[%clk]` parsing, hidden by default, shown
-  beside the players at the board.
+  after each move, in the game header, and beside the players at the board.
 - **Castling by dragging the king (done).** King-to-destination and
   king-to-rook gestures both work.
 - **PGN metadata (done).** Editable common tags, fixed tag names, delete/add,
@@ -471,7 +472,8 @@ never writes to the source database.
 - **Classic CBH support (done).** Native read-only support for the older
   multi-file format, including modes 0/4/5/10, variations, comments, NAGs,
   drawing tokens, custom starts, and Chess960. See
-  [docs/CBH.md](docs/CBH.md).
+  [docs/CBH.md](docs/CBH.md) and the component audit in
+  [docs/PROVENANCE.md](docs/PROVENANCE.md).
 - **Cloud references (done).** The **Refs** tab configures the current/reference
   database and online opponent lookups; the **Tree** tab shows the Lichess
   opening explorer (Masters by default, full Lichess optional) and Lichess top

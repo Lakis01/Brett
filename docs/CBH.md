@@ -96,7 +96,10 @@ ECO codes cover A00-E99.
 ## Validation
 
 The reader was validated against the independent MIT-licensed `cbvault` reader
-on the personal reference database (the database itself is not committed):
+on the personal reference database (the database itself is not committed).
+The code-level provenance, including the MIT `cbvault-format` dependency and
+its `oschess-cb-bridge` port, is recorded in
+[PROVENANCE.md](PROVENANCE.md). Validation results:
 
 - **24,865 games** and **2,003,054 nodes** decoded with **zero errors**;
 - full export comparison: no tree-path, SAN, or NAG mismatches;

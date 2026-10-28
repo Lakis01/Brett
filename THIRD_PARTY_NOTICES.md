@@ -105,23 +105,34 @@ executable is used.
   independent validation oracle and as the source of the four move-encoding
   translation tables. Its documentation attributes parts of its format work
   to `asdfjkl/cbh2pgn` (MIT) and to `oschess-cb-bridge`.
+- **cbvault-format** 0.1.4 (MIT): <https://crates.io/crates/cbvault-format>.
+  A direct dependency used to read `.cbv`/`.cbz` containers. Its
+  classic-format reader is a port of `cbformat` in `oschess-cb-bridge` at
+  commit `ca9e8f8e`, which is MIT-licensed ("Copyright (c) 2026 the
+  oschess-cb-bridge contributors"); the ported files retain the upstream
+  notice. Brett links this crate as a normal Rust dependency.
 - **cbh2pgn** by asdfjkl (MIT): <https://github.com/asdfjkl/cbh2pgn>. Used as
   an additional public format reference and cross-check.
 - **oschess-cb-bridge** by asavis: <https://github.com/asavis/oschess-cb-bridge>.
-  Its published format notes were consulted as format facts only; its code is
-  AGPL and is not copied, linked, or distributed here.
+  Its published format notes were consulted as format facts. The source of the
+  code ported into `cbvault-format` was MIT through v1.0.3 and at commit
+  `ca9e8f8e`; later upstream releases are AGPL-3.0-only, and Brett does not
+  link or copy that AGPL code.
 
 Brett's decoder, annotation mapping, entity-name handling, and tests are an
 independent implementation. The reference validation sample is a personal
 database and is not redistributed; `src/cbh/tests.rs` generates a synthetic
-classic CBH database at test time.
+classic CBH database at test time. See [`docs/PROVENANCE.md`](docs/PROVENANCE.md)
+for the component-by-component audit.
 
-The move-encoding tables are distributed under cbvault's MIT licence:
+The move-encoding tables and the `cbvault-format` crate are distributed under
+MIT licences:
 
 ```text
 MIT License
 
 Copyright (c) 2026 cbvault Contributors
+Copyright (c) 2026 the oschess-cb-bridge contributors
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -148,9 +159,11 @@ notice does not imply endorsement by ChessBase or by the referenced projects.
 ## Rust dependencies
 
 Brett depends on third-party Rust crates (including `eframe`, `egui`,
-`shakmaty`, `pgn-reader`, `image`, `memmap2`, `serde_json`, and `ureq`). Their
-licences are listed in the crate metadata and in `Cargo.lock`; redistributed
-binaries should include the licence texts required by those crates.
+`shakmaty`, `pgn-reader`, `cbvault-format`, `image`, `memmap2`, `serde_json`,
+and `ureq`). Their licences are listed in the crate metadata and in
+`Cargo.lock`; redistributed binaries should include the licence texts required
+by those crates. `cbvault-format` is MIT; see the classic-CBH section above for
+its provenance.
 
 ### GPL-licensed chess and PGN crates
 

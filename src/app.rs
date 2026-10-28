@@ -4271,7 +4271,7 @@ impl App {
                         egui::Checkbox::new(&mut self.show_clocks, "Show PGN clocks"),
                     )
                     .on_hover_text(if has_clocks {
-                        "Show remaining time from [%clk] comments"
+                        "Show remaining time from [%clk] comments in the board strips, move list, and header"
                     } else {
                         "This game has no [%clk] clock comments"
                     });
@@ -6242,6 +6242,8 @@ impl App {
             self.rating_priority,
             self.show_all_ratings,
             &mut date_clicked,
+            node,
+            self.show_clocks,
         );
         ui.add_space(6.0);
         let mut show_empty = self.show_empty_pgn_tags;
@@ -6334,6 +6336,7 @@ impl App {
                             &mut nag_action,
                             &mut hover_preview,
                             self.hover_moves,
+                            self.show_clocks,
                         );
                     });
             });
@@ -7848,6 +7851,8 @@ impl App {
             self.rating_priority,
             self.show_all_ratings,
             &mut date_clicked,
+            node,
+            self.show_clocks,
         );
         ui.add_space(8.0);
 
@@ -7893,7 +7898,14 @@ impl App {
                         }
                         ui.spacing_mut().item_spacing = vec2(4.0, 3.0);
                         for line in &lines {
-                            render_readonly_move_line(ui, line, &game, node, &mut clicked);
+                            render_readonly_move_line(
+                                ui,
+                                line,
+                                &game,
+                                node,
+                                &mut clicked,
+                                self.show_clocks,
+                            );
                         }
                     });
             });
@@ -7992,7 +8004,9 @@ impl App {
                 }
                 if self.current.as_ref().is_some_and(|game| game.has_clocks()) {
                     ui.toggle_value(&mut self.show_clocks, "Clocks")
-                        .on_hover_text("Show PGN clock times beside the board");
+                        .on_hover_text(
+                            "Show PGN clock times in the board strips, move list, and header",
+                        );
                 }
 
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -10481,6 +10495,7 @@ fn tag_display_name(name: &str) -> String {
 
 /// Header card above the PGN move list. Date sits on the left, the tournament
 /// is centered, and the result stays on the right.
+#[allow(clippy::too_many_arguments)]
 fn game_header_card(
     ui: &mut Ui,
     game: &Game,
@@ -10488,6 +10503,8 @@ fn game_header_card(
     priority: RatingPriority,
     show_all_ratings: bool,
     date_clicked: &mut Option<egui::Pos2>,
+    node: usize,
+    show_clocks: bool,
 ) {
     egui::Frame::new()
         .fill(SURFACE)
@@ -10581,6 +10598,17 @@ fn game_header_card(
                 team_for(game, Color::Black),
                 Color::Black,
             );
+            if show_clocks && let Some((turn, clock)) = game.side_to_move_clock(node) {
+                ui.add_space(5.0);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(format!("{} to move", color_name(turn)))
+                            .small()
+                            .weak(),
+                    );
+                    meta_chip_hover(ui, &clock.display(), "Remaining time for the side to move");
+                });
+            }
             if let Some(opening) = opening {
                 ui.add_space(5.0);
                 ui.horizontal_wrapped(|ui| {
@@ -10932,6 +10960,7 @@ fn render_readonly_move_line(
     game: &Game,
     selected: usize,
     clicked: &mut Option<usize>,
+    show_clocks: bool,
 ) {
     if line.depth > 0 {
         ui.horizontal(|ui| {
@@ -10941,11 +10970,11 @@ fn render_readonly_move_line(
                 .corner_radius(5.0)
                 .inner_margin(5.0)
                 .show(ui, |ui| {
-                    render_readonly_move_tokens(ui, line, game, selected, clicked);
+                    render_readonly_move_tokens(ui, line, game, selected, clicked, show_clocks);
                 });
         });
     } else {
-        render_readonly_move_tokens(ui, line, game, selected, clicked);
+        render_readonly_move_tokens(ui, line, game, selected, clicked, show_clocks);
     }
 }
 
@@ -10955,6 +10984,7 @@ fn render_readonly_move_tokens(
     game: &Game,
     selected: usize,
     clicked: &mut Option<usize>,
+    show_clocks: bool,
 ) {
     ui.horizontal_wrapped(|ui| {
         for token in &line.tokens {
@@ -10988,6 +11018,9 @@ fn render_readonly_move_tokens(
                     let response = move_chip(ui, *node == selected, san, line.depth > 0);
                     if response.clicked() {
                         *clicked = Some(*node);
+                    }
+                    if show_clocks && let Some(clock) = game.nodes[*node].clock {
+                        move_clock_chip(ui, clock, line.depth > 0);
                     }
 
                     let symbols = nag_symbols(&game.nodes[*node].nags);
@@ -11026,6 +11059,7 @@ fn render_move_tokens_flat(
     nag_action: &mut Option<(usize, Option<u8>)>,
     hover_preview: &mut Option<HoverPreview>,
     allow_hover: bool,
+    show_clocks: bool,
 ) {
     let mut depth = 0usize;
     let mut last_move: Option<(u32, Color)> = None;
@@ -11093,6 +11127,9 @@ fn render_move_tokens_flat(
                         *clicked = Some(*node);
                     }
                     move_context_menu(&response, *node, game, nag_action, open_editor);
+                    if show_clocks && let Some(clock) = game.nodes[*node].clock {
+                        move_clock_chip(ui, clock, depth > 0);
+                    }
 
                     let symbols = nag_symbols(&game.nodes[*node].nags);
                     if !symbols.is_empty() {
@@ -11128,6 +11165,21 @@ fn render_move_tokens_flat(
             }
         }
     });
+}
+
+fn move_clock_chip(ui: &mut Ui, clock: Clock, muted: bool) {
+    let color = if muted {
+        Color32::from_gray(145)
+    } else {
+        Color32::from_gray(170)
+    };
+    ui.label(
+        RichText::new(clock.display())
+            .monospace()
+            .size(11.0)
+            .color(color),
+    )
+    .on_hover_text("Remaining time after this move");
 }
 
 fn move_chip(ui: &mut Ui, selected: bool, san: &str, muted: bool) -> egui::Response {

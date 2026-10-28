@@ -4,7 +4,7 @@ This is the working backlog after the preparation stage. Items are ordered by
 dependency and user value, not by estimated effort. Completed work is recorded
 in `README.md`; this file tracks what is next.
 
-**Status (2026-10-26):** items 1–7 and 11–14 are implemented, and the latest
+**Status (2026-10-28):** items 1–7 and 11–14 are implemented, and the latest
 moves-panel interaction polish is complete. Item 8's cloud, opening-tree,
 reference-source, and native-book parts are done; M2b mega-scale ingest remains,
 with the first safety pass now keeping huge archives responsive and avoiding
@@ -16,9 +16,25 @@ refresh remains. Deferred predictor refinements are recorded under item 6, and
 native player-title display is queued as item 15. Item 18 records the
 recently-trending move-popularity idea, including its graphical display.
 
+**Decision log (2026-10-28):**
+
+- **Item 17:** ask the upstream author for a permissive/dual licence first;
+  make no dependency or licence change until a written answer is recorded.
+- **Item 3:** complete the original scope — clocks after each move in the move
+  list and the side-to-move clock in the header, in addition to the board
+  strips.
+- **2CBH:** intended, but blocked on a sample file. Treat it as a new container
+  format, separate from the validated classic multi-file CBH reader/writer.
+- **Item 19:** request written redistribution permission from the Scid authors;
+  keep the pack local-only and out of releases until then.
+- **Chessable:** deferred; the local note is too ambiguous to schedule.
+- **Process:** this file remains authoritative for code status; the Obsidian
+  compiled backlog drives priority. The CBH/SCID provenance audit runs before
+  the classic CBH writer.
+
 Game review follow-ups that are intentionally deferred: position-index book
-marking and review caching. Clock display currently lives in the board player
-strips rather than move-list/header chips.
+marking and review caching. Clock display is complete: board strips, the move
+list, and the game header all follow the same **Clocks** toggle.
 
 The latest interaction pass hides absent or empty PGN fields by default, adds
 **Show empty** and a virtual **Board** field written as `round.board`, opens a
@@ -70,6 +86,10 @@ NAG write-back is included; book marking and caching are deferred.
 **Depends on:** UCI engine.
 
 ## 3. Clock display
+
+**Status:** implemented. The hidden-by-default **Clocks** toggle shows the
+remaining time after each move, the side-to-move time in the game header, and
+the latest time for each side in the board strips.
 
 **Goal:** show clock information already present in PGN comments.
 
@@ -181,6 +201,11 @@ multi-file database (`.cba`, `.cbb`, `.cbc`, `.cbe`, `.cbg`,
 `.cbgi`, `.cbh`, `.cbj`, `.cbm`, `.cbp`, `.cbs`, `.cbt`, `.cbtt`, `.flags`,
 `.ini`), not a 2CBH container.
 
+**2CBH:** the local note that says "cbh (2cbh)" is confirmed to mean a real
+2CBH container is wanted, but the work is blocked until a sample file is
+available. Do not extend this validated classic reader speculatively; 2CBH is
+a separate format reader/writer with its own fixtures and provenance.
+
 Implemented:
 
 - Open the `.cbh` index and its `.cbg` moves, `.cba` annotations, and
@@ -271,6 +296,8 @@ the classic CBH writer remains.
 - Add the native classic CBH writer. The readers are independent and validated;
   the writer must round-trip through the reader and, where available, an
   independent implementation.
+- **2CBH writer (separate):** blocked on a sample file. Do not fold 2CBH into
+  the classic CBH writer; the containers and validation fixtures are different.
 - **SCID writer (done):** native SCID4 export from **File → Save database as
   SCID…** builds the compressed namebase and stable IDs, encodes index
   flags/offsets, inverts the compact move stream, preserves
@@ -481,21 +508,27 @@ rendering helpers. **Related:** item 15 (native player titles).
 
 ## 17. Permissive chess and PGN stack
 
-**Status:** open; licensing limitation documented.
+**Status:** decision pending. Brett currently links `shakmaty` (chess rules,
+SAN, FEN) and `pgn-reader` (streaming PGN) under GPL-3.0-or-later. The original
+Brett code is MIT, but a built binary is a combined GPL work. The 2026-10-28
+decision is to ask the upstream author for a permissive/dual licence first and
+to make no dependency or licence change until a written answer is recorded.
+See `THIRD_PARTY_NOTICES.md` and the option-by-option analysis in
+[`GPL_OPTIONS.md`](GPL_OPTIONS.md).
 
-Brett currently links `shakmaty` (chess rules, SAN, FEN) and `pgn-reader`
-(streaming PGN) under GPL-3.0-or-later. The original Brett code is MIT, but a
-built binary is a combined GPL work. See `THIRD_PARTY_NOTICES.md` and the
-option-by-option analysis in [`GPL_OPTIONS.md`](GPL_OPTIONS.md).
-
-- Replace both crates with permissively licensed implementations, or make a
-  deliberate project-wide GPL-3.0-or-later decision and update `LICENSE`,
-  `Cargo.toml`, and the README.
+- Send the upstream request; record the answer and date in
+  `GPL_OPTIONS.md`.
+- If granted, update the dependency/licence notes and keep the permissive
+  build.
+- If refused, choose between adopting GPL-3.0-or-later for the combined binary
+  and funding the `cozy-chess` + streaming-PGN replacement.
 - Preserve legal-move correctness, SAN/FEN round-tripping, Chess960/custom
   starts, streaming PGN performance, and the existing large-database guards.
-- Keep the replacement behind the current domain types so the UI and database
+- Keep any replacement behind the current domain types so the UI and database
   readers do not depend on a particular chess crate.
 - Add regression tests against the public fixtures and the SCID/CBH readers.
+- While the decision is pending, do not describe a distributed binary as
+  MIT-only if it still links the GPL crates.
 
 **Depends on:** `src/domain.rs`, `src/pgn.rs`, `src/position.rs`, and
 `src/library.rs`.
@@ -538,6 +571,8 @@ preparation and repertoire review.
 ## 19. Player-photo pack redistribution
 
 **Status:** local loading implemented; redistribution blocked on permission.
+The 2026-10-28 decision is to request written permission from the Scid authors;
+keep the pack local-only and out of releases until an answer is recorded.
 
 - The optional BPF1 reader (`src/photos.rs`), WebP decoding, texture cache,
   **Settings → Show player photos**, **Settings → Photo size**
@@ -550,12 +585,16 @@ preparation and repertoire review.
   (`scid/PlayerData/Player_photos.zip`). The archive has no explicit
   redistribution licence; Scid's `COPYING` identifies database files as
   copyright Pascal Georges and asks users to contact the authors first.
+- Send a permission request that names the derived BPF1/WebP pack, the
+  intended distribution channel, and the required attribution; record the
+  answer and date in `docs/PHOTOS.md` and `THIRD_PARTY_NOTICES.md`.
 - `assets/photos.bin` is git-ignored and must not be committed or bundled in a
   release, installer, or AppImage without written permission.
-- If permission is granted, record it in `THIRD_PARTY_NOTICES.md` and
-  `docs/PHOTOS.md`, then decide whether to ship a pack. Until then, keep the
-  `BRETT_PHOTOS`/`assets/photos.bin` discovery path and the graceful
-  no-pack fallback.
+- If permission is granted, record it and decide whether to ship a pack. Until
+  then, keep the `BRETT_PHOTOS`/`assets/photos.bin` discovery path and the
+  graceful no-pack fallback.
+- A separate public-domain/CC-licensed source is an alternative only after its
+  licence and attribution requirements are audited.
 
 **Depends on:** `src/photos.rs`, `src/app.rs`, and the photo-pack provenance in
 `docs/PHOTOS.md`.
