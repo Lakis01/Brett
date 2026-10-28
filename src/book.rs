@@ -1,8 +1,7 @@
 //! Native opening-book readers: Polyglot `.bin` and ChessBase `.ctg`.
 //!
 //! Polyglot books are a flat, sorted table of 16-byte entries keyed by the
-//! standard Polyglot Zobrist hash.  shakmaty's [`Zobrist64`] uses the same
-//! table, so lookup needs no separate hashing implementation.
+//! standard Polyglot Zobrist hash, computed via Brett's [`polyglot`] table.
 //!
 //! CTG books are the reverse-engineered ChessBase format: a 4096-byte page
 //! file (`.ctg`), a page-offset table (`.cto`) and a small page-bound table
@@ -18,12 +17,15 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use memmap2::{Mmap, MmapOptions};
-use shakmaty::zobrist::Zobrist64;
-use shakmaty::{Chess, Color, EnPassantMode, File as ChessFile, Move, Position, Role, Square};
 
+use crate::chess::{
+    Bitboard, Chess, Color, EnPassantMode, File as ChessFile, Move, Position, Rank, Role, Square,
+};
 use crate::position::{encode_move, position_key};
 
 mod bkt;
+pub mod polyglot;
+mod polyglot_keys;
 
 const POLYGLOT_ENTRY: usize = 16;
 const CTG_PAGE: usize = 4096;
@@ -203,7 +205,7 @@ impl Book {
 
 impl PolyglotBook {
     fn moves(&self, pos: &Chess) -> Result<Vec<BookMove>> {
-        let key = pos.zobrist_hash::<Zobrist64>(EnPassantMode::Legal).0;
+        let key = polyglot::position_key(pos);
         let count = self.mmap.len() / POLYGLOT_ENTRY;
         let mut low = 0usize;
         let mut high = count;
@@ -761,13 +763,10 @@ fn pseudo_move(board: &[char; 64], encoding: u8) -> Option<(Square, Square, Opti
             if seen != occurrence as u32 {
                 continue;
             }
-            let from = Square::from_coords(ChessFile::new(x as u32), shakmaty::Rank::new(y as u32));
+            let from = Square::from_coords(ChessFile::new(x as u32), Rank::new(y as u32));
             let to_x = (x as i32 + i32::from(right)).rem_euclid(8);
             let to_y = (y as i32 + i32::from(forward)).rem_euclid(8);
-            let to = Square::from_coords(
-                ChessFile::new(to_x as u32),
-                shakmaty::Rank::new(to_y as u32),
-            );
+            let to = Square::from_coords(ChessFile::new(to_x as u32), Rank::new(to_y as u32));
             return Some((from, to, None));
         }
     }
@@ -879,14 +878,14 @@ fn append_bits(encoded: &mut [u8; 32], bit_position: &mut usize, bits: u8, num_b
     }
 }
 
-fn has_kingside(rights: shakmaty::Bitboard, color: Color) -> bool {
+fn has_kingside(rights: Bitboard, color: Color) -> bool {
     rights.contains(match color {
         Color::White => Square::H1,
         Color::Black => Square::H8,
     })
 }
 
-fn has_queenside(rights: shakmaty::Bitboard, color: Color) -> bool {
+fn has_queenside(rights: Bitboard, color: Color) -> bool {
     rights.contains(match color {
         Color::White => Square::A1,
         Color::Black => Square::A8,
@@ -1096,7 +1095,7 @@ const MOVE_TABLE: &[(u8, char, i8, i8, i8)] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
-    use shakmaty::CastlingMode;
+    use crate::chess::{CastlingMode, UciMove};
 
     #[test]
     fn polyglot_start_position_has_moves() {
@@ -1131,12 +1130,12 @@ mod tests {
         assert!(
             moves
                 .iter()
-                .any(|mv| { mv.mv.to_uci(shakmaty::CastlingMode::Standard).to_string() == "e2e4" })
+                .any(|mv| { mv.mv.to_uci(CastlingMode::Standard).to_string() == "e2e4" })
         );
         assert!(
             moves
                 .iter()
-                .any(|mv| { mv.mv.to_uci(shakmaty::CastlingMode::Standard).to_string() == "d2d4" })
+                .any(|mv| { mv.mv.to_uci(CastlingMode::Standard).to_string() == "d2d4" })
         );
     }
 
@@ -1155,12 +1154,12 @@ mod tests {
         assert!(
             moves
                 .iter()
-                .any(|mv| { mv.mv.to_uci(shakmaty::CastlingMode::Standard).to_string() == "e2e4" })
+                .any(|mv| { mv.mv.to_uci(CastlingMode::Standard).to_string() == "e2e4" })
         );
         assert!(
             moves
                 .iter()
-                .any(|mv| { mv.mv.to_uci(shakmaty::CastlingMode::Standard).to_string() == "d2d4" })
+                .any(|mv| { mv.mv.to_uci(CastlingMode::Standard).to_string() == "d2d4" })
         );
         assert!(moves.iter().any(|mv| mv.games > 0));
     }
@@ -1195,12 +1194,9 @@ mod tests {
             assert!(e4.white > 0 && e4.black > 0);
         }
 
-        let mut pos = Chess::default();
-        let e4 = shakmaty::uci::UciMove::from_ascii(b"e2e4")
-            .unwrap()
-            .to_move(&pos)
-            .unwrap();
-        pos.play_unchecked(e4);
+        let pos = Chess::default();
+        let e4 = UciMove::from_ascii(b"e2e4").unwrap().to_move(&pos).unwrap();
+        let pos = pos.play_unchecked(e4);
         let replies = book.moves(&pos).unwrap();
         assert!(
             !replies.is_empty(),

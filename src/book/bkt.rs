@@ -16,8 +16,8 @@ use std::collections::BTreeMap;
 
 use anyhow::{Result, bail};
 use memmap2::Mmap;
-use shakmaty::uci::UciMove;
-use shakmaty::{Chess, Color, Position, Role, Square};
+
+use crate::chess::{Chess, Color, Position, Role, Square, UciMove};
 
 use super::{BookMove, move_code};
 
