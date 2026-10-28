@@ -9,13 +9,33 @@
 
 ## Handover state
 
-- Branch: `permissive-rules-pgn`; HEAD `dc86ad1`.
+- Branch: `permissive-rules-pgn`; HEAD `d85f267` (tracked ledger snapshot). Task 3 code at `dc86ad1`; Task 3 BASE `dd129ab`.
 - Completed: Tasks 1–2, both reviews clean.
-- In flight: Task 3 implemented at `dc86ad1`; task review not yet dispatched. Task 3 BASE is `dd129ab`.
-- Next action: generate the review package for `dd129ab..dc86ad1`, dispatch the task reviewer, record the verdict here.
+- In flight: Task 3 implemented at `dc86ad1`; task review not yet dispatched.
+- Next action: generate the review package for `dd129ab..dc86ad1`, dispatch the task reviewer, record the verdict here, then mark Task 3 complete and snapshot.
 - Live artifacts in this directory: `progress.md`, `task-N-brief.md`, `task-N-report.md`, `review-<base>..<head>.diff`.
 - Recovery: `git log --oneline c696941..HEAD`; the plan is committed; briefs are regenerable with the skill's `task-brief` script.
 - Caveat: this directory is git-ignored (`.superpowers/sdd/.gitignore`). Copy it or commit a snapshot before moving the work to another machine.
+
+## Model handover — 2026-10-28
+
+Decision: do not run the migration as "Argon Medium implementer + Opus 5.5 Low reviewer". Argon Medium is the stronger model; Opus Low is the weak, cheap one. Recommended split:
+
+| Role | Model | Reason |
+|---|---|---|
+| Controller / bookkeeping | Gemini 3.8 Flash | Abundant 5-hour Pro quota; the plan is explicit; escalate after two failed attempts |
+| Hard implementer (FEN/hash, PGN, Polyglot, CBH/SCID) | Gemini 4 Argon Medium | Strongest Pro-available agentic model; Medium ≈ 98% of High on AutomationBench at lower cost |
+| Mechanical implementer (import-only migrations, notices, formatting) | Gemini 3.8 Flash, then Opus 5.5 Low | Cheap/concise; only with exact files, interfaces, and tests |
+| Reviewer | Claude Opus 5.5 Medium | 48 AA Intelligence at 43M tokens vs Low 35 at 21M and Argon High 50 at 110M; best judgment per token |
+| Final integration / stuck task | Argon High or Opus 5.5 Medium | Use sparingly; highest available competence |
+
+AA evidence (2026-10-28): Argon High 50 Intelligence, 110M output tokens/index, $7.68/task, TTFT 44.96s; Opus Low 35, 21M, $0.98, 4.63s; Opus Medium 48, 43M, $2.45, 12.68s; Opus Max 58, 220M, $10.04. AA has no separate Argon Medium page; Google/Zapier AutomationBench puts Medium at 50.08% vs High 51.29% at $1.54 vs $1.70 per attempt. The current AA Coding Agent Index v2.0 is the most relevant aggregate (FrontierCode 2.0 + Terminal-Bench 4.0 + SWE-Atlas-QnA-AA); FrontierCode is the best proxy for mergeable Rust changes, Terminal-Bench for cargo/git/debug loops. AA Intelligence Index is too broad and verbosity-sensitive to choose the implementer.
+
+Quota policy: Google AI Pro refreshes the main Gemini quota every 5 hours to a weekly cap; Argon has a separate weekly-only quota; Claude/GPT models have their own weekly + 5-hour pool (roughly $13/week Claude value on Pro, unofficial). One user report: a single Argon Medium benchmark task consumed 66% of the weekly Argon quota. Treat Argon as a scarce hard-task resource, not the default driver. Set AI Credit Overages to "Never" unless deliberately buying overage. Check `/usage` in the Antigravity CLI before each heavy task.
+
+Availability caveat: Google's Argon launch blog lists the Antigravity desktop app and CLI; several trackers say the standalone Antigravity IDE does not expose Argon. Verify in the client; use the app/CLI or an IDE extension if the IDE selector lacks it.
+
+Task priority if Argon quota is small: Argon Medium for Tasks 4, 5, 8, 10 (FEN/hash, PGN reader, Polyglot, CBH/SCID); Opus Medium for reviews of those and for Tasks 6, 9, 12 if quota allows; Flash/Low for 7, 11, 13 and test/docs scaffolding. If Argon is exhausted, use Opus Medium/High for the remaining hard tasks and keep Opus Low off review duty.
 
 ## Baseline
 
