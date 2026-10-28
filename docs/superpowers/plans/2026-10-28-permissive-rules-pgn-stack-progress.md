@@ -9,10 +9,10 @@
 
 ## Handover state
 
-- Branch: `permissive-rules-pgn`; Task 4 complete at `25a0376`. Controller handed from DeepSeek 4.1 Flash (opencode quota exhausted) to Claude Opus 5.5 Medium in Antigravity on 2026-10-29.
-- Completed: Tasks 1–4, all reviews clean.
-- Next action: generate `task-5-brief.md` and dispatch Task 5 (PGN reader) with BASE = the ledger snapshot after `25a0376`.
-- Controller gate check at `25a0376` (chess_facade 17/17): `cargo test --all-targets` green (132 lib + 17 chess_facade + all integration suites; 1 pre-existing ignored), `cargo clippy --all-targets -- -D warnings` clean, `cargo fmt --all -- --check` clean.
+- Branch: `permissive-rules-pgn`; Task 5 complete at `aed2c66`. Controller/implementer handed from Claude Opus 5.5 Medium (429 quota reached) to Gemini 4 Argon Medium in Antigravity on 2026-10-29.
+- Completed: Tasks 1–5, all reviews clean.
+- Next action: execute Task 6 (`src/domain.rs` migration) from `task-6-brief.md` with BASE = the ledger snapshot after `aed2c66`.
+- Controller gate check at `aed2c66`: `cargo test --all-targets` green (132 lib + 17 chess_facade + 8 pgn_reader + all integration suites; 1 pre-existing ignored), `cargo clippy --all-targets -- -D warnings` clean, `cargo fmt --all -- --check` clean.
 - Live artifacts in this directory: `progress.md`, `task-N-brief.md`, `task-N-report.md`, `review-<base>..<head>.diff`.
 - Recovery: `git log --oneline c696941..HEAD`; the plan is committed; briefs are regenerable with the skill's `task-brief` script.
 - Caveat: this directory is git-ignored (`.superpowers/sdd/.gitignore`). Copy it or commit a snapshot before moving the work to another machine.
@@ -116,6 +116,7 @@ Task priority if Argon quota is small: Argon Medium for Tasks 4, 5, 8, 10 (FEN/h
   - Controller note for the fix: the existing `dfrc_setup()` cannot exercise castling (D1/E1 knights block queenside; G1/H1 kingside is a no-op), so the fix uses a dedicated legal DFRC castling setup (king B1, rooks A1/H1).
   - Fix round 1: `4f36598` adds `chess960_castling_san_uci_round_trip` (SAN `O-O`/`O-O-O` → `Move::Castle`, Chess960 UCI `b1h1`/`b1a1` round trip, Standard UCI `b1g1`/`b1c1`, SAN display, resulting king/rook squares). Re-review (Opus 5.5 Medium, controller): clean. The background GLM reviewer verdict was superseded. Task 3 complete (commits dd129ab..4f36598); Minor items above remain deferred.
 - Task 4: complete (commits e21eda4..25a0376, implementer Opus 5.5 Medium subagent, controller review clean). DONE_WITH_CONCERNS accepted: (1) `move.rs`/`san.rs` each gain `use …{Chess, Position}` because `legal_moves` is now a trait method; (2) inherent accessors/play moved into `impl Position for Chess` (shakmaty-style; callers need `use brett::chess::Position`; later tasks already import it); `from_setup`, `castling_mode`, `to_setup`, `to_setup_always`, `swap_turn`, `position_hash` stay inherent; (3) `Fen::from_ascii` accepts partial FEN (placement required, defaults `w - - 0 1`), matching shakmaty leniency for PGN `FEN` tags; >6 fields is an error; (4) test `use` line left where the brief placed it. Minor noted: `ep_square(Legal)` generates all legal moves, but only when an EP file exists, so the cost to `position_hash` is bounded.
+- Task 5: complete (commits 9f10212..aed2c66, Gemini 4 Argon Medium, review clean). DONE_WITH_CONCERNS accepted: (1) `Recorder` in `tests/pgn_reader.rs` retains `tags` in `begin_movetext` and returns them from `end_game` (the brief's `(Vec::new(), mt)` discarded tags that `tags_support_escaped_quotes_and_lossy_utf8` asserts on) and adds `type RecordedGame` for `clippy::type_complexity`; (2) `stream_positions_cover_each_game` uses `windows(4)` for 4-byte `b"One\""` / `b"Two\""` slices (`windows(5) == 4-byte slice` is unreachable in Rust); (3) added `castling_zeroes_glyph_nags_and_ep_markers` test.
 
 ## Tasks
 
@@ -123,7 +124,7 @@ Task priority if Argon quota is small: Argon Medium for Tasks 4, 5, 8, 10 (FEN/h
 - [x] Task 2: board, setup, castling, `Chess`
 - [x] Task 3: moves, SAN, UCI
 - [x] Task 4: FEN, position hash, `Position`
-- [ ] Task 5: Brett streaming PGN reader
+- [x] Task 5: Brett streaming PGN reader
 - [ ] Task 6: migrate `domain.rs`
 - [ ] Task 7: migrate `library.rs`
 - [ ] Task 8: Polyglot hash and `.bin` book
