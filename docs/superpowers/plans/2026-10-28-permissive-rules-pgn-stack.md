@@ -110,7 +110,7 @@ fn scalar_types_round_trip() {
     assert_eq!(Piece::new(Color::Black, Role::Queen).char(), 'q');
     assert!(Bitboard::from_square(Square::E4).contains(Square::E4));
     assert!(!Bitboard::EMPTY.contains(Square::E4));
-    assert_eq!((Bitboard::from_square(Square::A1) | Bitboard::from_square(Square::H8)).to_u64(), 0x8100_0000_0000_0001);
+    assert_eq!((Bitboard::from_square(Square::A1) | Bitboard::from_square(Square::H8)).to_u64(), 0x8000_0000_0000_0001);
 }
 
 #[test]
@@ -554,7 +554,7 @@ Expected: FAIL because `Fen`, `EnPassantMode`, and `position_hash` do not exist.
 Create `src/chess/fen.rs`:
 
 - `Fen { pub setup: Setup }`.
-- `Fen::from_ascii`: split into six fields. Parse the board rank by rank from Eighth down to First, accepting `pnbrqkPNBRQK` and digits 1–8. Parse `w`/`b`. Parse castling as `-` or a sequence of `KQkq` and `A-Ha-h`; `K`/`Q` resolve to the outermost rook right/left of that color's king on its back rank; file letters resolve to the rook on that file and back rank; ignore rights without a matching rook. Parse EP as `-` or a square. Parse halfmoves as `u32`. Parse fullmoves as `NonZeroU32` with `0` mapped to `1`.
+- `Fen::from_ascii`: split into six fields. Parse the board rank by rank from Eighth down to First, accepting `pnbrqkPNBRQK` and digits 1–8. Parse `w`/`b`. Parse castling as `-` or a sequence of `KQkq` and `A-Ha-h`; `K`/`Q` resolve to the outermost rook on the king's side of that color's king on its back rank, where kingside means a higher file number and queenside means a lower file number for both colors. File letters resolve to the rook on that file and back rank; ignore rights without a matching rook. Parse EP as `-` or a square. Parse halfmoves as `u32`. Parse fullmoves as `NonZeroU32` with `0` mapped to `1`.
 - `Fen::into_setup` returns the stored `Setup`.
 - `Fen::into_position(mode)` calls `Chess::from_setup(self.setup, mode)`.
 - `Fen::from_position(pos, ep_mode)` calls `pos.to_setup(ep_mode)` and wraps it.
@@ -1061,7 +1061,7 @@ Create `src/book/polyglot.rs`:
 
 Modify `src/book.rs`:
 
-- Add `mod polyglot;` and `mod polyglot_keys;` (or keep `polyglot_keys` private inside `polyglot`).
+- Add `pub mod polyglot;` and `mod polyglot_keys;` (or keep `polyglot_keys` private inside `polyglot`). The integration test imports `brett::book::polyglot::position_key`, so `polyglot` itself must be public.
 - Replace `pos.zobrist_hash::<Zobrist64>(EnPassantMode::Legal).0` with `polyglot::position_key(pos)`.
 - Replace `shakmaty::zobrist::Zobrist64` and `shakmaty::{...}` imports with `crate::chess::{...}`.
 - Keep `pos.ep_square(EnPassantMode::Legal)` for CTG.
