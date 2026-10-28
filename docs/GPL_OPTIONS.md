@@ -211,3 +211,29 @@ The decision gate is a product decision, not a technical one: is Brett's value
 in being permissively reusable, or in being open source with the least legal and
 engineering risk? The current code can support either, but not both without the
 rewrite.
+
+## Draft upstream request (unsent)
+
+**To:** Niklas Fiekas, author of `shakmaty` and `pgn-reader`
+**Channel:** the contact route published on
+<https://github.com/niklasf/shakmaty>
+**Status:** drafted 2026-10-28; **not sent**. Record the answer and date here
+when it arrives.
+
+> Hello Niklas,
+>
+> I maintain Brett, a native Rust desktop chess database and preparation app
+> (<https://github.com/Lakis01/Brett>). Brett's original code is MIT, but it
+> links `shakmaty` 0.30 and `pgn-reader` 0.29, both GPL-3.0-or-later, so a
+> distributed binary is a combined GPL work.
+>
+> Would you consider dual-licensing these two crates under a permissive
+> licence (MIT or Apache-2.0), or granting Brett a permissive licence for its
+> use? I am happy to keep the existing attribution, contribute fixes upstream,
+> or discuss a commercial arrangement if that is the better fit.
+>
+> If the answer is no, I will either adopt GPL-3.0-or-later for the combined
+> binary or replace the crates; either way I would like to record your answer
+> accurately. Thank you for the work you have put into both libraries.
+>
+> [name / contact]

@@ -116,3 +116,35 @@ entry: u8 key length | key bytes | u32 offset | u32 length
 - Missing players simply keep the colour dot and the normal strip height.
 - The pack is loaded once at startup. A corrupt or unreadable pack is ignored
   with a warning in the log; it never prevents a database from opening.
+
+## Draft permission request (unsent)
+
+**To:** the Scid authors/maintainers
+**Channel:** the Scid project's published contact route (SourceForge project
+mailing list or maintainer address)
+**Status:** drafted 2026-10-28; **not sent**. Record the answer and date here
+when it arrives.
+
+> Hello,
+>
+> I maintain Brett, an MIT-licensed open-source chess database and preparation
+> application (<https://github.com/Lakis01/Brett>). Brett can display player
+> portraits from a local pack derived from Scid's `Player_photos.zip`
+> (`PlayerData/Players.spf`). The conversion re-encodes each portrait as WebP
+> and stores it in Brett's `BPF1` pack; it does not alter the source archive.
+>
+> I would like written permission to redistribute the derived pack with Brett
+> (GitHub releases and, if applicable, an installer), with attribution to the
+> Scid project and to the photographers whose images are included. Please let
+> me know:
+>
+> 1. whether redistribution is permitted;
+> 2. the attribution and licence notice you want displayed;
+> 3. whether any images must be excluded; and
+> 4. whether you prefer a different distribution channel or a separate
+>    download.
+>
+> Until I have your answer, the pack remains local-only and is not committed or
+> bundled. Thank you.
+>
+> [name / contact]
