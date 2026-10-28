@@ -9,10 +9,10 @@
 
 ## Handover state
 
-- Branch: `permissive-rules-pgn`; Task 3 complete at `4f36598` (fix round 1 on top of `dc86ad1`). Controller handed from DeepSeek 4.1 Flash (opencode quota exhausted) to Claude Opus 5.5 Medium in Antigravity on 2026-10-29.
-- Completed: Tasks 1–3, all reviews clean.
-- Next action: dispatch Task 4 from `task-4-brief.md` with BASE = the ledger snapshot commit following `4f36598`.
-- Controller gate check at `4f36598`: `cargo test --all-targets` green (132 lib + 12 chess_facade + all integration suites; 1 pre-existing ignored), `cargo clippy --all-targets -- -D warnings` clean, `cargo fmt --all -- --check` clean.
+- Branch: `permissive-rules-pgn`; Task 4 complete at `25a0376`. Controller handed from DeepSeek 4.1 Flash (opencode quota exhausted) to Claude Opus 5.5 Medium in Antigravity on 2026-10-29.
+- Completed: Tasks 1–4, all reviews clean.
+- Next action: generate `task-5-brief.md` and dispatch Task 5 (PGN reader) with BASE = the ledger snapshot after `25a0376`.
+- Controller gate check at `25a0376` (chess_facade 17/17): `cargo test --all-targets` green (132 lib + 12 chess_facade + all integration suites; 1 pre-existing ignored), `cargo clippy --all-targets -- -D warnings` clean, `cargo fmt --all -- --check` clean.
 - Live artifacts in this directory: `progress.md`, `task-N-brief.md`, `task-N-report.md`, `review-<base>..<head>.diff`.
 - Recovery: `git log --oneline c696941..HEAD`; the plan is committed; briefs are regenerable with the skill's `task-brief` script.
 - Caveat: this directory is git-ignored (`.superpowers/sdd/.gitignore`). Copy it or commit a snapshot before moving the work to another machine.
@@ -115,13 +115,14 @@ Task priority if Argon quota is small: Argon Medium for Tasks 4, 5, 8, 10 (FEN/h
 - Task 3: review verdict spec ✅ / quality Needs fixes. Important: no committed Chess960 castling test — the scratch tests that covered DFRC `O-O`/`O-O-O` and rook-square UCI were deleted before commit. Fix round 1 dispatched. Minor (deferred): SAN resolution regenerates legal moves for the mandated membership check; illegal/drop moves render a plausible fallback SAN with no dev assertion; mid-file `use` in `tests/chess_facade.rs`; `Chess::castles()` re-derived per king move in `legal_moves()`.
   - Controller note for the fix: the existing `dfrc_setup()` cannot exercise castling (D1/E1 knights block queenside; G1/H1 kingside is a no-op), so the fix uses a dedicated legal DFRC castling setup (king B1, rooks A1/H1).
   - Fix round 1: `4f36598` adds `chess960_castling_san_uci_round_trip` (SAN `O-O`/`O-O-O` → `Move::Castle`, Chess960 UCI `b1h1`/`b1a1` round trip, Standard UCI `b1g1`/`b1c1`, SAN display, resulting king/rook squares). Re-review (Opus 5.5 Medium, controller): clean. The background GLM reviewer verdict was superseded. Task 3 complete (commits dd129ab..4f36598); Minor items above remain deferred.
+- Task 4: complete (commits e21eda4..25a0376, implementer Opus 5.5 Medium subagent, controller review clean). DONE_WITH_CONCERNS accepted: (1) `move.rs`/`san.rs` each gain `use …{Chess, Position}` because `legal_moves` is now a trait method; (2) inherent accessors/play moved into `impl Position for Chess` (shakmaty-style; callers need `use brett::chess::Position`; later tasks already import it); `from_setup`, `castling_mode`, `to_setup`, `to_setup_always`, `swap_turn`, `position_hash` stay inherent; (3) `Fen::from_ascii` accepts partial FEN (placement required, defaults `w - - 0 1`), matching shakmaty leniency for PGN `FEN` tags; >6 fields is an error; (4) test `use` line left where the brief placed it. Minor noted: `ep_square(Legal)` generates all legal moves, but only when an EP file exists, so the cost to `position_hash` is bounded.
 
 ## Tasks
 
 - [x] Task 1: add `cozy-chess` and facade scalars
 - [x] Task 2: board, setup, castling, `Chess`
 - [x] Task 3: moves, SAN, UCI
-- [ ] Task 4: FEN, position hash, `Position`
+- [x] Task 4: FEN, position hash, `Position`
 - [ ] Task 5: Brett streaming PGN reader
 - [ ] Task 6: migrate `domain.rs`
 - [ ] Task 7: migrate `library.rs`
