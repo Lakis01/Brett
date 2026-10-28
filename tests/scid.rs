@@ -1,11 +1,11 @@
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use brett::chess::Chess;
 use brett::library::GameLibrary;
 use brett::players::PlayerDirectory;
 use brett::position::{BuildOptions, PositionIndex, position_key};
 use brett::scid::ScidLibrary;
-use shakmaty::Chess;
 
 fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))

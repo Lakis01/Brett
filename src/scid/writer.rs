@@ -17,12 +17,11 @@ use std::io::{BufReader, BufWriter, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result, bail};
-use shakmaty::fen::Fen;
-use shakmaty::uci::UciMove;
-use shakmaty::{
-    Chess, Color, EnPassantMode, File as ChessFile, Move, Position, Rank, Role, Square,
+use crate::chess::{
+    Chess, Color, EnPassantMode, Fen, File as ChessFile, Move, Position, Rank, Role, Square,
+    UciMove,
 };
+use anyhow::{Context, Result, bail};
 
 use crate::domain::{Clock, Game, Node};
 use crate::scid::PieceLists;

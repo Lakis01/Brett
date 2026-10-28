@@ -11,13 +11,11 @@
 
 use std::num::NonZeroU32;
 
-use anyhow::{Context, Result, bail};
-use shakmaty::fen::Fen;
-use shakmaty::uci::UciMove;
-use shakmaty::{
-    Bitboard, Board, CastlingMode, CastlingSide, Chess, Color, EnPassantMode, FromSetup, Move,
-    Piece, Position, Role, Setup, Square,
+use crate::chess::{
+    Bitboard, Board, CastlingMode, CastlingSide, Chess, Color, EnPassantMode, Fen, File, Move,
+    Piece, Position, Rank, Role, SanPlus, Setup, Square, UciMove,
 };
+use anyhow::{Context, Result, bail};
 
 use super::tables;
 use crate::domain::{Game, Node, Ply};
@@ -196,7 +194,7 @@ fn decode_board(bits: &[u8]) -> Result<[Option<(Color, Role)>; 64]> {
         // The stored square order is file-major (`a1`, `a2`, ...); Shakmaty
         // indices are rank-major (`a1`, `b1`, ...).
         let square = Square::new(u32::from((cb % 8) * 8 + cb / 8));
-        board[square as usize] = Some((color, role));
+        board[usize::from(square)] = Some((color, role));
     }
     Ok(board)
 }
@@ -220,7 +218,7 @@ fn rook_file(
     chess960: bool,
 ) -> Option<u8> {
     let rank = if color == Color::White { 0 } else { 7 };
-    let at = |file: u8| pieces[square(file, rank) as usize];
+    let at = |file: u8| pieces[usize::from(square(file, rank))];
     let king_file = (0..8u8).find(|&file| at(file) == Some((color, Role::King)))?;
     if named_king.is_some_and(|named| named != king_file) {
         return None;
@@ -254,7 +252,7 @@ fn usable_ep(
         if !(0..8).contains(&file) {
             return None;
         }
-        pieces[square(file as u8, rank) as usize]
+        pieces[usize::from(square(file as u8, rank))]
     };
     if at(file as i8, pawn_rank) != Some((them, Role::Pawn)) {
         return None;
@@ -441,7 +439,7 @@ impl Walker<'_> {
             CastlingMode::Standard
         };
         let ply = Ply {
-            san: shakmaty::san::SanPlus::from_move(before.clone(), mv).to_string(),
+            san: SanPlus::from_move(before.clone(), mv).to_string(),
             uci: UciMove::from_move(mv, uci_mode).to_string(),
             number: before.fullmoves().get(),
             color: before.turn(),
@@ -689,10 +687,7 @@ fn from_stored_square(cb: u8) -> Square {
 }
 
 fn square(file: u8, rank: u8) -> Square {
-    Square::from_coords(
-        shakmaty::File::new(u32::from(file)),
-        shakmaty::Rank::new(u32::from(rank)),
-    )
+    Square::from_coords(File::new(u32::from(file)), Rank::new(u32::from(rank)))
 }
 
 fn step(from: Square, file_delta: i8, rank_delta: i8) -> Square {

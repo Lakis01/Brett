@@ -5,7 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use shakmaty::{Chess, Position, Role};
+use crate::chess::{CastlingSide, Chess, Color, File, Position, Rank, Role, Square};
 
 use super::tables;
 use super::*;
@@ -369,14 +369,11 @@ fn standard_start(mode: u8) -> Vec<u8> {
         // ChessBase numbers squares by file first: a1, a2, ... a8, b1.
         let file = cb / 8;
         let rank = cb % 8;
-        let square = shakmaty::Square::from_coords(
-            shakmaty::File::new(u32::from(file)),
-            shakmaty::Rank::new(u32::from(rank)),
-        );
+        let square = Square::from_coords(File::new(u32::from(file)), Rank::new(u32::from(rank)));
         match board.board().piece_at(square) {
             Some(piece) => {
                 bits.push(1, 1);
-                bits.push(u8::from(piece.color == shakmaty::Color::Black), 1);
+                bits.push(u8::from(piece.color == Color::Black), 1);
                 let code = match piece.role {
                     Role::King => 1,
                     Role::Queen => 2,
@@ -673,7 +670,7 @@ fn mode_ten_explicit_start_and_castling() {
         !game
             .final_position()
             .castles()
-            .has(shakmaty::Color::White, shakmaty::CastlingSide::KingSide)
+            .has(Color::White, CastlingSide::KingSide)
     );
 }
 
@@ -886,4 +883,47 @@ fn rejects_a_header_file_that_is_not_classic_cbh() {
         .err()
         .expect("a header file stating 45-byte records must be rejected");
     assert!(format!("{error:#}").contains("states a 45-byte game record"));
+}
+
+#[test]
+fn chess960_start_keeps_outer_rook_castling_rights() {
+    let mut board = crate::chess::Board::empty();
+    for (square, role) in [
+        (crate::chess::Square::A1, Role::Rook),
+        (crate::chess::Square::B1, Role::Knight),
+        (crate::chess::Square::C1, Role::Bishop),
+        (crate::chess::Square::D1, Role::Queen),
+        (crate::chess::Square::E1, Role::King),
+        (crate::chess::Square::F1, Role::Bishop),
+        (crate::chess::Square::G1, Role::Knight),
+        (crate::chess::Square::H1, Role::Rook),
+        (crate::chess::Square::E8, Role::King),
+    ] {
+        let color = if square.rank() == crate::chess::Rank::Eighth {
+            crate::chess::Color::Black
+        } else {
+            crate::chess::Color::White
+        };
+        board.set_piece_at(square, crate::chess::Piece::new(color, role));
+    }
+    let mut rights = crate::chess::Bitboard::EMPTY;
+    rights |= crate::chess::Bitboard::from_square(crate::chess::Square::A1);
+    rights |= crate::chess::Bitboard::from_square(crate::chess::Square::H1);
+    let setup = crate::chess::Setup {
+        board,
+        turn: crate::chess::Color::White,
+        castling_rights: rights,
+        ep_square: None,
+        halfmoves: 0,
+        fullmoves: std::num::NonZeroU32::new(1).unwrap(),
+    };
+    let pos = Chess::from_setup(setup, crate::chess::CastlingMode::Chess960).unwrap();
+    assert!(pos.castles().has(
+        crate::chess::Color::White,
+        crate::chess::CastlingSide::KingSide
+    ));
+    assert!(pos.castles().has(
+        crate::chess::Color::White,
+        crate::chess::CastlingSide::QueenSide
+    ));
 }

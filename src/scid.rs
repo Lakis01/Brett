@@ -12,9 +12,10 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use crate::chess::{
+    CastlingMode, Chess, Color, EnPassantMode, Fen, File as ChessFile, Move, Position, Role, Square,
+};
 use anyhow::{Context, Result, bail};
-use shakmaty::fen::Fen;
-use shakmaty::{CastlingMode, Chess, Color, File as ChessFile, Move, Position, Role, Square};
 
 use crate::domain::{Game, Node, Ply};
 use crate::library::{GameLibrary, IndexedGame, SourceMeta, StringPool, intern_headers};
@@ -668,7 +669,7 @@ fn decode_record(bytes: &[u8], mut headers: Vec<(String, String)>) -> Result<Gam
                         format!(
                             "ply {} (SCID byte {val:#04x}, FEN {})",
                             moves + 1,
-                            Fen::from_position(&parent_pos, shakmaty::EnPassantMode::Legal)
+                            Fen::from_position(&parent_pos, EnPassantMode::Legal)
                         )
                     })?;
                 let mv = match decoded.special {
