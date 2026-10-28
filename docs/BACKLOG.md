@@ -14,15 +14,43 @@ writer remains. Item 10 is no longer blocked: the current ICCF SCID source is av
 and the automatic correspondence reference is integrated; only an optional
 refresh remains. Deferred predictor refinements are recorded under item 6, and
 native player-title display is queued as item 15. Item 18 records the
-recently-trending move-popularity idea, including its graphical display.
+recently-trending move-popularity idea, including its graphical display. Items
+20 and 21 add native ECO classification and Wikipedia player summaries; item 16
+now includes the FIDE-profile link. Item 22 records the player clock-usage
+analysis idea for the player profile/preparation view.
 
 **Decision log (2026-10-28):**
 
-- **Item 17:** ask the upstream author for a permissive/dual licence first;
-  make no dependency or licence change until a written answer is recorded.
-- **Item 3:** complete the original scope — clocks after each move in the move
-  list and the side-to-move clock in the header, in addition to the board
-  strips.
+- **Item 17:** replace `shakmaty` and `pgn-reader` with MIT components
+  (`cozy-chess` 0.3.4, a Brett-owned streaming PGN parser, and a Brett-owned
+  Polyglot hash); do not send the upstream licence request. Bump the
+  position-index cache version because the hash changes.
+- **Item 20 (ECO):** use the CC0 `lichess-org/chess-openings` dataset; classify
+  by replaying the game and keeping the deepest named position; write `ECO` and
+  `Opening` from that match.
+- **Item 21 (Wikipedia):** fetch an introductory summary on demand, cache it
+  locally, show attribution and an article link; auto-display only when the
+  match is confidently a chess player, otherwise offer a search link.
+- **Item 16 (FIDE):** when a real FIDE ID is present, link from the player
+  profile to `https://ratings.fide.com/profile/{id}`; never construct a link
+  without a real ID.
+- **Item 3:** clocks are shown in the board strips only. The move-list clock
+  chips and the side-to-move clock in the header are removed; the PGN moves
+  window stays clock-free.
+- **Board evaluation bar:** optional in Settings and enabled by default. The
+  bar uses the highest-depth available local-engine or Lichess cloud
+  evaluation; a PGN `[%eval]` is the fallback when neither exists. PGN eval
+  directives are decoded into a structured node field and are never rendered
+  as comment text.
+- **Item 2 (review book and accuracy):** skip only the leading opening-book
+  prefix. Prefer the native opening book, then the configured local
+  opening-tree file, then the Lichess Masters explorer; a Masters/tree move
+  counts as book at a configurable minimum game count (default 3) and the
+  prefix is capped (default 30 plies). Book moves do not count toward accuracy.
+  Use a Lichess-style win-probability accuracy per color, plus ACPL; forced
+  moves are excluded from accuracy.
+- **Item 22:** add a player clock-usage analysis brainstorm for the player
+  profile/preparation view; no implementation is scheduled yet.
 - **2CBH:** intended, but blocked on a sample file. Treat it as a new container
   format, separate from the validated classic multi-file CBH reader/writer.
 - **Item 19:** request written redistribution permission from the Scid authors;
@@ -32,9 +60,10 @@ recently-trending move-popularity idea, including its graphical display.
   compiled backlog drives priority. The CBH/SCID provenance audit runs before
   the classic CBH writer.
 
-Game review follow-ups that are intentionally deferred: position-index book
-marking and review caching. Clock display is complete: board strips, the move
-list, and the game header all follow the same **Clocks** toggle.
+Game review follow-ups that remain deferred: review caching. Book-prefix
+marking is now in scope through item 2. Clock display is board-only: the
+**Clocks** toggle controls the board strips, while the move list and game
+header stay clock-free.
 
 The latest interaction pass hides absent or empty PGN fields by default, adds
 **Show empty** and a virtual **Board** field written as `round.board`, opens a
@@ -67,7 +96,8 @@ UI.
 ## 2. Game Review with the local engine
 
 **Status:** implemented in `src/review.rs` and the **Review** tab. The optional
-NAG write-back is included; book marking and caching are deferred.
+NAG write-back is included. Book-prefix skipping and the revised accuracy
+metric are the remaining review work; review caching is still deferred.
 
 **Goal:** annotate and grade a complete game.
 
@@ -77,27 +107,35 @@ NAG write-back is included; book marking and caching are deferred.
   and centipawn loss.
 - Classify moves (for example: best, good, inaccuracy, mistake, blunder) using
   documented thresholds and special handling for mates and forced moves.
-- Show an evaluation graph, accuracy summary, and a clickable move-quality list.
-  At minimum, review output is display-only; optionally write `?!`/`?`/`??`
+- Skip the leading opening-book prefix. Prefer the native opening book, then
+  the configured local opening-tree file, then the Lichess Masters explorer.
+  A tree/Masters move counts as book at a configurable minimum game count
+  (default 3); cap the prefix at a configurable depth (default 30 plies).
+  Book moves do not count toward accuracy.
+- Show an evaluation graph, a per-color accuracy summary, ACPL, and a
+  clickable move-quality list. Use a Lichess-style win-probability accuracy
+  formula; exclude book and forced moves from accuracy.
+- At minimum, review output is display-only; optionally write `?!`/`?`/`??`
   NAGs back into the in-memory game.
-- Use the position index to mark book/opening moves where meaningful.
 - Cache reviews by game content and engine settings if the analysis is slow.
 
 **Depends on:** UCI engine.
 
 ## 3. Clock display
 
-**Status:** implemented. The hidden-by-default **Clocks** toggle shows the
-remaining time after each move, the side-to-move time in the game header, and
-the latest time for each side in the board strips.
+**Status:** implemented for the board strips. The hidden-by-default **Clocks**
+toggle shows the latest time for each side above and below the board. The
+move-list clock chips and the side-to-move clock in the header were removed on
+2026-10-28.
 
-**Goal:** show clock information already present in PGN comments.
+**Goal:** show clock information already present in PGN comments, in the board
+view only.
 
 - Parse `[%clk H:MM:SS]` (and, if useful, `[%emt ...]`) from move comments.
 - Add a **Clocks** toggle; it is hidden by default.
-- When enabled, show the clock after each move in the move list and the side to
-  move's remaining time in the header. Missing or malformed clock tags are
-  simply absent, never guessed.
+- When enabled, show the latest time for each side in the board strips. The
+  PGN moves window and the game header stay clock-free. Missing or malformed
+  clock tags are simply absent, never guessed.
 - Keep the human comment text separate from the machine clock token.
 - Add PGN fixtures for increments, missing clock tags, and partial clocks.
 
@@ -502,36 +540,51 @@ across preparation and game browsing.
   previews, and database views. Preserve the raw tag when editing/exporting.
 - Do not fabricate an ID when the source only supplies a name; FIDE IDs must
   come from a real tag or resolved ChessABC/FIDE lookup.
+- In the player profile detail view (opened by clicking a player's name or
+  portrait), show a **FIDE profile** link when a real ID is available. The link
+  opens `https://ratings.fide.com/profile/{id}` in the system browser; validate
+  that the ID is numeric before constructing it.
+- Make the link visually secondary to the name and title, with a hover
+  explanation. If no real ID is present, show no link (not a disabled or
+  guessed URL).
+- Keep the player-selection and photo-viewer click behavior intact; the FIDE
+  link is an explicit action inside the profile, not a replacement for the
+  portrait viewer.
 
-**Depends on:** `src/domain.rs`, `src/online.rs`, and the shared player-name
-rendering helpers. **Related:** item 15 (native player titles).
+**Depends on:** `src/domain.rs`, `src/online.rs`, `src/players.rs`, and the
+shared player-name rendering helpers. **Related:** item 15 (native player
+titles).
 
 ## 17. Permissive chess and PGN stack
 
-**Status:** decision pending. Brett currently links `shakmaty` (chess rules,
-SAN, FEN) and `pgn-reader` (streaming PGN) under GPL-3.0-or-later. The original
-Brett code is MIT, but a built binary is a combined GPL work. The 2026-10-28
-decision is to ask the upstream author for a permissive/dual licence first and
-to make no dependency or licence change until a written answer is recorded.
-See `THIRD_PARTY_NOTICES.md` and the option-by-option analysis in
+**Status:** selected; implementation planned. Brett currently links `shakmaty`
+(chess rules, SAN, FEN) and `pgn-reader` (streaming PGN) under
+GPL-3.0-or-later. The original Brett code is MIT, but a built binary is a
+combined GPL work. The 2026-10-28 decision is to replace both crates rather
+than ask upstream. See `THIRD_PARTY_NOTICES.md` and
 [`GPL_OPTIONS.md`](GPL_OPTIONS.md).
 
-- Send the upstream request; record the answer and date in
-  `GPL_OPTIONS.md`.
-- If granted, update the dependency/licence notes and keep the permissive
-  build.
-- If refused, choose between adopting GPL-3.0-or-later for the combined binary
-  and funding the `cozy-chess` + streaming-PGN replacement.
+- Use `cozy-chess` 0.3.4 (MIT) for legal moves, SAN/UCI helpers, FEN/Shredder
+  FEN, Chess960/DFRC, and custom starts. Put it behind Brett-owned facade types
+  so the UI, SCID/CBH readers, and database code do not depend on the crate
+  directly.
+- Replace `pgn-reader` with a Brett-owned streaming parser that preserves
+  tags, comments, NAGs, recursive variations, null moves, results, malformed
+  games, byte ranges for the lazy PGN index, and large-archive throughput.
+- Implement a Brett-owned Polyglot Zobrist hash for `.bin` books. `cozy-chess`
+  hashes are not Polyglot-compatible.
+- Bump `src/position.rs::VERSION` and rebuild existing position indexes; do not
+  silently reuse keys from the old Zobrist table.
 - Preserve legal-move correctness, SAN/FEN round-tripping, Chess960/custom
   starts, streaming PGN performance, and the existing large-database guards.
-- Keep any replacement behind the current domain types so the UI and database
-  readers do not depend on a particular chess crate.
-- Add regression tests against the public fixtures and the SCID/CBH readers.
-- While the decision is pending, do not describe a distributed binary as
-  MIT-only if it still links the GPL crates.
+- Add regression tests against the public fixtures, perft positions, the
+  SCID/CBH readers, and a large local archive benchmark.
+- Update `Cargo.toml`, `Cargo.lock`, `THIRD_PARTY_NOTICES.md`, and the
+  provenance notes; the default binary must not link either GPL crate.
+- The drafted upstream request is obsolete and must not be sent.
 
-**Depends on:** `src/domain.rs`, `src/pgn.rs`, `src/position.rs`, and
-`src/library.rs`.
+**Depends on:** `src/domain.rs`, `src/pgn.rs`, `src/position.rs`,
+`src/library.rs`, and `src/book.rs`.
 
 ## 18. Recently trending move popularity
 
@@ -598,3 +651,106 @@ keep the pack local-only and out of releases until an answer is recorded.
 
 **Depends on:** `src/photos.rs`, `src/app.rs`, and the photo-pack provenance in
 `docs/PHOTOS.md`.
+
+## 20. Native ECO classification and Opening tag
+
+**Status:** planned.
+
+**Goal:** classify each game's opening from its own mainline, like SCID, and
+write the matching `ECO` and `Opening` tags. The `ECO` value must be the exact
+code for the matched opening, not a family-level approximation.
+
+- Use the CC0 [`lichess-org/chess-openings`](https://github.com/lichess-org/chess-openings)
+  dataset (`a.tsv`…`e.tsv`: `eco`, `name`, `pgn`). Record the dataset version or
+  commit and the CC0 provenance in `THIRD_PARTY_NOTICES.md`.
+- Build a position → `(eco, name)` table from the dataset. Replay the game's
+  mainline and keep the deepest position that has a named entry, following the
+  dataset's recommended backwards-search classification. Stop cleanly at the
+  first illegal move or unsupported position.
+- Resolve transpositions deterministically: when several entries share the same
+  position, prefer the shortest defining line, then the lexicographically
+  smallest ECO code and name. Never emit an ambiguous or invented code.
+- Add an explicit **Classify openings** action (current game or all games in the
+  session, with a progress summary). Write `ECO` and `Opening` from the deepest
+  match. Preserve existing tags unless the user explicitly confirms
+  reclassification; do not silently rewrite imported metadata.
+- Show the computed classification in the game header even when the tags are
+  absent, but only write tags through the explicit action. Keep the raw tags
+  intact when editing and exporting.
+- Handle custom starts, Chess960, missing move text, illegal moves, and games
+  that leave the dataset without a match: leave existing tags unchanged and
+  report “unclassified” rather than guessing.
+- Add tests for the Sicilian Najdorf, Ruy Lopez, Queen's Gambit, a transposition,
+  a custom-start game, an illegal move, and preserve/overwrite behavior for
+  existing `ECO`/`Opening` tags.
+- Classify the mainline only; variations do not change the game's opening.
+  Classification must be O(plies) per game and must not require the position
+  index.
+
+**Depends on:** item 17 (rules/PGN backend) for SAN replay and position keys;
+`src/domain.rs`, `src/pgn.rs`, and the game-header UI. **Unblocks:** ECO-based
+filtering, preparation, and opening reports.
+
+## 21. Wikipedia player summaries
+
+**Status:** planned; one UX decision remains open.
+
+**Goal:** show a short introductory Wikipedia summary in the player profile
+beside the photo, similar to Navidrome's MusicBrainz artist biography, without
+shipping or redistributing Wikipedia content.
+
+- Fetch on demand from the Wikipedia REST summary endpoint (or the MediaWiki
+  API) using the player's name, and cache the result locally keyed by the
+  resolved article title. Include a descriptive User-Agent, respect rate limits,
+  and keep an offline/no-network fallback.
+- Only display a summary automatically when the match is confidently a chess
+  player (for example the article description/occupation mentions chess).
+  Otherwise offer a clearly labelled Wikipedia search link instead of showing a
+  possibly wrong person's biography.
+- Show the summary text, a “Wikipedia” attribution link, and the article link.
+  Preserve the CC BY-SA attribution; do not bundle article text in the binary or
+  redistribute a Wikipedia dump.
+- Keep the photo, name, title, FIDE link, and summary visually coherent; the
+  summary must not push the photo or the game record out of the profile.
+- Add a setting to disable network lookups. Never fetch during bulk import or
+  for every player in a large database; fetch only for the selected profile.
+- **Open UX question:** should a confidently matched player fetch the summary
+  automatically when the profile opens (with a loading state and cache), or
+  should the profile show a **Show Wikipedia summary** button? Recommendation:
+  auto-fetch only for confident matches, with a setting to turn it off; use
+  click-to-load for ambiguous matches. Resolve this before implementation.
+- Add tests for confident match, ambiguous match, no network, cached response,
+  HTML/entity cleanup, and attribution/link rendering.
+
+**Depends on:** `src/players.rs`, `src/app.rs`, the profile/photo layout, and the
+existing `ureq` HTTP client. **Related:** item 16 (FIDE profile link) and item
+19 (player photos).
+
+## 22. Player clock-usage analysis
+
+**Status:** brainstorm / backlog only. No implementation is scheduled yet.
+
+**Goal:** in the player profile view, where preparation against that player
+also happens, analyze how the player uses clock time. The profile is the right
+home because the same screen is used to prepare an opening and a practical
+game plan.
+
+- Parse the available `[%clk]` values and derive time spent per move, remaining
+  time, and move-number/time-control phase. Never guess when clocks are absent.
+- Summarize time trouble (for example moves played below a low-time threshold),
+  long thinks, fast moves, and how those correlate with move quality, results,
+  and the player's rating band/era.
+- Compare the player's habits with their own baseline, the opponent, and the
+  current preparation line; surface recurring patterns rather than a single
+  game.
+- Provide a graphical timeline/heatmap by move number and game phase, with
+  click-through to the source games.
+- Keep the analysis read-only and local; it must not require uploading games.
+- Consider a future link to the engine review/accuracy data so a long think can
+  be compared with the quality of the resulting move.
+- Add fixtures with complete, partial, and missing clocks, increments, and
+  correspondence-scale times; verify that games without clocks are excluded
+  rather than treated as zero.
+
+**Depends on:** `src/domain.rs` clock parsing, `src/players.rs` player book,
+`src/app.rs` profile/preparation view, and the review/accuracy work in item 2.

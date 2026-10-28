@@ -1,14 +1,17 @@
 # Removing the GPL/AGPL dependency exposure
 
-**Status:** analysis only. No dependency or source change is implied by this
-document. This is an engineering and licensing-risk assessment, not legal
-advice; a lawyer should confirm the distribution model before a release.
+**Status:** decision recorded (2026-10-28); implementation planned. This is an
+engineering and licensing-risk assessment, not legal advice; a lawyer should
+confirm the distribution model before a release.
 
-**Decision (2026-10-28):** ask the upstream author for a permissive/dual
-licence first. Make no dependency or licence change until a written answer is
-recorded here. If granted, keep the permissive build and update the notices. If
-refused, choose between adopting GPL-3.0-or-later for the combined binary and
-funding the `cozy-chess` + streaming-PGN replacement described below.
+**Decision (2026-10-28):** do not send the upstream licence request. Replace
+`shakmaty` and `pgn-reader` with MIT components and keep Brett MIT/permissive:
+`cozy-chess` 0.3.4 for rules (legal moves, SAN/UCI helpers, FEN/Shredder FEN,
+Chess960/DFRC, Zobrist), a Brett-owned streaming PGN parser, and a Brett-owned
+Polyglot Zobrist for `.bin` books. The position-index cache version will be
+bumped because `cozy-chess` hashes differ from the current Polyglot-compatible
+keys. The MIT `chess` crate is rejected because it lacks Chess960; a clean-room
+move generator is rejected as an unreasonable rewrite.
 
 ## Current exposure
 
@@ -89,19 +92,22 @@ Chess960/DFRC support and an incremental Zobrist hash. It is the closest
 permissive match to the parts of `shakmaty` Brett uses.
 
 - **Work:** add a thin Brett-owned facade (`Position`, `Move`, `Color`,
-  `Square`, SAN/FEN helpers) so the 22 files that import `shakmaty` do not all
-  change at once. Implement SAN parsing/formatting on top of legal moves, FEN
-  formatting, UCI adapters (including Chess960 king-captures-rook notation),
-  and a position-key adapter.
-- **Hidden cost:** the position index is keyed by the current hash. A new
-  Zobrist table requires a cache-format version bump and a rebuild of existing
-  indexes. Budget for that migration rather than silently reusing stale keys.
+  `Square`, SAN/FEN helpers) so the 16 files that import `shakmaty` do not all
+  change at once. `cozy-chess` already supplies
+  `util::{parse_san_move, display_san_move, parse_uci_move, display_uci_move}`;
+  the facade adapts its flat `Move` representation and king-captures-rook
+  castling notation to Brett's tree, SCID, and CBH code. It also supplies
+  FEN/Shredder FEN and `BoardBuilder` for custom starts.
+- **Hidden cost:** the position index is keyed by the current
+  Polyglot-compatible hash. `cozy-chess`'s `Board::hash()` uses a different
+  Zobrist table, so bump `src/position.rs::VERSION` and rebuild existing
+  indexes. Polyglot `.bin` books need a separate Brett-owned Polyglot hash.
 - **Risk:** SAN edge cases and Chess960 castling are the usual sources of
-  subtle bugs. Perft suites and the existing SCID/CBH fixtures are the safety
-  net.
+  subtle bugs. Perft suites, SAN/FEN round-trip tests, and the existing
+  SCID/CBH fixtures are the safety net.
 - **Pros:** MIT, fast, Chess960, no new copyleft.
-- **Cons:** not a drop-in `shakmaty` replacement; SAN/FEN layers are ours to
-  write and test.
+- **Cons:** not a drop-in `shakmaty` replacement; the facade and adapters are
+  ours to test.
 
 `chess` 3.2.0 is also MIT and fast, but it does not advertise Chess960 support;
 Brett's classic-CBH path needs Chess960, so `cozy-chess` is the better fit.
@@ -120,22 +126,21 @@ references, not as a drop-in replacement for `pgn-reader`.
 - **Cons:** real-world PGN is messy; this is where most of the compatibility
   risk lives. A naive parser will be slower than `pgn-reader` on multi-million
   game archives.
-- **Mitigation:** keep the current `pgn-reader` path behind a feature while the
-  new parser is validated on the public fixtures and large local archives;
-  compare game trees move-for-move before switching the default.
+- **Mitigation:** validate the new parser on the public fixtures and large
+  local archives, and compare game trees move-for-move before removing the GPL
+  crates. No GPL-backed feature ships in the default binary.
 
 #### Staged sequence
 
-1. Put the current GPL crates behind a non-default `gpl` feature and make the
-   rest of the code depend on Brett-owned facade types.
-2. Replace `pgn-reader` first. It touches four files and has a narrower surface
+1. Add `cozy-chess` and a Brett-owned facade, keeping the current call sites on
+   the facade types. Use `shakmaty` temporarily only for differential tests.
+2. Replace `pgn-reader` with the Brett-owned streaming parser. It touches three
+   files (`domain.rs`, `library.rs`, `position.rs`) and has a narrower surface
    than the rules engine.
-3. Replace `shakmaty` with `cozy-chess` plus SAN/FEN/UCI adapters; bump the
-   position-index cache version.
-4. Flip the default build to the permissive backend; keep the GPL backend as an
-   optional compatibility feature for a release or two.
-5. Remove the GPL feature and dependencies once the permissive path has passed
-   the full fixture, SCID/CBH, and large-archive suites.
+3. Switch the facade to `cozy-chess`, migrate Polyglot book lookup to the
+   Brett-owned hash, and bump the position-index cache version.
+4. Remove the GPL dependencies and update `THIRD_PARTY_NOTICES.md`; run the
+   full fixture, SCID/CBH, and large-archive suites plus a streaming benchmark.
 
 - **Effort:** roughly 4–8 focused weeks for a careful implementation,
   validation, and performance pass; more if SAN/Chess960 edge cases are worse
@@ -193,32 +198,31 @@ Keep the source MIT and let users build locally, or distribute only source.
 
 ## Recommendation
 
-1. **In parallel, ask upstream for a dual/permissive licence.** It is cheap and
-   could remove the problem outright.
-2. **If permissive distribution matters, choose option 3** and fund a short
-   spike first: `cozy-chess` for rules, a prototype streaming PGN parser, and a
-   facade that hides both. Gate the full rewrite on perft, SAN/FEN round-trip,
-   the existing PGN/SCID/CBH fixtures, and a large-archive benchmark.
-3. **If permissive distribution does not matter, choose option 1 now.** Adopt
-   GPL-3.0-or-later for the combined distribution, keep the MIT notices for the
-   original code, and stop spending engineering time on a replacement that the
-   project does not need.
-4. **Do not** ship a binary that links GPL code while describing the whole
-   binary as MIT, and do not rely on process isolation or an optional feature
-   as a legal workaround.
+The project selected **option 3** on 2026-10-28: keep Brett MIT/permissive and
+replace both GPL crates.
 
-The decision gate is a product decision, not a technical one: is Brett's value
-in being permissively reusable, or in being open source with the least legal and
-engineering risk? The current code can support either, but not both without the
-rewrite.
+1. **Implement the `cozy-chess` facade first**, with `shakmaty` retained only as
+   a test oracle. Gate it on perft, SAN/FEN round-trip, and the existing
+   PGN/SCID/CBH fixtures.
+2. **Replace `pgn-reader` with the Brett-owned streaming parser**, validated on
+   public fixtures and a large local archive before removal.
+3. **Bump the position-index version** and rebuild caches; add the Brett-owned
+   Polyglot hash for `.bin` books.
+4. **Remove the GPL dependencies and update the notices.** Do not ship a binary
+   that links GPL code while describing the whole binary as MIT, and do not
+   rely on process isolation or an optional feature as a legal workaround.
 
-## Draft upstream request (unsent)
+The upstream request is no longer part of the plan; it is retained below only
+as a record of the option considered.
+
+## Draft upstream request (unsent and obsolete — do not send)
 
 **To:** Niklas Fiekas, author of `shakmaty` and `pgn-reader`
 **Channel:** the contact route published on
 <https://github.com/niklasf/shakmaty>
-**Status:** drafted 2026-10-28; **not sent**. Record the answer and date here
-when it arrives.
+**Status:** drafted 2026-10-28; **not sent**. The 2026-10-28 decision replaced
+both crates instead, so this request is retained only as a record. Do not send
+it.
 
 > Hello Niklas,
 >
