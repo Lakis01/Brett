@@ -4,7 +4,7 @@ This is the working backlog after the preparation stage. Items are ordered by
 dependency and user value, not by estimated effort. Completed work is recorded
 in `README.md`; this file tracks what is next.
 
-**Status (2026-10-28):** items 1–7 and 11–14 are implemented, and the latest
+**Status (2026-10-29):** items 1–7, 11–14, and 17 are implemented, and the latest
 moves-panel interaction polish is complete. Item 8's cloud, opening-tree,
 reference-source, and native-book parts are done; M2b mega-scale ingest remains,
 with the first safety pass now keeping huge archives responsive and avoiding
@@ -557,12 +557,12 @@ titles).
 
 ## 17. Permissive chess and PGN stack
 
-**Status:** selected; implementation planned. Brett currently links `shakmaty`
-(chess rules, SAN, FEN) and `pgn-reader` (streaming PGN) under
-GPL-3.0-or-later. The original Brett code is MIT, but a built binary is a
-combined GPL work. The 2026-10-28 decision is to replace both crates rather
-than ask upstream. See `THIRD_PARTY_NOTICES.md` and
-[`GPL_OPTIONS.md`](GPL_OPTIONS.md).
+**Status:** implemented (2026-10-29). Replaced `shakmaty` and `pgn-reader`
+with MIT-licensed `cozy-chess` 0.3.4 behind a Brett-owned chess facade
+(`src/chess/`), the Brett streaming PGN reader (`src/pgn/reader.rs`), and the
+Brett Polyglot hash (`src/book/polyglot.rs`), and bumped
+`src/position.rs::VERSION` to 2. Built binaries no longer link any GPL crates.
+See `THIRD_PARTY_NOTICES.md` and [`GPL_OPTIONS.md`](GPL_OPTIONS.md).
 
 - Use `cozy-chess` 0.3.4 (MIT) for legal moves, SAN/UCI helpers, FEN/Shredder
   FEN, Chess960/DFRC, and custom starts. Put it behind Brett-owned facade types

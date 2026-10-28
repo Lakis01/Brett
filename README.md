@@ -485,11 +485,12 @@ never writes to the source database.
   names and auto-orientation, persistent FEN strip and full-move counter,
   inline WhiteElo/BlackElo fields, compact PGN tags, title badges, multiple
   ratings, ICCF notice, and secret-safe contribution rules.
-- **Permissive dependency path.** Replace the GPL-licensed `shakmaty` and
-  `pgn-reader` crates with permissively licensed chess-rules/PGN
-  implementations, or deliberately relicense Brett as GPL. Until then, built
-  binaries are GPL-3.0-or-later; see
-  [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md#gpl-licensed-chess-and-pgn-crates).
+- **Permissive dependency path (done).** Replaced the GPL-licensed `shakmaty`
+  and `pgn-reader` crates with MIT-licensed `cozy-chess` 0.3.4 behind a
+  Brett-owned chess facade, a Brett-owned streaming PGN parser, and a
+  Brett-owned Polyglot Zobrist hash; see
+  [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) and
+  [docs/GPL_OPTIONS.md](docs/GPL_OPTIONS.md).
 - **M2b — Mega-scale ingest.** External sorting, an on-disk header table, and
   incremental updates for multi-million-game databases.
 - **Database editing and export (in progress).** Drag rows to reorder the
@@ -553,10 +554,7 @@ licence, so no photo data is committed or bundled with Brett; see
 Brett's original application code is **MIT** — see [LICENSE](LICENSE). The
 piece artwork remains CC BY-SA 3.0, and the font remains under its own licence.
 
-**Important:** Brett currently links `shakmaty` and `pgn-reader`, both
-GPL-3.0-or-later. A built binary is therefore a combined work under
-GPL-3.0-or-later, even though the original Brett code is MIT. Do not describe
-a built binary as MIT-only. Replacing those crates is on the backlog; the
-options, effort, and trade-offs are analysed in
-[docs/GPL_OPTIONS.md](docs/GPL_OPTIONS.md). See also
-[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md#gpl-licensed-chess-and-pgn-crates).
+Brett links only MIT/permissive runtime dependencies, with `cozy-chess` 0.3.4
+for chess rules, a Brett-owned streaming PGN parser, and a Brett-owned Polyglot
+Zobrist hash. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) and
+[docs/GPL_OPTIONS.md](docs/GPL_OPTIONS.md).

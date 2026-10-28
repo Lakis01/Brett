@@ -10,7 +10,7 @@ format, cache invalidation, and current limits.
 - Every **mainline** move of every game. Variations are skipped: they are
   analysis, not games played in the database.
 - For each move, the position **before** the move is hashed with a stable
-  Zobrist key from `shakmaty`.
+  Brett position hash from `cozy-chess`.
 - A game is counted at most once per position. If a game repeats a position,
   indexing stops at the repetition.
 - Result (`1-0`, `0-1`, `1/2-1/2`, `*`), `WhiteElo`/`BlackElo`, and `Date` tags
@@ -23,7 +23,7 @@ Position totals shown in the UI are the sum of the outgoing move records. A
 position with no outgoing move (the final position of a game) is not stored;
 the opening tree is about moves that were actually played.
 
-PGN files use the streaming `pgn-reader` visitor: tags and byte ranges are
+PGN files use the Brett streaming PGN visitor: tags and byte ranges are
 indexed once, and the position builder reads the file directly without building
 a full game tree. SCID and classic CBH databases implement the shared
 `GameLibrary` interface and use the generic builder, which loads one decoded
@@ -37,7 +37,7 @@ All integers are little-endian.
 ```text
 header (80 bytes)
   magic                8   "BRETTPOS"
-  version              4   1
+  version              4   2
   flags                4   reserved
   source length        8   combined source bytes at build time
   source mtime seconds 8   newest source modification time

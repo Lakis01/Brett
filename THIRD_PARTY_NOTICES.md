@@ -159,28 +159,44 @@ notice does not imply endorsement by ChessBase or by the referenced projects.
 ## Rust dependencies
 
 Brett depends on third-party Rust crates (including `eframe`, `egui`,
-`shakmaty`, `pgn-reader`, `cbvault-format`, `image`, `memmap2`, `serde_json`,
-and `ureq`). Their licences are listed in the crate metadata and in
-`Cargo.lock`; redistributed binaries should include the licence texts required
-by those crates. `cbvault-format` is MIT; see the classic-CBH section above for
-its provenance.
+`cozy-chess`, `cbvault-format`, `image`, `memmap2`, `serde_json`, and `ureq`).
+Their licences are listed in the crate metadata and in `Cargo.lock`;
+redistributed binaries should include the licence texts required by those
+crates. `cbvault-format` is MIT; see the classic-CBH section above for its
+provenance.
 
-### GPL-licensed chess and PGN crates
+### Chess rules and types (`cozy-chess`)
 
-Two direct dependencies are **GPL-3.0-or-later**, not permissive:
+- **cozy-chess** 0.3.4 (MIT) — chess rules, legal move generation, FEN/Shredder
+  FEN, SAN/UCI helpers, Chess960/DFRC, and incremental Zobrist hashing.
+  <https://github.com/analog-hors/cozy-chess>
+- **cozy-chess-types** 0.2.2 (MIT) — board scalar and bitboard types used by
+  `cozy-chess`.
+  <https://github.com/analog-hors/cozy-chess>
 
-- **shakmaty** 0.30 — chess rules, move generation, FEN, and SAN.
-  <https://github.com/niklasf/shakmaty>
-- **pgn-reader** 0.29 — streaming PGN tokenizer.
-  <https://github.com/niklasf/shakmaty>
+### Polyglot Zobrist random table (`gigachess`)
 
-Brett's original application code remains MIT-licensed (see `LICENSE`), but a
-binary built from this repository links these crates and is therefore a
-combined work under **GPL-3.0-or-later**. If you redistribute a Brett binary,
-comply with the GPL: include the corresponding source and the GPL licence text.
-The source repository itself is distributed under the licences of its parts.
+The 781-entry Polyglot Zobrist random array in `src/book/polyglot_keys.rs` is
+transcribed from the MIT-licensed `gigachess` 0.1.9 crate:
 
-This is a known licensing limitation, not an intentional choice to ship a
-permissive binary. Replacing these two crates with permissively licensed
-implementations is tracked in `docs/BACKLOG.md`; until then, do not describe a
-built Brett binary as MIT-only.
+```text
+MIT License
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```

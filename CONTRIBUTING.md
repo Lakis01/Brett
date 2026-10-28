@@ -1,8 +1,9 @@
 # Contributing to Brett
 
 Brett is a native Linux desktop application. The project is written in Rust and
-uses `eframe`/`egui` for the window, `shakmaty` for rules and SAN, and native
-readers for PGN, SCID, and classic ChessBase CBH databases.
+uses `eframe`/`egui` for the window, `cozy-chess` for rules and SAN, a
+Brett-owned streaming parser for PGN, and native readers for PGN, SCID, and
+classic ChessBase CBH databases.
 
 ## Platform status
 
@@ -18,7 +19,7 @@ an assumed build.
 
 ## Prerequisites
 
-- Rust 1.97 or newer (edition 2024; `shakmaty`/`pgn-reader` set the floor).
+- Rust 1.97 or newer (edition 2024; `eframe`/`egui` set the floor).
 - A C toolchain and the usual X11/Wayland development packages required by
   `eframe`/`winit`.
 - `zenity` or `kdialog` for native file dialogs. Without one, **Open…** and
@@ -101,12 +102,10 @@ Other useful environment variables:
 
 ## Licensing
 
-Brett's original code is MIT, but the current build links `shakmaty` and
-`pgn-reader` under GPL-3.0-or-later. A distributed binary is therefore GPL,
-not MIT-only. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Do not add
-GPL/AGPL source code or assets; if you can replace the two GPL crates with
-permissively licensed equivalents without regressing correctness or
-large-database performance, that is a welcome contribution.
+Brett's original code is MIT, and the current build links only MIT/permissive
+dependencies (`cozy-chess` for rules, a Brett-owned streaming PGN parser, and a
+Brett-owned Polyglot hash). See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+Do not add GPL/AGPL source code, dependencies, or assets.
 
 ## Source databases
 

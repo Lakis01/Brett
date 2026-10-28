@@ -1,6 +1,6 @@
 # Removing the GPL/AGPL dependency exposure
 
-**Status:** decision recorded (2026-10-28); implementation planned. This is an
+**Status:** implemented (2026-10-29). This is an
 engineering and licensing-risk assessment, not legal advice; a lawyer should
 confirm the distribution model before a release.
 
@@ -131,6 +131,8 @@ references, not as a drop-in replacement for `pgn-reader`.
   crates. No GPL-backed feature ships in the default binary.
 
 #### Staged sequence
+
+**Status: implemented (2026-10-29).**
 
 1. Add `cozy-chess` and a Brett-owned facade, keeping the current call sites on
    the facade types. Use `shakmaty` temporarily only for differential tests.

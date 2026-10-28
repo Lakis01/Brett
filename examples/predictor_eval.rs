@@ -11,6 +11,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
+use brett::chess::{Color, Position, UciMove};
 use brett::domain::Game;
 use brett::evaluation::{Evaluator, Metrics};
 use brett::library::PgnLibrary;
@@ -18,8 +19,6 @@ use brett::players::{
     self, PlayerBook, PlayerDirectory, PlayerSummary, PredictionConfig, PriorSource,
 };
 use brett::position::{self, MoveStat};
-use shakmaty::Position;
-use shakmaty::uci::UciMove;
 
 type MoveAggregate = HashMap<u64, BTreeMap<u32, MoveStat>>;
 
@@ -131,9 +130,9 @@ fn main() -> Result<()> {
             }
         };
         let color = match players::player_key(game.white()).as_deref() {
-            Some(key) if key == player.key => shakmaty::Color::White,
+            Some(key) if key == player.key => Color::White,
             _ => match players::player_key(game.black()).as_deref() {
-                Some(key) if key == player.key => shakmaty::Color::Black,
+                Some(key) if key == player.key => Color::Black,
                 _ => continue,
             },
         };

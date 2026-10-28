@@ -178,21 +178,10 @@ dependencies = [
  "egui",
  "image",
  "memmap2",
- "pgn-reader",
  "serde_json",
- "shakmaty",
  "tracing",
  "tracing-subscriber",
  "ureq",
-]
-
-[[package]]
-name = "btoi"
-version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3b5ab9db53bcda568284df0fd39f6eac24ad6f7ba7ff1168b9e76eba6576b976"
-dependencies = [
- "num-traits",
 ]
 
 [[package]]
@@ -1900,17 +1889,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pgn-reader"
-version = "0.29.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "50e9c8c7d9654b31768477ec2712b9e40682ad1dd323db2867dfeefa94651c6a"
-dependencies = [
- "btoi",
- "memchr",
- "shakmaty",
-]
-
-[[package]]
 name = "pin-project"
 version = "1.1.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2322,19 +2300,6 @@ dependencies = [
  "serde",
  "serde_core",
  "zmij",
-]
-
-[[package]]
-name = "shakmaty"
-version = "0.30.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d465a6a07031a8c60d92dc9b656cc8f59f8c1640493576d5d88f898883b4bd67"
-dependencies = [
- "arrayvec",
- "bitflags 2.13.2",
- "btoi",
- "nohash-hasher",
- "serde",
 ]
 
 [[package]]

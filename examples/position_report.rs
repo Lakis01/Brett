@@ -6,8 +6,8 @@
 
 use std::time::Instant;
 
+use brett::chess::Chess;
 use brett::position::{BuildOptions, PositionIndex, position_key};
-use shakmaty::Chess;
 
 fn main() {
     let Some(path) = std::env::args().nth(1) else {
