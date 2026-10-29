@@ -73,10 +73,10 @@ queued with their open UX decisions.
   factual sentence, and the tooltip is shared by the profile and board strips.
 - **Round/Board labels:** full words by default; `R`/`B` only when the header
   runs out of width. Never shorten just because a compact form exists.
-- **Forced vs only move:** keep them distinct. NAG 7 stays `□`; NAG 8 gets a
-  different glyph (proposed `◇`).
-- **Site map search:** implement the click target and URL encoding; recommend
-  OpenStreetMap as the default provider. Final provider choice remains open
+- **Forced vs only move:** keep them distinct. NAG 7 stays `□`; NAG 8 now
+  renders `◇`.
+- **Site map search:** the clickable Site label now opens an OpenStreetMap
+  search with the URL-encoded value. Final provider choice remains open
   (item 23).
 - **Open vs Load:** audit before consolidating; functionality and
   discoverability first, visual simplification later (item 24).
@@ -84,8 +84,9 @@ queued with their open UX decisions.
   never attach a photo on an ambiguous short match (item 19).
 - **ECO/Opening row:** combine into one editable row with a narrow four-digit
   ECO field and a wide Opening field (item 20).
-- **FEN copy:** treat the current behavior as a bug; make the strip a single
-  click target and verify the clipboard command (item 14).
+- **FEN copy:** fixed as a bug: the strip is a single click target and the
+  selectable-label click capture is removed (item 14). Manual clipboard
+  verification remains.
 - **Keyboard line playthrough:** queue the interaction design before coding
   (item 14).
 
@@ -539,16 +540,15 @@ and the ChessABC preparation list are implemented.
 - **Move-hover setting:** **Settings → Preview moves on hover** controls only
   the open game's move list and is off by default. Tree, engine, reference, and
   read-only preview hovers remain enabled.
-- **Click-to-copy FEN (bug):** the FEN strip reports “copied” but the clipboard
-  is unchanged. Make the whole strip a single click target, stop selectable
-  labels from swallowing the click, and keep a visible confirmation. Add a
-  regression test around the click handler and clipboard command.
-- **Forced vs only move:** NAG 7 (forced move) and NAG 8 (only/singular move)
-  currently both render `□`. Give NAG 8 a distinct glyph (proposed `◇`), keep
-  the review’s forced-move `□`, and document the legend in the moves panel.
-- **Round/Board shortening:** show **Round** and **Board** in full by default.
-  Fall back to `R`/`B` only when the header row genuinely runs out of width;
-  never shorten merely because the compact layout exists.
+- **Click-to-copy FEN (fixed 2026-10-29):** the FEN label is now the click
+  target and is no longer selectable, so text selection cannot swallow the
+  click; the strip padding also copies. Manual clipboard verification remains.
+- **Forced vs only move (fixed 2026-10-29):** NAG 7 (forced move) stays `□`;
+  NAG 8 (only/singular move) now renders `◇`. The review’s forced-move `□` is
+  unchanged. A visible symbol legend in the moves panel remains queued.
+- **Round/Board shortening (implemented 2026-10-29):** **Round** and **Board**
+  are shown in full by default; `R`/`B` appear only when the header row would
+  otherwise squeeze the event below a usable width.
 - **Keyboard line playthrough:** hovering or selecting an engine, Lichess, or
   opening-tree line should let the user step through it with the arrow keys /
   `Enter` without replacing the open game; `Esc` returns to the game cursor.
@@ -756,11 +756,10 @@ code for the matched opening, not a family-level approximation.
 - Classify the mainline only; variations do not change the game's opening.
   Classification must be O(plies) per game and must not require the position
   index.
-- **PGN tags layout (queued 2026-10-29):** ECO and Opening share one editable
-  row, like White/WhiteElo. Reserve a fixed narrow ECO field that comfortably
-  holds four characters, and let Opening take the remaining width. The game
-  header already combines them; bring the PGN tags card to the same pattern
-  instead of showing two full-width rows.
+- **PGN tags layout (implemented 2026-10-29):** ECO and Opening share one
+  editable row, like White/WhiteElo. The ECO field is fixed narrow enough for
+  four characters and Opening takes the remaining width. The game header
+  already combined them; the PGN tags card now matches.
 
 **Depends on:** item 17 (rules/PGN backend) for SAN replay and position keys;
 `src/domain.rs`, `src/pgn.rs`, and the game-header UI. **Unblocks:** ECO-based
@@ -832,7 +831,8 @@ game plan.
 
 ## 23. Clickable Site → map search
 
-**Status:** queued 2026-10-29. Provider decision open.
+**Status:** OpenStreetMap link implemented 2026-10-29; the provider choice
+remains open.
 
 **Goal:** clicking the Site field in the PGN tags card opens a map search with
 the Site value, so a tournament venue can be located without copying the text.
