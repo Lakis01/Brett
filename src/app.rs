@@ -8793,6 +8793,7 @@ impl App {
                     if let Some(game) = self.current.as_ref() {
                         let fen = fen_string(&game.nodes[self.node].pos);
                         let width = (ui.available_width() - 8.0).max(80.0);
+                        let mut copy_clicked = false;
                         let frame = egui::Frame::new()
                             .fill(Color32::from_rgb(0x18, 0x1A, 0x1C))
                             .corner_radius(6.0)
@@ -8800,15 +8801,25 @@ impl App {
                             .show(ui, |ui| {
                                 ui.set_width(width);
                                 ui.horizontal(|ui| {
-                                    ui.add(
+                                    // The label is the natural click target.
+                                    // Selectable labels otherwise consume the
+                                    // click for text selection and the copy
+                                    // never fires.
+                                    let label = ui.add(
                                         egui::Label::new(
                                             RichText::new(&fen)
                                                 .monospace()
                                                 .size(10.5)
                                                 .color(Color32::from_gray(200)),
                                         )
-                                        .truncate(),
+                                        .truncate()
+                                        .selectable(false)
+                                        .sense(Sense::click()),
                                     );
+                                    if label.clicked() {
+                                        copy_clicked = true;
+                                    }
+                                    label.on_hover_text("Click to copy FEN");
                                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                         ui.label(
                                             RichText::new(format!(
@@ -8822,12 +8833,16 @@ impl App {
                                     });
                                 });
                             });
+                        // Also accept clicks on the strip's padding.
                         let response = ui.interact(
                             frame.response.rect,
                             ui.scope_id().with("bottom-fen-copy"),
                             Sense::click(),
                         );
                         if response.clicked() {
+                            copy_clicked = true;
+                        }
+                        if copy_clicked {
                             ui.ctx().copy_text(fen);
                             self.status = "FEN copied to clipboard.".to_string();
                         }
@@ -10719,6 +10734,8 @@ fn game_tags_card(
     let date_visible = visible("Date");
     let round_visible = visible("Round") || show_board;
     let result_visible = visible("Result");
+    let eco_visible = visible("ECO");
+    let opening_visible = visible("Opening");
 
     egui::Frame::new()
         .fill(SURFACE)
@@ -10814,6 +10831,10 @@ fn game_tags_card(
                 });
                 ui.add_space(3.0);
             }
+            if eco_visible || opening_visible {
+                compact_eco_opening_tag(ui, game, tag_update, tag_add_value);
+                ui.add_space(3.0);
+            }
 
             for (index, (name, value)) in game.headers.iter().enumerate() {
                 if !is_default_pgn_tag(name)
@@ -10862,6 +10883,8 @@ fn game_tags_card(
                 && !date_visible
                 && !round_visible
                 && !result_visible
+                && !eco_visible
+                && !opening_visible
                 && !has_default_row
                 && !has_additional_row
                 && !game.headers.is_empty()
@@ -10959,7 +10982,7 @@ fn game_tags_card(
 }
 
 fn is_compact_pgn_tag(name: &str) -> bool {
-    ["Event", "Site", "Date", "Round", "Result"]
+    ["Event", "Site", "Date", "Round", "Result", "ECO", "Opening"]
         .iter()
         .any(|tag| tag.eq_ignore_ascii_case(name))
 }
@@ -11016,7 +11039,28 @@ fn compact_text_tag(
 ) {
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 4.0;
-        ui.label(RichText::new(tag_display_name(name)).small().weak());
+        let is_site = name.eq_ignore_ascii_case("Site");
+        let label = ui.add(
+            egui::Label::new(RichText::new(tag_display_name(name)).small().weak())
+                .selectable(false)
+                .sense(if is_site {
+                    Sense::click()
+                } else {
+                    Sense::hover()
+                }),
+        );
+        if is_site && label.clicked() {
+            let site = game.header("Site").unwrap_or("").trim();
+            if !pgn_tag_is_empty(site) {
+                ui.ctx()
+                    .open_url(egui::OpenUrl::new_tab(map_search_url(site)));
+            }
+        }
+        label.on_hover_text(if is_site {
+            "Click to search this venue on OpenStreetMap"
+        } else {
+            name
+        });
         if let Some(index) = header_index(game, name) {
             let mut value = game.headers[index].1.clone();
             let width = (ui.available_width() - 2.0).max(36.0);
@@ -11174,6 +11218,63 @@ fn compact_result_tag(
             ui.label(RichText::new("—").weak());
             if ui.small_button("+").on_hover_text("Add Result").clicked() {
                 *tag_add = Some("Result");
+            }
+        }
+    });
+}
+
+/// ECO and Opening share one row, mirroring White/WhiteElo. The ECO field is
+/// fixed narrow so four-character codes fit without stealing space from the
+/// opening name.
+fn compact_eco_opening_tag(
+    ui: &mut Ui,
+    game: &Game,
+    tag_update: &mut Option<(usize, String)>,
+    tag_add_value: &mut Option<(&'static str, String)>,
+) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        ui.label(RichText::new("ECO").small().weak());
+        let eco_index = header_index(game, "ECO");
+        let mut eco = eco_index
+            .map(|index| game.headers[index].1.clone())
+            .unwrap_or_default();
+        let eco_response = ui.add_sized(
+            [44.0, 19.0],
+            egui::TextEdit::singleline(&mut eco)
+                .id_salt("compact-eco")
+                .frame(egui::Frame::NONE)
+                .margin(egui::Margin::ZERO)
+                .font(FontId::monospace(12.5))
+                .hint_text("ECO"),
+        );
+        if eco_response.changed() {
+            if let Some(index) = eco_index {
+                *tag_update = Some((index, eco));
+            } else if !eco.trim().is_empty() {
+                *tag_add_value = Some(("ECO", eco));
+            }
+        }
+        ui.label(RichText::new("Opening").small().weak());
+        let opening_index = header_index(game, "Opening");
+        let mut opening = opening_index
+            .map(|index| game.headers[index].1.clone())
+            .unwrap_or_default();
+        let width = (ui.available_width() - 2.0).max(60.0);
+        let opening_response = ui.add_sized(
+            [width, 19.0],
+            egui::TextEdit::singleline(&mut opening)
+                .id_salt("compact-opening")
+                .frame(egui::Frame::NONE)
+                .margin(egui::Margin::ZERO)
+                .font(FontId::monospace(12.5))
+                .hint_text("Opening"),
+        );
+        if opening_response.changed() {
+            if let Some(index) = opening_index {
+                *tag_update = Some((index, opening));
+            } else if !opening.trim().is_empty() {
+                *tag_add_value = Some(("Opening", opening));
             }
         }
     });
@@ -11354,6 +11455,30 @@ fn tag_display_name(name: &str) -> String {
     out
 }
 
+/// Percent-encode a query value for a URL. Unreserved RFC 3986 characters stay
+/// literal; everything else (including UTF-8 bytes) becomes `%XX`.
+fn url_encode_query(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for byte in text.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char);
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
+/// Search URL for the PGN `Site` tag. OpenStreetMap needs no API key and keeps
+/// the venue query out of an advertising profile.
+fn map_search_url(site: &str) -> String {
+    format!(
+        "https://www.openstreetmap.org/search?query={}",
+        url_encode_query(site.trim())
+    )
+}
+
 /// Header card above the PGN move list. Date sits on the left, the tournament
 /// is centered, and the result stays on the right.
 fn game_header_card(
@@ -11422,33 +11547,58 @@ fn game_header_card(
                 response.on_hover_text("Click to choose a date");
                 let board = board.filter(|board| !board.is_empty());
                 let show_round = !round.is_empty() && round != "?";
-                let show_board = board.is_some();
                 // When an Opening tag is present, the ECO moves down beside
                 // it; otherwise it stays in this compact top bar.
                 let show_eco = opening.is_none() && eco.is_some();
-                // Compact labels first, then truncate the event. The result
-                // always keeps its reserved space at the right edge.
-                let mut reserve = 70.0;
-                if show_round {
-                    reserve += 34.0;
-                }
-                if show_board {
-                    reserve += 34.0;
-                }
-                if show_eco {
-                    reserve += 34.0;
-                }
-                let event_width = (ui.available_width() - reserve).max(48.0);
+                // Prefer the full Round/Board words. Only fall back to R/B
+                // when the event would otherwise be squeezed below a usable
+                // width. The result always keeps its reserved space at the
+                // right edge.
+                let round_full = format!("Round {round}");
+                let round_short = format!("R {round}");
+                let board_full = board.as_deref().map(|board| format!("Board {board}"));
+                let board_short = board.as_deref().map(|board| format!("B {board}"));
+                let chip_width = |text: &str| text.chars().count() as f32 * 6.8 + 14.0;
+                let reserve_for = |round: &str, board: Option<&str>| {
+                    let mut reserve = 70.0;
+                    if show_round {
+                        reserve += chip_width(round);
+                    }
+                    if let Some(board) = board {
+                        reserve += chip_width(board);
+                    }
+                    if show_eco {
+                        reserve += 34.0;
+                    }
+                    reserve
+                };
+                let available = ui.available_width();
+                let full_reserve = reserve_for(&round_full, board_full.as_deref());
+                let use_short = available - full_reserve < 96.0;
+                let (round_text, board_text, reserve) = if use_short {
+                    (
+                        round_short.as_str(),
+                        board_short.as_deref(),
+                        reserve_for(&round_short, board_short.as_deref()),
+                    )
+                } else {
+                    (
+                        round_full.as_str(),
+                        board_full.as_deref(),
+                        full_reserve,
+                    )
+                };
+                let event_width = (available - reserve).max(48.0);
                 ui.add_sized(
                     [event_width, 20.0],
                     egui::Label::new(RichText::new(event).small().strong().color(GOLD)).truncate(),
                 )
                 .on_hover_text(event);
                 if show_round {
-                    meta_chip_hover(ui, &format!("R {round}"), &format!("Round {round}"));
+                    meta_chip_hover(ui, round_text, &format!("Round {round}"));
                 }
-                if let Some(board) = board.as_deref() {
-                    meta_chip_hover(ui, &format!("B {board}"), &format!("Board {board}"));
+                if let Some(board) = board_text {
+                    meta_chip_hover(ui, board, &format!("Board {board}"));
                 }
                 if show_eco && let Some(eco) = eco {
                     meta_chip(ui, eco);
@@ -14674,5 +14824,21 @@ mod tests {
         assert!(rect.max.x <= 220.0);
         assert!(rect.max.y <= 100.0);
         assert!(plain.is_none(), "a label without a crown must not match");
+    }
+
+    #[test]
+    fn map_search_url_encodes_the_site_value() {
+        assert_eq!(
+            map_search_url("  Café de la Paix  "),
+            "https://www.openstreetmap.org/search?query=Caf%C3%A9%20de%20la%20Paix"
+        );
+        assert_eq!(
+            map_search_url("St. Louis & Co."),
+            "https://www.openstreetmap.org/search?query=St.%20Louis%20%26%20Co."
+        );
+        assert_eq!(
+            map_search_url(""),
+            "https://www.openstreetmap.org/search?query="
+        );
     }
 }

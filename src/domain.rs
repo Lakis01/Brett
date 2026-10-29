@@ -765,7 +765,8 @@ pub fn nag_symbol(nag: u8) -> Option<&'static str> {
         4 => "??",
         5 => "!?",
         6 => "?!",
-        7 | 8 => "□",
+        7 => "□",
+        8 => "◇",
         9 => "??",
         10 | 11 => "=",
         12 | 13 => "∞",
@@ -862,7 +863,7 @@ pub const NAG_GROUPS: &[(&str, &[NagChoice])] = &[
             },
             NagChoice {
                 code: 8,
-                symbol: "□",
+                symbol: "◇",
                 label: "Only move",
             },
         ],
@@ -1203,6 +1204,13 @@ mod tests {
                 mate: None,
             })
         );
+    }
+
+    #[test]
+    fn forced_and_only_move_have_distinct_symbols() {
+        assert_eq!(nag_symbol(7), Some("□"));
+        assert_eq!(nag_symbol(8), Some("◇"));
+        assert_ne!(nag_symbol(7), nag_symbol(8));
     }
 
     #[test]

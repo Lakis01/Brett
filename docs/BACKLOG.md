@@ -4,6 +4,10 @@ This is the working backlog after the preparation stage. Items are ordered by
 dependency and user value, not by estimated effort. Completed work is recorded
 in `README.md`; this file tracks what is next.
 
+**Project shape (2026-10-29):** Brett is intended as a long-term,
+community-maintained project. Functional correctness, data safety, and clear
+documentation come first; visual polish is queued and may land incrementally.
+
 **Status (2026-10-29):** items 1–7, 11–14, and 17 are implemented, and the latest
 moves-panel interaction polish is complete. Item 8's cloud, opening-tree,
 reference-source, and native-book parts are done; M2b mega-scale ingest remains,
@@ -18,7 +22,9 @@ Tree badge column, and Settings controls are implemented; the sparkline and
 moves-panel display remain. Items
 20 and 21 add native ECO classification and Wikipedia player summaries; item 16
 now includes the FIDE-profile link. Item 22 records the player clock-usage
-analysis idea for the player profile/preparation view.
+analysis idea for the player profile/preparation view. Items 23 and 24 record
+the clickable Site/map-search idea and the Open-vs-Load control audit; both are
+queued with their open UX decisions.
 
 **Decision log (2026-10-28):**
 
@@ -60,6 +66,28 @@ analysis idea for the player profile/preparation view.
 - **Process:** this file remains authoritative for code status; the Obsidian
   compiled backlog drives priority. The CBH/SCID provenance audit runs before
   the classic CBH writer.
+
+**Decision log (2026-10-29 UX review):**
+
+- **Crown hover:** already implemented; every champion entry has a reign and a
+  factual sentence, and the tooltip is shared by the profile and board strips.
+- **Round/Board labels:** full words by default; `R`/`B` only when the header
+  runs out of width. Never shorten just because a compact form exists.
+- **Forced vs only move:** keep them distinct. NAG 7 stays `□`; NAG 8 gets a
+  different glyph (proposed `◇`).
+- **Site map search:** implement the click target and URL encoding; recommend
+  OpenStreetMap as the default provider. Final provider choice remains open
+  (item 23).
+- **Open vs Load:** audit before consolidating; functionality and
+  discoverability first, visual simplification later (item 24).
+- **Player photos:** prefer FIDE ID, then conservative full-name matching;
+  never attach a photo on an ambiguous short match (item 19).
+- **ECO/Opening row:** combine into one editable row with a narrow four-digit
+  ECO field and a wide Opening field (item 20).
+- **FEN copy:** treat the current behavior as a bug; make the strip a single
+  click target and verify the clipboard command (item 14).
+- **Keyboard line playthrough:** queue the interaction design before coding
+  (item 14).
 
 Game review follow-ups that remain deferred: review caching. Book-prefix
 skipping, the board evaluation bar, PGN `[%eval]` decoding, and the per-color
@@ -511,6 +539,20 @@ and the ChessABC preparation list are implemented.
 - **Move-hover setting:** **Settings → Preview moves on hover** controls only
   the open game's move list and is off by default. Tree, engine, reference, and
   read-only preview hovers remain enabled.
+- **Click-to-copy FEN (bug):** the FEN strip reports “copied” but the clipboard
+  is unchanged. Make the whole strip a single click target, stop selectable
+  labels from swallowing the click, and keep a visible confirmation. Add a
+  regression test around the click handler and clipboard command.
+- **Forced vs only move:** NAG 7 (forced move) and NAG 8 (only/singular move)
+  currently both render `□`. Give NAG 8 a distinct glyph (proposed `◇`), keep
+  the review’s forced-move `□`, and document the legend in the moves panel.
+- **Round/Board shortening:** show **Round** and **Board** in full by default.
+  Fall back to `R`/`B` only when the header row genuinely runs out of width;
+  never shorten merely because the compact layout exists.
+- **Keyboard line playthrough:** hovering or selecting an engine, Lichess, or
+  opening-tree line should let the user step through it with the arrow keys /
+  `Enter` without replacing the open game; `Esc` returns to the game cursor.
+  This is an interaction design task; capture the exact key map before coding.
 
 **Depends on:** `src/app.rs`, `src/pgn.rs`, and `src/settings.rs`.
 
@@ -661,9 +703,21 @@ keep the pack local-only and out of releases until an answer is recorded.
   graceful no-pack fallback.
 - A separate public-domain/CC-licensed source is an alternative only after its
   licence and attribution requirements are audited.
+- **Identity matching (queued 2026-10-29):** the current name-only lookup can
+  attach the wrong portrait. Prefer a real FIDE ID when both the game and the
+  pack expose one; otherwise use accent-folded, word-order-insensitive full-name
+  matching. Never attach a photo on a surname-only or short-key match when more
+  than one player could match. Keep a neutral placeholder for unresolved or
+  ambiguous players, and offer a local “wrong photo?” override/report action
+  rather than silently guessing. Add fixtures for spelling variants, initials,
+  transliterations, married names, and deliberate false-positive traps.
+- **Crown hover:** already implemented for both lineages; every champion entry
+  carries a reign and a factual sentence, and the same tooltip is used in the
+  player profile and board strips. Verify the table when adding a champion; no
+  implementation work remains for the current roster.
 
-**Depends on:** `src/photos.rs`, `src/app.rs`, and the photo-pack provenance in
-`docs/PHOTOS.md`.
+**Depends on:** `src/photos.rs`, `src/app.rs`, `src/players.rs`, and the
+photo-pack provenance in `docs/PHOTOS.md`.
 
 ## 20. Native ECO classification and Opening tag
 
@@ -702,6 +756,11 @@ code for the matched opening, not a family-level approximation.
 - Classify the mainline only; variations do not change the game's opening.
   Classification must be O(plies) per game and must not require the position
   index.
+- **PGN tags layout (queued 2026-10-29):** ECO and Opening share one editable
+  row, like White/WhiteElo. Reserve a fixed narrow ECO field that comfortably
+  holds four characters, and let Opening take the remaining width. The game
+  header already combines them; bring the PGN tags card to the same pattern
+  instead of showing two full-width rows.
 
 **Depends on:** item 17 (rules/PGN backend) for SAN replay and position keys;
 `src/domain.rs`, `src/pgn.rs`, and the game-header UI. **Unblocks:** ECO-based
@@ -770,3 +829,46 @@ game plan.
 
 **Depends on:** `src/domain.rs` clock parsing, `src/players.rs` player book,
 `src/app.rs` profile/preparation view, and the review/accuracy work in item 2.
+
+## 23. Clickable Site → map search
+
+**Status:** queued 2026-10-29. Provider decision open.
+
+**Goal:** clicking the Site field in the PGN tags card opens a map search with
+the Site value, so a tournament venue can be located without copying the text.
+
+- Keep the Site value editable. Make the “Site” label or a small map-pin button
+  the click target; do not turn the text field itself into a link.
+- URL-encode the trimmed value and ignore empty or placeholder values (`""`,
+  `"?"`). Never guess a location.
+- **Open decision — provider:** OpenStreetMap or Google Maps. Recommendation:
+  OpenStreetMap (`https://www.openstreetmap.org/search?query=…`) because it
+  needs no API key, uses open data, and avoids Google Maps Platform terms.
+  Google’s plain `https://www.google.com/maps/search/?api=1&query=…` URL also
+  works without a key but is less privacy-preserving. Add a provider setting
+  only if users ask for both.
+- Add tests for URL construction, percent-encoding, and placeholder handling.
+
+**Depends on:** `src/app.rs` PGN tags card and the existing `Context::open_url`
+path.
+
+## 24. Open vs Load control consolidation
+
+**Status:** queued 2026-10-29. Open UX decision; functionality first.
+
+**Goal:** the app currently exposes **File → Open database…**, a bottom-bar
+**Load** + **Open…** pair, and Tree-tab **Load** / **Choose…** / **Current DB**
+controls. Decide which distinctions are real and remove the rest.
+
+- Audit each control’s behavior and document it before changing the UI.
+- Proposed direction: one primary **Open…** file picker for choosing a
+  database, and **Load** only where it applies a typed/configured path without
+  a picker; auxiliary opening-book/tree rows get **Use** / **Clear** rather
+  than a second Open.
+- Do not remove a control until its behavior is available elsewhere and covered
+  by a test or manual check.
+- This is a long-term community-maintained project: prefer correctness,
+  discoverability, and a small stable surface over visual polish; incremental
+  UI cleanup is welcome after the functional audit.
+
+**Depends on:** `src/app.rs` menu bar, bottom bar, and Tree tab.
