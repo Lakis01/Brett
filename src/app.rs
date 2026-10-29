@@ -642,7 +642,6 @@ pub struct App {
     trend_window: crate::recent::TrendWindow,
     trend_baseline: crate::recent::TrendBaseline,
     trend_min_games: u32,
-    path_input: String,
     filter: String,
     pending_pgn_export: Option<PendingPgnExport>,
     pending_scid_export: Option<PendingScidExport>,
@@ -913,7 +912,6 @@ impl App {
             trend_window: display_prefs.trend_window,
             trend_baseline: display_prefs.trend_baseline,
             trend_min_games: display_prefs.trend_min_games,
-            path_input: String::new(),
             filter: String::new(),
             pending_pgn_export: None,
             pending_scid_export: None,
@@ -1392,7 +1390,6 @@ impl App {
             indexed_in.as_secs_f64()
         );
         self.status = self.index_status.clone();
-        self.path_input = path.display().to_string();
         if let Some(id) = self.session.id_at(0) {
             self.select_slot(id);
         }
@@ -8773,18 +8770,10 @@ impl App {
                 }
 
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui.button("Load").clicked() {
-                        let path = std::path::PathBuf::from(self.path_input.trim());
-                        if !path.as_os_str().is_empty() {
-                            self.load_file(&path);
-                        }
-                    }
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.path_input)
-                            .hint_text("/path/to/file.pgn, database.si4, or database.cbh")
-                            .desired_width(340.0),
-                    );
-                    if ui.button("Open…").clicked()
+                    if ui
+                        .button("Open…")
+                        .on_hover_text("Open a PGN, SCID, or classic CBH database")
+                        .clicked()
                         && let Some(path) = open_dialog()
                     {
                         self.load_file(&path);
@@ -12799,6 +12788,15 @@ fn cloud_engine_rows(snapshot: &cloud::Snapshot, pos: &Chess) -> Vec<CloudEngine
     rows
 }
 
+/// Number of leading rows that still have a Lichess line. Any chessdb-only
+/// rows after the last Lichess row are trailing and can be folded into one
+/// compact line.
+fn cloud_primary_split(rows: &[CloudEngineRow]) -> usize {
+    rows.iter()
+        .rposition(|row| row.lichess.is_some())
+        .map_or(0, |index| index + 1)
+}
+
 /// Cloud Engine: chessdb.cn and every available Lichess cloud-eval variation
 /// in one compact table. The Lichess line itself is made of clickable moves,
 /// so clicking a prefix plays up to that point.
@@ -12879,10 +12877,16 @@ fn cloud_engine_section(
                 });
                 ui.separator();
                 // Keep the table compact: the best eight rows stay open and
-                // the rest are available under "More moves".
+                // the rest are available under "More moves". Chessdb-only
+                // rows that trail the last Lichess variation have no line to
+                // show, so fold them into one compact line instead of giving
+                // each one a full table row.
                 const PRIMARY_ROWS: usize = 8;
                 let primary_count = rows.len().min(PRIMARY_ROWS);
-                for row in &rows[..primary_count] {
+                let primary = &rows[..primary_count];
+                let split = cloud_primary_split(primary);
+                let (primary_lines, trailing) = primary.split_at(split);
+                for row in primary_lines {
                     cloud_row_ui(
                         ui,
                         row,
@@ -12891,6 +12895,42 @@ fn cloud_engine_section(
                         &mut hover_preview,
                         &mut clicked_line,
                     );
+                }
+                let trailing_chessdb: Vec<&CloudEngineRow> = trailing
+                    .iter()
+                    .filter(|row| row.lichess.is_none())
+                    .collect();
+                if trailing_chessdb.len() >= 2 {
+                    ui.label(
+                        RichText::new("chessdb-only moves · no Lichess line")
+                            .small()
+                            .weak(),
+                    );
+                    ui.add_space(2.0);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing = vec2(8.0, 3.0);
+                        for row in trailing_chessdb {
+                            cloud_compact_row_ui(
+                                ui,
+                                row,
+                                pos,
+                                best_score,
+                                &mut hover_preview,
+                                &mut clicked_line,
+                            );
+                        }
+                    });
+                } else {
+                    for row in trailing_chessdb {
+                        cloud_row_ui(
+                            ui,
+                            row,
+                            pos,
+                            best_score,
+                            &mut hover_preview,
+                            &mut clicked_line,
+                        );
+                    }
                 }
                 if primary_count < rows.len() {
                     let extra = &rows[primary_count..];
@@ -13957,7 +13997,6 @@ mod tests {
             trend_window: crate::recent::TrendWindow::default(),
             trend_baseline: crate::recent::TrendBaseline::default(),
             trend_min_games: 10,
-            path_input: String::new(),
             filter: String::new(),
             pending_pgn_export: None,
             pending_scid_export: None,
@@ -14289,6 +14328,29 @@ mod tests {
             app.current.as_ref().unwrap().nodes[app.node].san(),
             Some("e4")
         );
+    }
+
+    #[test]
+    fn cloud_primary_split_folds_only_trailing_chessdb_rows() {
+        let row = |san: &str, lichess: bool| CloudEngineRow {
+            uci: "e2e4".to_string(),
+            san: san.to_string(),
+            chessdb: Some(20),
+            lichess: lichess.then_some((Some(20), None)),
+            variation: vec!["e2e4".to_string()],
+        };
+        let rows = vec![
+            row("e4", true),
+            row("d4", false),
+            row("Nf3", true),
+            row("c4", false),
+            row("b3", false),
+        ];
+        assert_eq!(cloud_primary_split(&rows), 3);
+        assert!(rows[3..].iter().all(|row| row.lichess.is_none()));
+
+        let all_chessdb = vec![row("e4", false), row("d4", false)];
+        assert_eq!(cloud_primary_split(&all_chessdb), 0);
     }
 
     #[test]

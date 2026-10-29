@@ -22,9 +22,10 @@ Tree badge column, and Settings controls are implemented; the sparkline and
 moves-panel display remain. Items
 20 and 21 add native ECO classification and Wikipedia player summaries; item 16
 now includes the FIDE-profile link. Item 22 records the player clock-usage
-analysis idea for the player profile/preparation view. Items 23 and 24 record
-the clickable Site/map-search idea and the Open-vs-Load control audit; both are
-queued with their open UX decisions.
+analysis idea for the player profile/preparation view. Item 23 adds the
+clickable Site → OpenStreetMap search (provider choice remains open); item 24
+records the Open-vs-Load audit, with the bottom bar now reduced to a single
+**Open…** picker.
 
 **Decision log (2026-10-28):**
 
@@ -78,8 +79,9 @@ queued with their open UX decisions.
 - **Site map search:** the clickable Site label now opens an OpenStreetMap
   search with the URL-encoded value. Final provider choice remains open
   (item 23).
-- **Open vs Load:** audit before consolidating; functionality and
-  discoverability first, visual simplification later (item 24).
+- **Open vs Load:** the bottom bar now has only **Open…**; the typed-path
+  field and **Load** button were removed. The File menu entry and Tree-tab
+  auxiliary controls remain for a later pass (item 24).
 - **Player photos:** prefer FIDE ID, then conservative full-name matching;
   never attach a photo on an ambiguous short match (item 19).
 - **ECO/Opening row:** combine into one editable row with a narrow four-digit
@@ -484,7 +486,8 @@ orientation.
 ## 13. Cloud analysis depth and ChessABC
 
 **Status:** Lichess depth/full-line display, ChessABC import/reference search,
-and the ChessABC preparation list are implemented.
+the ChessABC preparation list, and the compact chessdb-only tail in the Cloud
+Engine table are implemented.
 
 - **Lichess depth:** show the Lichess cloud-evaluation depth as part of the
   analysis itself, not only as a separate caption. Include it in the Cloud
@@ -511,6 +514,11 @@ and the ChessABC preparation list are implemented.
 - **ChessABC preparation (done):** Prep Mode can load the prepared player’s
   latest ChessABC games on demand, filters them to the side being prepared,
   respects the recent-game limit, and opens them as read-only previews.
+- **Compact chessdb-only tail (implemented 2026-10-29):** when the primary
+  Cloud Engine table ends with chessdb-only rows (no Lichess line), fold that
+  trailing group into one horizontal compact line showing only the eval and
+  move chips. Reuse the existing “More moves” chip renderer; do not give each
+  one-ply row its own variation column.
 - Keep Lichess and Chess.com behavior unchanged. Do not scrape the web client
   when the JSON API is available.
 
@@ -854,17 +862,23 @@ path.
 
 ## 24. Open vs Load control consolidation
 
-**Status:** queued 2026-10-29. Open UX decision; functionality first.
+**Status:** main bottom bar simplified 2026-10-29. The typed path field and
+**Load** button are gone; a single **Open…** picker loads a database. The File
+menu keeps **Open database…**. The Tree tab’s opening-book and opening-tree
+path rows still expose **Load** / **Choose…** and remain to audit.
 
-**Goal:** the app currently exposes **File → Open database…**, a bottom-bar
-**Load** + **Open…** pair, and Tree-tab **Load** / **Choose…** / **Current DB**
-controls. Decide which distinctions are real and remove the rest.
+**Goal:** the app exposed **File → Open database…**, a bottom-bar **Load** +
+**Open…** pair, and Tree-tab **Load** / **Choose…** / **Current DB** controls.
+Decide which distinctions are real and remove the rest.
 
-- Audit each control’s behavior and document it before changing the UI.
-- Proposed direction: one primary **Open…** file picker for choosing a
-  database, and **Load** only where it applies a typed/configured path without
-  a picker; auxiliary opening-book/tree rows get **Use** / **Clear** rather
-  than a second Open.
+- Audit result: the bottom-bar **Load** only applied the typed path; **Open…**
+  opened the file picker. Both called `load_file`, so the typed path was the
+  only unique behavior and the user chose to drop it. Keep the picker.
+- Keep **File → Open database…** as the menu entry and the bottom-bar
+  **Open…** as the quick action; they open the same picker.
+- Tree-tab auxiliary rows are a separate configuration surface: keep
+  **Choose…** / **Clear** / **Current DB**, and revisit their **Load** buttons
+  in the next UI pass rather than removing them now.
 - Do not remove a control until its behavior is available elsewhere and covered
   by a test or manual check.
 - This is a long-term community-maintained project: prefer correctness,
