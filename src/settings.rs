@@ -445,6 +445,8 @@ pub struct DisplayPrefs {
     pub show_nav_buttons: bool,
     /// Show the editable PGN-tags card above the move list.
     pub show_pgn_tags: bool,
+    /// Show PGN clock times in the board strips when the game has clocks.
+    pub show_clocks: bool,
     /// Show the vertical evaluation bar beside the board.
     pub engine_bar: bool,
     /// Skip leading opening-book moves when running game review.
@@ -481,6 +483,7 @@ impl Default for DisplayPrefs {
             champion_lineage: ChampionLineage::default(),
             show_nav_buttons: false,
             show_pgn_tags: true,
+            show_clocks: true,
             engine_bar: true,
             review_skip_book: true,
             review_book_min_games: 3,
@@ -575,6 +578,10 @@ impl DisplayPrefs {
             .get("show_pgn_tags")
             .and_then(Value::as_bool)
             .unwrap_or(true);
+        let show_clocks = value
+            .get("show_clocks")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
         let engine_bar = value
             .get("engine_bar")
             .and_then(Value::as_bool)
@@ -623,6 +630,7 @@ impl DisplayPrefs {
             champion_lineage,
             show_nav_buttons,
             show_pgn_tags,
+            show_clocks,
             engine_bar,
             review_skip_book,
             review_book_min_games,
@@ -649,6 +657,7 @@ impl DisplayPrefs {
             "champion_lineage": self.champion_lineage.config_value(),
             "show_nav_buttons": self.show_nav_buttons,
             "show_pgn_tags": self.show_pgn_tags,
+            "show_clocks": self.show_clocks,
             "engine_bar": self.engine_bar,
             "review_skip_book": self.review_skip_book,
             "review_book_min_games": self.review_book_min_games,
@@ -928,6 +937,7 @@ mod tests {
             champion_lineage: ChampionLineage::Classical,
             show_nav_buttons: true,
             show_pgn_tags: false,
+            show_clocks: false,
             engine_bar: false,
             review_skip_book: false,
             review_book_min_games: 5,
@@ -973,6 +983,18 @@ mod tests {
             DisplayPrefs::from_json(r#"{"engine_view":"nonsense"}"#).engine_view,
             "both"
         );
+    }
+
+    #[test]
+    fn display_prefs_show_clocks_defaults_on_and_round_trips() {
+        assert!(DisplayPrefs::default().show_clocks);
+        let prefs = DisplayPrefs {
+            show_clocks: false,
+            ..DisplayPrefs::default()
+        };
+        assert_eq!(DisplayPrefs::from_json(&prefs.to_json()), prefs);
+        assert!(!DisplayPrefs::from_json(r#"{"show_clocks":false}"#).show_clocks);
+        assert!(DisplayPrefs::from_json(r#"{"show_clocks":"false"}"#).show_clocks);
     }
 
     #[test]

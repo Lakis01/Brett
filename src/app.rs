@@ -655,6 +655,8 @@ pub struct App {
     settings_show_all_ratings: bool,
     settings_photo_size: PhotoSize,
     settings_champion_lineage: ChampionLineage,
+    settings_show_clocks: bool,
+    settings_engine_bar: bool,
     settings_my_player_names: String,
     settings_correspondence_enabled: bool,
     settings_correspondence_path: String,
@@ -747,7 +749,7 @@ impl App {
             current_slot: None,
             node: 0,
             orientation: Color::White,
-            show_clocks: false,
+            show_clocks: display_prefs.show_clocks,
             selected: None,
             targets: Vec::new(),
             drag_from: None,
@@ -925,6 +927,8 @@ impl App {
             settings_show_all_ratings: display_prefs.show_all_ratings,
             settings_photo_size: display_prefs.photo_size,
             settings_champion_lineage: display_prefs.champion_lineage,
+            settings_show_clocks: display_prefs.show_clocks,
+            settings_engine_bar: display_prefs.engine_bar,
             settings_my_player_names: String::new(),
             settings_correspondence_enabled: preparation_prefs.correspondence_enabled,
             settings_correspondence_path: String::new(),
@@ -2716,6 +2720,7 @@ impl App {
             champion_lineage: self.champion_lineage,
             show_nav_buttons: self.show_nav_buttons,
             show_pgn_tags: self.show_pgn_tags,
+            show_clocks: self.show_clocks,
             engine_bar: self.engine_bar,
             review_skip_book: self.review_skip_book,
             review_book_min_games: self.review_book_min_games.clamp(1, 100),
@@ -2793,6 +2798,8 @@ impl App {
         self.settings_show_all_ratings = self.show_all_ratings;
         self.settings_photo_size = self.photo_size;
         self.settings_champion_lineage = self.champion_lineage;
+        self.settings_show_clocks = self.show_clocks;
+        self.settings_engine_bar = self.engine_bar;
         self.settings_my_player_names = self.prep_player_names.join("\n");
         self.settings_correspondence_enabled = self.correspondence_enabled;
         self.settings_correspondence_path = if self.correspondence_path.trim().is_empty() {
@@ -2842,6 +2849,8 @@ impl App {
         self.show_all_ratings = self.settings_show_all_ratings;
         self.photo_size = self.settings_photo_size;
         self.champion_lineage = self.settings_champion_lineage;
+        self.show_clocks = self.settings_show_clocks;
+        self.engine_bar = self.settings_engine_bar;
         self.review_skip_book = self.settings_review_skip_book;
         self.review_book_min_games = self.settings_review_book_min_games.clamp(1, 100);
         self.review_book_max_plies = self.settings_review_book_max_plies.clamp(4, 80);
@@ -4967,29 +4976,6 @@ impl App {
                     if ui.button("Start position (Home)").clicked() {
                         self.goto(0);
                         ui.close();
-                    }
-                    ui.separator();
-                    let has_clocks = self.current.as_ref().is_some_and(|game| game.has_clocks());
-                    ui.add_enabled(
-                        has_clocks,
-                        egui::Checkbox::new(&mut self.show_clocks, "Show PGN clocks"),
-                    )
-                    .on_hover_text(if has_clocks {
-                        "Show remaining time from [%clk] comments in the board strips"
-                    } else {
-                        "This game has no [%clk] clock comments"
-                    });
-                    if !has_clocks {
-                        self.show_clocks = false;
-                    }
-                    if ui
-                        .checkbox(&mut self.engine_bar, "Show evaluation bar")
-                        .on_hover_text(
-                            "Show the vertical White/Black evaluation bar beside the board",
-                        )
-                        .changed()
-                    {
-                        self.save_display_prefs();
                     }
                 });
 
@@ -7317,14 +7303,12 @@ impl App {
         self.maybe_request_cloud();
         let mut explorer_source = self.explorer_source;
         let mut source_changed = None;
-        let mut load_tree_path = None;
         let mut choose_tree = false;
         let mut use_current_tree = false;
         let mut clicked = None;
         let mut clicked_uci = None;
         let mut hover_preview = None;
         let mut load_game_id = None;
-        let mut load_book_path = None;
         let mut choose_book = false;
         let mut clear_book = false;
         let mut build_index = false;
@@ -7344,24 +7328,16 @@ impl App {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(RichText::new("Opening book").small().weak());
                     let width = (ui.available_width() - 176.0).max(80.0);
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.book_path)
-                            .desired_width(width)
-                            .hint_text("Polyglot .bin, ChessBase .ctg, Arena .abk, or Shredder .bkt"),
-                    );
-                    if ui
-                        .button("Load")
-                        .on_hover_text("Open this native opening book in the Tree tab")
-                        .clicked()
-                    {
-                        let path = PathBuf::from(self.book_path.trim());
-                        if path.exists() {
-                            load_book_path = Some(path);
-                        } else {
-                            self.book_status =
-                                format!("Opening book not found: {}", path.display());
-                        }
-                    }
+                    let path = if self.book_path.trim().is_empty() {
+                        "No opening book selected".to_string()
+                    } else {
+                        self.book_path.clone()
+                    };
+                    ui.add_sized(
+                        [width, 18.0],
+                        egui::Label::new(RichText::new(&path).monospace().small()).truncate(),
+                    )
+                    .on_hover_text(path);
                     if ui.button("Choose…").clicked() {
                         choose_book = true;
                     }
@@ -7378,24 +7354,16 @@ impl App {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(RichText::new("Opening tree file").small().weak());
                     let width = (ui.available_width() - 176.0).max(80.0);
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.tree_path)
-                            .desired_width(width)
-                            .hint_text("optional PGN, SCID, or CBH tree database"),
-                    );
-                    if ui
-                        .button("Load")
-                        .on_hover_text("Build or load a cached opening-tree index for this file")
-                        .clicked()
-                    {
-                        let path = PathBuf::from(self.tree_path.trim());
-                        if path.exists() {
-                            load_tree_path = Some(path);
-                        } else {
-                            self.tree_status =
-                                format!("Opening-tree file not found: {}", path.display());
-                        }
-                    }
+                    let path = if self.tree_path.trim().is_empty() {
+                        "Using the current database".to_string()
+                    } else {
+                        self.tree_path.clone()
+                    };
+                    ui.add_sized(
+                        [width, 18.0],
+                        egui::Label::new(RichText::new(&path).monospace().small()).truncate(),
+                    )
+                    .on_hover_text(path);
                     if ui.button("Choose…").clicked() {
                         choose_tree = true;
                     }
@@ -7709,11 +7677,6 @@ impl App {
         if build_index {
             self.request_index_build();
         }
-        if let Some(path) = load_tree_path {
-            self.tree_path = path.display().to_string();
-            self.save_display_prefs();
-            self.start_tree_index(path);
-        }
         if choose_tree && let Some(path) = open_dialog() {
             self.tree_path = path.display().to_string();
             self.save_display_prefs();
@@ -7727,11 +7690,6 @@ impl App {
             self.tree_index_job = None;
             self.tree_status = "Using the current database for the opening tree.".to_string();
             self.save_display_prefs();
-        }
-        if let Some(path) = load_book_path {
-            self.book_path = path.display().to_string();
-            self.save_display_prefs();
-            self.start_book(path);
         }
         if choose_book && let Some(path) = open_dialog() {
             self.book_path = path.display().to_string();
@@ -8757,18 +8715,6 @@ impl App {
                     }
                     ui.separator();
                 }
-                if self.current.as_ref().is_some_and(|game| game.has_clocks()) {
-                    ui.toggle_value(&mut self.show_clocks, "Clocks")
-                        .on_hover_text("Show PGN clock times in the board strips");
-                }
-                if ui
-                    .toggle_value(&mut self.engine_bar, "Eval bar")
-                    .on_hover_text("Show the vertical evaluation bar beside the board")
-                    .changed()
-                {
-                    self.save_display_prefs();
-                }
-
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if ui
                         .button("Open…")
@@ -9493,6 +9439,21 @@ impl App {
                 ui.add_space(8.0);
                 ui.separator();
                 ui.heading("Display");
+                ui.checkbox(
+                    &mut self.settings_show_clocks,
+                    "Show PGN clocks in the board strips",
+                )
+                .on_hover_text(
+                    "Show remaining time from [%clk] comments above and below the board when the game has clocks.",
+                );
+                ui.checkbox(
+                    &mut self.settings_engine_bar,
+                    "Show the evaluation bar beside the board",
+                )
+                .on_hover_text(
+                    "Show the vertical White/Black evaluation bar using the local engine, Lichess cloud evaluation, or a PGN [%eval] fallback.",
+                );
+                ui.add_space(4.0);
                 ui.horizontal_wrapped(|ui| {
                     ui.label("Photo size");
                     for size in PhotoSize::ALL {
@@ -13850,7 +13811,7 @@ mod tests {
             current_slot: None,
             node: 0,
             orientation: Color::White,
-            show_clocks: false,
+            show_clocks: true,
             selected: None,
             targets: Vec::new(),
             drag_from: None,
@@ -14010,6 +13971,8 @@ mod tests {
             settings_show_all_ratings: false,
             settings_photo_size: PhotoSize::Small,
             settings_champion_lineage: ChampionLineage::Fide,
+            settings_show_clocks: true,
+            settings_engine_bar: true,
             settings_my_player_names: String::new(),
             settings_correspondence_enabled: true,
             settings_correspondence_path: String::new(),

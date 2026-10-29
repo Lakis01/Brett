@@ -24,8 +24,10 @@ moves-panel display remain. Items
 now includes the FIDE-profile link. Item 22 records the player clock-usage
 analysis idea for the player profile/preparation view. Item 23 adds the
 clickable Site → OpenStreetMap search (provider choice remains open); item 24
-records the Open-vs-Load audit, with the bottom bar now reduced to a single
-**Open…** picker.
+records the Open-vs-Load audit: the bottom bar is reduced to a single **Open…**
+picker, and the Tree-tab path rows are read-only labels with **Choose…**,
+**Clear**, and **Current DB**. Clocks are now shown by default and both the
+clock and evaluation-bar toggles live in Settings.
 
 **Decision log (2026-10-28):**
 
@@ -80,8 +82,12 @@ records the Open-vs-Load audit, with the bottom bar now reduced to a single
   search with the URL-encoded value. Final provider choice remains open
   (item 23).
 - **Open vs Load:** the bottom bar now has only **Open…**; the typed-path
-  field and **Load** button were removed. The File menu entry and Tree-tab
-  auxiliary controls remain for a later pass (item 24).
+  field and **Load** button were removed. The Tree-tab opening-book and
+  opening-tree rows are now read-only path labels with **Choose…**, **Clear**,
+  and **Current DB**; their redundant **Load** buttons are gone (item 24).
+- **Clocks and evaluation bar:** clocks are visible by default. Both the clock
+  and evaluation-bar toggles moved from the Board menu and bottom bar into
+  **Settings → Display**; the board strips remain the only clock surface.
 - **Player photos:** prefer FIDE ID, then conservative full-name matching;
   never attach a photo on an ambiguous short match (item 19).
 - **ECO/Opening row:** combine into one editable row with a narrow four-digit
@@ -95,8 +101,8 @@ records the Open-vs-Load audit, with the bottom bar now reduced to a single
 Game review follow-ups that remain deferred: review caching. Book-prefix
 skipping, the board evaluation bar, PGN `[%eval]` decoding, and the per-color
 win-probability accuracy + ACPL metric are implemented (`docs/BOARD_EVAL_AND_REVIEW.md`).
-Clock display is board-only: the **Clocks** toggle controls the board strips,
-while the move list and game header stay clock-free.
+Clock display is board-only and on by default: **Settings → Display** controls
+the board strips, while the move list and game header stay clock-free.
 
 The latest interaction pass hides absent or empty PGN fields by default, adds
 **Show empty** and a virtual **Board** field written as `round.board`, opens a
@@ -158,9 +164,10 @@ still deferred.
 
 ## 3. Clock display
 
-**Status:** implemented for the board strips. The hidden-by-default **Clocks**
-toggle shows the latest time for each side above and below the board. The
-move-list clock chips and the side-to-move clock in the header were removed on
+**Status:** implemented for the board strips. Clocks are shown by default; the
+**Show PGN clocks in the board strips** setting in **Settings → Display**
+shows the latest time for each side above and below the board. The move-list
+clock chips and the side-to-move clock in the header were removed on
 2026-10-28.
 
 **Goal:** show clock information already present in PGN comments, in the board
@@ -862,10 +869,11 @@ path.
 
 ## 24. Open vs Load control consolidation
 
-**Status:** main bottom bar simplified 2026-10-29. The typed path field and
-**Load** button are gone; a single **Open…** picker loads a database. The File
-menu keeps **Open database…**. The Tree tab’s opening-book and opening-tree
-path rows still expose **Load** / **Choose…** and remain to audit.
+**Status:** implemented 2026-10-29. The typed path field and **Load** button are
+gone; a single **Open…** picker loads a database. The File menu keeps **Open
+database…**. The Tree tab’s opening-book and opening-tree path rows are now
+read-only labels with **Choose…**, **Clear**, and **Current DB**; their
+redundant **Load** buttons were removed.
 
 **Goal:** the app exposed **File → Open database…**, a bottom-bar **Load** +
 **Open…** pair, and Tree-tab **Load** / **Choose…** / **Current DB** controls.
@@ -877,8 +885,9 @@ Decide which distinctions are real and remove the rest.
 - Keep **File → Open database…** as the menu entry and the bottom-bar
   **Open…** as the quick action; they open the same picker.
 - Tree-tab auxiliary rows are a separate configuration surface: keep
-  **Choose…** / **Clear** / **Current DB**, and revisit their **Load** buttons
-  in the next UI pass rather than removing them now.
+  **Choose…** / **Clear** / **Current DB**. The **Load** buttons were removed
+  in the follow-up pass: the path is displayed read-only and only the picker or
+  **Current DB** changes it.
 - Do not remove a control until its behavior is available elsewhere and covered
   by a test or manual check.
 - This is a long-term community-maintained project: prefer correctness,
