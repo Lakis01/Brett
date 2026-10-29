@@ -167,3 +167,11 @@ Task priority if Argon quota is small: Argon Medium for Tasks 4, 5, 8, 10 (FEN/h
 - Gate after `f5128aa`: `cargo test --all-targets` 167 lib + all suites passed
   (1 ignored); `cargo clippy --all-targets -- -D warnings` clean; `cargo fmt
   --all -- --check` clean.
+- 2026-10-29 `072ce98`: clocks are shown by default and persisted through
+  `DisplayPrefs.show_clocks`; the clock and evaluation-bar toggles moved from
+  the Board menu and bottom bar into **Settings → Display**; the Tree-tab
+  opening-book/opening-tree paths are read-only labels with redundant **Load**
+  buttons removed; backlog item 24 closed.
+- Gate after `072ce98`: `cargo test --all-targets` 168 lib + all suites passed
+  (1 ignored); `cargo clippy --all-targets -- -D warnings` clean; `cargo fmt
+  --all -- --check` clean.
