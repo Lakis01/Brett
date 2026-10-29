@@ -906,6 +906,7 @@ fn add_null_move(game: &mut Game, parent: usize, parent_pos: &Chess) -> Result<u
         }),
         comment: String::new(),
         clock: None,
+        eval: None,
         nags: Vec::new(),
         parent: Some(parent),
         children: Vec::new(),

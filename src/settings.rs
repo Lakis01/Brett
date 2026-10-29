@@ -445,6 +445,16 @@ pub struct DisplayPrefs {
     pub show_nav_buttons: bool,
     /// Show the editable PGN-tags card above the move list.
     pub show_pgn_tags: bool,
+    /// Show the vertical evaluation bar beside the board.
+    pub engine_bar: bool,
+    /// Skip leading opening-book moves when running game review.
+    pub review_skip_book: bool,
+    /// Minimum games in the local opening tree or Lichess Masters explorer to
+    /// treat a move as book during review (`1..=100`).
+    pub review_book_min_games: u32,
+    /// Maximum plies from the start of the game that can be skipped as book
+    /// during review (`4..=80`).
+    pub review_book_max_plies: u32,
 }
 
 impl Default for DisplayPrefs {
@@ -464,6 +474,10 @@ impl Default for DisplayPrefs {
             champion_lineage: ChampionLineage::default(),
             show_nav_buttons: false,
             show_pgn_tags: true,
+            engine_bar: true,
+            review_skip_book: true,
+            review_book_min_games: 3,
+            review_book_max_plies: 30,
         }
     }
 }
@@ -543,6 +557,24 @@ impl DisplayPrefs {
             .get("show_pgn_tags")
             .and_then(Value::as_bool)
             .unwrap_or(true);
+        let engine_bar = value
+            .get("engine_bar")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        let review_skip_book = value
+            .get("review_skip_book")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        let review_book_min_games = value
+            .get("review_book_min_games")
+            .and_then(Value::as_u64)
+            .unwrap_or(3)
+            .clamp(1, 100) as u32;
+        let review_book_max_plies = value
+            .get("review_book_max_plies")
+            .and_then(Value::as_u64)
+            .unwrap_or(30)
+            .clamp(4, 80) as u32;
         Self {
             rating_priority,
             show_all_ratings,
@@ -558,6 +590,10 @@ impl DisplayPrefs {
             champion_lineage,
             show_nav_buttons,
             show_pgn_tags,
+            engine_bar,
+            review_skip_book,
+            review_book_min_games,
+            review_book_max_plies,
         }
     }
 
@@ -577,6 +613,10 @@ impl DisplayPrefs {
             "champion_lineage": self.champion_lineage.config_value(),
             "show_nav_buttons": self.show_nav_buttons,
             "show_pgn_tags": self.show_pgn_tags,
+            "engine_bar": self.engine_bar,
+            "review_skip_book": self.review_skip_book,
+            "review_book_min_games": self.review_book_min_games,
+            "review_book_max_plies": self.review_book_max_plies,
         }))
         .unwrap_or_default()
     }
@@ -849,6 +889,10 @@ mod tests {
             champion_lineage: ChampionLineage::Classical,
             show_nav_buttons: true,
             show_pgn_tags: false,
+            engine_bar: false,
+            review_skip_book: false,
+            review_book_min_games: 5,
+            review_book_max_plies: 24,
         };
         assert_eq!(DisplayPrefs::from_json(&prefs.to_json()), prefs);
         assert_eq!(DisplayPrefs::from_json("not json"), DisplayPrefs::default());
@@ -861,6 +905,20 @@ mod tests {
         assert!(DisplayPrefs::default().show_player_photos);
         assert!(!DisplayPrefs::default().show_nav_buttons);
         assert!(DisplayPrefs::default().show_pgn_tags);
+        assert!(DisplayPrefs::default().engine_bar);
+        assert!(DisplayPrefs::default().review_skip_book);
+        assert_eq!(DisplayPrefs::default().review_book_min_games, 3);
+        assert_eq!(DisplayPrefs::default().review_book_max_plies, 30);
+        assert_eq!(
+            DisplayPrefs::from_json(r#"{"review_book_min_games":0,"review_book_max_plies":999}"#)
+                .review_book_min_games,
+            1
+        );
+        assert_eq!(
+            DisplayPrefs::from_json(r#"{"review_book_min_games":0,"review_book_max_plies":999}"#)
+                .review_book_max_plies,
+            80
+        );
         assert!(!DisplayPrefs::default().show_all_ratings);
         assert!(DisplayPrefs::default().engine_auto);
         assert!(!DisplayPrefs::from_json(r#"{"engine_auto":false}"#).engine_auto);

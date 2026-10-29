@@ -265,6 +265,51 @@ pub fn fetch(fen: &str, lichess_token: Option<&str>, explorer_source: ExplorerSo
     }
 }
 
+/// Fetch only the Lichess cloud evaluation (`multiPv=1`) for the evaluation bar.
+///
+/// Returns `Ok(None)` when Lichess does not have a cached cloud evaluation for
+/// `fen` (HTTP 404).
+pub fn fetch_eval_only(fen: &str) -> Result<Option<CloudEval>, String> {
+    let agent = ureq::AgentBuilder::new()
+        .user_agent(USER_AGENT)
+        .timeout_connect(Duration::from_secs(5))
+        .timeout(Duration::from_secs(6))
+        .build();
+    let url = format!(
+        "https://lichess.org/api/cloud-eval?fen={}&multiPv=1",
+        encode_component(fen)
+    );
+    match agent.get(&url).set("Accept", "application/json").call() {
+        Ok(response) => read_body(response)
+            .and_then(|body| parse_cloud_eval(&body))
+            .map(Some)
+            .map_err(|err| format!("{err:#}")),
+        Err(ureq::Error::Status(404, _)) => Ok(None),
+        Err(err) => Err(format!(
+            "{:#}",
+            anyhow::Error::new(err).context("querying the Lichess cloud evaluation")
+        )),
+    }
+}
+
+/// Query the public Lichess Masters opening explorer with a caller-supplied timeout.
+pub fn fetch_masters_explorer_with_timeout(
+    fen: &str,
+    lichess_token: Option<&str>,
+    timeout: Duration,
+) -> Result<Explorer, String> {
+    let connect_timeout = timeout.min(Duration::from_secs(3));
+    let agent = ureq::AgentBuilder::new()
+        .user_agent(USER_AGENT)
+        .timeout_connect(connect_timeout)
+        .timeout(timeout)
+        .build();
+    let token = lichess_token
+        .map(str::trim)
+        .filter(|token| !token.is_empty());
+    fetch_explorer(&agent, fen, token, ExplorerSource::Masters).map_err(|err| format!("{err:#}"))
+}
+
 fn fetch_both_explorers(agent: &ureq::Agent, fen: &str, token: Option<&str>) -> Result<Explorer> {
     let masters = fetch_explorer(agent, fen, token, ExplorerSource::Masters);
     let lichess = if token.is_some() {
@@ -487,7 +532,7 @@ fn parse_chessdb(text: &str) -> Result<ChessDb> {
     Ok(ChessDb { moves })
 }
 
-fn parse_explorer(text: &str) -> Result<Explorer> {
+pub(crate) fn parse_explorer(text: &str) -> Result<Explorer> {
     let value: Value =
         serde_json::from_str(text).context("Lichess explorer returned invalid JSON")?;
     let white = value.get("white").and_then(Value::as_u64).unwrap_or(0);

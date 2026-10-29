@@ -78,6 +78,51 @@ impl Clock {
     }
 }
 
+/// Evaluation extracted from a PGN `[%eval ...]` comment directive.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PgnEval {
+    /// Centipawns from White's perspective (`0.15` -> `Some(15)`).
+    pub cp: Option<i32>,
+    /// Moves to mate from White's perspective (`#3` -> `Some(3)`, `#-3` -> `Some(-3)`).
+    pub mate: Option<i32>,
+}
+
+impl PgnEval {
+    pub fn parse(text: &str) -> Option<Self> {
+        let head = text.split(',').next()?.trim();
+        if head.is_empty() {
+            return None;
+        }
+        if let Some(mate_str) = head.strip_prefix('#') {
+            let mate = mate_str.trim().parse::<i32>().ok()?;
+            if mate == 0 {
+                return None;
+            }
+            Some(Self {
+                cp: None,
+                mate: Some(mate),
+            })
+        } else {
+            let val = head.parse::<f64>().ok()?;
+            if !val.is_finite() || val.abs() > 1000.0 {
+                return None;
+            }
+            Some(Self {
+                cp: Some((val * 100.0).round() as i32),
+                mate: None,
+            })
+        }
+    }
+
+    pub fn pgn_text(self) -> Option<String> {
+        if let Some(mate) = self.mate {
+            Some(format!("#{mate}"))
+        } else {
+            self.cp.map(|cp| format!("{:.2}", cp as f64 / 100.0))
+        }
+    }
+}
+
 /// A position in the game tree.
 #[derive(Clone, Debug)]
 pub struct Node {
@@ -86,6 +131,8 @@ pub struct Node {
     pub comment: String,
     /// Remaining time for the player who made `mv`, when the PGN has clocks.
     pub clock: Option<Clock>,
+    /// Evaluation from a PGN `[%eval ...]` directive, when present.
+    pub eval: Option<PgnEval>,
     pub nags: Vec<u8>,
     pub parent: Option<usize>,
     pub children: Vec<usize>,
@@ -98,35 +145,48 @@ impl Node {
         self.mv.as_ref().map(|m| m.san.as_str())
     }
 
-    /// Append a PGN comment, extracting clock directives from it.
+    /// Append a PGN comment, extracting clock and eval directives from it.
     pub fn add_comment(&mut self, text: &str) {
-        let (comment, clock) = parse_comment_directives(text);
-        if let Some(clock) = clock {
+        let directives = parse_comment_directives(text);
+        if let Some(clock) = directives.clock {
             self.clock = Some(clock);
         }
-        if !comment.is_empty() {
+        if let Some(eval) = directives.eval {
+            self.eval = Some(eval);
+        }
+        if !directives.text.is_empty() {
             if !self.comment.is_empty() {
                 self.comment.push(' ');
             }
-            self.comment.push_str(&comment);
+            self.comment.push_str(&directives.text);
         }
     }
 
-    /// Replace the human comment while preserving any existing clock.
+    /// Replace the human comment while preserving any existing clock and eval.
     pub fn replace_comment(&mut self, text: &str) {
-        let (comment, clock) = parse_comment_directives(text);
-        self.comment = comment;
-        if let Some(clock) = clock {
+        let directives = parse_comment_directives(text);
+        self.comment = directives.text;
+        if let Some(clock) = directives.clock {
             self.clock = Some(clock);
+        }
+        if let Some(eval) = directives.eval {
+            self.eval = Some(eval);
         }
     }
 }
 
-/// Split `[%clk ...]` out of a PGN comment. Other directives remain text.
-fn parse_comment_directives(text: &str) -> (String, Option<Clock>) {
+struct CommentDirectives {
+    text: String,
+    clock: Option<Clock>,
+    eval: Option<PgnEval>,
+}
+
+/// Split `[%clk ...]` and `[%eval ...]` out of a PGN comment. Other directives remain text.
+fn parse_comment_directives(text: &str) -> CommentDirectives {
     let mut out = String::new();
     let mut rest = text;
     let mut clock = None;
+    let mut eval = None;
     loop {
         let Some(start) = rest.find("[%") else {
             out.push_str(rest);
@@ -142,15 +202,27 @@ fn parse_comment_directives(text: &str) -> (String, Option<Clock>) {
         let mut fields = body.split_whitespace();
         let name = fields.next().unwrap_or_default();
         if name.eq_ignore_ascii_case("clk") {
-            if let Some(value) = fields.next() {
-                clock = Clock::parse(value);
+            if let Some(value) = fields.next()
+                && let Some(parsed) = Clock::parse(value)
+            {
+                clock = Some(parsed);
+            }
+        } else if name.eq_ignore_ascii_case("eval") {
+            if let Some(value) = fields.next()
+                && let Some(parsed) = PgnEval::parse(value)
+            {
+                eval = Some(parsed);
             }
         } else {
             out.push_str(&rest[start..start + 2 + end + 1]);
         }
         rest = &directive[end + 1..];
     }
-    (out.split_whitespace().collect::<Vec<_>>().join(" "), clock)
+    CommentDirectives {
+        text: out.split_whitespace().collect::<Vec<_>>().join(" "),
+        clock,
+        eval,
+    }
 }
 
 /// A single game: headers plus an arena of nodes rooted at index 0.
@@ -170,6 +242,7 @@ impl Default for Game {
                 mv: None,
                 comment: String::new(),
                 clock: None,
+                eval: None,
                 nags: Vec::new(),
                 parent: None,
                 children: Vec::new(),
@@ -320,6 +393,7 @@ impl Game {
             mv: Some(ply),
             comment: String::new(),
             clock: None,
+            eval: None,
             nags: Vec::new(),
             parent: Some(parent),
             children: Vec::new(),
@@ -443,6 +517,7 @@ impl Builder {
                 mv: None,
                 comment: String::new(),
                 clock: None,
+                eval: None,
                 nags: Vec::new(),
                 parent: None,
                 children: Vec::new(),
@@ -530,6 +605,7 @@ impl Builder {
             mv: Some(ply),
             comment: String::new(),
             clock: None,
+            eval: None,
             nags: Vec::new(),
             parent: Some(parent),
             children: Vec::new(),
@@ -1062,6 +1138,71 @@ mod tests {
             Some((Color::White, Clock { centis: 30_000 }))
         );
         assert!(game.side_to_move_clock(0).is_none());
+    }
+
+    #[test]
+    fn eval_and_clock_directives_decode_from_lichess_broadcast_comments() {
+        let games = parse_pgn(
+            br#"[Event "Broadcast"]
+
+1. d4 { [%eval 0.15] [%clk 1:30:56] } d5 { [%eval 0.25,20] [%clk 1:40:54] } 2. c4 { Good move! [%eval #3] } e6 { [%eval #-2] } 3. Nc3 { [%eval bogus] [%emt 0:01:12] Still text. } *
+"#,
+        )
+        .unwrap();
+        let game = &games[0];
+
+        assert!(game.nodes[1].comment.is_empty());
+        assert_eq!(game.nodes[1].clock, Some(Clock { centis: 545_600 }));
+        assert_eq!(
+            game.nodes[1].eval,
+            Some(PgnEval {
+                cp: Some(15),
+                mate: None,
+            })
+        );
+
+        assert!(game.nodes[2].comment.is_empty());
+        assert_eq!(game.nodes[2].clock, Some(Clock { centis: 605_400 }));
+        assert_eq!(
+            game.nodes[2].eval,
+            Some(PgnEval {
+                cp: Some(25),
+                mate: None,
+            })
+        );
+
+        assert_eq!(game.nodes[3].comment, "Good move!");
+        assert_eq!(
+            game.nodes[3].eval,
+            Some(PgnEval {
+                cp: None,
+                mate: Some(3),
+            })
+        );
+
+        assert!(game.nodes[4].comment.is_empty());
+        assert_eq!(
+            game.nodes[4].eval,
+            Some(PgnEval {
+                cp: None,
+                mate: Some(-2),
+            })
+        );
+
+        assert_eq!(game.nodes[5].comment, "[%emt 0:01:12] Still text.");
+        assert_eq!(game.nodes[5].eval, None);
+
+        let mut edited = game.nodes[1].clone();
+        edited.replace_comment("Human note");
+        assert_eq!(edited.comment, "Human note");
+        assert_eq!(edited.clock, Some(Clock { centis: 545_600 }));
+        assert_eq!(
+            edited.eval,
+            Some(PgnEval {
+                cp: Some(15),
+                mate: None,
+            })
+        );
     }
 
     #[test]

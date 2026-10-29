@@ -12,6 +12,7 @@ use crate::chess::{Color, EnPassantMode, Fen, Position};
 
 use crate::domain::Game;
 use crate::engine::{EngineHandle, EngineInfo, Score, SearchLimit};
+use crate::eval::{self, WhiteScore};
 
 /// A coarse move-quality label shown in the review table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -117,12 +118,30 @@ pub struct MoveReview {
     pub best: Option<String>,
     /// Centipawn loss from the mover's point of view.
     pub cp_loss: Option<i32>,
+    /// Mover's win probability before the move (`0.0..=100.0`).
+    pub win_before: Option<f64>,
+    /// Mover's win probability after the move (`0.0..=100.0`).
+    pub win_after: Option<f64>,
+    /// Per-move Lichess accuracy (`0.0..=100.0`); `None` for forced moves.
+    pub accuracy: Option<f64>,
     pub quality: Quality,
+}
+
+/// Per-color game accuracy and average centipawn loss summary.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct AccuracySummary {
+    pub white: Option<f64>,
+    pub black: Option<f64>,
+    pub white_acpl: Option<f64>,
+    pub black_acpl: Option<f64>,
+    pub white_moves: usize,
+    pub black_moves: usize,
 }
 
 /// In-progress or completed review of a game.
 pub struct ReviewState {
     pub config: ReviewConfig,
+    pub book_plies: usize,
     pub running: bool,
     /// Request id of the position currently being analyzed.
     pub request: Option<u64>,
@@ -135,9 +154,24 @@ pub struct ReviewState {
 }
 
 impl ReviewState {
-    pub fn new(game: &Game, config: ReviewConfig) -> Self {
-        let mut nodes = vec![0usize];
-        nodes.extend(game.mainline());
+    pub fn new(game: &Game, config: ReviewConfig, book_plies: usize) -> Self {
+        let mainline = game.mainline();
+        let book_plies = book_plies.min(mainline.len());
+        let nodes = if mainline.is_empty() {
+            vec![0usize]
+        } else if book_plies >= mainline.len() {
+            Vec::new()
+        } else if book_plies == 0 {
+            let mut n = Vec::with_capacity(mainline.len() + 1);
+            n.push(0);
+            n.extend(mainline);
+            n
+        } else {
+            let mut n = Vec::with_capacity(mainline.len() - book_plies + 1);
+            n.push(mainline[book_plies - 1]);
+            n.extend_from_slice(&mainline[book_plies..]);
+            n
+        };
         let positions = nodes
             .iter()
             .map(|&node| {
@@ -151,6 +185,7 @@ impl ReviewState {
         let total = positions.len();
         Self {
             config,
+            book_plies,
             running: total > 0,
             request: None,
             started: Instant::now(),
@@ -160,6 +195,16 @@ impl ReviewState {
             next: 0,
             last_info: None,
         }
+    }
+
+    /// Live engine info for the position currently being searched by the review.
+    pub fn current_search_eval(&self) -> Option<(&str, Color, &EngineInfo)> {
+        if !self.running {
+            return None;
+        }
+        let pos = self.positions.get(self.next)?;
+        let info = self.last_info.as_ref()?;
+        Some((pos.fen.as_str(), pos.turn, info))
     }
 
     pub fn total(&self) -> usize {
@@ -234,10 +279,21 @@ impl ReviewState {
                 continue;
             };
             let legal = game.nodes[self.nodes[index - 1]].pos.legal_moves().len();
-            let (quality, cp_loss) = if legal == 1 {
-                (Quality::Forced, None)
+            let (quality, cp_loss, win_before, win_after, accuracy) = if legal == 1 {
+                (Quality::Forced, None, None, None, None)
             } else {
-                classify(&ply.uci, Some(before), Some(after), ply.color)
+                let (quality, cp_loss) = classify(&ply.uci, Some(before), Some(after), ply.color);
+                let (win_before, win_after, accuracy) = match (before.eval, after.eval) {
+                    (Some(before_score), Some(after_score)) => {
+                        let wb = WhiteScore::from_side_to_move(before_score, ply.color)
+                            .win_percent_for(ply.color);
+                        let wa = WhiteScore::from_side_to_move(after_score, ply.color.other())
+                            .win_percent_for(ply.color);
+                        (Some(wb), Some(wa), Some(eval::move_accuracy(wb, wa)))
+                    }
+                    _ => (None, None, None),
+                };
+                (quality, cp_loss, win_before, win_after, accuracy)
             };
             out.push(MoveReview {
                 node,
@@ -249,6 +305,9 @@ impl ReviewState {
                 eval_after: after.eval,
                 best: before.best.clone(),
                 cp_loss,
+                win_before,
+                win_after,
+                accuracy,
                 quality,
             });
         }
@@ -333,19 +392,163 @@ fn classify(
     (quality, Some(cp_loss))
 }
 
-/// Average per-move heuristic accuracy. This is intentionally simple and is
-/// labelled as an estimate in the UI.
-pub fn accuracy(moves: &[MoveReview]) -> Option<f64> {
-    let mut total = 0.0;
-    let mut count = 0usize;
-    for mov in moves {
-        let Some(loss) = mov.cp_loss else {
-            continue;
-        };
-        total += 100.0 * (-(loss as f64) / 400.0).exp();
-        count += 1;
+/// Compute Lichess-style per-color win-probability accuracy (combining the
+/// volatility-weighted mean and harmonic mean) and average centipawn loss
+/// (ACPL, with individual losses capped at 1000).
+pub fn accuracy_summary(moves: &[MoveReview]) -> AccuracySummary {
+    let mut white_positions = Vec::with_capacity(moves.len() + 1);
+    for (idx, mov) in moves.iter().enumerate() {
+        if idx == 0 {
+            let w0 = mov
+                .eval_before
+                .map(|s| WhiteScore::from_side_to_move(s, mov.color).win_percent())
+                .or_else(|| {
+                    mov.win_before.map(|wb| {
+                        if mov.color == Color::White {
+                            wb
+                        } else {
+                            100.0 - wb
+                        }
+                    })
+                })
+                .unwrap_or(50.0);
+            white_positions.push(w0);
+        }
+        let w_after = mov
+            .eval_after
+            .map(|s| WhiteScore::from_side_to_move(s, mov.color.other()).win_percent())
+            .or_else(|| {
+                mov.win_after.map(|wa| {
+                    if mov.color == Color::White {
+                        wa
+                    } else {
+                        100.0 - wa
+                    }
+                })
+            })
+            .or_else(|| white_positions.last().copied())
+            .unwrap_or(50.0);
+        white_positions.push(w_after);
     }
-    (count > 0).then_some(total / count as f64)
+
+    let weights = volatility_weights(&white_positions, moves.len());
+
+    let mut white_weighted = Vec::new();
+    let mut black_weighted = Vec::new();
+    let mut white_losses = Vec::new();
+    let mut black_losses = Vec::new();
+
+    for (idx, mov) in moves.iter().enumerate() {
+        if mov.quality == Quality::Forced {
+            continue;
+        }
+        let weight = weights.get(idx).copied().unwrap_or(1.0);
+        if let Some(acc) = mov.accuracy.or_else(|| {
+            let (wb, wa) = (mov.win_before?, mov.win_after?);
+            Some(eval::move_accuracy(wb, wa))
+        }) {
+            match mov.color {
+                Color::White => white_weighted.push((acc, weight)),
+                Color::Black => black_weighted.push((acc, weight)),
+            }
+        }
+        if let Some(loss) = mov.cp_loss {
+            let capped = f64::from(loss.clamp(0, 1_000));
+            match mov.color {
+                Color::White => white_losses.push(capped),
+                Color::Black => black_losses.push(capped),
+            }
+        }
+    }
+
+    AccuracySummary {
+        white: color_accuracy(&white_weighted),
+        black: color_accuracy(&black_weighted),
+        white_acpl: mean(&white_losses),
+        black_acpl: mean(&black_losses),
+        white_moves: white_weighted.len(),
+        black_moves: black_weighted.len(),
+    }
+}
+
+fn volatility_weights(white_positions: &[f64], move_count: usize) -> Vec<f64> {
+    if move_count == 0 || white_positions.len() < 2 {
+        return Vec::new();
+    }
+    let window_size = (white_positions.len() / 10)
+        .clamp(2, 8)
+        .min(white_positions.len());
+    let mut windows: Vec<&[f64]> = Vec::with_capacity(move_count);
+    let leading_count = window_size.saturating_sub(2);
+    for i in 0..leading_count {
+        let end = (i + 2).min(white_positions.len());
+        windows.push(&white_positions[..end]);
+    }
+    for start in 0..=white_positions.len().saturating_sub(window_size) {
+        windows.push(&white_positions[start..start + window_size]);
+    }
+    windows
+        .into_iter()
+        .take(move_count)
+        .map(|slice| std_dev(slice).clamp(0.5, 12.0))
+        .collect()
+}
+
+fn std_dev(values: &[f64]) -> f64 {
+    if values.len() < 2 {
+        return 0.5;
+    }
+    let avg = values.iter().sum::<f64>() / values.len() as f64;
+    let var = values
+        .iter()
+        .map(|v| {
+            let d = v - avg;
+            d * d
+        })
+        .sum::<f64>()
+        / values.len() as f64;
+    var.sqrt()
+}
+
+fn color_accuracy(entries: &[(f64, f64)]) -> Option<f64> {
+    if entries.is_empty() {
+        return None;
+    }
+    let weight_sum: f64 = entries.iter().map(|(_, w)| *w).sum();
+    let weighted_mean = if weight_sum > 0.0 {
+        entries.iter().map(|(a, w)| a * w).sum::<f64>() / weight_sum
+    } else {
+        entries.iter().map(|(a, _)| *a).sum::<f64>() / entries.len() as f64
+    };
+    let inv_sum: f64 = entries.iter().map(|(a, _)| 1.0 / a.max(1.0)).sum();
+    let harmonic_mean = entries.len() as f64 / inv_sum;
+    Some(((weighted_mean + harmonic_mean) / 2.0).clamp(0.0, 100.0))
+}
+
+fn mean(values: &[f64]) -> Option<f64> {
+    (!values.is_empty()).then(|| values.iter().sum::<f64>() / values.len() as f64)
+}
+
+/// Average per-move accuracy across both colors.
+pub fn accuracy(moves: &[MoveReview]) -> Option<f64> {
+    let summary = accuracy_summary(moves);
+    match (summary.white, summary.black) {
+        (Some(w), Some(b)) => Some((w + b) / 2.0),
+        (Some(w), None) => Some(w),
+        (None, Some(b)) => Some(b),
+        (None, None) => {
+            let mut total = 0.0;
+            let mut count = 0usize;
+            for mov in moves {
+                let Some(loss) = mov.cp_loss else {
+                    continue;
+                };
+                total += 100.0 * (-(loss as f64) / 400.0).exp();
+                count += 1;
+            }
+            (count > 0).then_some(total / count as f64)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -396,10 +599,39 @@ mod tests {
             ReviewConfig {
                 limit: SearchLimit::Depth(8),
             },
+            0,
         );
         assert_eq!(review.total(), 4);
         assert_eq!(review.progress(), (0, 4));
         assert!(review.moves(&games[0]).is_empty());
+    }
+
+    #[test]
+    fn review_skips_book_prefix_positions() {
+        let games =
+            crate::domain::parse_pgn(b"[Event \"Book skip\"]\n\n1. e4 e5 2. Nf3 Nc6 *\n").unwrap();
+        let game = &games[0];
+        let review = ReviewState::new(
+            game,
+            ReviewConfig {
+                limit: SearchLimit::Depth(8),
+            },
+            2,
+        );
+        // 4 plies total, 2 skipped -> position after 1...e5 plus 2.Nf3 and 2...Nc6 = 3 positions.
+        assert_eq!(review.book_plies, 2);
+        assert_eq!(review.total(), 3);
+
+        let all_book = ReviewState::new(
+            game,
+            ReviewConfig {
+                limit: SearchLimit::Depth(8),
+            },
+            4,
+        );
+        assert_eq!(all_book.total(), 0);
+        assert!(!all_book.running);
+        assert!(all_book.complete());
     }
 
     #[test]
@@ -411,6 +643,7 @@ mod tests {
             ReviewConfig {
                 limit: SearchLimit::Depth(8),
             },
+            0,
         );
         review.evaluated[0] = Some(Evaluated {
             eval: Some(Score::Cp(20)),
@@ -434,6 +667,11 @@ mod tests {
         assert_eq!(moves[1].quality, Quality::Best);
         assert_eq!(moves[1].cp_loss, Some(20));
         assert!(accuracy(&moves).unwrap() > 90.0);
+        let summary = accuracy_summary(&moves);
+        assert!(summary.white.unwrap() > 90.0);
+        assert!(summary.black.unwrap() > 90.0);
+        assert_eq!(summary.white_acpl, Some(10.0));
+        assert_eq!(summary.black_acpl, Some(20.0));
     }
 
     #[test]
@@ -448,9 +686,70 @@ mod tests {
             eval_after: Some(Score::Cp(0)),
             best: None,
             cp_loss: Some(loss),
+            win_before: None,
+            win_after: None,
+            accuracy: None,
             quality: Quality::Good,
         };
         let accuracy = accuracy(&[make(0), make(400)]).unwrap();
         assert!((accuracy - (100.0 + 100.0 * (-1.0f64).exp()) / 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn accuracy_summary_caps_acpl_and_penalizes_blunders_with_harmonic_mean() {
+        let good = MoveReview {
+            node: 1,
+            number: 1,
+            color: Color::White,
+            san: "e4".to_string(),
+            played: "e2e4".to_string(),
+            eval_before: Some(Score::Cp(20)),
+            eval_after: Some(Score::Cp(-20)),
+            best: Some("e2e4".to_string()),
+            cp_loss: Some(0),
+            win_before: Some(52.0),
+            win_after: Some(52.0),
+            accuracy: Some(100.0),
+            quality: Quality::Best,
+        };
+        let blunder = MoveReview {
+            node: 3,
+            number: 2,
+            color: Color::White,
+            san: "Qh5".to_string(),
+            played: "d1h5".to_string(),
+            eval_before: Some(Score::Cp(20)),
+            eval_after: Some(Score::Cp(1500)),
+            best: Some("g1f3".to_string()),
+            cp_loss: Some(1520),
+            win_before: Some(52.0),
+            win_after: Some(2.0),
+            accuracy: Some(eval::move_accuracy(52.0, 2.0)),
+            quality: Quality::Blunder,
+        };
+        let forced = MoveReview {
+            node: 2,
+            number: 1,
+            color: Color::Black,
+            san: "Kh8".to_string(),
+            played: "g8h8".to_string(),
+            eval_before: Some(Score::Cp(0)),
+            eval_after: Some(Score::Cp(0)),
+            best: None,
+            cp_loss: None,
+            win_before: None,
+            win_after: None,
+            accuracy: None,
+            quality: Quality::Forced,
+        };
+
+        let summary = accuracy_summary(&[good, forced, blunder]);
+        assert_eq!(summary.white_moves, 2);
+        assert_eq!(summary.black_moves, 0);
+        assert!(summary.black.is_none());
+        // 0 and 1520 (capped to 1000) -> average 500.0
+        assert_eq!(summary.white_acpl, Some(500.0));
+        // Arithmetic mean would be > 55%, harmonic mean pulls the combined accuracy down.
+        assert!(summary.white.unwrap() < 50.0);
     }
 }

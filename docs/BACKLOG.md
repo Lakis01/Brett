@@ -61,9 +61,10 @@ analysis idea for the player profile/preparation view.
   the classic CBH writer.
 
 Game review follow-ups that remain deferred: review caching. Book-prefix
-marking is now in scope through item 2. Clock display is board-only: the
-**Clocks** toggle controls the board strips, while the move list and game
-header stay clock-free.
+skipping, the board evaluation bar, PGN `[%eval]` decoding, and the per-color
+win-probability accuracy + ACPL metric are implemented (`docs/BOARD_EVAL_AND_REVIEW.md`).
+Clock display is board-only: the **Clocks** toggle controls the board strips,
+while the move list and game header stay clock-free.
 
 The latest interaction pass hides absent or empty PGN fields by default, adds
 **Show empty** and a virtual **Board** field written as `round.board`, opens a
@@ -95,9 +96,11 @@ UI.
 
 ## 2. Game Review with the local engine
 
-**Status:** implemented in `src/review.rs` and the **Review** tab. The optional
-NAG write-back is included. Book-prefix skipping and the revised accuracy
-metric are the remaining review work; review caching is still deferred.
+**Status:** implemented in `src/review.rs`, `src/review_book.rs`, `src/eval.rs`,
+and the **Review** tab. The optional NAG write-back, leading opening-book prefix
+skipping (native book -> local opening-tree -> Lichess Masters), and per-color
+Lichess-style win-probability accuracy + ACPL are included; review caching is
+still deferred.
 
 **Goal:** annotate and grade a complete game.
 

@@ -12,7 +12,7 @@ pub use reader::{Reader, Visitor};
 
 use crate::chess::{Chess, Color, EnPassantMode, Fen};
 
-use crate::domain::{Clock, Game};
+use crate::domain::{Clock, Game, PgnEval};
 
 const WIDTH: usize = 80;
 const SEVEN_TAGS: [&str; 7] = ["Event", "Site", "Date", "Round", "White", "Black", "Result"];
@@ -162,7 +162,7 @@ fn write_root_comment(out: &mut Movetext, game: &Game) {
     let Some(root) = game.nodes.first() else {
         return;
     };
-    if let Some(comment) = format_comment(&root.comment, root.clock) {
+    if let Some(comment) = format_comment(&root.comment, root.clock, root.eval) {
         out.token(&comment);
     }
 }
@@ -201,17 +201,29 @@ fn write_move(game: &Game, node: usize, force_number: bool, out: &mut Movetext) 
         }
     }
 
-    if let Some(comment) = format_comment(&game.nodes[node].comment, game.nodes[node].clock) {
+    if let Some(comment) = format_comment(
+        &game.nodes[node].comment,
+        game.nodes[node].clock,
+        game.nodes[node].eval,
+    ) {
         out.token(&comment);
     }
 }
 
-fn format_comment(comment: &str, clock: Option<Clock>) -> Option<String> {
+fn format_comment(comment: &str, clock: Option<Clock>, eval: Option<PgnEval>) -> Option<String> {
     let text = comment
         .replace(['\n', '\r'], " ")
         .replace('{', "(")
         .replace('}', ")");
     let mut text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if let Some(eval_text) = eval.and_then(PgnEval::pgn_text) {
+        if !text.is_empty() {
+            text.push(' ');
+        }
+        text.push_str("[%eval ");
+        text.push_str(&eval_text);
+        text.push(']');
+    }
     if let Some(clock) = clock {
         if !text.is_empty() {
             text.push(' ');
@@ -377,5 +389,43 @@ mod tests {
         assert!(text.contains(r#"[Event "A \"quoted\" \\ event"]"#));
         let round = parse_one(&text);
         assert_eq!(round.header("Event"), Some("A \"quoted\" \\ event"));
+    }
+
+    #[test]
+    fn round_trips_eval_and_clock_directives() {
+        let source = r#"[Event "Broadcast"]
+[Site "Lichess"]
+[Date "2026.04.05"]
+[Round "3.2"]
+[White "Keymer, Vincent"]
+[Black "Sindarov, Javokhir"]
+[Result "*"]
+
+1. d4 { [%eval 0.15] [%clk 1:30:56] } d5 { Opening note [%eval #-4] [%clk 1:40:54] } *
+"#;
+        let game = parse_one(source);
+        let exported = game_to_pgn(&game);
+        assert!(exported.contains("[%eval 0.15]"));
+        assert!(exported.contains("[%clk 1:30:56]"));
+        assert!(exported.contains("[%eval #-4]"));
+        let round = parse_one(&exported);
+        assert!(round.nodes[1].comment.is_empty());
+        assert_eq!(
+            round.nodes[1].eval,
+            Some(PgnEval {
+                cp: Some(15),
+                mate: None,
+            })
+        );
+        assert_eq!(round.nodes[1].clock.map(|c| c.centis), Some(545_600));
+        assert_eq!(round.nodes[2].comment, "Opening note");
+        assert_eq!(
+            round.nodes[2].eval,
+            Some(PgnEval {
+                cp: None,
+                mate: Some(-4),
+            })
+        );
+        assert_eq!(round.nodes[2].clock.map(|c| c.centis), Some(605_400));
     }
 }

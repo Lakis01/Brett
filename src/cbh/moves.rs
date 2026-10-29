@@ -491,6 +491,7 @@ impl Walker<'_> {
             mv: Some(ply),
             comment: String::new(),
             clock: None,
+            eval: None,
             nags: Vec::new(),
             parent: Some(self.current),
             children: Vec::new(),

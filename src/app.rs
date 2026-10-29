@@ -20,6 +20,7 @@ use crate::champions;
 use crate::cloud;
 use crate::domain::{self, Clock, Game, Token};
 use crate::engine::{EngineEvent, EngineHandle, EngineInfo, EngineOptions, Score, SearchLimit};
+use crate::eval::{self, BoardEval};
 use crate::library::{GameLibrary, PgnLibrary};
 use crate::online::{self, ImportResult, OnlineSource};
 use crate::pgn;
@@ -28,12 +29,14 @@ use crate::position::{
     self, BuildOptions, BuildProgress, PositionIndex, PositionStats, RatingFilter,
 };
 use crate::review::{self, Quality, ReviewConfig, ReviewState};
+use crate::review_book::{self, BookSource};
 use crate::scid::ScidLibrary;
 use crate::settings::{
     ChampionLineage, CloudPrefs, DisplayPrefs, EnginePrefs, PhotoSize, PreparationPrefs,
     RatingPriority,
 };
 use crate::ui::board::{self, BoardEvent, BoardState};
+use crate::ui::eval_bar;
 use crate::ui::fonts;
 use crate::ui::pieces::PieceTextures;
 
@@ -282,6 +285,17 @@ enum ExplorerMessage {
         source: cloud::ExplorerSource,
         result: Result<cloud::Explorer, String>,
     },
+}
+
+struct BarCloudMessage {
+    fen: String,
+    result: Result<Option<cloud::CloudEval>, String>,
+}
+
+struct ReviewBookMessage {
+    game: Game,
+    config: ReviewConfig,
+    book_plies: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -541,6 +555,11 @@ pub struct App {
     photo_viewer: Option<String>,
     show_nav_buttons: bool,
     show_pgn_tags: bool,
+    engine_bar: bool,
+    bar_cloud_cache: BTreeMap<String, Option<cloud::CloudEval>>,
+    bar_cloud_rx: Option<mpsc::Receiver<BarCloudMessage>>,
+    bar_cloud_job: Option<String>,
+    bar_cloud_pending: Option<(String, Instant)>,
     /// Open calendar for the Date tag.
     date_picker: Option<DatePicker>,
     /// Screen position of the date field that opened the calendar.
@@ -609,6 +628,10 @@ pub struct App {
     review_depth: u32,
     review_time_ms: u64,
     review_use_time: bool,
+    review_skip_book: bool,
+    review_book_min_games: u32,
+    review_book_max_plies: u32,
+    review_book_rx: Option<mpsc::Receiver<ReviewBookMessage>>,
     path_input: String,
     filter: String,
     pending_pgn_export: Option<PendingPgnExport>,
@@ -622,6 +645,9 @@ pub struct App {
     settings_my_player_names: String,
     settings_correspondence_enabled: bool,
     settings_correspondence_path: String,
+    settings_review_skip_book: bool,
+    settings_review_book_min_games: u32,
+    settings_review_book_max_plies: u32,
     settings_token: String,
     settings_token_visible: bool,
     settings_token_from_env: bool,
@@ -796,6 +822,11 @@ impl App {
             photo_viewer: None,
             show_nav_buttons: display_prefs.show_nav_buttons,
             show_pgn_tags: display_prefs.show_pgn_tags,
+            engine_bar: display_prefs.engine_bar,
+            bar_cloud_cache: BTreeMap::new(),
+            bar_cloud_rx: None,
+            bar_cloud_job: None,
+            bar_cloud_pending: None,
             date_picker: None,
             date_picker_anchor: None,
             rating_priority: display_prefs.rating_priority,
@@ -858,6 +889,10 @@ impl App {
             review_depth: 14,
             review_time_ms: 500,
             review_use_time: true,
+            review_skip_book: display_prefs.review_skip_book,
+            review_book_min_games: display_prefs.review_book_min_games,
+            review_book_max_plies: display_prefs.review_book_max_plies,
+            review_book_rx: None,
             path_input: String::new(),
             filter: String::new(),
             pending_pgn_export: None,
@@ -871,6 +906,9 @@ impl App {
             settings_my_player_names: String::new(),
             settings_correspondence_enabled: preparation_prefs.correspondence_enabled,
             settings_correspondence_path: String::new(),
+            settings_review_skip_book: display_prefs.review_skip_book,
+            settings_review_book_min_games: display_prefs.review_book_min_games,
+            settings_review_book_max_plies: display_prefs.review_book_max_plies,
             settings_token: String::new(),
             settings_token_visible: false,
             settings_token_from_env: false,
@@ -2334,6 +2372,10 @@ impl App {
             champion_lineage: self.champion_lineage,
             show_nav_buttons: self.show_nav_buttons,
             show_pgn_tags: self.show_pgn_tags,
+            engine_bar: self.engine_bar,
+            review_skip_book: self.review_skip_book,
+            review_book_min_games: self.review_book_min_games.clamp(1, 100),
+            review_book_max_plies: self.review_book_max_plies.clamp(4, 80),
         };
         if let Err(err) = prefs.save() {
             self.status = format!("Could not save display settings: {err:#}");
@@ -2405,6 +2447,9 @@ impl App {
         } else {
             self.correspondence_path.clone()
         };
+        self.settings_review_skip_book = self.review_skip_book;
+        self.settings_review_book_min_games = self.review_book_min_games;
+        self.settings_review_book_max_plies = self.review_book_max_plies;
         self.settings_token_from_env = std::env::var("BRETT_LICHESS_TOKEN")
             .ok()
             .is_some_and(|token| !token.trim().is_empty());
@@ -2439,6 +2484,9 @@ impl App {
         self.show_all_ratings = self.settings_show_all_ratings;
         self.photo_size = self.settings_photo_size;
         self.champion_lineage = self.settings_champion_lineage;
+        self.review_skip_book = self.settings_review_skip_book;
+        self.review_book_min_games = self.settings_review_book_min_games.clamp(1, 100);
+        self.review_book_max_plies = self.settings_review_book_max_plies.clamp(4, 80);
         self.prep_player_names = self
             .settings_my_player_names
             .lines()
@@ -2924,7 +2972,11 @@ impl App {
     }
 
     fn maybe_engine_analysis(&mut self) {
-        if !self.right_tab_visible(RightTab::Engine) || self.engine_view == EngineView::Cloud {
+        let review_busy = self.review.as_ref().is_some_and(|review| review.running)
+            || self.review_book_rx.is_some();
+        let wants_engine = self.right_tab_visible(RightTab::Engine)
+            || (self.engine_bar && self.engine_auto && !review_busy);
+        if !wants_engine || self.engine_view == EngineView::Cloud {
             return;
         }
         if self.engine.is_none() {
@@ -3036,14 +3088,126 @@ impl App {
             self.review_open = false;
             return;
         }
-        let Some(game) = self.current.as_ref() else {
+        let Some(game) = self.current.clone() else {
             self.review_status = "Open a game before starting a review.".to_string();
             return;
         };
         let config = ReviewConfig {
             limit: self.review_limit(),
         };
-        let mut review = ReviewState::new(game, config);
+        self.review_book_rx = None;
+        if !self.review_skip_book {
+            self.begin_review(&game, config, 0);
+            return;
+        }
+
+        let max_plies = (self.review_book_max_plies.clamp(4, 80) as usize).min(game.mainline_len());
+        if max_plies == 0 {
+            self.begin_review(&game, config, 0);
+            return;
+        }
+
+        let min_games = self.review_book_min_games.clamp(1, 100);
+        let local_hits = self.local_book_hits(&game, max_plies, min_games);
+        let local_prefix = local_hits.iter().take_while(|&&hit| hit).count();
+        if local_prefix >= max_plies {
+            self.begin_review(&game, config, local_prefix);
+            return;
+        }
+
+        let token = self.lichess_token.clone();
+        let (tx, rx) = mpsc::channel();
+        let ctx = self.ctx.clone();
+        self.review = None;
+        self.review_open = true;
+        self.review_status = "Checking opening book…".to_string();
+        std::thread::spawn(move || {
+            struct PrecomputedHits {
+                hits: Vec<bool>,
+                cursor: usize,
+            }
+            impl BookSource for PrecomputedHits {
+                fn is_book_move(
+                    &mut self,
+                    _pos: &Chess,
+                    _mv: Option<Move>,
+                    _played_uci: &str,
+                ) -> bool {
+                    let hit = self.hits.get(self.cursor).copied().unwrap_or(false);
+                    self.cursor += 1;
+                    hit
+                }
+            }
+            let mut local = PrecomputedHits {
+                hits: local_hits,
+                cursor: 0,
+            };
+            let mut masters = review_book::MastersExplorerSource::new(
+                min_games,
+                token,
+                review_book::DEFAULT_MASTERS_BUDGET,
+            );
+            let mut sources: [&mut dyn BookSource; 2] = [&mut local, &mut masters];
+            let book_plies = review_book::detect_prefix(&game, &mut sources, max_plies);
+            let _ = tx.send(ReviewBookMessage {
+                game,
+                config,
+                book_plies,
+            });
+            ctx.request_repaint();
+        });
+        self.review_book_rx = Some(rx);
+    }
+
+    fn local_book_hits(&self, game: &Game, max_plies: usize, min_games: u32) -> Vec<bool> {
+        let mut hits = Vec::with_capacity(max_plies);
+        let tree_index = self.tree_index.as_ref().or(self.index.as_ref());
+        let mut cur = 0usize;
+        for _ in 0..max_plies {
+            let Some(&next) = game.nodes[cur].children.first() else {
+                break;
+            };
+            let Some(ply) = game.nodes[next].mv.as_ref() else {
+                break;
+            };
+            if ply.uci == "0000" {
+                break;
+            }
+            let pos = &game.nodes[cur].pos;
+            let mv = UciMove::from_ascii(ply.uci.as_bytes())
+                .ok()
+                .and_then(|uci| uci.to_move(pos).ok());
+            let mut in_book = false;
+            if let Some(book) = self.book.as_deref() {
+                let mut src = review_book::NativeBookSource::new(book);
+                if src.is_book_move(pos, mv, &ply.uci) {
+                    in_book = true;
+                }
+            }
+            if !in_book && let Some(index) = tree_index {
+                let mut src = review_book::PositionIndexSource::new(index, min_games);
+                if src.is_book_move(pos, mv, &ply.uci) {
+                    in_book = true;
+                }
+            }
+            hits.push(in_book);
+            cur = next;
+        }
+        hits
+    }
+
+    fn begin_review(&mut self, game: &Game, config: ReviewConfig, book_plies: usize) {
+        let mut review = ReviewState::new(game, config, book_plies);
+        if review.total() == 0 {
+            self.review = Some(review);
+            self.review_open = true;
+            self.review_status = if book_plies > 0 {
+                format!("Review complete: all {book_plies} plies are in the opening book.")
+            } else {
+                "This game has no positions to review.".to_string()
+            };
+            return;
+        }
         if !self.ensure_review_engine() {
             return;
         }
@@ -3060,10 +3224,44 @@ impl App {
         let total = review.total();
         self.review = Some(review);
         self.review_open = true;
-        self.review_status = format!("Reviewing {total} positions…");
+        self.review_status = if book_plies > 0 {
+            format!("Reviewing {total} positions ({book_plies} book plies skipped)…")
+        } else {
+            format!("Reviewing {total} positions…")
+        };
+    }
+
+    fn poll_review_book(&mut self) {
+        let Some(rx) = self.review_book_rx.take() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(msg) => {
+                let same_game = self.current.as_ref().is_some_and(|cur| {
+                    cur.mainline_len() == msg.game.mainline_len()
+                        && cur.white() == msg.game.white()
+                        && cur.black() == msg.game.black()
+                });
+                if same_game {
+                    self.begin_review(&msg.game, msg.config, msg.book_plies);
+                }
+            }
+            Err(TryRecvError::Empty) => {
+                self.review_book_rx = Some(rx);
+            }
+            Err(TryRecvError::Disconnected) => {
+                if let Some(game) = self.current.clone() {
+                    let config = ReviewConfig {
+                        limit: self.review_limit(),
+                    };
+                    self.begin_review(&game, config, 0);
+                }
+            }
+        }
     }
 
     fn cancel_review(&mut self) {
+        self.review_book_rx = None;
         if let Some(engine) = &self.review_engine {
             engine.stop();
         }
@@ -3074,6 +3272,7 @@ impl App {
     }
 
     fn clear_review(&mut self) {
+        self.review_book_rx = None;
         if let Some(engine) = &self.review_engine {
             engine.stop();
         }
@@ -3781,6 +3980,124 @@ impl App {
         }
     }
 
+    fn poll_bar_cloud(&mut self) {
+        let Some(rx) = self.bar_cloud_rx.take() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(BarCloudMessage { fen, result }) => {
+                self.bar_cloud_job = None;
+                let cached = result.unwrap_or(None);
+                self.bar_cloud_cache.insert(fen, cached);
+                if self.bar_cloud_cache.len() > 256
+                    && let Some(key) = self.bar_cloud_cache.keys().next().cloned()
+                {
+                    self.bar_cloud_cache.remove(&key);
+                }
+            }
+            Err(TryRecvError::Empty) => {
+                self.bar_cloud_rx = Some(rx);
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.bar_cloud_job = None;
+            }
+        }
+    }
+
+    fn maybe_request_bar_cloud(&mut self) {
+        if !self.engine_bar {
+            return;
+        }
+        let Some(fen) = self.current_fen() else {
+            return;
+        };
+        if self.cloud.as_ref().is_some_and(|s| s.fen == fen)
+            || self.bar_cloud_cache.contains_key(&fen)
+            || self.cloud_cache.keys().any(|(_, f)| f == &fen)
+        {
+            self.bar_cloud_pending = None;
+            return;
+        }
+        if self.cloud_rx.is_some() && self.cloud_job.as_deref() == Some(fen.as_str()) {
+            return;
+        }
+        if self.bar_cloud_rx.is_some() {
+            return;
+        }
+        let now = Instant::now();
+        match self.bar_cloud_pending.take() {
+            Some((pending, started)) if pending == fen => {
+                if now.duration_since(started) < Duration::from_millis(350) {
+                    self.bar_cloud_pending = Some((pending, started));
+                    self.ctx.request_repaint_after(Duration::from_millis(50));
+                    return;
+                }
+                self.bar_cloud_job = Some(fen.clone());
+                let (tx, rx) = mpsc::channel();
+                let ctx = self.ctx.clone();
+                std::thread::spawn(move || {
+                    let result = cloud::fetch_eval_only(&fen);
+                    let _ = tx.send(BarCloudMessage { fen, result });
+                    ctx.request_repaint();
+                });
+                self.bar_cloud_rx = Some(rx);
+            }
+            _ => {
+                self.bar_cloud_pending = Some((fen, now));
+                self.ctx.request_repaint_after(Duration::from_millis(350));
+            }
+        }
+    }
+
+    fn current_board_eval(&self) -> Option<BoardEval> {
+        let game = self.game()?;
+        let node = game.nodes.get(self.node)?;
+        let pos = &node.pos;
+        let fen = Fen::from_position(pos, EnPassantMode::Legal).to_string();
+        let turn = pos.turn();
+
+        let local = if self.engine_fen.as_deref() == Some(fen.as_str()) {
+            self.engine_infos
+                .get(&1)
+                .or_else(|| self.engine_infos.values().next())
+                .and_then(|info| {
+                    info.score
+                        .map(|score| BoardEval::from_local(score, turn, info.depth))
+                })
+        } else if let Some((rev_fen, rev_turn, info)) = self
+            .review
+            .as_ref()
+            .and_then(ReviewState::current_search_eval)
+            && rev_fen == fen
+        {
+            info.score
+                .map(|score| BoardEval::from_local(score, rev_turn, info.depth))
+        } else {
+            None
+        };
+
+        let cloud_eval = self
+            .cloud
+            .as_ref()
+            .filter(|s| s.fen == fen)
+            .and_then(|s| s.cloud_eval.as_ref().ok())
+            .or_else(|| {
+                self.cloud_cache
+                    .iter()
+                    .find(|((_, f), _)| f == &fen)
+                    .and_then(|(_, s)| s.cloud_eval.as_ref().ok())
+            })
+            .or_else(|| self.bar_cloud_cache.get(&fen).and_then(Option::as_ref));
+        let cloud = cloud_eval.and_then(|ce| {
+            let pv = ce.pvs.first()?;
+            BoardEval::from_cloud(pv.cp, pv.mate, ce.depth)
+        });
+
+        let pgn = node.eval.and_then(BoardEval::from_pgn);
+
+        eval::choose(local, cloud, pgn)
+    }
+
     /// Load a game by its original source index. Player lists use this path.
     fn select_source(&mut self, source_index: usize) {
         if let Some(id) = self.session.source_slot(source_index) {
@@ -4270,12 +4587,21 @@ impl App {
                         egui::Checkbox::new(&mut self.show_clocks, "Show PGN clocks"),
                     )
                     .on_hover_text(if has_clocks {
-                        "Show remaining time from [%clk] comments in the board strips, move list, and header"
+                        "Show remaining time from [%clk] comments in the board strips"
                     } else {
                         "This game has no [%clk] clock comments"
                     });
                     if !has_clocks {
                         self.show_clocks = false;
+                    }
+                    if ui
+                        .checkbox(&mut self.engine_bar, "Show evaluation bar")
+                        .on_hover_text(
+                            "Show the vertical White/Black evaluation bar beside the board",
+                        )
+                        .changed()
+                    {
+                        self.save_display_prefs();
                     }
                 });
 
@@ -5944,11 +6270,13 @@ impl App {
     }
 
     fn review_content(&mut self, ui: &mut Ui) {
-        let running = self.review.as_ref().is_some_and(|review| review.running);
+        let running = self.review.as_ref().is_some_and(|review| review.running)
+            || self.review_book_rx.is_some();
         let can_write_nags = self.recent_preview.is_none();
         let mut start = false;
         let mut cancel = false;
         let mut write_nags = false;
+        let mut prefs_changed = false;
 
         egui::Frame::new()
             .fill(SURFACE)
@@ -6005,6 +6333,15 @@ impl App {
                                     .speed(1),
                             );
                         }
+                        if ui
+                            .checkbox(&mut self.review_skip_book, "Skip opening book")
+                            .on_hover_text(
+                                "Skip leading book moves (open book → local opening tree → Lichess Masters)",
+                            )
+                            .changed()
+                        {
+                            prefs_changed = true;
+                        }
                     });
                 });
 
@@ -6041,6 +6378,9 @@ impl App {
                 .on_hover_text("Change the engine in the Engine tab");
             });
 
+        if prefs_changed {
+            self.save_display_prefs();
+        }
         if start {
             self.start_review();
         }
@@ -6055,7 +6395,7 @@ impl App {
             let moves = review.moves(game);
             let (done, total) = review.progress();
             let fraction = if total == 0 {
-                0.0
+                1.0
             } else {
                 done as f32 / total as f32
             };
@@ -6066,21 +6406,59 @@ impl App {
                     .desired_width(ui.available_width()),
             );
 
+            if review.book_plies > 0 {
+                ui.label(
+                    RichText::new(format!(
+                        "Opening book: {} skipped",
+                        moves_label(full_moves(review.book_plies))
+                    ))
+                    .small()
+                    .weak(),
+                )
+                .on_hover_text(format!(
+                    "{} leading plies matched the opening book and are excluded from move grades and accuracy.",
+                    review.book_plies
+                ));
+            }
+
+            let summary = review::accuracy_summary(&moves);
             ui.horizontal_wrapped(|ui| {
-                match review::accuracy(&moves) {
-                    Some(accuracy) => {
+                let tooltip = "Lichess-style win-probability accuracy (volatility-weighted + harmonic mean) and average centipawn loss. Opening-book and forced moves are excluded; this is an engine estimate, not an official rating.";
+                if summary.white.is_some() || summary.black.is_some() {
+                    let w_str = summary
+                        .white
+                        .map(|w| format!("{w:.1}%"))
+                        .unwrap_or_else(|| "—".to_string());
+                    let b_str = summary
+                        .black
+                        .map(|b| format!("{b:.1}%"))
+                        .unwrap_or_else(|| "—".to_string());
+                    let prefix = if running { "Accuracy (partial)" } else { "Accuracy" };
+                    ui.label(
+                        RichText::new(format!("{prefix}: White {w_str} · Black {b_str}"))
+                            .strong()
+                            .color(GOLD),
+                    )
+                    .on_hover_text(tooltip);
+
+                    if summary.white_acpl.is_some() || summary.black_acpl.is_some() {
+                        let wa = summary
+                            .white_acpl
+                            .map(|a| format!("{a:.0}"))
+                            .unwrap_or_else(|| "—".to_string());
+                        let ba = summary
+                            .black_acpl
+                            .map(|a| format!("{a:.0}"))
+                            .unwrap_or_else(|| "—".to_string());
                         ui.label(
-                            RichText::new(format!("Accuracy {accuracy:.1}%"))
-                                .strong()
-                                .color(GOLD),
+                            RichText::new(format!("ACPL {wa} · {ba}"))
+                                .small()
+                                .weak(),
                         )
-                        .on_hover_text(
-                            "Heuristic estimate from centipawn loss, not an official rating",
-                        );
+                        .on_hover_text(tooltip);
                     }
-                    None => {
-                        ui.label(RichText::new("Accuracy pending").weak());
-                    }
+                } else {
+                    ui.label(RichText::new("Accuracy pending").weak());
                 }
                 let counts = review.quality_counts(&moves);
                 for quality in Quality::ALL {
@@ -6241,8 +6619,6 @@ impl App {
             self.rating_priority,
             self.show_all_ratings,
             &mut date_clicked,
-            node,
-            self.show_clocks,
         );
         ui.add_space(6.0);
         let mut show_empty = self.show_empty_pgn_tags;
@@ -6335,7 +6711,6 @@ impl App {
                             &mut nag_action,
                             &mut hover_preview,
                             self.hover_moves,
-                            self.show_clocks,
                         );
                     });
             });
@@ -7850,8 +8225,6 @@ impl App {
             self.rating_priority,
             self.show_all_ratings,
             &mut date_clicked,
-            node,
-            self.show_clocks,
         );
         ui.add_space(8.0);
 
@@ -7897,14 +8270,7 @@ impl App {
                         }
                         ui.spacing_mut().item_spacing = vec2(4.0, 3.0);
                         for line in &lines {
-                            render_readonly_move_line(
-                                ui,
-                                line,
-                                &game,
-                                node,
-                                &mut clicked,
-                                self.show_clocks,
-                            );
+                            render_readonly_move_line(ui, line, &game, node, &mut clicked);
                         }
                     });
             });
@@ -8003,9 +8369,14 @@ impl App {
                 }
                 if self.current.as_ref().is_some_and(|game| game.has_clocks()) {
                     ui.toggle_value(&mut self.show_clocks, "Clocks")
-                        .on_hover_text(
-                            "Show PGN clock times in the board strips, move list, and header",
-                        );
+                        .on_hover_text("Show PGN clock times in the board strips");
+                }
+                if ui
+                    .toggle_value(&mut self.engine_bar, "Eval bar")
+                    .on_hover_text("Show the vertical evaluation bar beside the board")
+                    .changed()
+                {
+                    self.save_display_prefs();
                 }
 
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -8774,6 +9145,34 @@ impl App {
 
                 ui.add_space(8.0);
                 ui.separator();
+                ui.heading("Game review");
+                ui.checkbox(
+                    &mut self.settings_review_skip_book,
+                    "Skip opening-book moves during game review",
+                )
+                .on_hover_text(
+                    "Checks the loaded native book, local opening tree, and Lichess Masters explorer before running the engine.",
+                );
+                ui.add_enabled_ui(self.settings_review_skip_book, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new("Min Masters games").small().strong());
+                        ui.add(
+                            egui::DragValue::new(&mut self.settings_review_book_min_games)
+                                .range(1..=100)
+                                .speed(1),
+                        );
+                        ui.add_space(8.0);
+                        ui.label(RichText::new("Max book plies").small().strong());
+                        ui.add(
+                            egui::DragValue::new(&mut self.settings_review_book_max_plies)
+                                .range(4..=80)
+                                .speed(1),
+                        );
+                    });
+                });
+
+                ui.add_space(8.0);
+                ui.separator();
                 ui.heading("Correspondence database");
                 ui.checkbox(
                     &mut self.settings_correspondence_enabled,
@@ -8996,10 +9395,13 @@ impl eframe::App for App {
         self.poll_online_reference();
         self.poll_prep_online();
         self.poll_cloud();
+        self.poll_bar_cloud();
         self.poll_explorer();
+        self.poll_review_book();
         self.poll_engine();
         self.poll_review();
         self.maybe_engine_analysis();
+        self.maybe_request_bar_cloud();
         if self.open_rx.is_some()
             || self.index_rx.is_some()
             || self.tree_index_rx.is_some()
@@ -9011,7 +9413,9 @@ impl eframe::App for App {
             || self.online_game_rx.is_some()
             || self.online_ref_rx.is_some()
             || self.cloud_rx.is_some()
+            || self.bar_cloud_rx.is_some()
             || self.explorer_rx.is_some()
+            || self.review_book_rx.is_some()
         {
             ctx.request_repaint_after(Duration::from_millis(150));
         }
@@ -9058,10 +9462,16 @@ impl eframe::App for App {
             } else {
                 0.0
             };
-            let side = (avail.x.min(avail.y - 140.0 - photo_extra) - 24.0).max(120.0);
+            let bar_extra = if self.engine_bar {
+                eval_bar::WIDTH + eval_bar::GAP
+            } else {
+                0.0
+            };
+            let side = ((avail.x - bar_extra).min(avail.y - 140.0 - photo_extra) - 24.0).max(120.0);
             ui.with_layout(Layout::top_down(Align::Center), |ui| {
                 ui.add_space(6.0);
                 let hover = self.hover_preview.as_ref();
+                let board_eval = self.current_board_eval();
                 let board_meta = self.game().map(|game| {
                     let node = &game.nodes[self.node];
                     let top_color = self.orientation.other();
@@ -9124,19 +9534,45 @@ impl eframe::App for App {
                         top_champion,
                     );
                     ui.add_space(2.0);
-                    let event = board::draw(
-                        ui,
-                        &self.textures,
-                        BoardState {
-                            pos: &meta.pos,
-                            orientation: self.orientation,
-                            last_move: meta.last_move,
-                            selected: self.selected,
-                            targets: &self.targets,
-                            drag_from: self.drag_from,
-                        },
-                        side,
-                    );
+                    let event = if self.engine_bar {
+                        let mut event = None;
+                        ui.allocate_ui_with_layout(
+                            vec2(side + eval_bar::WIDTH + eval_bar::GAP, side),
+                            Layout::left_to_right(Align::Center),
+                            |ui| {
+                                ui.spacing_mut().item_spacing.x = eval_bar::GAP;
+                                eval_bar::draw(ui, board_eval, side);
+                                event = board::draw(
+                                    ui,
+                                    &self.textures,
+                                    BoardState {
+                                        pos: &meta.pos,
+                                        orientation: self.orientation,
+                                        last_move: meta.last_move,
+                                        selected: self.selected,
+                                        targets: &self.targets,
+                                        drag_from: self.drag_from,
+                                    },
+                                    side,
+                                );
+                            },
+                        );
+                        event
+                    } else {
+                        board::draw(
+                            ui,
+                            &self.textures,
+                            BoardState {
+                                pos: &meta.pos,
+                                orientation: self.orientation,
+                                last_move: meta.last_move,
+                                selected: self.selected,
+                                targets: &self.targets,
+                                drag_from: self.drag_from,
+                            },
+                            side,
+                        )
+                    };
                     ui.add_space(2.0);
                     let bottom_clicked = player_strip(
                         ui,
@@ -10494,7 +10930,6 @@ fn tag_display_name(name: &str) -> String {
 
 /// Header card above the PGN move list. Date sits on the left, the tournament
 /// is centered, and the result stays on the right.
-#[allow(clippy::too_many_arguments)]
 fn game_header_card(
     ui: &mut Ui,
     game: &Game,
@@ -10502,8 +10937,6 @@ fn game_header_card(
     priority: RatingPriority,
     show_all_ratings: bool,
     date_clicked: &mut Option<egui::Pos2>,
-    node: usize,
-    show_clocks: bool,
 ) {
     egui::Frame::new()
         .fill(SURFACE)
@@ -10597,17 +11030,6 @@ fn game_header_card(
                 team_for(game, Color::Black),
                 Color::Black,
             );
-            if show_clocks && let Some((turn, clock)) = game.side_to_move_clock(node) {
-                ui.add_space(5.0);
-                ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new(format!("{} to move", color_name(turn)))
-                            .small()
-                            .weak(),
-                    );
-                    meta_chip_hover(ui, &clock.display(), "Remaining time for the side to move");
-                });
-            }
             if let Some(opening) = opening {
                 ui.add_space(5.0);
                 ui.horizontal_wrapped(|ui| {
@@ -10959,7 +11381,6 @@ fn render_readonly_move_line(
     game: &Game,
     selected: usize,
     clicked: &mut Option<usize>,
-    show_clocks: bool,
 ) {
     if line.depth > 0 {
         ui.horizontal(|ui| {
@@ -10969,11 +11390,11 @@ fn render_readonly_move_line(
                 .corner_radius(5.0)
                 .inner_margin(5.0)
                 .show(ui, |ui| {
-                    render_readonly_move_tokens(ui, line, game, selected, clicked, show_clocks);
+                    render_readonly_move_tokens(ui, line, game, selected, clicked);
                 });
         });
     } else {
-        render_readonly_move_tokens(ui, line, game, selected, clicked, show_clocks);
+        render_readonly_move_tokens(ui, line, game, selected, clicked);
     }
 }
 
@@ -10983,7 +11404,6 @@ fn render_readonly_move_tokens(
     game: &Game,
     selected: usize,
     clicked: &mut Option<usize>,
-    show_clocks: bool,
 ) {
     ui.horizontal_wrapped(|ui| {
         for token in &line.tokens {
@@ -11017,9 +11437,6 @@ fn render_readonly_move_tokens(
                     let response = move_chip(ui, *node == selected, san, line.depth > 0);
                     if response.clicked() {
                         *clicked = Some(*node);
-                    }
-                    if show_clocks && let Some(clock) = game.nodes[*node].clock {
-                        move_clock_chip(ui, clock, line.depth > 0);
                     }
 
                     let symbols = nag_symbols(&game.nodes[*node].nags);
@@ -11058,7 +11475,6 @@ fn render_move_tokens_flat(
     nag_action: &mut Option<(usize, Option<u8>)>,
     hover_preview: &mut Option<HoverPreview>,
     allow_hover: bool,
-    show_clocks: bool,
 ) {
     let mut depth = 0usize;
     let mut last_move: Option<(u32, Color)> = None;
@@ -11126,9 +11542,6 @@ fn render_move_tokens_flat(
                         *clicked = Some(*node);
                     }
                     move_context_menu(&response, *node, game, nag_action, open_editor);
-                    if show_clocks && let Some(clock) = game.nodes[*node].clock {
-                        move_clock_chip(ui, clock, depth > 0);
-                    }
 
                     let symbols = nag_symbols(&game.nodes[*node].nags);
                     if !symbols.is_empty() {
@@ -11164,21 +11577,6 @@ fn render_move_tokens_flat(
             }
         }
     });
-}
-
-fn move_clock_chip(ui: &mut Ui, clock: Clock, muted: bool) {
-    let color = if muted {
-        Color32::from_gray(145)
-    } else {
-        Color32::from_gray(170)
-    };
-    ui.label(
-        RichText::new(clock.display())
-            .monospace()
-            .size(11.0)
-            .color(color),
-    )
-    .on_hover_text("Remaining time after this move");
 }
 
 fn move_chip(ui: &mut Ui, selected: bool, san: &str, muted: bool) -> egui::Response {
@@ -12887,6 +13285,11 @@ mod tests {
             explorer_source: cloud::ExplorerSource::Masters,
             engine: None,
             engine_view: EngineView::Both,
+            engine_bar: true,
+            bar_cloud_cache: BTreeMap::new(),
+            bar_cloud_rx: None,
+            bar_cloud_job: None,
+            bar_cloud_pending: None,
             engine_status: "Engine not started.".to_string(),
             engine_name: String::new(),
             engine_ready: false,
@@ -12911,6 +13314,10 @@ mod tests {
             review_depth: 14,
             review_time_ms: 500,
             review_use_time: true,
+            review_skip_book: true,
+            review_book_min_games: 3,
+            review_book_max_plies: 30,
+            review_book_rx: None,
             path_input: String::new(),
             filter: String::new(),
             pending_pgn_export: None,
@@ -12924,6 +13331,9 @@ mod tests {
             settings_my_player_names: String::new(),
             settings_correspondence_enabled: true,
             settings_correspondence_path: String::new(),
+            settings_review_skip_book: true,
+            settings_review_book_min_games: 3,
+            settings_review_book_max_plies: 30,
             settings_token: String::new(),
             settings_token_visible: false,
             settings_token_from_env: false,

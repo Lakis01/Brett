@@ -1,7 +1,7 @@
 # Board clocks, engine bar, and book-aware review
 
-**Status:** approved 2026-10-28. Implementation follows item 17 (the
-`shakmaty`/`pgn-reader` replacement) so these features land on the new facade.
+**Status:** implemented 2026-10-29 following item 17 (the
+`shakmaty`/`pgn-reader` replacement).
 This document covers the board-view clock change, PGN `[%eval]` decoding, the
 optional engine-evaluation bar, and the book-aware game review with a revised
 accuracy metric.
