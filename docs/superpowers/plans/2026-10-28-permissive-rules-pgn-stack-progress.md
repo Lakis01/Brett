@@ -161,3 +161,9 @@ Task priority if Argon quota is small: Argon Medium for Tasks 4, 5, 8, 10 (FEN/h
   combined ECO/Opening PGN-tag row.
 - Gate after `5dae0a5`: `cargo test --lib` 166 passed; `cargo clippy
   --all-targets -- -D warnings` clean; `cargo fmt --all -- --check` clean.
+- 2026-10-29 `f5128aa`: bottom bar reduced to one **Open…** picker (typed path
+  and **Load** removed); two or more trailing chessdb-only Cloud Engine rows
+  are folded into one compact line.
+- Gate after `f5128aa`: `cargo test --all-targets` 167 lib + all suites passed
+  (1 ignored); `cargo clippy --all-targets -- -D warnings` clean; `cargo fmt
+  --all -- --check` clean.
