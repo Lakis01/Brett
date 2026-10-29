@@ -11,6 +11,7 @@ pub mod champions;
 pub mod chess;
 pub mod cloud;
 pub mod domain;
+pub mod eco;
 pub mod engine;
 pub mod eval;
 pub mod evaluation;

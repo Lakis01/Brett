@@ -200,3 +200,15 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
+
+## Lichess chess-openings ECO dataset (`assets/eco/`)
+
+The ECO opening tables in `assets/eco/a.tsv` through `assets/eco/e.tsv` (used by
+`src/eco.rs`) come from the `lichess-org/chess-openings` repository:
+
+- **Source:** <https://github.com/lichess-org/chess-openings>
+- **Commit:** `e76b8b4ec5c8aeeba41dac6caf4a60b938f652db`
+- **Licence:** Creative Commons CC0 1.0 Universal Public Domain Dedication
+  (CC0-1.0) — <https://creativecommons.org/publicdomain/zero/1.0/>
+- **Modifications:** none. The upstream `a.tsv`…`e.tsv` files are embedded
+  verbatim and indexed by position hash at runtime.

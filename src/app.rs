@@ -644,6 +644,9 @@ pub struct App {
     pending_pgn_export: Option<PendingPgnExport>,
     pending_scid_export: Option<PendingScidExport>,
     pending_cbh_export: Option<PendingCbhExport>,
+    classify_openings_open: bool,
+    classify_overwrite: bool,
+    classify_status: String,
     show_about: bool,
     show_settings: bool,
     settings_rating_priority: RatingPriority,
@@ -906,6 +909,9 @@ impl App {
             pending_pgn_export: None,
             pending_scid_export: None,
             pending_cbh_export: None,
+            classify_openings_open: false,
+            classify_overwrite: false,
+            classify_status: String::new(),
             show_about: false,
             show_settings: false,
             settings_rating_priority: display_prefs.rating_priority,
@@ -2111,6 +2117,161 @@ impl App {
                 .map(|id| self.session.load(id, &self.edited)),
         )
         .map_err(|err| format!("{err:#}"))
+    }
+
+    pub fn classify_current_game_opening(
+        &mut self,
+        overwrite: bool,
+    ) -> crate::eco::ClassifyOutcome {
+        let Some(game) = self.current.as_mut() else {
+            self.classify_status = "No game is open.".to_string();
+            self.status = self.classify_status.clone();
+            return crate::eco::ClassifyOutcome::Unclassified;
+        };
+        let outcome = crate::eco::apply_classification(game, overwrite);
+        let eco = game.header("ECO").unwrap_or("").to_string();
+        let opening = game.header("Opening").unwrap_or("").to_string();
+        match outcome {
+            crate::eco::ClassifyOutcome::Updated => {
+                self.dirty = true;
+                self.sync_current_slot();
+                let msg = format!("Classified current game as {eco} · {opening}.");
+                self.classify_status = msg.clone();
+                self.status = msg;
+            }
+            crate::eco::ClassifyOutcome::PreservedExisting => {
+                let msg = format!(
+                    "Preserved existing opening tags ({eco}{}). Enable overwrite to replace them.",
+                    if opening.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" · {opening}")
+                    }
+                );
+                self.classify_status = msg.clone();
+                self.status = msg;
+            }
+            crate::eco::ClassifyOutcome::Unclassified => {
+                let msg = "Current game could not be classified from its mainline (unclassified)."
+                    .to_string();
+                self.classify_status = msg.clone();
+                self.status = msg;
+            }
+        }
+        outcome
+    }
+
+    pub fn classify_session_openings(&mut self, overwrite: bool) -> crate::eco::ClassifySummary {
+        let mut summary = crate::eco::ClassifySummary::default();
+        if self.session.is_empty() {
+            if self.current.is_some() {
+                let outcome = self.classify_current_game_opening(overwrite);
+                summary.record(outcome);
+            } else {
+                self.classify_status = "There are no games in the session to classify.".to_string();
+                self.status = self.classify_status.clone();
+            }
+            return summary;
+        }
+
+        let ids: Vec<usize> = self.session.slots().iter().map(|slot| slot.id).collect();
+        let current_slot = self.current_slot;
+        for id in ids {
+            if current_slot == Some(id)
+                && let Some(game) = self.current.as_mut()
+            {
+                let outcome = crate::eco::apply_classification(game, overwrite);
+                summary.record(outcome);
+                if outcome == crate::eco::ClassifyOutcome::Updated {
+                    self.dirty = true;
+                    let snapshot = game.clone();
+                    self.session.update_headers(id, &snapshot);
+                }
+                continue;
+            }
+            let Ok(mut game) = self.session.load(id, &self.edited) else {
+                summary.record(crate::eco::ClassifyOutcome::Unclassified);
+                continue;
+            };
+            let outcome = crate::eco::apply_classification(&mut game, overwrite);
+            summary.record(outcome);
+            if outcome == crate::eco::ClassifyOutcome::Updated {
+                self.session.update_headers(id, &game);
+                self.edited.insert(id, game);
+            }
+        }
+
+        let msg = format!(
+            "Classified {} games: {} updated, {} preserved existing tags, {} unclassified.",
+            summary.total, summary.updated, summary.preserved, summary.unclassified
+        );
+        self.classify_status = msg.clone();
+        self.status = msg;
+        summary
+    }
+
+    fn classify_openings_dialog(&mut self, ctx: &egui::Context) {
+        if !self.classify_openings_open {
+            return;
+        }
+        let mut open = self.classify_openings_open;
+        let mut classify_current = false;
+        let mut classify_all = false;
+        let has_current = self.current.is_some();
+        let session_len = self.session.len();
+        egui::Window::new("Classify openings")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.set_min_width(360.0);
+                ui.label(
+                    RichText::new(
+                        "Replay each game's mainline against the CC0 lichess-org/chess-openings dataset and write the deepest matching ECO and Opening tags.",
+                    )
+                    .small()
+                    .weak(),
+                );
+                ui.add_space(6.0);
+                ui.checkbox(
+                    &mut self.classify_overwrite,
+                    "Overwrite existing ECO and Opening tags",
+                )
+                .on_hover_text(
+                    "When unchecked, games that already have ECO or Opening tags keep their imported metadata.",
+                );
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(has_current, egui::Button::new("Classify current game"))
+                        .clicked()
+                    {
+                        classify_current = true;
+                    }
+                    let all_label = if session_len > 0 {
+                        format!("Classify session ({})", games_label(session_len))
+                    } else {
+                        "Classify session".to_string()
+                    };
+                    if ui
+                        .add_enabled(session_len > 0, egui::Button::new(all_label))
+                        .clicked()
+                    {
+                        classify_all = true;
+                    }
+                });
+                if !self.classify_status.is_empty() {
+                    ui.add_space(6.0);
+                    ui.label(RichText::new(&self.classify_status).small().color(GOLD));
+                }
+            });
+        self.classify_openings_open = open;
+        let overwrite = self.classify_overwrite;
+        if classify_current {
+            self.classify_current_game_opening(overwrite);
+        } else if classify_all {
+            self.classify_session_openings(overwrite);
+        }
     }
 
     /// Load a cached position index, or build one in the background.
@@ -4725,6 +4886,19 @@ impl App {
                         .clicked()
                     {
                         self.start_cbh_export();
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(
+                            self.current.is_some() || !self.session.is_empty(),
+                            egui::Button::new("Classify openings…"),
+                        )
+                        .on_hover_text(
+                            "Classify game mainlines using the CC0 lichess-org/chess-openings dataset and write ECO and Opening tags",
+                        )
+                        .clicked()
+                    {
+                        self.classify_openings_open = true;
                         ui.close();
                     }
                     if ui
@@ -9800,6 +9974,7 @@ impl eframe::App for App {
         self.pgn_export_dialog(&ctx);
         self.scid_export_dialog(&ctx);
         self.cbh_export_dialog(&ctx);
+        self.classify_openings_dialog(&ctx);
         self.index_confirmation_dialog(&ctx);
         self.branch_choice_dialog(&ctx);
         self.date_picker_dialog(&ctx);
@@ -11154,8 +11329,27 @@ fn game_header_card(
 
             let event = game.event();
             let (round, board) = round_and_board(game.header("Round").unwrap_or(""));
-            let eco = game.header("ECO").filter(|eco| !eco.is_empty());
-            let opening = game.header("Opening").filter(|opening| !opening.is_empty());
+            let tag_eco = game
+                .header("ECO")
+                .map(str::trim)
+                .filter(|eco| !eco.is_empty() && *eco != "?");
+            let tag_opening = game
+                .header("Opening")
+                .map(str::trim)
+                .filter(|opening| !opening.is_empty() && *opening != "?");
+            let derived_opening = if tag_eco.is_none() || tag_opening.is_none() {
+                crate::eco::classify_game(game)
+            } else {
+                None
+            };
+            let (eco, opening, is_derived_opening) = match (tag_eco, tag_opening, derived_opening) {
+                (Some(e), Some(o), _) => (Some(e), Some(o), false),
+                (None, None, Some(d)) => (Some(d.eco.as_str()), Some(d.name.as_str()), true),
+                (Some(e), None, Some(d)) if e.eq_ignore_ascii_case(&d.eco) => {
+                    (Some(e), Some(d.name.as_str()), true)
+                }
+                (e, o, _) => (e, o, false),
+            };
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing = vec2(6.0, 4.0);
                 let response = date_chip(ui, game.date());
@@ -11220,12 +11414,19 @@ fn game_header_card(
             );
             if let Some(opening) = opening {
                 ui.add_space(5.0);
+                let hover = if is_derived_opening {
+                    format!(
+                        "{opening} · classified from mainline (use File → Classify openings… to write ECO and Opening tags)"
+                    )
+                } else {
+                    opening.to_string()
+                };
                 ui.horizontal_wrapped(|ui| {
                     if let Some(eco) = eco {
                         accent_chip(ui, eco);
                     }
                     ui.label(RichText::new(opening).small().weak())
-                        .on_hover_text(opening);
+                        .on_hover_text(hover);
                 });
             }
         });
@@ -13523,6 +13724,9 @@ mod tests {
             pending_pgn_export: None,
             pending_scid_export: None,
             pending_cbh_export: None,
+            classify_openings_open: false,
+            classify_overwrite: false,
+            classify_status: String::new(),
             show_about: false,
             show_settings: false,
             settings_rating_priority: RatingPriority::Elo,
@@ -13658,6 +13862,44 @@ mod tests {
         for companion in crate::cbh::existing_companion_files(&path) {
             let _ = std::fs::remove_file(companion);
         }
+    }
+
+    #[test]
+    fn classifies_session_openings_preserving_or_overwriting_existing_tags() {
+        let mut app = test_app();
+        let untagged = domain::parse_pgn(b"1. e4 e5 2. Nf3 Nc6 3. Bb5 *\n")
+            .unwrap()
+            .remove(0);
+        let tagged =
+            domain::parse_pgn(b"[ECO \"A00\"]\n[Opening \"Custom\"]\n\n1. d4 d5 2. c4 *\n")
+                .unwrap()
+                .remove(0);
+        let id1 = app.session.insert_game(untagged, None);
+        let id2 = app.session.insert_game(tagged, None);
+
+        let summary = app.classify_session_openings(false);
+        assert_eq!(summary.total, 2);
+        assert_eq!(summary.updated, 1);
+        assert_eq!(summary.preserved, 1);
+        assert_eq!(app.session.slot(id1).unwrap().header("ECO"), Some("C60"));
+        assert_eq!(
+            app.session.slot(id1).unwrap().header("Opening"),
+            Some("Ruy Lopez")
+        );
+        assert_eq!(app.session.slot(id2).unwrap().header("ECO"), Some("A00"));
+        assert_eq!(
+            app.session.slot(id2).unwrap().header("Opening"),
+            Some("Custom")
+        );
+
+        let summary = app.classify_session_openings(true);
+        assert_eq!(summary.total, 2);
+        assert_eq!(summary.updated, 2);
+        assert_eq!(app.session.slot(id2).unwrap().header("ECO"), Some("D06"));
+        assert_eq!(
+            app.session.slot(id2).unwrap().header("Opening"),
+            Some("Queen's Gambit")
+        );
     }
 
     #[test]

@@ -663,7 +663,10 @@ keep the pack local-only and out of releases until an answer is recorded.
 
 ## 20. Native ECO classification and Opening tag
 
-**Status:** planned.
+**Status:** implemented in `src/eco.rs` and wired into the Moves header card and
+**File → Classify openings…** (`src/app.rs`). Uses the CC0
+`lichess-org/chess-openings` dataset (`assets/eco/a.tsv`…`e.tsv`, commit
+`e76b8b4ec5c8aeeba41dac6caf4a60b938f652db`).
 
 **Goal:** classify each game's opening from its own mainline, like SCID, and
 write the matching `ECO` and `Opening` tags. The `ECO` value must be the exact
