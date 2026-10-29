@@ -145,3 +145,19 @@ Task priority if Argon quota is small: Argon Medium for Tasks 4, 5, 8, 10 (FEN/h
 - [x] Task 11: remaining library modules
 - [x] Task 12: app and UI
 - [x] Task 13: remove GPL crates, notices, docs, full gate
+
+## Post-plan feature log
+
+- 2026-10-29 `29f15f4`: board evaluation bar, PGN `[%eval]` decoding, and
+  book-aware review accuracy.
+- 2026-10-29 `cde47ca`: native classic CBH writer and database export.
+- 2026-10-29 `5a454e1`: native ECO classification with the CC0
+  `lichess-org/chess-openings` dataset.
+- 2026-10-29 `7f156a4`: move-popularity trend backend (quarterly buckets,
+  external-sort merge), Tree trend badge/tooltip, and Settings controls.
+- 2026-10-29 `5dae0a5`: 2026-10-29 UX review in `docs/BACKLOG.md`; reliable
+  click-to-copy FEN; distinct forced/only-move NAG glyphs; full Round/Board
+  labels with conditional `R`/`B`; clickable Site → OpenStreetMap search;
+  combined ECO/Opening PGN-tag row.
+- Gate after `5dae0a5`: `cargo test --lib` 166 passed; `cargo clippy
+  --all-targets -- -D warnings` clean; `cargo fmt --all -- --check` clean.
