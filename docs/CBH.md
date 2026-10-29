@@ -1,8 +1,9 @@
 # Native classic ChessBase CBH support
 
-Brett reads the older multi-file ChessBase database format directly. This is
-the classic `.cbh` format, not CBH2/2CBH. Opening a database does not require
-ChessBase, Wine, or a converter, and never writes to the source files.
+Brett reads and writes the older multi-file ChessBase database format directly.
+This is the classic `.cbh` format, not CBH2/2CBH. Opening or exporting a
+database does not require ChessBase, Wine, or a converter, and opening a
+database never writes to the source files.
 
 The implementation is native Rust in `src/cbh/`. It was written from the
 published on-disk layout and independent format references; no GPL converter
@@ -130,10 +131,35 @@ identical to PGN and SCID. The cache is keyed by the canonical `.cbh` path and
 its fingerprint combines the lengths and newest modification time of the
 header, move, annotation, name, and wide-offset files under the base name.
 
+## Exporting and writing (`src/cbh/writer.rs`)
+
+**File → Save database as CBH…** (and `cbh::write_database`) writes a complete
+classic multi-file database from the ordered session:
+
+- streams `.cbh` (46-byte header records), `.cbg` (move streams in mode 0, 4,
+  5, or 10), and `.cba` (annotations in depth-first stored move order) to
+  temporary files;
+- interns `.cbp` (players), `.cbt` (tournaments and sites), `.cbc`
+  (annotators), and `.cbs` (sources) with zero-based entity IDs;
+- writes a `.cbj` 64-bit wide-offset companion when `.cbg` or `.cba` reaches
+  4 GiB (or when `CbhWriteOptions::force_wide` is set);
+- encodes 1-byte `PieceLists` compact move codes and `235` 2-byte square
+  escapes, promotions, en passant, null moves, recursive variations, custom
+  start positions, and Chess960;
+- preserves text comments, NAGs (`0x03`), evaluations (`0x21`, from both
+  `Node::eval` and `[%eval cp,depth]`), `[%emt]` (`0x07`), `[%csl]` (`0x04`),
+  `[%cal]` (`0x05`), and `[%mdl]` (`0x22`);
+- atomically replaces existing companion files with rollback and removes stale
+  derived `.cbb`/`.cbgi` boosters so ChessBase does not read mismatched index
+  accelerators;
+- round-trips cleanly through both `CbhLibrary` and the independent
+  `cbvault-format` reader (`Headers`, `Entities`, `Batch`, `Annotations`, and
+  `Wide`).
+
 ## Limits
 
-- Read-only. Editing, deleting, or compacting a classic CBH database is out of
-  scope.
+- Exporting writes a fresh classic database via Save As; in-place record
+  patching or compacting of an open source database is intentionally avoided.
 - Mode 11 games are header-only with a visible error.
 - Mode 4 and mode 5 are implemented and synthetically tested but are not
   represented in the local reference sample.

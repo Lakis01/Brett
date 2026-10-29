@@ -382,6 +382,13 @@ struct PendingScidExport {
     existing: Vec<PathBuf>,
 }
 
+#[derive(Clone, Debug)]
+struct PendingCbhExport {
+    path: PathBuf,
+    games: usize,
+    existing: Vec<PathBuf>,
+}
+
 /// Small dependency-free calendar used by the Date PGN tag.
 #[derive(Clone, Debug)]
 struct DatePicker {
@@ -636,6 +643,7 @@ pub struct App {
     filter: String,
     pending_pgn_export: Option<PendingPgnExport>,
     pending_scid_export: Option<PendingScidExport>,
+    pending_cbh_export: Option<PendingCbhExport>,
     show_about: bool,
     show_settings: bool,
     settings_rating_priority: RatingPriority,
@@ -897,6 +905,7 @@ impl App {
             filter: String::new(),
             pending_pgn_export: None,
             pending_scid_export: None,
+            pending_cbh_export: None,
             show_about: false,
             show_settings: false,
             settings_rating_priority: display_prefs.rating_priority,
@@ -1933,6 +1942,171 @@ impl App {
         crate::scid::write_database(
             path,
             &description,
+            ids.into_iter()
+                .map(|id| self.session.load(id, &self.edited)),
+        )
+        .map_err(|err| format!("{err:#}"))
+    }
+
+    fn cbh_export_dialog(&mut self, ctx: &egui::Context) {
+        let Some(pending) = self.pending_cbh_export.clone() else {
+            return;
+        };
+        let mut open = true;
+        let mut confirm = false;
+        let mut cancel = false;
+        egui::Window::new("Replace CBH database")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.label(format!(
+                    "This will write {} to:",
+                    games_label(pending.games)
+                ));
+                ui.label(RichText::new(pending.path.display().to_string()).monospace());
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(
+                        "A classic ChessBase database is a multi-file set. These existing companion files will be replaced together:",
+                    )
+                    .strong(),
+                );
+                for path in &pending.existing {
+                    ui.label(RichText::new(path.display().to_string()).monospace());
+                }
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(
+                        "The old companion files are kept aside until the new set is complete, then removed.",
+                    )
+                    .weak(),
+                );
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Replace database").clicked() {
+                        confirm = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        if confirm {
+            self.pending_cbh_export = None;
+            self.write_cbh_export(&pending.path);
+        } else if cancel || !open {
+            self.pending_cbh_export = None;
+            self.status = "CBH export cancelled.".to_string();
+        }
+    }
+
+    fn start_cbh_export(&mut self) {
+        if self.session.is_empty() {
+            self.status = "There are no games to export.".to_string();
+            return;
+        }
+        let default = self.default_cbh_export_path();
+        let Some(mut path) = save_cbh_dialog(&default) else {
+            return;
+        };
+        if !path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("cbh"))
+        {
+            path.set_extension("cbh");
+        }
+        if is_read_only_export_target(&path) {
+            self.status =
+                "That folder is read-only in Brett. Choose a path outside the source collection."
+                    .to_string();
+            return;
+        }
+        if self.cbh_export_would_overwrite_source(&path) {
+            self.status =
+                "Refusing to overwrite the open source database. Choose a new file.".to_string();
+            return;
+        }
+
+        let existing = crate::cbh::existing_companion_files(&path);
+        let games = self.session.len();
+        if existing.is_empty() {
+            self.write_cbh_export(&path);
+        } else {
+            self.pending_cbh_export = Some(PendingCbhExport {
+                path,
+                games,
+                existing,
+            });
+            self.status = format!(
+                "Confirm replacing the existing CBH database for {}.",
+                games_label(games)
+            );
+        }
+    }
+
+    fn default_cbh_export_path(&self) -> PathBuf {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let stem = self
+            .library
+            .as_ref()
+            .and_then(|library| library.path().file_stem())
+            .map(|stem| stem.to_string_lossy().trim().to_string())
+            .filter(|stem| !stem.is_empty())
+            .unwrap_or_else(|| "brett-export".to_string());
+        home.join(format!("{stem}-export.cbh"))
+    }
+
+    fn cbh_export_would_overwrite_source(&self, path: &std::path::Path) -> bool {
+        let Some(library) = &self.library else {
+            return false;
+        };
+        let source = library.path();
+        let mut protected = vec![source.to_path_buf()];
+        for extension in crate::cbh::ALL_EXTENSIONS {
+            protected.push(source.with_extension(extension));
+        }
+        for extension in crate::cbh::ALL_EXTENSIONS {
+            let target = path.with_extension(extension);
+            if protected
+                .iter()
+                .any(|source_file| same_file_path(&target, source_file))
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn write_cbh_export(&mut self, path: &std::path::Path) {
+        match self.try_write_cbh_export(path) {
+            Ok(report) => {
+                self.status = format!(
+                    "Exported {} to {} ({}).",
+                    games_label(report.games),
+                    path.display(),
+                    human_bytes(report.bytes)
+                );
+            }
+            Err(err) => {
+                self.status = format!("CBH export failed: {err}");
+            }
+        }
+    }
+
+    fn try_write_cbh_export(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<crate::cbh::CbhWriteReport, String> {
+        crate::session::ensure_unique_ids(&self.session)
+            .map_err(|err| format!("checking the session: {err:#}"))?;
+
+        let ids: Vec<usize> = self.session.slots().iter().map(|slot| slot.id).collect();
+        crate::cbh::write_database(
+            path,
             ids.into_iter()
                 .map(|id| self.session.load(id, &self.edited)),
         )
@@ -4538,6 +4712,19 @@ impl App {
                         .clicked()
                     {
                         self.start_scid_export();
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(
+                            !self.session.is_empty(),
+                            egui::Button::new("Save database as CBH…"),
+                        )
+                        .on_hover_text(
+                            "Write a classic ChessBase .cbh database with its .cbg, .cba, .cbp, .cbt, .cbc, and .cbs companions",
+                        )
+                        .clicked()
+                    {
+                        self.start_cbh_export();
                         ui.close();
                     }
                     if ui
@@ -9612,6 +9799,7 @@ impl eframe::App for App {
         self.online_dialog(&ctx);
         self.pgn_export_dialog(&ctx);
         self.scid_export_dialog(&ctx);
+        self.cbh_export_dialog(&ctx);
         self.index_confirmation_dialog(&ctx);
         self.branch_choice_dialog(&ctx);
         self.date_picker_dialog(&ctx);
@@ -13098,6 +13286,18 @@ fn save_scid_dialog(default_path: &std::path::Path) -> Option<std::path::PathBuf
     )
 }
 
+/// Native Save As dialog for a classic ChessBase CBH export. Overwriting is
+/// confirmed in-app because the companion files are replaced together.
+fn save_cbh_dialog(default_path: &std::path::Path) -> Option<std::path::PathBuf> {
+    save_database_dialog(
+        default_path,
+        "Save database as CBH",
+        "ChessBase database",
+        "*.cbh",
+        false,
+    )
+}
+
 fn save_database_dialog(
     default_path: &std::path::Path,
     title: &str,
@@ -13322,6 +13522,7 @@ mod tests {
             filter: String::new(),
             pending_pgn_export: None,
             pending_scid_export: None,
+            pending_cbh_export: None,
             show_about: false,
             show_settings: false,
             settings_rating_priority: RatingPriority::Elo,
@@ -13422,6 +13623,58 @@ mod tests {
         for path in scid_triple(&path) {
             let _ = std::fs::remove_file(path);
         }
+    }
+
+    #[test]
+    fn exports_session_games_as_cbh_database() {
+        let mut app = test_app();
+        let game = app.current.clone().unwrap();
+        let mut first = game.clone();
+        first.set_header("White", "First".to_string());
+        let mut second = game;
+        second.set_header("White", "Second".to_string());
+        app.session.insert_game(first, None);
+        app.session.insert_game(second, None);
+
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "brett-cbh-export-{}-{stamp}.cbh",
+            std::process::id()
+        ));
+        let report = app.try_write_cbh_export(&path).unwrap();
+        assert_eq!(report.games, 2);
+        for companion in crate::cbh::core_companion_files(&path) {
+            assert!(companion.exists(), "missing {}", companion.display());
+        }
+
+        let library = CbhLibrary::open(&path).unwrap();
+        assert_eq!(library.len(), 2);
+        assert_eq!(library.load(0).unwrap().white(), "First");
+        assert_eq!(library.load(1).unwrap().white(), "Second");
+
+        for companion in crate::cbh::existing_companion_files(&path) {
+            let _ = std::fs::remove_file(companion);
+        }
+    }
+
+    #[test]
+    fn cbh_export_lists_companion_files_and_protects_source() {
+        let base = PathBuf::from("/tmp/example.cbh");
+        assert_eq!(
+            crate::cbh::core_companion_files(&base),
+            [
+                PathBuf::from("/tmp/example.cbh"),
+                PathBuf::from("/tmp/example.cbg"),
+                PathBuf::from("/tmp/example.cba"),
+                PathBuf::from("/tmp/example.cbp"),
+                PathBuf::from("/tmp/example.cbt"),
+                PathBuf::from("/tmp/example.cbc"),
+                PathBuf::from("/tmp/example.cbs"),
+            ]
+        );
     }
 
     #[test]

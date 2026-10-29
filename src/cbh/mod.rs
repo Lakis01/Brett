@@ -1,12 +1,13 @@
-//! Native reader for classic ChessBase databases (`.cbh` + `.cbg` and their
-//! companion files).
+//! Native reader and writer for classic ChessBase databases (`.cbh` + `.cbg`
+//! and their companion files).
 //!
 //! The classic format is the multi-file database ChessBase used before CBH2:
 //! a fixed 46-byte header per game (`.cbh`), a move record per game (`.cbg`),
 //! optional annotations (`.cba`), and small name/title files for players,
-//! tournaments, annotators and sources.  The format is read-only here: Brett
-//! indexes the headers when a database is opened and decodes a game's moves,
-//! variations, comments and NAGs only when it is displayed.
+//! tournaments, annotators and sources.  Brett indexes the headers when a
+//! database is opened, decodes a game's moves, variations, comments and NAGs
+//! on demand when it is displayed, and writes new `.cbh` databases through
+//! [`writer`].
 //!
 //! The implementation is written from the published on-disk layout and the
 //! independent format work in the MIT-licensed `cbvault` project.  It does
@@ -15,6 +16,12 @@
 mod annotations;
 mod moves;
 mod tables;
+pub mod writer;
+
+pub use writer::{
+    ALL_EXTENSIONS, CORE_EXTENSIONS, CbhWriteOptions, CbhWriteReport, core_companion_files,
+    existing_companion_files, write_database, write_database_with_options,
+};
 
 use std::ffi::OsString;
 use std::fs::{self, File};

@@ -331,12 +331,18 @@ first-move verification. External file drops ask whether to open, merge into
 the current database, or open in a view. **File → Save database as PGN…**
 streams the session in order, preserves comments, clocks, NAGs, and
 variations, and asks for confirmation before exports estimated at 100 MB or
-more. The native SCID4 writer is implemented and validated against SCID 4.27;
-the classic CBH writer remains.
+more. Both the native SCID4 writer (**File → Save database as SCID…**) and the
+native classic CBH writer (**File → Save database as CBH…**) are implemented
+and validated.
 
-- Add the native classic CBH writer. The readers are independent and validated;
-  the writer must round-trip through the reader and, where available, an
-  independent implementation.
+- **Classic CBH writer (done):** native classic `.cbh` export from **File →
+  Save database as CBH…** (`src/cbh/writer.rs`) writes `.cbh`, `.cbg`, `.cba`,
+  `.cbp`, `.cbt`, `.cbc`, and `.cbs` (plus `.cbj` when `.cbg` or `.cba` reaches
+  4 GiB or `force_wide` is enabled), encodes compact `PieceLists` move streams
+  in modes 0/4/5/10, preserves headers, names, comments, NAGs, evaluations,
+  drawing/time/medal tokens, variations, custom starts, and Chess960, and
+  atomically replaces existing companion sets with rollback. Round-trips
+  through both `CbhLibrary` and `cbvault_format::cbh`.
 - **2CBH writer (separate):** blocked on a sample file. Do not fold 2CBH into
   the classic CBH writer; the containers and validation fixtures are different.
 - **SCID writer (done):** native SCID4 export from **File → Save database as

@@ -682,11 +682,15 @@ impl Walker<'_> {
     }
 }
 
-fn from_stored_square(cb: u8) -> Square {
+pub(super) fn from_stored_square(cb: u8) -> Square {
     Square::new(u32::from((cb % 8) * 8 + cb / 8))
 }
 
-fn square(file: u8, rank: u8) -> Square {
+pub(super) fn to_stored_square(square: Square) -> u8 {
+    (square.file().to_u32() as u8) * 8 + (square.rank().to_u32() as u8)
+}
+
+pub(super) fn square(file: u8, rank: u8) -> Square {
     Square::from_coords(File::new(u32::from(file)), Rank::new(u32::from(rank)))
 }
 
@@ -701,7 +705,7 @@ fn step(from: Square, file_delta: i8, rank_delta: i8) -> Square {
 /// finds them; pawns keep fixed numbers.  Captures shift the higher numbers
 /// down and promotions append to the promoted kind.
 #[derive(Clone, Copy)]
-struct PieceLists {
+pub(super) struct PieceLists {
     kinds: [[KindList; 4]; 2],
     pawns: [[Option<Square>; 8]; 2],
 }
@@ -750,7 +754,7 @@ impl KindList {
 }
 
 impl PieceLists {
-    fn scan(pos: &Chess) -> Result<Self> {
+    pub(super) fn scan(pos: &Chess) -> Result<Self> {
         let mut pieces = Self {
             kinds: [[KindList::default(); 4]; 2],
             pawns: [[None; 8]; 2],
@@ -777,15 +781,132 @@ impl PieceLists {
         Ok(pieces)
     }
 
-    fn kind(&self, color: Color, kind: usize, index: usize) -> Option<Square> {
+    pub(super) fn kind(&self, color: Color, kind: usize, index: usize) -> Option<Square> {
         self.kinds[color_index(color)][kind].get(index)
     }
 
-    fn pawn(&self, color: Color, index: usize) -> Option<Square> {
+    pub(super) fn pawn(&self, color: Color, index: usize) -> Option<Square> {
         self.pawns[color_index(color)].get(index).copied().flatten()
     }
 
-    fn update(&mut self, before: &Chess, mv: Move) -> Result<()> {
+    pub(super) fn kind_position(&self, color: Color, kind: usize, square: Square) -> Option<usize> {
+        self.kinds[color_index(color)][kind].position(square)
+    }
+
+    pub(super) fn pawn_position(&self, color: Color, square: Square) -> Option<usize> {
+        self.pawns[color_index(color)]
+            .iter()
+            .position(|&slot| slot == Some(square))
+    }
+
+    /// Encode `mv` as a one-byte compact code (`1..=234`), or `None` when the
+    /// move must be written with the `235` two-byte escape (promotions and
+    /// fourth-or-later pieces of one kind).
+    pub(super) fn compact_code(&self, before: &Chess, mv: Move) -> Option<u8> {
+        const KING: [(i8, i8); 8] = [
+            (0, 1),
+            (1, 1),
+            (1, 0),
+            (1, -1),
+            (0, -1),
+            (-1, -1),
+            (-1, 0),
+            (-1, 1),
+        ];
+        const KNIGHT: [(i8, i8); 8] = [
+            (2, 1),
+            (1, 2),
+            (-1, 2),
+            (-2, 1),
+            (-2, -1),
+            (-1, -2),
+            (1, -2),
+            (2, -1),
+        ];
+        const Q: [(i8, i8); 4] = [(0, 1), (1, 0), (1, 1), (1, -1)];
+        const R: [(i8, i8); 2] = [(0, 1), (1, 0)];
+        const B: [(i8, i8); 2] = [(1, 1), (1, -1)];
+
+        if let Move::Castle { king, rook } = mv {
+            return Some(if rook > king { 9 } else { 10 });
+        }
+        if mv.promotion().is_some() {
+            return None;
+        }
+        let from = mv.from()?;
+        let to = mv.to();
+        let us = before.turn();
+        let piece = before.board().piece_at(from)?;
+        if piece.color != us {
+            return None;
+        }
+        let line = |k: u8, dirs: &[(i8, i8)]| {
+            let (file_delta, rank_delta) = dirs[(k / 7) as usize];
+            let steps = (k % 7 + 1) as i8;
+            (file_delta * steps, rank_delta * steps)
+        };
+        match piece.role {
+            Role::King => (0..8u8)
+                .find(|&k| step(from, KING[k as usize].0, KING[k as usize].1) == to)
+                .map(|k| k + 1),
+            Role::Pawn => {
+                if to.rank().to_u32() == 0 || to.rank().to_u32() == 7 {
+                    return None;
+                }
+                let pawn = self.pawn_position(us, from)? as u8;
+                let forward: i8 = if us == Color::White { 1 } else { -1 };
+                let deltas = [
+                    (0, forward),
+                    (0, 2 * forward),
+                    (forward, forward),
+                    (-forward, forward),
+                ];
+                let how = (0..4u8)
+                    .find(|&h| step(from, deltas[h as usize].0, deltas[h as usize].1) == to)?;
+                Some(111 + pawn * 4 + how)
+            }
+            role => {
+                let kind = kind_index(role)?;
+                let index = self.kind_position(us, kind, from)?;
+                match (kind, index) {
+                    (0, 0..=2) => {
+                        let base = [11u8, 143, 171][index];
+                        let k = (0..28u8).find(|&k| {
+                            let (df, dr) = line(k, &Q);
+                            step(from, df, dr) == to
+                        })?;
+                        Some(base + k)
+                    }
+                    (1, 0..=2) => {
+                        let base = [39u8, 53, 199][index];
+                        let k = (0..14u8).find(|&k| {
+                            let (df, dr) = line(k, &R);
+                            step(from, df, dr) == to
+                        })?;
+                        Some(base + k)
+                    }
+                    (2, 0..=2) => {
+                        let base = [67u8, 81, 213][index];
+                        let k = (0..14u8).find(|&k| {
+                            let (df, dr) = line(k, &B);
+                            step(from, df, dr) == to
+                        })?;
+                        Some(base + k)
+                    }
+                    (3, 0..=2) => {
+                        let base = [95u8, 103, 227][index];
+                        let k = (0..8u8).find(|&k| {
+                            step(from, KNIGHT[k as usize].0, KNIGHT[k as usize].1) == to
+                        })?;
+                        Some(base + k)
+                    }
+                    _ => None,
+                }
+            }
+        }
+    }
+
+    pub(super) fn update(&mut self, before: &Chess, mv: Move) -> Result<()> {
         let us = before.turn();
         let me = color_index(us);
         let them = color_index(us.other());
