@@ -13,8 +13,9 @@ reorder/merge, PGN export, and native SCID writer are done; the classic CBH
 writer remains. Item 10 is no longer blocked: the current ICCF SCID source is available
 and the automatic correspondence reference is integrated; only an optional
 refresh remains. Deferred predictor refinements are recorded under item 6, and
-native player-title display is queued as item 15. Item 18 records the
-recently-trending move-popularity idea, including its graphical display. Items
+native player-title display is queued as item 15. Item 18's trend backend,
+Tree badge column, and Settings controls are implemented; the sparkline and
+moves-panel display remain. Items
 20 and 21 add native ECO classification and Wikipedia player summaries; item 16
 now includes the FIDE-profile link. Item 22 records the player clock-usage
 analysis idea for the player profile/preparation view.
@@ -597,7 +598,10 @@ See `THIRD_PARTY_NOTICES.md` and [`GPL_OPTIONS.md`](GPL_OPTIONS.md).
 
 ## 18. Recently trending move popularity
 
-**Status:** planned.
+**Status:** backend implemented 2026-10-29; the Tree shows a compact
+trend badge with a detailed tooltip and **Settings → Move trends** exposes the
+window, baseline, and minimum sample. The sparkline and moves-panel rendering
+remain planned.
 
 **Goal:** surface opening ideas whose popularity has recently picked up, rather
 than only showing all-time frequency, and make the trend visible at a glance.

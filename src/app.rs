@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{self, TryRecvError};
@@ -639,6 +639,9 @@ pub struct App {
     review_book_min_games: u32,
     review_book_max_plies: u32,
     review_book_rx: Option<mpsc::Receiver<ReviewBookMessage>>,
+    trend_window: crate::recent::TrendWindow,
+    trend_baseline: crate::recent::TrendBaseline,
+    trend_min_games: u32,
     path_input: String,
     filter: String,
     pending_pgn_export: Option<PendingPgnExport>,
@@ -659,6 +662,9 @@ pub struct App {
     settings_review_skip_book: bool,
     settings_review_book_min_games: u32,
     settings_review_book_max_plies: u32,
+    settings_trend_window: crate::recent::TrendWindow,
+    settings_trend_baseline: crate::recent::TrendBaseline,
+    settings_trend_min_games: u32,
     settings_token: String,
     settings_token_visible: bool,
     settings_token_from_env: bool,
@@ -904,6 +910,9 @@ impl App {
             review_book_min_games: display_prefs.review_book_min_games,
             review_book_max_plies: display_prefs.review_book_max_plies,
             review_book_rx: None,
+            trend_window: display_prefs.trend_window,
+            trend_baseline: display_prefs.trend_baseline,
+            trend_min_games: display_prefs.trend_min_games,
             path_input: String::new(),
             filter: String::new(),
             pending_pgn_export: None,
@@ -924,6 +933,9 @@ impl App {
             settings_review_skip_book: display_prefs.review_skip_book,
             settings_review_book_min_games: display_prefs.review_book_min_games,
             settings_review_book_max_plies: display_prefs.review_book_max_plies,
+            settings_trend_window: display_prefs.trend_window,
+            settings_trend_baseline: display_prefs.trend_baseline,
+            settings_trend_min_games: display_prefs.trend_min_games,
             settings_token: String::new(),
             settings_token_visible: false,
             settings_token_from_env: false,
@@ -2711,9 +2723,20 @@ impl App {
             review_skip_book: self.review_skip_book,
             review_book_min_games: self.review_book_min_games.clamp(1, 100),
             review_book_max_plies: self.review_book_max_plies.clamp(4, 80),
+            trend_window: self.trend_window,
+            trend_baseline: self.trend_baseline,
+            trend_min_games: self.trend_min_games.clamp(3, 200),
         };
         if let Err(err) = prefs.save() {
             self.status = format!("Could not save display settings: {err:#}");
+        }
+    }
+
+    fn trend_config(&self) -> crate::recent::TrendConfig {
+        crate::recent::TrendConfig {
+            window: self.trend_window,
+            baseline: self.trend_baseline,
+            min_recent_games: self.trend_min_games.clamp(3, 200),
         }
     }
 
@@ -2785,6 +2808,9 @@ impl App {
         self.settings_review_skip_book = self.review_skip_book;
         self.settings_review_book_min_games = self.review_book_min_games;
         self.settings_review_book_max_plies = self.review_book_max_plies;
+        self.settings_trend_window = self.trend_window;
+        self.settings_trend_baseline = self.trend_baseline;
+        self.settings_trend_min_games = self.trend_min_games;
         self.settings_token_from_env = std::env::var("BRETT_LICHESS_TOKEN")
             .ok()
             .is_some_and(|token| !token.trim().is_empty());
@@ -2822,6 +2848,9 @@ impl App {
         self.review_skip_book = self.settings_review_skip_book;
         self.review_book_min_games = self.settings_review_book_min_games.clamp(1, 100);
         self.review_book_max_plies = self.settings_review_book_max_plies.clamp(4, 80);
+        self.trend_window = self.settings_trend_window;
+        self.trend_baseline = self.settings_trend_baseline;
+        self.trend_min_games = self.settings_trend_min_games.clamp(3, 200);
         self.prep_player_names = self
             .settings_my_player_names
             .lines()
@@ -3011,6 +3040,7 @@ impl App {
                         BuildOptions {
                             max_plies: u32::MAX,
                             rating_filter: filter,
+                            ..BuildOptions::default()
                         },
                         move |progress| {
                             let _ = progress_tx.send(ReferenceMessage::Progress(progress));
@@ -7404,6 +7434,7 @@ impl App {
                         key,
                         &pos,
                         "No indexed game reached this position.",
+                        self.trend_config(),
                         &mut hover_preview,
                     );
                 } else {
@@ -8294,6 +8325,7 @@ impl App {
                                 key,
                                 pos,
                                 "No indexed game reached this position.",
+                                self.trend_config(),
                                 &mut hover_preview,
                             )
                             .or(clicked);
@@ -9480,6 +9512,37 @@ impl App {
                     .small()
                     .weak(),
                 );
+
+                ui.add_space(8.0);
+                ui.separator();
+                ui.heading("Move trends");
+                ui.label(
+                    RichText::new(
+                        "The Tree tab compares a recent window with a historical baseline. Small samples are shrunk toward the baseline and never shown as a trend.",
+                    )
+                    .small()
+                    .weak(),
+                );
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Recent window");
+                    for window in crate::recent::TrendWindow::ALL {
+                        ui.radio_value(&mut self.settings_trend_window, window, window.label());
+                    }
+                });
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Baseline");
+                    for baseline in crate::recent::TrendBaseline::ALL {
+                        ui.radio_value(&mut self.settings_trend_baseline, baseline, baseline.label());
+                    }
+                });
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("Minimum games per window").small().strong());
+                    ui.add(
+                        egui::DragValue::new(&mut self.settings_trend_min_games)
+                            .range(3..=200)
+                            .speed(1),
+                    );
+                });
 
                 ui.add_space(8.0);
                 ui.separator();
@@ -13224,6 +13287,7 @@ fn opening_tree_table(
     key: u64,
     pos: &Chess,
     empty_message: &str,
+    trends: crate::recent::TrendConfig,
     hover_preview: &mut Option<HoverPreview>,
 ) -> Option<Move> {
     let Some(index) = index else {
@@ -13232,6 +13296,11 @@ fn opening_tree_table(
     };
     let stats = index.stats(key);
     let moves = index.moves(key);
+    let trend_by_move: HashMap<u32, crate::recent::MoveTrend> =
+        crate::recent::position_trends(&moves, trends)
+            .into_iter()
+            .map(|trend| (trend.mv, trend))
+            .collect();
 
     if let Some(stats) = stats {
         ui.horizontal(|ui| {
@@ -13277,7 +13346,7 @@ fn opening_tree_table(
     let mut clicked = None;
     ui.add_space(4.0);
     egui::Grid::new("opening-tree-grid")
-        .num_columns(6)
+        .num_columns(7)
         .striped(true)
         .spacing([10.0, 4.0])
         .show(ui, |ui| {
@@ -13287,6 +13356,7 @@ fn opening_tree_table(
             ui.label(RichText::new("W/D/B").strong());
             ui.label(RichText::new("Elo").strong());
             ui.label(RichText::new("Years").strong());
+            ui.label(RichText::new("Trend").strong());
             ui.end_row();
 
             for (san, mv, stat) in rows {
@@ -13308,6 +13378,21 @@ fn opening_tree_table(
                         .unwrap_or_else(|| "—".to_string()),
                 );
                 ui.label(date_range(stat.first_date, stat.last_date));
+                match trend_by_move
+                    .get(&stat.mv)
+                    .and_then(crate::recent::MoveTrend::compact_label)
+                {
+                    Some(label) => {
+                        let trend = trend_by_move.get(&stat.mv).expect("trend map entry");
+                        ui.label(RichText::new(label).small())
+                            .on_hover_text(trend.tooltip(trends));
+                    }
+                    None => {
+                        ui.label(RichText::new("—").weak()).on_hover_text(
+                            "Not enough dated games in both windows for a trend badge.",
+                        );
+                    }
+                }
                 ui.end_row();
             }
         });
@@ -13719,6 +13804,9 @@ mod tests {
             review_book_min_games: 3,
             review_book_max_plies: 30,
             review_book_rx: None,
+            trend_window: crate::recent::TrendWindow::default(),
+            trend_baseline: crate::recent::TrendBaseline::default(),
+            trend_min_games: 10,
             path_input: String::new(),
             filter: String::new(),
             pending_pgn_export: None,
@@ -13739,6 +13827,9 @@ mod tests {
             settings_review_skip_book: true,
             settings_review_book_min_games: 3,
             settings_review_book_max_plies: 30,
+            settings_trend_window: crate::recent::TrendWindow::default(),
+            settings_trend_baseline: crate::recent::TrendBaseline::default(),
+            settings_trend_min_games: 10,
             settings_token: String::new(),
             settings_token_visible: false,
             settings_token_from_env: false,

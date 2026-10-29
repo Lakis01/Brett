@@ -455,6 +455,13 @@ pub struct DisplayPrefs {
     /// Maximum plies from the start of the game that can be skipped as book
     /// during review (`4..=80`).
     pub review_book_max_plies: u32,
+    /// Rolling recent window used for move-popularity trends in the Tree tab.
+    pub trend_window: crate::recent::TrendWindow,
+    /// Historical baseline period used for move-popularity trends.
+    pub trend_baseline: crate::recent::TrendBaseline,
+    /// Minimum dated games required in both windows at a position before
+    /// showing a trend badge (`3..=200`).
+    pub trend_min_games: u32,
 }
 
 impl Default for DisplayPrefs {
@@ -478,11 +485,22 @@ impl Default for DisplayPrefs {
             review_skip_book: true,
             review_book_min_games: 3,
             review_book_max_plies: 30,
+            trend_window: crate::recent::TrendWindow::default(),
+            trend_baseline: crate::recent::TrendBaseline::default(),
+            trend_min_games: 10,
         }
     }
 }
 
 impl DisplayPrefs {
+    pub fn trend_config(&self) -> crate::recent::TrendConfig {
+        crate::recent::TrendConfig {
+            window: self.trend_window,
+            baseline: self.trend_baseline,
+            min_recent_games: self.trend_min_games.clamp(3, 200),
+        }
+    }
+
     pub fn from_json(text: &str) -> Self {
         let value: Value = serde_json::from_str(text).unwrap_or(Value::Null);
         let rating_priority = value
@@ -575,6 +593,21 @@ impl DisplayPrefs {
             .and_then(Value::as_u64)
             .unwrap_or(30)
             .clamp(4, 80) as u32;
+        let trend_window = value
+            .get("trend_window")
+            .and_then(Value::as_str)
+            .map(crate::recent::TrendWindow::from_config)
+            .unwrap_or_default();
+        let trend_baseline = value
+            .get("trend_baseline")
+            .and_then(Value::as_str)
+            .map(crate::recent::TrendBaseline::from_config)
+            .unwrap_or_default();
+        let trend_min_games = value
+            .get("trend_min_games")
+            .and_then(Value::as_u64)
+            .unwrap_or(10)
+            .clamp(3, 200) as u32;
         Self {
             rating_priority,
             show_all_ratings,
@@ -594,6 +627,9 @@ impl DisplayPrefs {
             review_skip_book,
             review_book_min_games,
             review_book_max_plies,
+            trend_window,
+            trend_baseline,
+            trend_min_games,
         }
     }
 
@@ -617,6 +653,9 @@ impl DisplayPrefs {
             "review_skip_book": self.review_skip_book,
             "review_book_min_games": self.review_book_min_games,
             "review_book_max_plies": self.review_book_max_plies,
+            "trend_window": self.trend_window.config_value(),
+            "trend_baseline": self.trend_baseline.config_value(),
+            "trend_min_games": self.trend_min_games,
         }))
         .unwrap_or_default()
     }
@@ -893,6 +932,9 @@ mod tests {
             review_skip_book: false,
             review_book_min_games: 5,
             review_book_max_plies: 24,
+            trend_window: crate::recent::TrendWindow::SixMonths,
+            trend_baseline: crate::recent::TrendBaseline::Prior24Months,
+            trend_min_games: 15,
         };
         assert_eq!(DisplayPrefs::from_json(&prefs.to_json()), prefs);
         assert_eq!(DisplayPrefs::from_json("not json"), DisplayPrefs::default());
