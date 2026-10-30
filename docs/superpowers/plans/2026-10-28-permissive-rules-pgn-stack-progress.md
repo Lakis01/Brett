@@ -175,3 +175,12 @@ Task priority if Argon quota is small: Argon Medium for Tasks 4, 5, 8, 10 (FEN/h
 - Gate after `072ce98`: `cargo test --all-targets` 168 lib + all suites passed
   (1 ignored); `cargo clippy --all-targets -- -D warnings` clean; `cargo fmt
   --all -- --check` clean.
+- 2026-10-30 `67ff6da`: `src/titles.rs` normalizes PGN/imported player titles
+  and compact badges now appear in board strips, game lists, the player
+  directory and profile, preparation, online references, and database views;
+  raw tags are preserved. The CBH/SCID format audit found no player-title
+  field in classic `.cbp` records or the SCID namebase, documented in
+  `docs/CBH.md` and `docs/SCID.md`; backlog item 15 closed.
+- Gate after `67ff6da`: `cargo test --all-targets` 179 lib + all suites passed
+  (1 ignored); `cargo clippy --all-targets -- -D warnings` clean; `cargo fmt
+  --all -- --check` clean.
