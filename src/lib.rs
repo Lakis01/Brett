@@ -27,4 +27,5 @@ pub mod review_book;
 pub mod scid;
 pub mod session;
 pub mod settings;
+pub mod titles;
 pub mod ui;

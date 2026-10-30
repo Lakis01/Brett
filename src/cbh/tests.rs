@@ -181,6 +181,23 @@ fn write_entity(path: &Path, data_size: usize, records: &[Vec<u8>]) {
     fs::write(path, bytes).unwrap();
 }
 
+#[test]
+fn classic_player_records_have_no_title_field() {
+    let dir = TempDir::new();
+    let stem = dir.path().join("titles");
+    write_entity(
+        &stem.with_extension("cbp"),
+        50,
+        &[player_record("Doe", "GM Jane")],
+    );
+    let entities = Entities::open(&stem).unwrap();
+    assert_eq!(
+        entities.player_name(0),
+        "Doe, GM Jane",
+        "a title-looking given name stays part of the name; the 50-byte player record has no title field"
+    );
+}
+
 fn player_record(last: &str, first: &str) -> Vec<u8> {
     let mut data = vec![0u8; 50];
     data[..last.len()].copy_from_slice(last.as_bytes());

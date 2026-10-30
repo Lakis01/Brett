@@ -35,6 +35,7 @@ use crate::settings::{
     ChampionLineage, CloudPrefs, DisplayPrefs, EnginePrefs, PhotoSize, PreparationPrefs,
     RatingPriority,
 };
+use crate::titles;
 use crate::ui::board::{self, BoardEvent, BoardState};
 use crate::ui::eval_bar;
 use crate::ui::fonts;
@@ -302,6 +303,7 @@ struct ReviewBookMessage {
 struct PrepSession {
     player_key: String,
     player_name: String,
+    player_title: Option<titles::PlayerTitle>,
     our_color: Color,
     previous_game: Option<usize>,
     previous_orientation: Color,
@@ -352,7 +354,10 @@ struct PrepLineRow {
 #[derive(Clone, Debug)]
 struct PrepRecentRow {
     index: usize,
-    title: String,
+    white: String,
+    black: String,
+    white_title: Option<&'static str>,
+    black_title: Option<&'static str>,
     subtitle: String,
 }
 
@@ -3858,14 +3863,21 @@ impl App {
         } else {
             (display_name.clone(), you_name)
         };
+        let mut headers = vec![
+            ("Event".to_string(), "Preparation".to_string()),
+            ("White".to_string(), white),
+            ("Black".to_string(), black),
+            ("Date".to_string(), pgn_date(players::today())),
+            ("Result".to_string(), "*".to_string()),
+        ];
+        if let Some(title) = player.title {
+            headers.push((
+                if as_white { "WhiteTitle" } else { "BlackTitle" }.to_string(),
+                title.short().to_string(),
+            ));
+        }
         let game = Game {
-            headers: vec![
-                ("Event".to_string(), "Preparation".to_string()),
-                ("White".to_string(), white),
-                ("Black".to_string(), black),
-                ("Date".to_string(), pgn_date(players::today())),
-                ("Result".to_string(), "*".to_string()),
-            ],
+            headers,
             ..Game::default()
         };
         let previous_orientation = self.orientation;
@@ -3880,6 +3892,7 @@ impl App {
         self.prep = Some(PrepSession {
             player_key: player.key.clone(),
             player_name: display_name.clone(),
+            player_title: player.title,
             our_color,
             previous_game,
             previous_orientation,
@@ -5288,25 +5301,53 @@ impl App {
                                 let game = &self.online_ref_games[index];
                                 let is_white = game.white().to_lowercase() == username;
                                 let is_black = game.black().to_lowercase() == username;
-                                let (title, subtitle) = if is_white || is_black {
-                                    let opponent = if is_white {
-                                        game.black()
+                                let (prefix, white, black, suffix, subtitle) = if is_white || is_black {
+                                    let (opponent, opponent_color, color) = if is_white {
+                                        (game.black(), Color::Black, "White")
                                     } else {
-                                        game.white()
+                                        (game.white(), Color::White, "Black")
                                     };
-                                    let color = if is_white { "White" } else { "Black" };
                                     (
-                                        format!("vs {opponent} · as {color}"),
-                                        format!("{} · {} · {}", game.result(), game.event(), game.date()),
+                                        "vs ",
+                                        RowName::new(opponent, player_title(game, opponent_color)),
+                                        None,
+                                        format!(" · as {color}"),
+                                        format!(
+                                            "{} · {} · {}",
+                                            game.result(),
+                                            game.event(),
+                                            game.date()
+                                        ),
                                     )
                                 } else {
                                     (
-                                        format!("{} – {}", game.white(), game.black()),
+                                        "",
+                                        RowName::new(
+                                            game.white(),
+                                            player_title(game, Color::White),
+                                        ),
+                                        Some(RowName::new(
+                                            game.black(),
+                                            player_title(game, Color::Black),
+                                        )),
+                                        String::new(),
                                         format!("{} · {}", game.result(), game.date()),
                                     )
                                 };
                                 let width = ui.available_width();
-                                if game_row(ui, false, &title, &subtitle, width, 42.0).clicked() {
+                                if game_row(
+                                    ui,
+                                    false,
+                                    prefix,
+                                    white,
+                                    black,
+                                    &suffix,
+                                    &subtitle,
+                                    width,
+                                    42.0,
+                                )
+                                .clicked()
+                                {
                                     selected = Some(index);
                                 }
                             }
@@ -5361,11 +5402,22 @@ impl App {
                     let Some(slot) = self.session.slot(id) else {
                         continue;
                     };
-                    let title = format!("{} – {}", slot.white(), slot.black());
+                    let white_title = title_from_tag(slot.header("WhiteTitle"));
+                    let black_title = title_from_tag(slot.header("BlackTitle"));
                     let subtitle = format!("{} · {}", slot.event(), slot.date());
                     let selected = self.current_slot == Some(id) && self.prep.is_none();
                     let width = ui.available_width();
-                    let response = game_row(ui, selected, &title, &subtitle, width, row_h - 2.0);
+                    let response = game_row(
+                        ui,
+                        selected,
+                        "",
+                        RowName::new(slot.white(), white_title),
+                        Some(RowName::new(slot.black(), black_title)),
+                        "",
+                        &subtitle,
+                        width,
+                        row_h - 2.0,
+                    );
                     response.dnd_set_drag_payload(GameRowDrag { id });
 
                     let pointer = ui.ctx().pointer_interact_pos();
@@ -5516,6 +5568,10 @@ impl App {
                 if response.clicked() {
                     open_photo = true;
                 }
+            }
+            if let Some(title) = player.title {
+                ui.label(RichText::new(title.short()).small().strong().color(GOLD))
+                    .on_hover_text("Title from the database or imported PGN");
             }
             ui.heading(&player.name);
             if let Some(champion) = champion {
@@ -5742,12 +5798,16 @@ impl App {
                         };
                         let player_white = players::player_key(entry.white()).as_deref()
                             == Some(player.key.as_str());
-                        let (opponent, color) = if player_white {
-                            (entry.black(), "White")
+                        let (opponent, opponent_color, color) = if player_white {
+                            (entry.black(), Color::Black, "White")
                         } else {
-                            (entry.white(), "Black")
+                            (entry.white(), Color::White, "Black")
                         };
-                        let title = format!("vs {opponent} · as {color}");
+                        let opponent_title = title_from_tag(entry.header(match opponent_color {
+                            Color::White => "WhiteTitle",
+                            Color::Black => "BlackTitle",
+                        }));
+                        let suffix = format!(" · as {color}");
                         let subtitle =
                             format!("{} · {} · {}", entry.result(), entry.event(), entry.date());
                         let selected = self
@@ -5756,7 +5816,19 @@ impl App {
                             .is_some_and(|id| self.current_slot == Some(id))
                             && self.prep.is_none();
                         let width = ui.available_width();
-                        if game_row(ui, selected, &title, &subtitle, width, row_h - 2.0).clicked() {
+                        if game_row(
+                            ui,
+                            selected,
+                            "vs ",
+                            RowName::new(opponent, opponent_title),
+                            None,
+                            &suffix,
+                            &subtitle,
+                            width,
+                            row_h - 2.0,
+                        )
+                        .clicked()
+                        {
                             select_game = Some(idx);
                         }
                     }
@@ -5830,6 +5902,7 @@ impl App {
                     };
                     let name = player.name.clone();
                     let key = player.key.clone();
+                    let player_title = player.title.map(titles::PlayerTitle::short);
                     let is_you = you_key.as_deref() == Some(key.as_str());
                     let title = if is_you {
                         "You".to_string()
@@ -5859,6 +5932,7 @@ impl App {
                         ui,
                         selected,
                         &title,
+                        player_title,
                         &subtitle,
                         width,
                         photo.as_ref(),
@@ -7898,7 +7972,10 @@ impl App {
                 let indexed = library.get(game.index)?;
                 Some(PrepRecentRow {
                     index: game.index,
-                    title: format!("{} – {}", indexed.white(), indexed.black()),
+                    white: indexed.white().to_string(),
+                    black: indexed.black().to_string(),
+                    white_title: title_from_tag(indexed.header("WhiteTitle")),
+                    black_title: title_from_tag(indexed.header("BlackTitle")),
                     subtitle: format!(
                         "{} · as {} · {} · {}",
                         short_date(game.date),
@@ -7921,15 +7998,21 @@ impl App {
                 }
             });
         });
-        ui.label(
-            RichText::new(format!(
-                "vs {} · You play {} · board from {}",
-                prep.player_name,
-                color_name(prep.our_color),
-                color_name(self.orientation)
-            ))
-            .weak(),
-        );
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("vs").weak());
+            if let Some(title) = prep.player_title {
+                ui.label(RichText::new(title.short()).small().strong().color(GOLD));
+            }
+            ui.label(RichText::new(&prep.player_name).weak());
+            ui.label(
+                RichText::new(format!(
+                    "· You play {} · board from {}",
+                    color_name(prep.our_color),
+                    color_name(self.orientation)
+                ))
+                .weak(),
+            );
+        });
         ui.separator();
         if exit {
             self.exit_prep();
@@ -7979,7 +8062,6 @@ impl App {
             .take(recent_limit)
             .map(|game| {
                 (
-                    format!("{} – {}", game.white(), game.black()),
                     format!("{} · {} · {}", game.date(), game.event(), game.result()),
                     game.clone(),
                 )
@@ -8347,7 +8429,19 @@ impl App {
                         } else {
                             let width = (ui.available_width() - 4.0).max(100.0);
                             for row in recent_rows.iter().take(recent_limit) {
-                                if game_row(ui, false, &row.title, &row.subtitle, width, 40.0).clicked() {
+                                if game_row(
+                                    ui,
+                                    false,
+                                    "",
+                                    RowName::new(&row.white, row.white_title),
+                                    Some(RowName::new(&row.black, row.black_title)),
+                                    "",
+                                    &row.subtitle,
+                                    width,
+                                    40.0,
+                                )
+                                .clicked()
+                                {
                                     preview = Some(row.index);
                                 }
                             }
@@ -8405,8 +8499,26 @@ impl App {
                             }
                         } else {
                             let width = (ui.available_width() - 4.0).max(100.0);
-                            for (title, subtitle, game) in &online_rows {
-                                if game_row(ui, false, title, subtitle, width, 40.0).clicked() {
+                            for (subtitle, game) in &online_rows {
+                                if game_row(
+                                    ui,
+                                    false,
+                                    "",
+                                    RowName::new(
+                                        game.white(),
+                                        player_title(game, Color::White),
+                                    ),
+                                    Some(RowName::new(
+                                        game.black(),
+                                        player_title(game, Color::Black),
+                                    )),
+                                    "",
+                                    subtitle,
+                                    width,
+                                    40.0,
+                                )
+                                .clicked()
+                                {
                                     online_preview = Some(game.clone());
                                 }
                             }
@@ -8912,15 +9024,20 @@ impl App {
                                             let Some(slot) = view.session.slot(id) else {
                                                 continue;
                                             };
-                                            let title =
-                                                format!("{} – {}", slot.white(), slot.black());
+                                            let white_title =
+                                                title_from_tag(slot.header("WhiteTitle"));
+                                            let black_title =
+                                                title_from_tag(slot.header("BlackTitle"));
                                             let subtitle =
                                                 format!("{} · {}", slot.event(), slot.date());
                                             let width = ui.available_width();
                                             let response = game_row(
                                                 ui,
                                                 false,
-                                                &title,
+                                                "",
+                                                RowName::new(slot.white(), white_title),
+                                                Some(RowName::new(slot.black(), black_title)),
+                                                "",
                                                 &subtitle,
                                                 width,
                                                 row_h - 2.0,
@@ -9872,14 +9989,7 @@ impl eframe::App for App {
                         } else {
                             game.black().to_string()
                         },
-                        title: game
-                            .header(match color {
-                                Color::White => "WhiteTitle",
-                                Color::Black => "BlackTitle",
-                            })
-                            .map(str::trim)
-                            .filter(|title| !title.is_empty())
-                            .map(str::to_string),
+                        title: player_title(game, color).map(str::to_string),
                         rating: player_rating(
                             game,
                             color,
@@ -11698,13 +11808,15 @@ fn team_for(game: &Game, color: Color) -> Option<&str> {
     })
 }
 
-fn player_title(game: &Game, color: Color) -> Option<&str> {
-    game.header(match color {
+fn title_from_tag(raw: Option<&str>) -> Option<&'static str> {
+    titles::normalize(raw?).map(titles::PlayerTitle::short)
+}
+
+fn player_title(game: &Game, color: Color) -> Option<&'static str> {
+    title_from_tag(game.header(match color {
         Color::White => "WhiteTitle",
         Color::Black => "BlackTitle",
-    })
-    .map(str::trim)
-    .filter(|title| !title.is_empty())
+    }))
 }
 
 /// `3.4` means round 3, board 4. A plain value is a round with no board.
@@ -12426,10 +12538,12 @@ struct ViewDatabaseDrag {
 }
 
 /// Two-line, full-width selectable row for the game list.
+#[allow(clippy::too_many_arguments)]
 fn player_row(
     ui: &mut Ui,
     selected: bool,
-    title: &str,
+    name: &str,
+    title: Option<&str>,
     subtitle: &str,
     width: f32,
     photo: Option<&egui::TextureHandle>,
@@ -12475,15 +12589,17 @@ fn player_row(
     };
 
     let mut job = LayoutJob::default();
-    job.append(
-        title,
-        0.0,
-        TextFormat {
-            font_id: FontId::proportional(14.0),
-            color: visuals.strong_text_color(),
-            ..Default::default()
-        },
-    );
+    let name_format = TextFormat {
+        font_id: FontId::proportional(14.0),
+        color: visuals.strong_text_color(),
+        ..Default::default()
+    };
+    let title_format = TextFormat {
+        font_id: FontId::proportional(10.5),
+        color: GOLD,
+        ..Default::default()
+    };
+    append_player_name(&mut job, name, title, &title_format, &name_format);
     if champion.is_some() {
         job.append(
             " 👑",
@@ -12520,10 +12636,40 @@ fn player_row(
     (response, photo_clicked)
 }
 
+#[derive(Clone, Copy)]
+struct RowName<'a> {
+    name: &'a str,
+    title: Option<&'a str>,
+}
+
+impl<'a> RowName<'a> {
+    fn new(name: &'a str, title: Option<&'a str>) -> Self {
+        Self { name, title }
+    }
+}
+
+fn append_player_name(
+    job: &mut LayoutJob,
+    name: &str,
+    title: Option<&str>,
+    title_format: &TextFormat,
+    name_format: &TextFormat,
+) {
+    if let Some(title) = title {
+        job.append(title, 0.0, title_format.clone());
+        job.append(" ", 0.0, name_format.clone());
+    }
+    job.append(name, 0.0, name_format.clone());
+}
+
+#[allow(clippy::too_many_arguments)]
 fn game_row(
     ui: &mut Ui,
     selected: bool,
-    title: &str,
+    prefix: &str,
+    white: RowName<'_>,
+    black: Option<RowName<'_>>,
+    suffix: &str,
     subtitle: &str,
     width: f32,
     height: f32,
@@ -12539,11 +12685,53 @@ fn game_row(
     };
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 4.0, bg);
-    painter.text(
+
+    let name_format = TextFormat {
+        font_id: FontId::proportional(14.0),
+        color: visuals.strong_text_color(),
+        ..Default::default()
+    };
+    let title_format = TextFormat {
+        font_id: FontId::proportional(10.5),
+        color: GOLD,
+        ..Default::default()
+    };
+    let weak_format = TextFormat {
+        font_id: FontId::proportional(14.0),
+        color: visuals.weak_text_color(),
+        ..Default::default()
+    };
+    let mut job = LayoutJob::default();
+    if !prefix.is_empty() {
+        job.append(prefix, 0.0, name_format.clone());
+    }
+    append_player_name(
+        &mut job,
+        white.name,
+        white.title,
+        &title_format,
+        &name_format,
+    );
+    if let Some(black) = black {
+        job.append(" – ", 0.0, weak_format);
+        append_player_name(
+            &mut job,
+            black.name,
+            black.title,
+            &title_format,
+            &name_format,
+        );
+    }
+    if !suffix.is_empty() {
+        job.append(suffix, 0.0, name_format);
+    }
+    job.wrap.max_width = (width - 16.0).max(24.0);
+    job.wrap.max_rows = 1;
+    job.wrap.break_anywhere = true;
+    let title_galley = painter.layout_job(job);
+    painter.galley(
         rect.left_top() + vec2(8.0, 5.0),
-        Align2::LEFT_TOP,
-        title,
-        FontId::proportional(14.0),
+        title_galley,
         visuals.strong_text_color(),
     );
     painter.text(
@@ -13794,6 +13982,57 @@ mod tests {
         }
     }
 
+    #[test]
+    fn player_title_normalizes_without_rewriting_the_raw_tag() {
+        let pgn = b"[Event \"Titles\"]\n[White \"A\"]\n[WhiteTitle \"Women's Grandmaster\"]\n[Black \"B\"]\n[BlackTitle \"2500\"]\n[Result \"*\"]\n\n*\n";
+        let mut games = domain::parse_pgn(&pgn[..]).unwrap();
+        let game = games.remove(0);
+        assert_eq!(player_title(&game, Color::White), Some("WGM"));
+        assert_eq!(
+            game.header("WhiteTitle"),
+            Some("Women's Grandmaster"),
+            "display decoding must not rewrite the stored tag"
+        );
+        assert_eq!(player_title(&game, Color::Black), None);
+    }
+
+    #[test]
+    fn row_title_is_a_compact_prefix_before_the_name() {
+        let name_format = TextFormat {
+            font_id: FontId::proportional(14.0),
+            color: Color32::WHITE,
+            ..Default::default()
+        };
+        let title_format = TextFormat {
+            font_id: FontId::proportional(10.5),
+            color: GOLD,
+            ..Default::default()
+        };
+
+        let mut job = LayoutJob::default();
+        append_player_name(
+            &mut job,
+            "Kasparov, Garry",
+            Some("GM"),
+            &title_format,
+            &name_format,
+        );
+        assert_eq!(job.text, "GM Kasparov, Garry");
+        assert_eq!(job.sections[0].format.color, GOLD);
+        assert_eq!(job.sections[0].format.font_id.size, 10.5);
+
+        let mut plain = LayoutJob::default();
+        append_player_name(
+            &mut plain,
+            "Kasparov, Garry",
+            None,
+            &title_format,
+            &name_format,
+        );
+        assert_eq!(plain.text, "Kasparov, Garry");
+        assert_eq!(plain.sections.len(), 1);
+    }
+
     fn test_app() -> App {
         let mut games = domain::parse_pgn(include_bytes!("../fixtures/opera.pgn")).unwrap();
         let ctx = egui::Context::default();
@@ -14742,6 +14981,7 @@ mod tests {
         app.prep = Some(PrepSession {
             player_key: "opponent".to_string(),
             player_name: "Opponent".to_string(),
+            player_title: None,
             our_color: Color::White,
             previous_game: None,
             previous_orientation: Color::White,
@@ -14787,6 +15027,7 @@ mod tests {
         app.prep = Some(PrepSession {
             player_key: "opponent".to_string(),
             player_name: "Opponent".to_string(),
+            player_title: None,
             our_color: Color::White,
             previous_game: None,
             previous_orientation: Color::White,

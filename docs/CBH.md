@@ -35,6 +35,12 @@ the `.cbh` are zero-based. Brett reads `.cbp` records with 30-byte last-name and
 and the corresponding annotator/source fields. Deleted or missing entities are
 omitted or resolve to `?`.
 
+Classic `.cbp` player records have **no title field**: the 50-byte record is
+only the 30-byte last name followed by the 20-byte first name. A CBH database
+therefore cannot supply FIDE or historical player titles, and Brett does not
+infer one from a rating. Title badges appear only when the title comes from
+another source, such as an imported PGN tag.
+
 ## Opening and indexing
 
 `CbhLibrary::open` accepts the `.cbh` path, a `.cbg`/`.cba` companion, or the

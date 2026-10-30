@@ -573,9 +573,13 @@ Engine table are implemented.
 
 ## 15. Native player titles
 
-**Status:** PGN `WhiteTitle`/`BlackTitle` badges are implemented in the board
-strips and the Moves header. CBH/SCID title-field decoding and the wider
-surfaces below remain.
+**Status:** implemented (2026-10-30). `src/titles.rs` normalizes PGN/imported
+`WhiteTitle`/`BlackTitle` values and the badges now appear in the board strips,
+Moves header, game lists, player directory and profile, preparation header,
+online reference lists, and database views. The raw tags are preserved. The
+classic CBH and SCID audits found no player-title field in either format (see
+[CBH.md](CBH.md) and [SCID.md](SCID.md)); an explicit title tag stored in a SCID
+game record is still decoded as a custom tag.
 
 - Decode the PGN `WhiteTitle`/`BlackTitle` tags and classic CBH/SCID title
   fields natively, including FIDE titles (GM, IM, FM, CM, WGM, WIM, WFM, WCM)

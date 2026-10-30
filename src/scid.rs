@@ -1298,6 +1298,15 @@ mod tests {
     }
 
     #[test]
+    fn scid_namebase_has_no_separate_title_field() {
+        let library = ScidLibrary::open(fixture("opera.si4")).unwrap();
+        let game = library.get(0).unwrap();
+        assert_eq!(game.white(), "Paul Morphy");
+        assert!(game.header("WhiteTitle").is_none());
+        assert!(game.header("BlackTitle").is_none());
+    }
+
+    #[test]
     fn decode_event_date_round_trips() {
         let date = (1957 << 9) | (10 << 5) | 13;
         let packed = (4u32 << 9) | (10 << 5) | 13;

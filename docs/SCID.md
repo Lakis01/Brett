@@ -42,7 +42,8 @@ without decoding any moves.
   Round, Result, ECO, Elo, EventDate), with names resolved through the
   compressed namebase;
 - additional tags stored in the game record (`Annotator`, `PlyCount`, `SetUp`,
-  `FEN`, `Variant`, and other custom tags);
+  `FEN`, `Variant`, and other custom tags, including `WhiteTitle`/`BlackTitle`
+  if the record explicitly carries them);
 - encoded mainline moves, including castling, en passant, and promotions;
 - promotion and under-promotion flags;
 - null moves (`--`), which advance the side to move;
@@ -50,6 +51,12 @@ without decoding any moves.
 - textual comments, assigned in SCID's PGN traversal order;
 - NAGs, including the standard `!`, `?`, `!?`, `+=`, `=+`, and positional
   symbols.
+
+The namebase stores player names only; it has no separate title field, and
+SCID's own `scidpgn` export of the reference corpus emitted no
+`WhiteTitle`/`BlackTitle` tags. Brett therefore does not synthesize titles for
+SCID sources. A title tag stored explicitly in a game record is still decoded
+and displayed like any other custom tag.
 
 Custom starting positions are reconstructed from the record's FEN tag. The
 piece list used by SCID's compact move encoding is rebuilt from that position,
