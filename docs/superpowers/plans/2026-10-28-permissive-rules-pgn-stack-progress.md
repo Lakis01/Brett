@@ -193,3 +193,11 @@ Task priority if Argon quota is small: Argon Medium for Tasks 4, 5, 8, 10 (FEN/h
 - Gate after `289dc39`: `cargo test --all-targets` 185 lib + all suites passed
   (1 ignored); `cargo clippy --all-targets -- -D warnings` clean; `cargo fmt
   --all -- --check` clean.
+- 2026-10-30 review caching: completed reviews are stored in a bounded
+  in-session LRU cache (16 entries). The key covers every mainline node/FEN,
+  engine path and options, search limit, and the clamped book-prefix length;
+  incomplete reviews are never stored, and explicit **Restart review**
+  invalidates the matching entry. Covered by review-key and app cache tests.
+- Gate after review caching: `cargo test --all-targets` 191 lib + all suites
+  passed (1 ignored); `cargo clippy --all-targets -- -D warnings` clean;
+  `cargo fmt --all -- --check` clean.
