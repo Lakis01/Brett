@@ -25,7 +25,7 @@ use crate::fide;
 use crate::library::{GameLibrary, PgnLibrary};
 use crate::online::{self, ImportResult, OnlineSource};
 use crate::pgn;
-use crate::players::{self, PlayerBook, PlayerDirectory};
+use crate::players::{self, PlayerBook, PlayerDirectory, PlayerSummary};
 use crate::position::{
     self, BuildOptions, BuildProgress, PositionIndex, PositionStats, RatingFilter,
 };
@@ -303,6 +303,22 @@ struct ReviewBookMessage {
     book_plies: usize,
 }
 
+enum WikiMessage {
+    Done {
+        player_key: String,
+        result: Result<crate::wiki::Lookup, String>,
+    },
+}
+
+/// State of the Wikipedia card for the profile currently on screen.
+#[derive(Clone, Debug)]
+enum WikiState {
+    Idle,
+    Loading,
+    Ready(crate::wiki::Lookup),
+    Failed(String),
+}
+
 #[derive(Clone, Debug)]
 struct PrepSession {
     player_key: String,
@@ -512,6 +528,13 @@ pub struct App {
     players_status: String,
     player_filter: String,
     selected_player: Option<usize>,
+    /// Wikipedia summaries are fetched only for the opened profile.
+    wiki_enabled: bool,
+    wiki_cache: crate::wiki::Cache,
+    wiki_rx: Option<mpsc::Receiver<WikiMessage>>,
+    wiki_job: Option<String>,
+    wiki_for: Option<String>,
+    wiki_state: WikiState,
     player_book: Option<PlayerBook>,
     player_book_rx: Option<mpsc::Receiver<PlayerBookMessage>>,
     player_book_job: Option<String>,
@@ -682,6 +705,7 @@ pub struct App {
     settings_token: String,
     settings_token_visible: bool,
     settings_token_from_env: bool,
+    settings_wiki_enabled: bool,
     settings_status: String,
     textures: PieceTextures,
     ctx: egui::Context,
@@ -804,6 +828,12 @@ impl App {
             players_status: "No players indexed.".to_string(),
             player_filter: String::new(),
             selected_player: None,
+            wiki_enabled: cloud_prefs.wikipedia_summaries,
+            wiki_cache: crate::wiki::Cache::load(),
+            wiki_rx: None,
+            wiki_job: None,
+            wiki_for: None,
+            wiki_state: WikiState::Idle,
             player_book: None,
             player_book_rx: None,
             player_book_job: None,
@@ -955,6 +985,7 @@ impl App {
             settings_token: String::new(),
             settings_token_visible: false,
             settings_token_from_env: false,
+            settings_wiki_enabled: cloud_prefs.wikipedia_summaries,
             settings_status: String::new(),
             textures: PieceTextures::load(&cc.egui_ctx),
             ctx: cc.egui_ctx.clone(),
@@ -1382,6 +1413,7 @@ impl App {
         self.left_tab = LeftTab::Games;
         self.focus_right_tab(RightTab::Moves);
         self.selected_player = None;
+        self.reset_wiki();
         self.player_filter.clear();
         self.player_book = None;
         self.player_book_rx = None;
@@ -1442,6 +1474,7 @@ impl App {
         }
         self.players = PlayerDirectory::default();
         self.selected_player = None;
+        self.reset_wiki();
         self.players_job = Some(path.clone());
         self.players_status = format!("Indexing players in {}…", path.display());
         let (tx, rx) = mpsc::channel();
@@ -2814,6 +2847,7 @@ impl App {
         self.settings_champion_lineage = self.champion_lineage;
         self.settings_show_clocks = self.show_clocks;
         self.settings_engine_bar = self.engine_bar;
+        self.settings_wiki_enabled = self.wiki_enabled;
         self.settings_my_player_names = self.prep_player_names.join("\n");
         self.settings_correspondence_enabled = self.correspondence_enabled;
         self.settings_correspondence_path = if self.correspondence_path.trim().is_empty() {
@@ -2857,6 +2891,13 @@ impl App {
                     saved = false;
                 }
             }
+        }
+
+        let wiki_changed = self.wiki_enabled != self.settings_wiki_enabled;
+        self.wiki_enabled = self.settings_wiki_enabled;
+        if let Err(err) = CloudPrefs::save_wikipedia_summaries(self.wiki_enabled) {
+            self.settings_status = format!("Could not save the Wikipedia setting: {err:#}");
+            saved = false;
         }
 
         self.rating_priority = self.settings_rating_priority;
@@ -2924,6 +2965,17 @@ impl App {
 
         self.save_display_prefs();
         self.save_reference_prefs();
+        if wiki_changed {
+            if self.wiki_enabled {
+                if let Some(index) = self.selected_player
+                    && let Some(player) = self.players.get(index).cloned()
+                {
+                    self.open_wiki_for(&player);
+                }
+            } else {
+                self.reset_wiki();
+            }
+        }
         self.status = if saved {
             "Settings saved.".to_string()
         } else {
@@ -3812,6 +3864,166 @@ impl App {
         self.left_tab = LeftTab::Players;
         self.selected_player = Some(index);
         self.start_player_book(index);
+        self.open_wiki_for(&player);
+    }
+
+    /// Load the Wikipedia card for a profile. This is the only entry point
+    /// that may start a Wikipedia request: database installation and player
+    /// directory builds never call it.
+    fn open_wiki_for(&mut self, player: &PlayerSummary) {
+        if !self.wiki_enabled {
+            self.reset_wiki();
+            return;
+        }
+        if self.wiki_for.as_deref() == Some(player.key.as_str()) {
+            match &self.wiki_state {
+                WikiState::Loading | WikiState::Ready(_) => return,
+                WikiState::Idle | WikiState::Failed(_) => {}
+            }
+        }
+        if let Some(lookup) = self.wiki_cache.get(&player.name) {
+            self.wiki_rx = None;
+            self.wiki_job = None;
+            self.wiki_for = Some(player.key.clone());
+            self.wiki_state = WikiState::Ready(lookup);
+            return;
+        }
+        self.start_wiki_lookup(player);
+    }
+
+    fn start_wiki_lookup(&mut self, player: &PlayerSummary) {
+        if self.wiki_job.as_deref() == Some(player.key.as_str()) && self.wiki_rx.is_some() {
+            return;
+        }
+        let key = player.key.clone();
+        let name = player.name.clone();
+        let (tx, rx) = mpsc::channel();
+        let ctx = self.ctx.clone();
+        std::thread::spawn(move || {
+            let result = crate::wiki::lookup(&name);
+            let _ = tx.send(WikiMessage::Done {
+                player_key: key,
+                result,
+            });
+            ctx.request_repaint();
+        });
+        self.wiki_rx = Some(rx);
+        self.wiki_job = Some(player.key.clone());
+        self.wiki_for = Some(player.key.clone());
+        self.wiki_state = WikiState::Loading;
+    }
+
+    fn reset_wiki(&mut self) {
+        self.wiki_rx = None;
+        self.wiki_job = None;
+        self.wiki_for = None;
+        self.wiki_state = WikiState::Idle;
+    }
+
+    fn poll_wiki(&mut self) {
+        let Some(rx) = self.wiki_rx.as_ref() else {
+            return;
+        };
+        let message = match rx.try_recv() {
+            Ok(message) => message,
+            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.wiki_rx = None;
+                self.wiki_job = None;
+                if self.wiki_for.is_some() {
+                    self.wiki_state =
+                        WikiState::Failed("The Wikipedia lookup stopped unexpectedly.".to_string());
+                }
+                return;
+            }
+        };
+        self.wiki_rx = None;
+        self.wiki_job = None;
+        let WikiMessage::Done { player_key, result } = message;
+        let cache_changed = result.is_ok();
+        self.apply_wiki_result(player_key, result);
+        if cache_changed && let Err(err) = self.wiki_cache.save() {
+            tracing::warn!("could not save the Wikipedia cache: {err:#}");
+        }
+    }
+
+    fn apply_wiki_result(
+        &mut self,
+        player_key: String,
+        result: Result<crate::wiki::Lookup, String>,
+    ) {
+        if let Ok(lookup) = &result {
+            self.wiki_cache.insert(&player_key, lookup);
+        }
+        if self.wiki_for.as_deref() == Some(player_key.as_str()) {
+            self.wiki_state = match result {
+                Ok(lookup) => WikiState::Ready(lookup),
+                Err(err) => WikiState::Failed(err),
+            };
+        }
+    }
+
+    /// Short, attributed Wikipedia card shown between the profile statistics
+    /// and the preparation buttons.
+    fn wiki_summary_section(&mut self, ui: &mut Ui, player: &PlayerSummary) {
+        if !self.wiki_enabled {
+            ui.label(
+                RichText::new("Wikipedia summaries are disabled in Settings.")
+                    .small()
+                    .weak(),
+            );
+            return;
+        }
+        let mut retry = false;
+        match &self.wiki_state {
+            WikiState::Idle => {}
+            WikiState::Loading => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(RichText::new("Looking up Wikipedia…").small().weak());
+                });
+            }
+            WikiState::Ready(crate::wiki::Lookup::Summary(summary)) => {
+                ui.label(RichText::new(summary.excerpt(320)).small());
+                ui.horizontal_wrapped(|ui| {
+                    ui.hyperlink_to(
+                        RichText::new(format!("Wikipedia · {} ↗", summary.title)).small(),
+                        &summary.url,
+                    )
+                    .on_hover_text("Open the full article in your browser");
+                    ui.label(RichText::new("CC BY-SA 4.0").small().weak())
+                        .on_hover_text(
+                            "Summary text from Wikipedia, licensed CC BY-SA 4.0. Brett caches it locally and does not bundle Wikipedia content.",
+                        );
+                });
+            }
+            WikiState::Ready(crate::wiki::Lookup::Ambiguous { search_url }) => {
+                ui.label(
+                    RichText::new("No confident chess-player match on Wikipedia.")
+                        .small()
+                        .weak(),
+                );
+                ui.hyperlink_to(RichText::new("Search Wikipedia ↗").small(), search_url)
+                    .on_hover_text("The name may refer to a different person");
+            }
+            WikiState::Failed(err) => {
+                ui.label(
+                    RichText::new(format!("Wikipedia lookup failed: {err}"))
+                        .small()
+                        .color(Color32::from_rgb(0xE0, 0x8A, 0x7A)),
+                );
+                ui.horizontal_wrapped(|ui| {
+                    if ui.small_button("Retry").clicked() {
+                        retry = true;
+                    }
+                    let search = crate::wiki::search_url(&player.name);
+                    ui.hyperlink_to(RichText::new("Search Wikipedia ↗").small(), search);
+                });
+            }
+        }
+        if retry {
+            self.start_wiki_lookup(player);
+        }
     }
 
     /// Build a player's position book in the background.
@@ -5607,8 +5819,12 @@ impl App {
         };
         let Some(player) = self.players.get(index).cloned() else {
             self.selected_player = None;
+            self.reset_wiki();
             return;
         };
+        if self.wiki_enabled && self.wiki_for.as_deref() != Some(player.key.as_str()) {
+            self.open_wiki_for(&player);
+        }
         let ctx = ui.ctx().clone();
         let portrait = self.photo_texture(&ctx, &player.name);
         let champion = champions::champion(&player.name, self.champion_lineage);
@@ -5746,6 +5962,7 @@ impl App {
         if !detail.is_empty() {
             ui.label(RichText::new(detail.join(" · ")).weak().small());
         }
+        self.wiki_summary_section(ui, &player);
 
         ui.add_space(4.0);
         ui.horizontal(|ui| {
@@ -5953,6 +6170,7 @@ impl App {
                 exit = true;
             }
             self.selected_player = None;
+            self.reset_wiki();
             self.player_filter.clear();
         }
         if exit {
@@ -9920,6 +10138,24 @@ impl App {
                     );
                 }
 
+                ui.add_space(8.0);
+                ui.separator();
+                ui.heading("Player profiles");
+                ui.checkbox(
+                    &mut self.settings_wiki_enabled,
+                    "Load Wikipedia summaries when a player profile opens",
+                )
+                .on_hover_text(
+                    "Only the selected player is looked up. Opening a database or building the player list never contacts Wikipedia.",
+                );
+                ui.label(
+                    RichText::new(
+                        "Summaries come from Wikipedia, are cached locally, and are shown with CC BY-SA attribution. Brett does not bundle Wikipedia content.",
+                    )
+                    .small()
+                    .weak(),
+                );
+
                 if !self.settings_status.is_empty() {
                     ui.add_space(4.0);
                     ui.label(
@@ -10030,6 +10266,7 @@ impl eframe::App for App {
         self.poll_player_directory();
         self.poll_book();
         self.poll_player_book();
+        self.poll_wiki();
         self.poll_reference();
         self.poll_correspondence();
         self.poll_online();
@@ -14353,6 +14590,12 @@ mod tests {
             players_status: String::new(),
             player_filter: String::new(),
             selected_player: None,
+            wiki_enabled: true,
+            wiki_cache: crate::wiki::Cache::default(),
+            wiki_rx: None,
+            wiki_job: None,
+            wiki_for: None,
+            wiki_state: WikiState::Idle,
             player_book: None,
             player_book_rx: None,
             player_book_job: None,
@@ -14495,10 +14738,121 @@ mod tests {
             settings_token: String::new(),
             settings_token_visible: false,
             settings_token_from_env: false,
+            settings_wiki_enabled: true,
             settings_status: String::new(),
             textures: PieceTextures::load(&ctx),
             ctx,
         }
+    }
+
+    fn wiki_player(name: &str) -> PlayerSummary {
+        PlayerSummary {
+            name: name.to_string(),
+            key: players::player_key(name).unwrap(),
+            title: None,
+            fide_id: None,
+            white: players::PlayerRecord::default(),
+            black: players::PlayerRecord::default(),
+            elo_sum: 0,
+            elo_count: 0,
+            elo_max: 0,
+            opponent_elo_sum: 0,
+            opponent_elo_count: 0,
+            first_year: 0,
+            last_year: 0,
+            game_indices: Vec::new(),
+        }
+    }
+
+    fn wiki_summary(title: &str) -> crate::wiki::Summary {
+        crate::wiki::Summary {
+            title: title.to_string(),
+            description: "Norwegian chess grandmaster".to_string(),
+            extract: format!("{title} is a Norwegian chess grandmaster."),
+            url: format!("https://en.wikipedia.org/wiki/{}", title.replace(' ', "_")),
+        }
+    }
+
+    #[test]
+    fn wikipedia_summary_loads_from_the_cache_when_a_profile_opens() {
+        let mut app = test_app();
+        let player = wiki_player("Carlsen, Magnus");
+        app.wiki_cache.insert(
+            &player.name,
+            &crate::wiki::Lookup::Summary(wiki_summary("Magnus Carlsen")),
+        );
+        assert!(app.wiki_rx.is_none());
+        app.open_wiki_for(&player);
+        assert!(
+            app.wiki_rx.is_none(),
+            "a cache hit must not start a request"
+        );
+        assert_eq!(app.wiki_for.as_deref(), Some(player.key.as_str()));
+        let WikiState::Ready(crate::wiki::Lookup::Summary(summary)) = &app.wiki_state else {
+            panic!("expected the cached summary");
+        };
+        assert_eq!(summary.title, "Magnus Carlsen");
+    }
+
+    #[test]
+    fn wikipedia_summary_is_not_fetched_when_the_setting_is_off() {
+        let mut app = test_app();
+        app.wiki_enabled = false;
+        app.wiki_for = Some("stale".to_string());
+        app.wiki_state = WikiState::Failed("stale".to_string());
+        let player = wiki_player("Magnus Carlsen");
+        app.open_wiki_for(&player);
+        assert!(app.wiki_for.is_none());
+        assert!(matches!(app.wiki_state, WikiState::Idle));
+        assert!(app.wiki_rx.is_none());
+    }
+
+    #[test]
+    fn wikipedia_ambiguous_and_failed_results_are_handled() {
+        let mut app = test_app();
+        let player = wiki_player("Magnus Carlsen");
+        app.wiki_for = Some(player.key.clone());
+        app.wiki_state = WikiState::Loading;
+
+        let ambiguous = crate::wiki::Lookup::Ambiguous {
+            search_url: crate::wiki::search_url(&player.name),
+        };
+        app.apply_wiki_result(player.key.clone(), Ok(ambiguous.clone()));
+        let WikiState::Ready(crate::wiki::Lookup::Ambiguous { search_url }) = &app.wiki_state
+        else {
+            panic!("expected a search link");
+        };
+        assert!(search_url.contains("Magnus%20Carlsen"));
+        assert_eq!(app.wiki_cache.get(&player.name), Some(ambiguous));
+
+        app.apply_wiki_result(player.key.clone(), Err("offline".to_string()));
+        let WikiState::Failed(err) = &app.wiki_state else {
+            panic!("expected a failure");
+        };
+        assert!(err.contains("offline"));
+    }
+
+    #[test]
+    fn wikipedia_state_follows_the_selected_profile() {
+        let mut app = test_app();
+        let first = wiki_player("Magnus Carlsen");
+        let second = wiki_player("Judit Polgar");
+        app.wiki_cache.insert(
+            &first.name,
+            &crate::wiki::Lookup::Summary(wiki_summary("Magnus Carlsen")),
+        );
+        app.wiki_cache.insert(
+            &second.name,
+            &crate::wiki::Lookup::Summary(wiki_summary("Judit Polgár")),
+        );
+        app.open_wiki_for(&first);
+        assert_eq!(app.wiki_for.as_deref(), Some(first.key.as_str()));
+        app.open_wiki_for(&second);
+        assert_eq!(app.wiki_for.as_deref(), Some(second.key.as_str()));
+        let WikiState::Ready(crate::wiki::Lookup::Summary(summary)) = &app.wiki_state else {
+            panic!("expected the second player's summary");
+        };
+        assert_eq!(summary.title, "Judit Polgár");
     }
 
     #[test]

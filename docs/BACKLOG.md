@@ -38,9 +38,11 @@ clock and evaluation-bar toggles live in Settings.
 - **Item 20 (ECO):** use the CC0 `lichess-org/chess-openings` dataset; classify
   by replaying the game and keeping the deepest named position; write `ECO` and
   `Opening` from that match.
-- **Item 21 (Wikipedia):** fetch an introductory summary on demand, cache it
-  locally, show attribution and an article link; auto-display only when the
-  match is confidently a chess player, otherwise offer a search link.
+- **Item 21 (Wikipedia):** load an introductory summary automatically when a
+  player profile is clicked or opened, never when a database is opened. Cache
+  it locally, show attribution and an article link, and add a Settings toggle
+  (default on) to disable the lookup. Auto-display only when the match is
+  confidently a chess player; otherwise offer a labelled search link.
 - **Item 16 (FIDE):** when a real FIDE ID is present, link from the player
   profile to `https://ratings.fide.com/profile/{id}`; never construct a link
   without a real ID.
@@ -797,7 +799,9 @@ filtering, preparation, and opening reports.
 
 ## 21. Wikipedia player summaries
 
-**Status:** planned; one UX decision remains open.
+**Status:** implemented in `src/wiki.rs` and the player profile. Summaries load
+automatically when a profile opens; opening a database or building the player
+directory never contacts Wikipedia. The Settings toggle defaults to on.
 
 **Goal:** show a short introductory Wikipedia summary in the player profile
 beside the photo, similar to Navidrome's MusicBrainz artist biography, without
@@ -818,13 +822,19 @@ shipping or redistributing Wikipedia content.
   summary must not push the photo or the game record out of the profile.
 - Add a setting to disable network lookups. Never fetch during bulk import or
   for every player in a large database; fetch only for the selected profile.
-- **Open UX question:** should a confidently matched player fetch the summary
-  automatically when the profile opens (with a loading state and cache), or
-  should the profile show a **Show Wikipedia summary** button? Recommendation:
-  auto-fetch only for confident matches, with a setting to turn it off; use
-  click-to-load for ambiguous matches. Resolve this before implementation.
+- **Resolved UX:** clicking or opening a player profile starts the lookup
+  automatically, showing a spinner while it runs. A confident chess-player match
+  displays a short excerpt with a Wikipedia article link and CC BY-SA 4.0
+  attribution. An ambiguous name shows a clearly labelled **Search Wikipedia**
+  link instead of a possibly wrong biography. A network failure shows the error,
+  a retry button, and a search link. The Settings **Player profiles** toggle can
+  disable the automatic lookup; the profile then shows a muted disabled notice.
+- The cache is keyed by resolved article title, remembers ambiguous names, and
+  is bounded to 256 entries per kind. `Last, First` PGN names are reordered to
+  `First Last` for the search API and search page.
 - Add tests for confident match, ambiguous match, no network, cached response,
-  HTML/entity cleanup, and attribution/link rendering.
+  HTML/entity cleanup, attribution/link rendering, disabled lookups, and profile
+  switching.
 
 **Depends on:** `src/players.rs`, `src/app.rs`, the profile/photo layout, and the
 existing `ureq` HTTP client. **Related:** item 16 (FIDE profile link) and item

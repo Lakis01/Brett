@@ -30,3 +30,4 @@ pub mod session;
 pub mod settings;
 pub mod titles;
 pub mod ui;
+pub mod wiki;

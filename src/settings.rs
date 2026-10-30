@@ -699,7 +699,7 @@ impl DisplayPrefs {
 /// additional scopes is enough. The environment variable
 /// `BRETT_LICHESS_TOKEN` takes precedence, which keeps the token out of the
 /// config file for users who prefer that.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CloudPrefs {
     pub lichess_token: Option<String>,
     pub explorer_source: crate::cloud::ExplorerSource,
@@ -708,6 +708,22 @@ pub struct CloudPrefs {
     /// Optional default Chess.com account for the online-reference card.
     /// Public Chess.com game data does not require a password.
     pub chesscom_username: Option<String>,
+    /// Fetch a Wikipedia summary when a player profile is opened. This is the
+    /// only place Brett requests Wikipedia content; database indexing and
+    /// player lists never do.
+    pub wikipedia_summaries: bool,
+}
+
+impl Default for CloudPrefs {
+    fn default() -> Self {
+        Self {
+            lichess_token: None,
+            explorer_source: crate::cloud::ExplorerSource::default(),
+            lichess_username: None,
+            chesscom_username: None,
+            wikipedia_summaries: true,
+        }
+    }
 }
 
 impl CloudPrefs {
@@ -737,6 +753,10 @@ impl CloudPrefs {
             explorer_source,
             lichess_username: username("lichess_username"),
             chesscom_username: username("chesscom_username"),
+            wikipedia_summaries: value
+                .get("wikipedia_summaries")
+                .and_then(Value::as_bool)
+                .unwrap_or(true),
         }
     }
 
@@ -746,6 +766,7 @@ impl CloudPrefs {
             "explorer_source": self.explorer_source.config_value(),
             "lichess_username": self.lichess_username,
             "chesscom_username": self.chesscom_username,
+            "wikipedia_summaries": self.wikipedia_summaries,
         }))
         .unwrap_or_default()
     }
@@ -772,6 +793,22 @@ impl CloudPrefs {
             Err(err) => return Err(err).with_context(|| format!("reading {}", path.display())),
         };
         prefs.explorer_source = source;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+        }
+        fs::write(&path, prefs.to_json()).with_context(|| format!("writing {}", path.display()))
+    }
+
+    /// Persist only the Wikipedia-summary choice, leaving credentials and the
+    /// explorer choice untouched.
+    pub fn save_wikipedia_summaries(enabled: bool) -> Result<()> {
+        let path = cloud_path().context("no XDG config or HOME directory is available")?;
+        let mut prefs = match fs::read_to_string(&path) {
+            Ok(text) => Self::from_json(&text),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Self::default(),
+            Err(err) => return Err(err).with_context(|| format!("reading {}", path.display())),
+        };
+        prefs.wikipedia_summaries = enabled;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
         }
@@ -895,8 +932,12 @@ mod tests {
             explorer_source: crate::cloud::ExplorerSource::Lichess,
             lichess_username: Some("DrNykterstein".to_string()),
             chesscom_username: Some("MagnusCarlsen".to_string()),
+            wikipedia_summaries: false,
         };
         assert_eq!(CloudPrefs::from_json(&prefs.to_json()), prefs);
+        assert!(CloudPrefs::default().wikipedia_summaries);
+        assert!(!CloudPrefs::from_json(r#"{"wikipedia_summaries":false}"#).wikipedia_summaries);
+        assert!(CloudPrefs::from_json("{}").wikipedia_summaries);
 
         let parsed = CloudPrefs::from_json(r#"{"lichess_token":"  lip_trim  "}"#);
         assert_eq!(parsed.lichess_token.as_deref(), Some("lip_trim"));
