@@ -15,6 +15,7 @@ pub mod eco;
 pub mod engine;
 pub mod eval;
 pub mod evaluation;
+pub mod fide;
 pub mod library;
 pub mod online;
 pub mod pgn;

@@ -600,7 +600,13 @@ across preparation and game browsing.
 
 ## 16. FIDE ID presentation
 
-**Status:** planned.
+**Status:** implemented (2026-10-30). `src/fide.rs` validates numeric
+`WhiteFideId`/`BlackFideId` tags, `PlayerSummary` aggregates the first real ID,
+and a muted `· 1503014` suffix appears in the board strips, game lists, player
+directory, preparation, ChessABC/online previews, and database views. The
+player profile shows a small **FIDE 1503014 ↗** link to
+`https://ratings.fide.com/profile/{id}` only for numeric IDs. Raw tags are
+never rewritten and no ID is inferred from a name or rating.
 
 - Find a pretty, compact way to show a player's FIDE ID beside their name when
   the database or import provides a `WhiteFideId`/`BlackFideId` tag.

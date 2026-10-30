@@ -21,6 +21,7 @@ use crate::chess::{Color, UciMove};
 use anyhow::Result;
 
 use crate::domain::Game;
+use crate::fide;
 use crate::library::GameLibrary;
 #[cfg(test)]
 use crate::library::PgnLibrary;
@@ -76,6 +77,9 @@ pub struct PlayerSummary {
     /// Strongest recognized title seen in this player's games. The raw tags
     /// stay untouched; this is only a display aggregate.
     pub title: Option<PlayerTitle>,
+    /// First real numeric `WhiteFideId`/`BlackFideId` seen in this player's
+    /// games. The raw tag stays untouched; this is only a display aggregate.
+    pub fide_id: Option<String>,
     pub white: PlayerRecord,
     pub black: PlayerRecord,
     pub elo_sum: u64,
@@ -164,6 +168,7 @@ impl PlayerDirectory {
                     name: game.white().to_string(),
                     key: key.clone(),
                     title: None,
+                    fide_id: None,
                     white: PlayerRecord::default(),
                     black: PlayerRecord::default(),
                     elo_sum: 0,
@@ -189,6 +194,7 @@ impl PlayerDirectory {
                     name: game.black().to_string(),
                     key: key.clone(),
                     title: None,
+                    fide_id: None,
                     white: PlayerRecord::default(),
                     black: PlayerRecord::default(),
                     elo_sum: 0,
@@ -254,9 +260,9 @@ fn add_game(
     index: usize,
     self_play_other: Option<Color>,
 ) {
-    let (own_elo_tag, opponent_elo_tag, own_title_tag) = match color {
-        Color::White => ("WhiteElo", "BlackElo", "WhiteTitle"),
-        Color::Black => ("BlackElo", "WhiteElo", "BlackTitle"),
+    let (own_elo_tag, opponent_elo_tag, own_title_tag, own_fide_tag) = match color {
+        Color::White => ("WhiteElo", "BlackElo", "WhiteTitle", "WhiteFideId"),
+        Color::Black => ("BlackElo", "WhiteElo", "BlackTitle", "BlackFideId"),
     };
     if let Some(title) = game.header(own_title_tag).and_then(titles::normalize)
         && summary
@@ -264,6 +270,11 @@ fn add_game(
             .is_none_or(|current| title.rank() > current.rank())
     {
         summary.title = Some(title);
+    }
+    if summary.fide_id.is_none()
+        && let Some(id) = fide::from_tag(game.header(own_fide_tag))
+    {
+        summary.fide_id = Some(id.to_string());
     }
     let own_elo = game.header(own_elo_tag).and_then(parse_elo);
     let opponent_elo = game.header(opponent_elo_tag).and_then(parse_elo);
@@ -1205,6 +1216,58 @@ mod tests {
             .get(directory.find_key("richard roe").unwrap())
             .unwrap();
         assert_eq!(richard.title, None, "a rating is not a title");
+
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn directory_keeps_a_real_numeric_fide_id() {
+        const FIDE_GAMES: &str = r#"[Event "FIDE"]
+[Site "Test"]
+[Date "2024.01.01"]
+[White "Carlsen, Magnus"]
+[WhiteFideId " 1503014 "]
+[Black "Doe, Jane"]
+[BlackFideId "not-an-id"]
+[Result "1-0"]
+
+1. e4 e5 1-0
+
+[Event "FIDE"]
+[Site "Test"]
+[Date "2024.02.01"]
+[White "Carlsen, Magnus"]
+[WhiteFideId "1503015"]
+[Black "Roe, Richard"]
+[Result "1/2-1/2"]
+
+1. d4 d5 1/2-1/2
+"#;
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "brett-fide-{}-{}.pgn",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, FIDE_GAMES).unwrap();
+        let library = PgnLibrary::build(&path).unwrap();
+        let directory = PlayerDirectory::build(&library);
+
+        let magnus = directory
+            .get(directory.find_key("carlsen magnus").unwrap())
+            .unwrap();
+        assert_eq!(magnus.fide_id.as_deref(), Some("1503014"));
+        let jane = directory
+            .get(directory.find_key("doe jane").unwrap())
+            .unwrap();
+        assert_eq!(jane.fide_id, None, "a non-numeric value is not a FIDE id");
+        let richard = directory
+            .get(directory.find_key("richard roe").unwrap())
+            .unwrap();
+        assert_eq!(richard.fide_id, None, "no id is inferred from a name");
 
         std::fs::remove_file(path).unwrap();
     }

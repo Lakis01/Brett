@@ -21,6 +21,7 @@ use crate::cloud;
 use crate::domain::{self, Clock, Game, Token};
 use crate::engine::{EngineEvent, EngineHandle, EngineInfo, EngineOptions, Score, SearchLimit};
 use crate::eval::{self, BoardEval};
+use crate::fide;
 use crate::library::{GameLibrary, PgnLibrary};
 use crate::online::{self, ImportResult, OnlineSource};
 use crate::pgn;
@@ -94,6 +95,7 @@ fn read_only_roots() -> Vec<PathBuf> {
 struct PlayerBadge {
     name: String,
     title: Option<String>,
+    fide_id: Option<String>,
     rating: Option<String>,
     team: Option<String>,
     clock: Option<Clock>,
@@ -304,6 +306,7 @@ struct PrepSession {
     player_key: String,
     player_name: String,
     player_title: Option<titles::PlayerTitle>,
+    player_fide_id: Option<String>,
     our_color: Color,
     previous_game: Option<usize>,
     previous_orientation: Color,
@@ -358,6 +361,8 @@ struct PrepRecentRow {
     black: String,
     white_title: Option<&'static str>,
     black_title: Option<&'static str>,
+    white_fide_id: Option<String>,
+    black_fide_id: Option<String>,
     subtitle: String,
 }
 
@@ -3876,6 +3881,17 @@ impl App {
                 title.short().to_string(),
             ));
         }
+        if let Some(id) = &player.fide_id {
+            headers.push((
+                if as_white {
+                    "WhiteFideId"
+                } else {
+                    "BlackFideId"
+                }
+                .to_string(),
+                id.clone(),
+            ));
+        }
         let game = Game {
             headers,
             ..Game::default()
@@ -3893,6 +3909,7 @@ impl App {
             player_key: player.key.clone(),
             player_name: display_name.clone(),
             player_title: player.title,
+            player_fide_id: player.fide_id.clone(),
             our_color,
             previous_game,
             previous_orientation,
@@ -5309,7 +5326,8 @@ impl App {
                                     };
                                     (
                                         "vs ",
-                                        RowName::new(opponent, player_title(game, opponent_color)),
+                                        RowName::new(opponent, player_title(game, opponent_color))
+                                            .with_fide_id(player_fide_id(game, opponent_color)),
                                         None,
                                         format!(" · as {color}"),
                                         format!(
@@ -5325,11 +5343,15 @@ impl App {
                                         RowName::new(
                                             game.white(),
                                             player_title(game, Color::White),
+                                        )
+                                        .with_fide_id(player_fide_id(game, Color::White)),
+                                        Some(
+                                            RowName::new(
+                                                game.black(),
+                                                player_title(game, Color::Black),
+                                            )
+                                            .with_fide_id(player_fide_id(game, Color::Black)),
                                         ),
-                                        Some(RowName::new(
-                                            game.black(),
-                                            player_title(game, Color::Black),
-                                        )),
                                         String::new(),
                                         format!("{} · {}", game.result(), game.date()),
                                     )
@@ -5404,6 +5426,8 @@ impl App {
                     };
                     let white_title = title_from_tag(slot.header("WhiteTitle"));
                     let black_title = title_from_tag(slot.header("BlackTitle"));
+                    let white_fide_id = player_fide_id_from_header(slot.header("WhiteFideId"));
+                    let black_fide_id = player_fide_id_from_header(slot.header("BlackFideId"));
                     let subtitle = format!("{} · {}", slot.event(), slot.date());
                     let selected = self.current_slot == Some(id) && self.prep.is_none();
                     let width = ui.available_width();
@@ -5411,8 +5435,12 @@ impl App {
                         ui,
                         selected,
                         "",
-                        RowName::new(slot.white(), white_title),
-                        Some(RowName::new(slot.black(), black_title)),
+                        RowName::new(slot.white(), white_title)
+                            .with_fide_id(white_fide_id.as_deref()),
+                        Some(
+                            RowName::new(slot.black(), black_title)
+                                .with_fide_id(black_fide_id.as_deref()),
+                        ),
                         "",
                         &subtitle,
                         width,
@@ -5574,6 +5602,12 @@ impl App {
                     .on_hover_text("Title from the database or imported PGN");
             }
             ui.heading(&player.name);
+            if let Some(id) = player.fide_id.as_deref()
+                && let Some(url) = fide::profile_url(id)
+            {
+                ui.hyperlink_to(RichText::new(format!("FIDE {id} ↗")).small().weak(), url)
+                    .on_hover_text("Open this player's FIDE rating profile in your browser");
+            }
             if let Some(champion) = champion {
                 ui.label(RichText::new("👑").size(20.0).color(GOLD))
                     .on_hover_text(champion.tooltip());
@@ -5807,6 +5841,11 @@ impl App {
                             Color::White => "WhiteTitle",
                             Color::Black => "BlackTitle",
                         }));
+                        let opponent_fide_id =
+                            player_fide_id_from_header(entry.header(match opponent_color {
+                                Color::White => "WhiteFideId",
+                                Color::Black => "BlackFideId",
+                            }));
                         let suffix = format!(" · as {color}");
                         let subtitle =
                             format!("{} · {} · {}", entry.result(), entry.event(), entry.date());
@@ -5820,7 +5859,8 @@ impl App {
                             ui,
                             selected,
                             "vs ",
-                            RowName::new(opponent, opponent_title),
+                            RowName::new(opponent, opponent_title)
+                                .with_fide_id(opponent_fide_id.as_deref()),
                             None,
                             &suffix,
                             &subtitle,
@@ -5903,6 +5943,7 @@ impl App {
                     let name = player.name.clone();
                     let key = player.key.clone();
                     let player_title = player.title.map(titles::PlayerTitle::short);
+                    let player_fide_id = player.fide_id.clone();
                     let is_you = you_key.as_deref() == Some(key.as_str());
                     let title = if is_you {
                         "You".to_string()
@@ -5933,6 +5974,7 @@ impl App {
                         selected,
                         &title,
                         player_title,
+                        player_fide_id.as_deref(),
                         &subtitle,
                         width,
                         photo.as_ref(),
@@ -7976,6 +8018,8 @@ impl App {
                     black: indexed.black().to_string(),
                     white_title: title_from_tag(indexed.header("WhiteTitle")),
                     black_title: title_from_tag(indexed.header("BlackTitle")),
+                    white_fide_id: player_fide_id_from_header(indexed.header("WhiteFideId")),
+                    black_fide_id: player_fide_id_from_header(indexed.header("BlackFideId")),
                     subtitle: format!(
                         "{} · as {} · {} · {}",
                         short_date(game.date),
@@ -8004,6 +8048,10 @@ impl App {
                 ui.label(RichText::new(title.short()).small().strong().color(GOLD));
             }
             ui.label(RichText::new(&prep.player_name).weak());
+            if let Some(id) = &prep.player_fide_id {
+                ui.label(RichText::new(format!("· {id}")).small().weak())
+                    .on_hover_text(format!("FIDE ID {id}"));
+            }
             ui.label(
                 RichText::new(format!(
                     "· You play {} · board from {}",
@@ -8433,8 +8481,12 @@ impl App {
                                     ui,
                                     false,
                                     "",
-                                    RowName::new(&row.white, row.white_title),
-                                    Some(RowName::new(&row.black, row.black_title)),
+                                    RowName::new(&row.white, row.white_title)
+                                        .with_fide_id(row.white_fide_id.as_deref()),
+                                    Some(
+                                        RowName::new(&row.black, row.black_title)
+                                            .with_fide_id(row.black_fide_id.as_deref()),
+                                    ),
                                     "",
                                     &row.subtitle,
                                     width,
@@ -8507,11 +8559,15 @@ impl App {
                                     RowName::new(
                                         game.white(),
                                         player_title(game, Color::White),
+                                    )
+                                    .with_fide_id(player_fide_id(game, Color::White)),
+                                    Some(
+                                        RowName::new(
+                                            game.black(),
+                                            player_title(game, Color::Black),
+                                        )
+                                        .with_fide_id(player_fide_id(game, Color::Black)),
                                     ),
-                                    Some(RowName::new(
-                                        game.black(),
-                                        player_title(game, Color::Black),
-                                    )),
                                     "",
                                     subtitle,
                                     width,
@@ -9028,6 +9084,12 @@ impl App {
                                                 title_from_tag(slot.header("WhiteTitle"));
                                             let black_title =
                                                 title_from_tag(slot.header("BlackTitle"));
+                                            let white_fide_id = player_fide_id_from_header(
+                                                slot.header("WhiteFideId"),
+                                            );
+                                            let black_fide_id = player_fide_id_from_header(
+                                                slot.header("BlackFideId"),
+                                            );
                                             let subtitle =
                                                 format!("{} · {}", slot.event(), slot.date());
                                             let width = ui.available_width();
@@ -9035,8 +9097,12 @@ impl App {
                                                 ui,
                                                 false,
                                                 "",
-                                                RowName::new(slot.white(), white_title),
-                                                Some(RowName::new(slot.black(), black_title)),
+                                                RowName::new(slot.white(), white_title)
+                                                    .with_fide_id(white_fide_id.as_deref()),
+                                                Some(
+                                                    RowName::new(slot.black(), black_title)
+                                                        .with_fide_id(black_fide_id.as_deref()),
+                                                ),
                                                 "",
                                                 &subtitle,
                                                 width,
@@ -9990,6 +10056,7 @@ impl eframe::App for App {
                             game.black().to_string()
                         },
                         title: player_title(game, color).map(str::to_string),
+                        fide_id: player_fide_id(game, color).map(str::to_string),
                         rating: player_rating(
                             game,
                             color,
@@ -10216,6 +10283,15 @@ fn player_strip(
             ..Default::default()
         },
     );
+    if let Some(id) = &player.fide_id {
+        let format = TextFormat {
+            font_id: FontId::proportional(11.0),
+            color: Color32::from_gray(150),
+            ..Default::default()
+        };
+        label.append(" · ", 0.0, format.clone());
+        label.append(id, 0.0, format);
+    }
     if champion.is_some() {
         label.append(
             " 👑",
@@ -10314,7 +10390,7 @@ fn player_strip(
 
     if !crown_hovered {
         response.on_hover_text(format!(
-            "{} · {}{} · {}",
+            "{} · {}{}{} · {}",
             color_name(player.color),
             player
                 .title
@@ -10322,6 +10398,11 @@ fn player_strip(
                 .map(|title| format!("{title} "))
                 .unwrap_or_default(),
             player.name,
+            player
+                .fide_id
+                .as_deref()
+                .map(|id| format!(" · FIDE {id}"))
+                .unwrap_or_default(),
             player.rating.as_deref().unwrap_or("no rating")
         ));
     }
@@ -11672,6 +11753,7 @@ fn game_header_card(
                 ui,
                 game.white(),
                 player_title(game, Color::White),
+                player_fide_id(game, Color::White),
                 player_rating(game, Color::White, priority, show_all_ratings),
                 team_for(game, Color::White),
                 Color::White,
@@ -11681,6 +11763,7 @@ fn game_header_card(
                 ui,
                 game.black(),
                 player_title(game, Color::Black),
+                player_fide_id(game, Color::Black),
                 player_rating(game, Color::Black, priority, show_all_ratings),
                 team_for(game, Color::Black),
                 Color::Black,
@@ -11728,6 +11811,7 @@ fn header_player_row(
     ui: &mut Ui,
     name: &str,
     title: Option<&str>,
+    fide_id: Option<&str>,
     rating: Option<String>,
     team: Option<&str>,
     color: Color,
@@ -11776,6 +11860,15 @@ fn header_player_row(
                     ..Default::default()
                 },
             );
+            if let Some(id) = fide_id {
+                let format = TextFormat {
+                    font_id: FontId::proportional(10.5),
+                    color: Color32::from_gray(150),
+                    ..Default::default()
+                };
+                label.append(" · ", 0.0, format.clone());
+                label.append(id, 0.0, format);
+            }
             ui.allocate_ui_with_layout(
                 vec2(width, 21.0),
                 Layout::left_to_right(Align::Center),
@@ -11816,6 +11909,17 @@ fn player_title(game: &Game, color: Color) -> Option<&'static str> {
     title_from_tag(game.header(match color {
         Color::White => "WhiteTitle",
         Color::Black => "BlackTitle",
+    }))
+}
+
+fn player_fide_id_from_header(raw: Option<&str>) -> Option<String> {
+    fide::from_tag(raw).map(str::to_string)
+}
+
+fn player_fide_id(game: &Game, color: Color) -> Option<&str> {
+    fide::from_tag(game.header(match color {
+        Color::White => "WhiteFideId",
+        Color::Black => "BlackFideId",
     }))
 }
 
@@ -12544,6 +12648,7 @@ fn player_row(
     selected: bool,
     name: &str,
     title: Option<&str>,
+    fide_id: Option<&str>,
     subtitle: &str,
     width: f32,
     photo: Option<&egui::TextureHandle>,
@@ -12599,7 +12704,20 @@ fn player_row(
         color: GOLD,
         ..Default::default()
     };
-    append_player_name(&mut job, name, title, &title_format, &name_format);
+    let fide_format = TextFormat {
+        font_id: FontId::proportional(10.5),
+        color: visuals.weak_text_color(),
+        ..Default::default()
+    };
+    append_player_name(
+        &mut job,
+        name,
+        title,
+        fide_id,
+        &title_format,
+        &name_format,
+        &fide_format,
+    );
     if champion.is_some() {
         job.append(
             " 👑",
@@ -12640,11 +12758,21 @@ fn player_row(
 struct RowName<'a> {
     name: &'a str,
     title: Option<&'a str>,
+    fide_id: Option<&'a str>,
 }
 
 impl<'a> RowName<'a> {
     fn new(name: &'a str, title: Option<&'a str>) -> Self {
-        Self { name, title }
+        Self {
+            name,
+            title,
+            fide_id: None,
+        }
+    }
+
+    fn with_fide_id(mut self, fide_id: Option<&'a str>) -> Self {
+        self.fide_id = fide_id;
+        self
     }
 }
 
@@ -12652,14 +12780,20 @@ fn append_player_name(
     job: &mut LayoutJob,
     name: &str,
     title: Option<&str>,
+    fide_id: Option<&str>,
     title_format: &TextFormat,
     name_format: &TextFormat,
+    fide_format: &TextFormat,
 ) {
     if let Some(title) = title {
         job.append(title, 0.0, title_format.clone());
         job.append(" ", 0.0, name_format.clone());
     }
     job.append(name, 0.0, name_format.clone());
+    if let Some(id) = fide_id {
+        job.append(" · ", 0.0, fide_format.clone());
+        job.append(id, 0.0, fide_format.clone());
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -12701,6 +12835,11 @@ fn game_row(
         color: visuals.weak_text_color(),
         ..Default::default()
     };
+    let fide_format = TextFormat {
+        font_id: FontId::proportional(10.5),
+        color: visuals.weak_text_color(),
+        ..Default::default()
+    };
     let mut job = LayoutJob::default();
     if !prefix.is_empty() {
         job.append(prefix, 0.0, name_format.clone());
@@ -12709,8 +12848,10 @@ fn game_row(
         &mut job,
         white.name,
         white.title,
+        white.fide_id,
         &title_format,
         &name_format,
+        &fide_format,
     );
     if let Some(black) = black {
         job.append(" – ", 0.0, weak_format);
@@ -12718,8 +12859,10 @@ fn game_row(
             &mut job,
             black.name,
             black.title,
+            black.fide_id,
             &title_format,
             &name_format,
+            &fide_format,
         );
     }
     if !suffix.is_empty() {
@@ -13997,6 +14140,20 @@ mod tests {
     }
 
     #[test]
+    fn player_fide_id_reads_numeric_tags_without_rewriting_them() {
+        let pgn = b"[Event \"FIDE\"]\n[White \"A\"]\n[WhiteFideId \" 1503014 \"]\n[Black \"B\"]\n[BlackFideId \"not-an-id\"]\n[Result \"*\"]\n\n*\n";
+        let mut games = domain::parse_pgn(&pgn[..]).unwrap();
+        let game = games.remove(0);
+        assert_eq!(player_fide_id(&game, Color::White), Some("1503014"));
+        assert_eq!(
+            game.header("WhiteFideId"),
+            Some(" 1503014 "),
+            "display decoding must not rewrite the stored tag"
+        );
+        assert_eq!(player_fide_id(&game, Color::Black), None);
+    }
+
+    #[test]
     fn row_title_is_a_compact_prefix_before_the_name() {
         let name_format = TextFormat {
             font_id: FontId::proportional(14.0),
@@ -14008,14 +14165,21 @@ mod tests {
             color: GOLD,
             ..Default::default()
         };
+        let fide_format = TextFormat {
+            font_id: FontId::proportional(10.5),
+            color: Color32::from_gray(150),
+            ..Default::default()
+        };
 
         let mut job = LayoutJob::default();
         append_player_name(
             &mut job,
             "Kasparov, Garry",
             Some("GM"),
+            None,
             &title_format,
             &name_format,
+            &fide_format,
         );
         assert_eq!(job.text, "GM Kasparov, Garry");
         assert_eq!(job.sections[0].format.color, GOLD);
@@ -14026,11 +14190,47 @@ mod tests {
             &mut plain,
             "Kasparov, Garry",
             None,
+            None,
             &title_format,
             &name_format,
+            &fide_format,
         );
         assert_eq!(plain.text, "Kasparov, Garry");
         assert_eq!(plain.sections.len(), 1);
+    }
+
+    #[test]
+    fn row_fide_id_is_a_muted_suffix_after_the_name() {
+        let name_format = TextFormat {
+            font_id: FontId::proportional(14.0),
+            color: Color32::WHITE,
+            ..Default::default()
+        };
+        let title_format = TextFormat {
+            font_id: FontId::proportional(10.5),
+            color: GOLD,
+            ..Default::default()
+        };
+        let fide_format = TextFormat {
+            font_id: FontId::proportional(10.5),
+            color: Color32::from_gray(150),
+            ..Default::default()
+        };
+
+        let mut job = LayoutJob::default();
+        append_player_name(
+            &mut job,
+            "Carlsen, Magnus",
+            Some("GM"),
+            Some("1503014"),
+            &title_format,
+            &name_format,
+            &fide_format,
+        );
+        assert_eq!(job.text, "GM Carlsen, Magnus · 1503014");
+        let suffix = job.sections.last().unwrap();
+        assert_eq!(suffix.format.color, Color32::from_gray(150));
+        assert_eq!(suffix.format.font_id.size, 10.5);
     }
 
     fn test_app() -> App {
@@ -14982,6 +15182,7 @@ mod tests {
             player_key: "opponent".to_string(),
             player_name: "Opponent".to_string(),
             player_title: None,
+            player_fide_id: None,
             our_color: Color::White,
             previous_game: None,
             previous_orientation: Color::White,
@@ -15028,6 +15229,7 @@ mod tests {
             player_key: "opponent".to_string(),
             player_name: "Opponent".to_string(),
             player_title: None,
+            player_fide_id: None,
             our_color: Color::White,
             previous_game: None,
             previous_orientation: Color::White,
