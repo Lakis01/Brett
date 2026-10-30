@@ -23,7 +23,7 @@ moves-panel display remain. Items
 20 and 21 add native ECO classification and Wikipedia player summaries; item 16
 now includes the FIDE-profile link. Item 22 records the player clock-usage
 analysis idea for the player profile/preparation view. Item 23 adds the
-clickable Site → OpenStreetMap search (provider choice remains open); item 24
+clickable Site → OpenStreetMap search (settled provider); item 24
 records the Open-vs-Load audit: the bottom bar is reduced to a single **Open…**
 picker, and the Tree-tab path rows are read-only labels with **Choose…**,
 **Clear**, and **Current DB**. Clocks are now shown by default and both the
@@ -80,9 +80,11 @@ clock and evaluation-bar toggles live in Settings.
   runs out of width. Never shorten just because a compact form exists.
 - **Forced vs only move:** keep them distinct. NAG 7 stays `□`; NAG 8 now
   renders `◇`.
-- **Site map search:** the clickable Site label now opens an OpenStreetMap
-  search with the URL-encoded value. Final provider choice remains open
-  (item 23).
+- **Site map search:** the clickable Site label opens an OpenStreetMap search
+  with the URL-encoded value. OpenStreetMap is the settled provider: it needs
+  no API key, uses open data, and avoids Google Maps Platform terms. Google
+  Maps was rejected because it is less privacy-preserving. Add a provider
+  setting only if users ask for both (item 23).
 - **Open vs Load:** the bottom bar now has only **Open…**; the typed-path
   field and **Load** button were removed. The Tree-tab opening-book and
   opening-tree rows are now read-only path labels with **Choose…**, **Clear**,
@@ -871,8 +873,7 @@ game plan.
 
 ## 23. Clickable Site → map search
 
-**Status:** OpenStreetMap link implemented 2026-10-29; the provider choice
-remains open.
+**Status:** implemented 2026-10-29 with OpenStreetMap as the settled provider.
 
 **Goal:** clicking the Site field in the PGN tags card opens a map search with
 the Site value, so a tournament venue can be located without copying the text.
@@ -881,12 +882,12 @@ the Site value, so a tournament venue can be located without copying the text.
   the click target; do not turn the text field itself into a link.
 - URL-encode the trimmed value and ignore empty or placeholder values (`""`,
   `"?"`). Never guess a location.
-- **Open decision — provider:** OpenStreetMap or Google Maps. Recommendation:
-  OpenStreetMap (`https://www.openstreetmap.org/search?query=…`) because it
-  needs no API key, uses open data, and avoids Google Maps Platform terms.
-  Google’s plain `https://www.google.com/maps/search/?api=1&query=…` URL also
-  works without a key but is less privacy-preserving. Add a provider setting
-  only if users ask for both.
+- **Provider — OpenStreetMap (settled):** use
+  `https://www.openstreetmap.org/search?query=…`. It needs no API key, uses
+  open data, and avoids Google Maps Platform terms. Google’s plain
+  `https://www.google.com/maps/search/?api=1&query=…` URL also works without a
+  key but is less privacy-preserving. Do not add a provider setting unless
+  users ask for both.
 - Add tests for URL construction, percent-encoding, and placeholder handling.
 
 **Depends on:** `src/app.rs` PGN tags card and the existing `Context::open_url`
