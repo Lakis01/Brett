@@ -6,12 +6,13 @@
 //! a display-oriented, engine-relative grade; it is not a claim of objective
 //! accuracy.
 
+use std::path::PathBuf;
 use std::time::Instant;
 
 use crate::chess::{Color, EnPassantMode, Fen, Position};
 
 use crate::domain::Game;
-use crate::engine::{EngineHandle, EngineInfo, Score, SearchLimit};
+use crate::engine::{EngineHandle, EngineInfo, EngineOptions, Score, SearchLimit};
 use crate::eval::{self, WhiteScore};
 
 /// A coarse move-quality label shown in the review table.
@@ -85,6 +86,51 @@ pub struct ReviewConfig {
     pub limit: SearchLimit,
 }
 
+/// Identity of a completed review that may be reused.
+///
+/// The mainline is stored exactly, including node indices, so a cached review
+/// can only be restored into a game with the same tree layout. Engine path,
+/// resource options, search limit, and the detected opening-book prefix are
+/// part of the identity because each can change the grades.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReviewKey {
+    mainline: Vec<(usize, String)>,
+    engine_path: PathBuf,
+    engine_options: EngineOptions,
+    limit: SearchLimit,
+    book_plies: usize,
+}
+
+impl ReviewKey {
+    pub fn new(
+        game: &Game,
+        config: ReviewConfig,
+        book_plies: usize,
+        engine_path: impl Into<PathBuf>,
+        engine_options: EngineOptions,
+    ) -> Self {
+        let mainline = game.mainline();
+        let book_plies = book_plies.min(mainline.len());
+        let positions = mainline
+            .into_iter()
+            .map(|node| {
+                let position = &game.nodes[node].pos;
+                (
+                    node,
+                    Fen::from_position(position, EnPassantMode::Legal).to_string(),
+                )
+            })
+            .collect();
+        Self {
+            mainline: positions,
+            engine_path: engine_path.into(),
+            engine_options,
+            limit: config.limit,
+            book_plies,
+        }
+    }
+}
+
 /// Engine result for a single position.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Evaluated {
@@ -139,7 +185,10 @@ pub struct AccuracySummary {
 }
 
 /// In-progress or completed review of a game.
+#[derive(Clone)]
 pub struct ReviewState {
+    /// Cache identity, set when the review is started from the app.
+    pub key: Option<ReviewKey>,
     pub config: ReviewConfig,
     pub book_plies: usize,
     pub running: bool,
@@ -184,6 +233,7 @@ impl ReviewState {
             .collect::<Vec<_>>();
         let total = positions.len();
         Self {
+            key: None,
             config,
             book_plies,
             running: total > 0,
@@ -217,6 +267,20 @@ impl ReviewState {
 
     pub fn complete(&self) -> bool {
         !self.running && self.next >= self.positions.len()
+    }
+
+    /// Mark every position analyzed without an engine. Test-only: lets cache
+    /// tests build a completed review cheaply.
+    #[cfg(test)]
+    pub(crate) fn mark_complete_for_test(&mut self) {
+        self.evaluated.fill(Some(Evaluated {
+            eval: None,
+            best: None,
+            white_cp: None,
+        }));
+        self.next = self.positions.len();
+        self.running = false;
+        self.request = None;
     }
 
     /// Ask the engine for the next position. Returns true when a request was
@@ -604,6 +668,88 @@ mod tests {
         assert_eq!(review.total(), 4);
         assert_eq!(review.progress(), (0, 4));
         assert!(review.moves(&games[0]).is_empty());
+    }
+
+    #[test]
+    fn review_key_covers_game_engine_limit_and_book_prefix() {
+        let games =
+            crate::domain::parse_pgn(b"[Event \"Key test\"]\n\n1. e4 e5 2. Nf3 Nc6 *\n").unwrap();
+        let game = &games[0];
+        let config = ReviewConfig {
+            limit: SearchLimit::Depth(12),
+        };
+        let options = EngineOptions {
+            threads: 2,
+            hash_mb: 64,
+        };
+        let key = ReviewKey::new(game, config, 0, "/usr/bin/stockfish", options);
+
+        assert_eq!(
+            key,
+            ReviewKey::new(game, config, 0, "/usr/bin/stockfish", options)
+        );
+        assert_ne!(
+            key,
+            ReviewKey::new(game, config, 2, "/usr/bin/stockfish", options)
+        );
+        assert_ne!(
+            key,
+            ReviewKey::new(
+                game,
+                ReviewConfig {
+                    limit: SearchLimit::Depth(13)
+                },
+                0,
+                "/usr/bin/stockfish",
+                options
+            )
+        );
+        assert_ne!(
+            key,
+            ReviewKey::new(game, config, 0, "/opt/stockfish", options)
+        );
+        assert_ne!(
+            key,
+            ReviewKey::new(
+                game,
+                config,
+                0,
+                "/usr/bin/stockfish",
+                EngineOptions {
+                    threads: 4,
+                    hash_mb: 64
+                }
+            )
+        );
+        assert_ne!(
+            key,
+            ReviewKey::new(
+                game,
+                config,
+                0,
+                "/usr/bin/stockfish",
+                EngineOptions {
+                    threads: 2,
+                    hash_mb: 128
+                }
+            )
+        );
+
+        let other = crate::domain::parse_pgn(b"[Event \"Other\"]\n\n1. d4 d5 *\n").unwrap();
+        assert_ne!(
+            key,
+            ReviewKey::new(&other[0], config, 0, "/usr/bin/stockfish", options)
+        );
+        assert_eq!(
+            ReviewKey::new(game, config, usize::MAX, "/usr/bin/stockfish", options),
+            ReviewKey::new(
+                game,
+                config,
+                game.mainline_len(),
+                "/usr/bin/stockfish",
+                options
+            )
+        );
     }
 
     #[test]

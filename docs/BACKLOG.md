@@ -98,9 +98,12 @@ clock and evaluation-bar toggles live in Settings.
 - **Keyboard line playthrough:** queue the interaction design before coding
   (item 14).
 
-Game review follow-ups that remain deferred: review caching. Book-prefix
-skipping, the board evaluation bar, PGN `[%eval]` decoding, and the per-color
-win-probability accuracy + ACPL metric are implemented (`docs/BOARD_EVAL_AND_REVIEW.md`).
+Review caching is implemented: completed reviews are kept in a bounded
+in-session cache keyed by the exact mainline, engine path/options, search limit,
+and book-prefix length; explicit **Restart review** reruns the analysis.
+Book-prefix skipping, the board evaluation bar, PGN `[%eval]` decoding, and the
+per-color win-probability accuracy + ACPL metric are implemented
+(`docs/BOARD_EVAL_AND_REVIEW.md`).
 Clock display is board-only and on by default: **Settings → Display** controls
 the board strips, while the move list and game header stay clock-free.
 
@@ -136,9 +139,11 @@ UI.
 
 **Status:** implemented in `src/review.rs`, `src/review_book.rs`, `src/eval.rs`,
 and the **Review** tab. The optional NAG write-back, leading opening-book prefix
-skipping (native book -> local opening-tree -> Lichess Masters), and per-color
-Lichess-style win-probability accuracy + ACPL are included; review caching is
-still deferred.
+skipping (native book -> local opening-tree -> Lichess Masters), per-color
+Lichess-style win-probability accuracy + ACPL, and bounded in-session review
+caching are included. A completed review is reused only when the mainline,
+engine path/options, search limit, and book-prefix length all match; an explicit
+**Restart review** invalidates the matching entry.
 
 **Goal:** annotate and grade a complete game.
 

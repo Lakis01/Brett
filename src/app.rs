@@ -56,6 +56,8 @@ const LARGE_PGN_BYTES: u64 = 100 * 1024 * 1024;
 /// directory, session rows and position index exhausted RAM before the first
 /// move could be browsed.
 const LARGE_DATABASE_GAMES: usize = 500_000;
+/// Completed reviews kept for reuse during this session.
+const REVIEW_CACHE_LIMIT: usize = 16;
 /// A full position index is useful for normal collections but is not yet
 /// viable for multi-million-game archives. The streaming/external-sort indexer
 /// is tracked in `docs/BACKLOG.md` as part of the M2b work.
@@ -649,6 +651,7 @@ pub struct App {
     review_book_min_games: u32,
     review_book_max_plies: u32,
     review_book_rx: Option<mpsc::Receiver<ReviewBookMessage>>,
+    review_cache: Vec<(review::ReviewKey, ReviewState)>,
     trend_window: crate::recent::TrendWindow,
     trend_baseline: crate::recent::TrendBaseline,
     trend_min_games: u32,
@@ -921,6 +924,7 @@ impl App {
             review_book_min_games: display_prefs.review_book_min_games,
             review_book_max_plies: display_prefs.review_book_max_plies,
             review_book_rx: None,
+            review_cache: Vec::new(),
             trend_window: display_prefs.trend_window,
             trend_baseline: display_prefs.trend_baseline,
             trend_min_games: display_prefs.trend_min_games,
@@ -3438,6 +3442,37 @@ impl App {
         }
     }
 
+    /// Move a matching completed review to the front of the reuse cache.
+    fn cached_review(&mut self, key: &review::ReviewKey) -> Option<ReviewState> {
+        let index = self
+            .review_cache
+            .iter()
+            .position(|(cached, _)| cached == key)?;
+        let (key, review) = self.review_cache.remove(index);
+        self.review_cache.push((key, review.clone()));
+        Some(review)
+    }
+
+    /// Keep only completed reviews, replacing any older entry for the same key.
+    fn store_review(&mut self, key: review::ReviewKey, review: ReviewState) {
+        if !review.complete() {
+            return;
+        }
+        self.review_cache.retain(|(cached, _)| cached != &key);
+        if self.review_cache.len() >= REVIEW_CACHE_LIMIT {
+            self.review_cache.remove(0);
+        }
+        self.review_cache.push((key, review));
+    }
+
+    /// Forget the cached result for the review on screen so an explicit
+    /// **Restart review** reruns the analysis instead of restoring it.
+    fn invalidate_current_review_cache(&mut self) {
+        if let Some(key) = self.review.as_ref().and_then(|review| review.key.clone()) {
+            self.review_cache.retain(|(cached, _)| cached != &key);
+        }
+    }
+
     fn ensure_review_engine(&mut self) -> bool {
         if self.engine_view == EngineView::Cloud {
             self.review_status = "Game review is unavailable in Cloud-only mode.".to_string();
@@ -3473,6 +3508,9 @@ impl App {
             self.review_status = "Open a game before starting a review.".to_string();
             return;
         };
+        // An explicit restart must rerun the analysis instead of restoring the
+        // result it is replacing.
+        self.invalidate_current_review_cache();
         let config = ReviewConfig {
             limit: self.review_limit(),
         };
@@ -3578,7 +3616,30 @@ impl App {
     }
 
     fn begin_review(&mut self, game: &Game, config: ReviewConfig, book_plies: usize) {
+        let key = review::ReviewKey::new(
+            game,
+            config,
+            book_plies,
+            self.engine_path(),
+            self.engine_options(),
+        );
+        if let Some(cached) = self.cached_review(&key) {
+            let total = cached.total();
+            let skipped = cached.book_plies;
+            self.review = Some(cached);
+            self.review_open = true;
+            self.review_status = if skipped > 0 {
+                format!(
+                    "Review restored from cache: {total} positions ({skipped} book plies skipped)."
+                )
+            } else {
+                format!("Review restored from cache: {total} positions.")
+            };
+            return;
+        }
+
         let mut review = ReviewState::new(game, config, book_plies);
+        review.key = Some(key);
         if review.total() == 0 {
             self.review = Some(review);
             self.review_open = true;
@@ -3679,6 +3740,7 @@ impl App {
                 EngineEvent::BestMove { request, best, .. } => {
                     let mut next_request = false;
                     let mut status = None;
+                    let mut completed = None;
                     if let Some(review) = &mut self.review
                         && review.finish_search(request, &best)
                     {
@@ -3689,9 +3751,17 @@ impl App {
                         } else {
                             format!("Review complete: {done}/{total} positions.")
                         });
+                        if review.complete()
+                            && let Some(key) = review.key.clone()
+                        {
+                            completed = Some((key, review.clone()));
+                        }
                     }
                     if let Some(status) = status {
                         self.review_status = status;
+                    }
+                    if let Some((key, review)) = completed {
+                        self.store_review(key, review);
                     }
                     if next_request {
                         let mut failed = false;
@@ -14394,6 +14464,7 @@ mod tests {
             review_book_min_games: 3,
             review_book_max_plies: 30,
             review_book_rx: None,
+            review_cache: Vec::new(),
             trend_window: crate::recent::TrendWindow::default(),
             trend_baseline: crate::recent::TrendBaseline::default(),
             trend_min_games: 10,
@@ -15308,5 +15379,158 @@ mod tests {
             map_search_url(""),
             "https://www.openstreetmap.org/search?query="
         );
+    }
+
+    fn completed_review(
+        app: &App,
+        game: &Game,
+        book_plies: usize,
+    ) -> (review::ReviewKey, ReviewState) {
+        let config = ReviewConfig {
+            limit: SearchLimit::Depth(8),
+        };
+        let key = review::ReviewKey::new(
+            game,
+            config,
+            book_plies,
+            app.engine_path(),
+            app.engine_options(),
+        );
+        let mut state = ReviewState::new(game, config, book_plies);
+        state.key = Some(key.clone());
+        state.mark_complete_for_test();
+        (key, state)
+    }
+
+    #[test]
+    fn review_cache_restores_a_completed_review_without_an_engine() {
+        let mut app = test_app();
+        let game = app.current.clone().unwrap();
+        let (key, state) = completed_review(&app, &game, 0);
+        app.store_review(key.clone(), state);
+        assert_eq!(app.review_cache.len(), 1);
+
+        app.begin_review(
+            &game,
+            ReviewConfig {
+                limit: SearchLimit::Depth(8),
+            },
+            0,
+        );
+
+        let restored = app.review.as_ref().expect("cached review restored");
+        assert!(restored.complete());
+        assert_eq!(restored.key.as_ref(), Some(&key));
+        assert!(app.review_status.starts_with("Review restored from cache"));
+        assert!(app.review_open);
+        assert!(
+            app.review_engine.is_none(),
+            "a cache hit must not spawn an engine"
+        );
+    }
+
+    #[test]
+    fn review_cache_stores_only_completed_reviews() {
+        let mut app = test_app();
+        let game = app.current.clone().unwrap();
+        let config = ReviewConfig {
+            limit: SearchLimit::Depth(8),
+        };
+        let key = review::ReviewKey::new(&game, config, 0, app.engine_path(), app.engine_options());
+        let mut state = ReviewState::new(&game, config, 0);
+        state.key = Some(key.clone());
+        app.store_review(key, state);
+        assert!(app.review_cache.is_empty());
+    }
+
+    #[test]
+    fn review_cache_evicts_the_oldest_entry_at_the_limit() {
+        let mut app = test_app();
+        let game = app.current.clone().unwrap();
+        let config = ReviewConfig {
+            limit: SearchLimit::Depth(8),
+        };
+        let mut keys = Vec::new();
+        for index in 0..=REVIEW_CACHE_LIMIT {
+            let key = review::ReviewKey::new(
+                &game,
+                config,
+                0,
+                format!("/usr/bin/stockfish-{index}"),
+                app.engine_options(),
+            );
+            let mut state = ReviewState::new(&game, config, 0);
+            state.key = Some(key.clone());
+            state.mark_complete_for_test();
+            app.store_review(key.clone(), state);
+            keys.push(key);
+        }
+
+        assert_eq!(app.review_cache.len(), REVIEW_CACHE_LIMIT);
+        assert!(
+            app.cached_review(&keys[0]).is_none(),
+            "the oldest entry is evicted first"
+        );
+        assert!(app.cached_review(&keys[REVIEW_CACHE_LIMIT]).is_some());
+    }
+
+    #[test]
+    fn review_cache_hits_refresh_lru_order() {
+        let mut app = test_app();
+        let game = app.current.clone().unwrap();
+        let config = ReviewConfig {
+            limit: SearchLimit::Depth(8),
+        };
+        let mut keys = Vec::new();
+        for index in 0..REVIEW_CACHE_LIMIT {
+            let key = review::ReviewKey::new(
+                &game,
+                config,
+                0,
+                format!("/usr/bin/stockfish-{index}"),
+                app.engine_options(),
+            );
+            let mut state = ReviewState::new(&game, config, 0);
+            state.key = Some(key.clone());
+            state.mark_complete_for_test();
+            app.store_review(key.clone(), state);
+            keys.push(key);
+        }
+        assert!(app.cached_review(&keys[0]).is_some());
+
+        let extra = review::ReviewKey::new(
+            &game,
+            config,
+            0,
+            "/usr/bin/stockfish-extra",
+            app.engine_options(),
+        );
+        let mut state = ReviewState::new(&game, config, 0);
+        state.key = Some(extra.clone());
+        state.mark_complete_for_test();
+        app.store_review(extra, state);
+
+        assert_eq!(app.review_cache.len(), REVIEW_CACHE_LIMIT);
+        assert!(
+            app.cached_review(&keys[0]).is_some(),
+            "a cache hit refreshed the entry"
+        );
+        assert!(
+            app.cached_review(&keys[1]).is_none(),
+            "the second-oldest entry is evicted"
+        );
+    }
+
+    #[test]
+    fn restart_invalidates_the_matching_cached_review() {
+        let mut app = test_app();
+        let game = app.current.clone().unwrap();
+        let (key, state) = completed_review(&app, &game, 0);
+        app.store_review(key, state.clone());
+        app.review = Some(state);
+        assert_eq!(app.review_cache.len(), 1);
+
+        app.invalidate_current_review_cache();
+        assert!(app.review_cache.is_empty());
     }
 }
