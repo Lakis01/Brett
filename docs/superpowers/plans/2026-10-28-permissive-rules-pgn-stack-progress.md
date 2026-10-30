@@ -184,3 +184,12 @@ Task priority if Argon quota is small: Argon Medium for Tasks 4, 5, 8, 10 (FEN/h
 - Gate after `67ff6da`: `cargo test --all-targets` 179 lib + all suites passed
   (1 ignored); `cargo clippy --all-targets -- -D warnings` clean; `cargo fmt
   --all -- --check` clean.
+- 2026-10-30 `289dc39`: `src/fide.rs` validates trimmed numeric
+  `WhiteFideId`/`BlackFideId` tags; `PlayerSummary` aggregates the first real
+  ID; a muted `· 1503014` suffix appears in board strips, the game header, game
+  lists, the player directory, preparation, online previews, and database
+  views; the player profile links to `ratings.fide.com/profile/{id}` only for
+  numeric IDs. Raw tags are preserved; backlog item 16 closed.
+- Gate after `289dc39`: `cargo test --all-targets` 185 lib + all suites passed
+  (1 ignored); `cargo clippy --all-targets -- -D warnings` clean; `cargo fmt
+  --all -- --check` clean.
