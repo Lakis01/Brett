@@ -201,3 +201,15 @@ Task priority if Argon quota is small: Argon Medium for Tasks 4, 5, 8, 10 (FEN/h
 - Gate after review caching: `cargo test --all-targets` 191 lib + all suites
   passed (1 ignored); `cargo clippy --all-targets -- -D warnings` clean;
   `cargo fmt --all -- --check` clean.
+- 2026-10-30 `ed34bca`: `src/wiki.rs` adds Wikipedia player summaries with no
+  new dependencies. The lookup starts only when a profile is clicked or
+  opened, never during database installation or player-directory builds.
+  Confident chess-player matches show a short excerpt, article link, and
+  CC BY-SA 4.0 attribution; ambiguous names show a labelled search link;
+  failures show the error, retry, and search. Results are cached by resolved
+  article title in `$XDG_CACHE_HOME/brett/wikipedia.json` (256 summaries and
+  256 ambiguous names), `Last, First` names are reordered for search, and the
+  Settings **Player profiles** toggle defaults to on. Backlog item 21 closed.
+- Gate after `ed34bca`: `cargo test --all-targets` 205 lib + all suites passed
+  (1 ignored); `cargo clippy --all-targets -- -D warnings` clean; `cargo fmt
+  --all -- --check` clean.
