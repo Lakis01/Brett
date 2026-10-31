@@ -11,6 +11,7 @@ use crate::chess::{Chess, Color, EnPassantMode, Fen};
 use crate::domain::{self, Game, Node, PgnEval};
 
 mod board;
+pub mod typst;
 
 #[cfg(test)]
 mod tests;

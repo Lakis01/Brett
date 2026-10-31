@@ -258,3 +258,206 @@ fn build_document_embeds_the_board_in_every_diagram() {
     assert!(doc.diagrams[0].svg.contains("class=\"square\""));
     assert!(doc.diagrams[0].svg.contains("class=\"piece\""));
 }
+
+#[test]
+fn typst_source_uses_a4_two_columns_and_a_running_header() {
+    let doc = build_document(&opera(), meta(), &BTreeSet::new(), true);
+    let source = crate::print::typst::source(&doc);
+
+    assert!(source.contains("paper: \"a4\""));
+    assert!(source.contains("columns: 2"));
+    assert!(source.contains("header: context {"));
+    assert!(source.contains("counter(page).display()"));
+    assert!(source.contains("Test Database"));
+    assert!(source.contains("Tester"));
+    assert!(source.contains("2026-10-31"));
+}
+
+#[test]
+fn typst_source_has_a_compact_heading_bold_moves_and_a_result() {
+    let doc = build_document(&opera(), meta(), &BTreeSet::new(), false);
+    let source = crate::print::typst::source(&doc);
+
+    assert!(source.contains("Paul Morphy"));
+    assert!(source.contains("Duke Karl and Count Isouard"));
+    assert!(source.contains("Casual Game"));
+    assert!(source.contains("Paris FRA"));
+    assert!(source.contains("ECO C41"));
+    assert!(source.contains("column-gutter: 1em"));
+    assert!(source.contains("fill: white, stroke: 0.6pt + luma(60)"));
+    assert!(source.contains("fill: black"));
+    assert!(source.contains("#text(weight: \"bold\", \"1.e4\")"));
+    assert!(source.contains("#text(weight: \"bold\", \"1-0\")"));
+}
+
+#[test]
+fn typst_heading_stacks_players_and_keeps_their_elos_next_to_the_eco() {
+    let game = parse(
+        "[Event \"Elo test\"]\n[Site \"?\" ]\n[Date \"2026.01.01\"]\n[Round \"1\"]\n[White \"White Player\"]\n[WhiteElo \"2789\"]\n[Black \"Black Player\"]\n[BlackElo \"2698\"]\n[ECO \"C83\"]\n[Result \"*\"]\n\n1. e4 e5 *\n",
+    );
+    let doc = build_document(&game, meta(), &BTreeSet::new(), false);
+    let source = crate::print::typst::source(&doc);
+
+    let white = source.find("\"White Player\"").unwrap();
+    let white_elo = source.find("\"2789\"").unwrap();
+    let black = source.find("\"Black Player\"").unwrap();
+    let black_elo = source.find("\"2698\"").unwrap();
+    let eco = source.find("\"ECO C83\"").unwrap();
+    assert!(white < white_elo);
+    assert!(white_elo < black);
+    assert!(black < black_elo);
+    assert!(black_elo < eco);
+}
+
+#[test]
+fn typst_source_keeps_each_diagram_between_the_moves_it_follows() {
+    let game = opera();
+    let mainline = game.mainline();
+    let doc = build_document(
+        &game,
+        meta(),
+        &BTreeSet::from([mainline[2], mainline[10]]),
+        true,
+    );
+    let source = crate::print::typst::source(&doc);
+
+    let after_nf3 = source.find("\"2.Nf3\"").unwrap();
+    let d6 = source.find("\"d6\"").unwrap();
+    let after_bc4 = source.find("\"6.Bc4\"").unwrap();
+    let nf6 = source.find("#text(weight: \"bold\", \"Nf6\")").unwrap();
+    let last_move = source.find("\"17.Rd8#\"").unwrap();
+    let first = source.find("diagram-01.svg").unwrap();
+    let second = source.find("diagram-02.svg").unwrap();
+
+    assert!(after_nf3 < first);
+    assert!(first < d6);
+    assert!(after_bc4 < second);
+    assert!(second < nf6);
+    assert!(last_move < source.find("diagram-03.svg").unwrap());
+}
+
+#[test]
+fn typst_source_renders_comments_variations_and_diagrams() {
+    let game = opera();
+    let mainline = game.mainline();
+    let doc = build_document(&game, meta(), &BTreeSet::from([mainline[2]]), true);
+    let source = crate::print::typst::source(&doc);
+
+    assert!(source.contains("#text(\"Philidor's Defense.\")"));
+    assert!(source.contains("#text(\"[\")"));
+    assert!(source.contains("#text(\"]\")"));
+    assert!(source.contains("inset: (left: 1.2em)"));
+    assert!(source.contains("#image(\"diagrams/diagram-01.svg\""));
+    assert!(source.contains("#image(\"diagrams/diagram-02.svg\""));
+    assert!(source.contains("final position"));
+    assert!(!source.contains("(Diagram)"));
+}
+
+#[test]
+fn typst_source_preserves_annotations_and_nested_indentation() {
+    let annotated = parse(
+        "[Event \"Annotated\"]\n[Site \"?\"]\n[Date \"2026.01.01\"]\n[Round \"1\"]\n[White \"A\"]\n[Black \"B\"]\n[Result \"*\"]\n\n1. e4! {Opening [%clk 0:03:00] [%eval 0.35]} e5? {[%clk 0:02:59] [%eval -0.20]} *\n",
+    );
+    let doc = build_document(&annotated, meta(), &BTreeSet::new(), false);
+    let source = crate::print::typst::source(&doc);
+    assert!(source.contains("#text(\"Opening\")"));
+    assert!(source.contains("[clk 3:00; eval +0.35]"));
+    assert!(source.contains("[clk 2:59; eval -0.20]"));
+
+    let nested = parse(
+        "[Event \"Nested\"]\n[Site \"?\"]\n[Date \"2026.01.01\"]\n[Round \"1\"]\n[White \"A\"]\n[Black \"B\"]\n[Result \"*\"]\n\n1. e4 e5 (1... c5 2. Nf3 Nc6 (2... d6 3. d4) 3. Bb5) 2. Nf3 Nc6 *\n",
+    );
+    let doc = build_document(&nested, meta(), &BTreeSet::new(), false);
+    let source = crate::print::typst::source(&doc);
+    assert!(source.contains("inset: (left: 1.2em)"));
+    assert!(source.contains("inset: (left: 2.4em)"));
+}
+
+#[test]
+fn typst_source_preserves_custom_starts_and_chess960() {
+    let game = parse(
+        "[Event \"960\"]\n[Site \"?\"]\n[Date \"2026.01.01\"]\n[Round \"1\"]\n[White \"A\"]\n[Black \"B\"]\n[Result \"*\"]\n[FEN \"qnbnrkrb/pppppppp/8/8/8/8/PPPPPPPP/QNBNRKRB w GEge - 0 1\"]\n[Variant \"Fischerandom\"]\n[SetUp \"1\"]\n\n1. d4 d5 2. Nbc3 b6 3. O-O Ne6 *\n",
+    );
+    let doc = build_document(&game, meta(), &BTreeSet::new(), false);
+    let source = crate::print::typst::source(&doc);
+
+    assert!(source.contains("Start position:"));
+    assert!(source.contains("QNBNRKRB"));
+    assert!(source.contains("Fischerandom"));
+}
+
+#[test]
+fn typst_source_escapes_string_literals_and_is_deterministic() {
+    let doc = PrintDocument {
+        meta: PrintMeta {
+            source: "A \"quote\" \\ source".to_string(),
+            owner: "O#1 [x] $y".to_string(),
+            date: "2026-10-31".to_string(),
+        },
+        game: PrintGame {
+            headers: vec![
+                ("White".to_string(), "A \"quote\" \\ name".to_string()),
+                ("Black".to_string(), "Ünïcode".to_string()),
+                ("Result".to_string(), "*".to_string()),
+            ],
+            start_fen: None,
+            variant: None,
+            items: vec![PrintItem::Comment("He said \"hi\" \\ # $ [x]".to_string())],
+            result: "*".to_string(),
+        },
+        diagrams: Vec::new(),
+    };
+    let source = crate::print::typst::source(&doc);
+
+    assert!(source.contains("A \\\"quote\\\" \\\\ source"));
+    assert!(source.contains("A \\\"quote\\\" \\\\ name"));
+    assert!(source.contains("He said \\\"hi\\\" \\\\ # $ [x]"));
+    assert!(source.contains("Ünïcode"));
+    assert_eq!(source, crate::print::typst::source(&doc));
+}
+
+#[test]
+fn typst_source_renders_diagrams_for_an_empty_game() {
+    let doc = build_document(&Game::default(), meta(), &BTreeSet::new(), true);
+    let source = crate::print::typst::source(&doc);
+
+    assert!(source.contains("#image(\"diagrams/diagram-01.svg\""));
+    assert!(!source.contains("(Diagram)"));
+}
+
+#[test]
+fn write_bundle_writes_source_and_diagram_files() {
+    let dir = std::env::temp_dir().join(format!("brett-print-bundle-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("opera-print_diagrams")).unwrap();
+    std::fs::write(
+        dir.join("opera-print_diagrams/diagram-09.svg"),
+        "<svg>stale</svg>",
+    )
+    .unwrap();
+
+    let path = dir.join("opera-print.typ");
+    let game = opera();
+    let mainline = game.mainline();
+    let doc = build_document(&game, meta(), &BTreeSet::from([mainline[2]]), true);
+    let bundle = crate::print::typst::write_bundle(&path, &doc).unwrap();
+
+    assert_eq!(bundle.source, path);
+    assert_eq!(bundle.diagrams.len(), 2);
+    assert!(bundle.diagrams.iter().all(|path| path.exists()));
+    assert!(bundle.diagrams[0].ends_with("opera-print_diagrams/diagram-01.svg"));
+    assert!(bundle.diagrams[1].ends_with("opera-print_diagrams/diagram-02.svg"));
+    assert!(!dir.join("opera-print_diagrams/diagram-09.svg").exists());
+
+    let source = std::fs::read_to_string(&path).unwrap();
+    assert!(source.contains("opera-print_diagrams/diagram-01.svg"));
+    assert!(source.contains("opera-print_diagrams/diagram-02.svg"));
+    assert!(!source.contains("(Diagram)"));
+    assert!(
+        std::fs::read_to_string(&bundle.diagrams[0])
+            .unwrap()
+            .contains("class=\"square\"")
+    );
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
