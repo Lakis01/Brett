@@ -3,7 +3,7 @@
 Brett reads and writes SCID databases directly. Opening a `.si4` or `.si3` file
 does not require SCID to be installed, does not convert the database to PGN,
 and never writes to the source files. Exporting creates a new SCID4 triple; the
-writer is a separate, explicit **Save database as SCID…** action.
+writer is a separate, explicit **Save database as… → SCID4** action.
 
 Both implementations are independent: they were written from the published
 on-disk layout and the SCID project's format documentation. No SCID source code
@@ -64,7 +64,7 @@ so games that do not start from the standard array decode correctly.
 
 ## Writing a SCID database
 
-**File → Save database as SCID…** writes the current session, in its current
+**File → Save database as… → SCID4** writes the current session, in its current
 order, as a new SCID4 triple. The writer is native Rust in
 [`src/scid/writer.rs`](../src/scid/writer.rs); it does not invoke SCID, link
 SCID code, or convert through PGN.
@@ -174,8 +174,8 @@ stored beside the database.
 The conventional `$HOME/Chess Databases/` tree and every directory below it
 are strictly read-only, as are extra roots in `BRETT_READ_ONLY_ROOTS`. Brett
 opens the source triple directly for reading, and derived indexes are written
-only under the user's cache directory. **Save database as SCID…** writes a new
-triple at an explicit path; the app refuses to overwrite the open source
+only under the user's cache directory. **Save database as… → SCID4** writes a
+new triple at an explicit path; the app refuses to overwrite the open source
 database and asks before replacing an existing triple. If you need to run
 SCID's own tools for comparison, copy the triple to `/tmp/opencode` first; see
 [`scripts/scid-to-pgn.sh`](../scripts/scid-to-pgn.sh) and

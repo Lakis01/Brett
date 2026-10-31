@@ -66,7 +66,7 @@ ICCF server games under ICCF's terms, and comply with ICCF's terms. See
   installation, conversion step, or SCID code is involved. Legacy SCID3
   (`.si3`/`.sn3`/`.sg3`) uses the same reader.
 - **SCID4 export** through a native writer (`src/scid/writer.rs`).
-  **File → Save database as SCID…** writes a new `.si4`/`.sn4`/`.sg4` triple
+  **File → Save database as… → SCID4** writes a new `.si4`/`.sn4`/`.sg4` triple
   with headers, comments, clocks, NAGs, variations, and custom starts. Existing
   triples are backed up and restored if the replacement fails; source databases
   are never overwritten.
@@ -75,10 +75,16 @@ ICCF server games under ICCF's terms, and comply with ICCF's terms. See
   variations and comments, and real SVG board diagrams at user-chosen plies.
   Typst can compile a PDF locally when requested. See
   [docs/PRINT.md](docs/PRINT.md).
-- **Classic ChessBase CBH** databases through a native, read-only reader
+- **ChessBase 2CBH** databases through a native, read-only reader
+  (`src/twocbh/`). This is the current ChessBase container. Brett decodes
+  headers, names, standard chess, Chess960, and nested variations; `.2cba`
+  annotation items are not decoded yet, so comments and NAGs are not
+  fabricated. Writing 2CBH is deferred until compatibility tests are ready.
+- **Classic ChessBase CBH** databases through a native reader and writer
   (`src/cbh/`). Brett opens the `.cbh` header file and its `.cbg` moves,
   `.cba` annotations, and `.cbp`/`.cbt`/`.cbc`/`.cbs` names directly. This is
-  the older multi-file format, not CBH2/2CBH.
+  the older multi-file format, not CBH2/2CBH. **File → Save database as… →
+  Classic CBH** writes a fresh companion set.
 - Lazy game loading for all three formats, a searchable game list, and a
   **Players** tab with career W/D/L, score, Elo, year range, and per-player
   game lists.
@@ -298,9 +304,8 @@ ICCF server games under ICCF's terms, and comply with ICCF's terms. See
 - Start, Previous, Next, and End buttons sit beside the board and are hidden by
   default; **Settings → Show navigation buttons** reveals them. The keyboard
   shortcuts work either way.
-- The FEN field lives in the bottom bar to the left of **Open…** and **Load**;
-  clicking it copies the FEN. The move counter beside it counts full moves, not
-  plies.
+- The FEN field lives in the bottom bar beside the move counter; clicking it
+  copies the FEN. The move counter counts full moves, not plies.
 - The Moves header keeps one metadata line: compact `R`/`B` chips, the event
   truncated rather than wrapped or squeezed, and the result right-aligned.
   When the game has an `Opening` tag, its bare ECO code (for example `A07`)
@@ -326,9 +331,8 @@ ICCF server games under ICCF's terms, and comply with ICCF's terms. See
   bounded scroll area. Long annotations, comments, and tag cards therefore stay
   reachable instead of running past the bottom of the window.
 - PGN clock comments (`[%clk ...]`) are parsed separately from human comments
-  and hidden by default. The **Clocks** toggle in the bottom bar displays the
-  remaining time after each move, the side-to-move time in the game header, and
-  the latest remaining time for each side at the right of its board strip.
+  and shown by default. **Settings → Display → Show PGN clocks in the board
+  strips** controls the remaining time at the right of each board strip.
 - Hovering a move in the open game's move list previews the resulting
   position. This is controlled by **Settings → Preview moves on hover** and is
   off by default; tree, engine, reference, and read-only preview hovers are
@@ -499,13 +503,15 @@ never writes to the source database.
   [docs/GPL_OPTIONS.md](docs/GPL_OPTIONS.md).
 - **M2b — Mega-scale ingest.** External sorting, an on-disk header table, and
   incremental updates for multi-million-game databases.
-- **Database editing and export (in progress).** Drag rows to reorder the
-  current list, drag games between internal database views, and drag a
-  database onto another to merge it. **File → Save database as PGN…** writes
-  the session in its current order, preserving headers, comments, clocks,
-  NAGs, and variations; exports estimated at 100 MB or more ask for
-  confirmation first. **File → Save database as SCID…** writes the same
-  session as a native SCID4 triple. The classic CBH writer remains.
+- **Database editing and export (done).** Drag rows to reorder the current
+  list, drag games between internal database views, and drag a database onto
+  another to merge it. **File → Save database** writes the session in its
+  current format; **Save database as…** chooses PGN, SCID4, or classic CBH.
+  A new database asks for a format, and 2CBH is shown as read-only. Saves
+  preserve headers, comments, clocks, NAGs, and variations; exports estimated
+  at 100 MB or more ask for confirmation first. The last database folder is
+  remembered for Open and Save As, and closing a modified database asks
+  whether to save, discard, or cancel.
 - **Opening-tree files and reference sources (done).** A separate PGN, SCID,
   or classic CBH opening-tree database can be indexed for the Tree tab and
   saved as the default. The Refs tab can point preparation at the current

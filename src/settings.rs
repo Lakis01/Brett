@@ -426,6 +426,9 @@ pub struct DisplayPrefs {
     /// Optional native opening book (`.bin`, `.ctg`, or `.abk`) shown in the
     /// Tree tab.
     pub opening_book_path: String,
+    /// Folder of the last database opened or saved, used as the initial
+    /// location for database pickers.
+    pub last_database_dir: Option<PathBuf>,
     /// Maximum number of recent preparation games shown for a position.
     pub prep_recent_limit: usize,
     /// Show PGN fields that are absent or empty. Hidden by default so a game
@@ -475,6 +478,7 @@ impl Default for DisplayPrefs {
             engine_auto: true,
             opening_tree_path: String::new(),
             opening_book_path: String::new(),
+            last_database_dir: None,
             prep_recent_limit: 10,
             show_empty_pgn_tags: false,
             hover_moves: false,
@@ -543,6 +547,12 @@ impl DisplayPrefs {
             .map(str::trim)
             .unwrap_or("")
             .to_string();
+        let last_database_dir = value
+            .get("last_database_dir")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from);
         let prep_recent_limit = value
             .get("prep_recent_limit")
             .and_then(Value::as_u64)
@@ -622,6 +632,7 @@ impl DisplayPrefs {
             engine_auto,
             opening_tree_path,
             opening_book_path,
+            last_database_dir,
             prep_recent_limit,
             show_empty_pgn_tags,
             hover_moves,
@@ -649,6 +660,7 @@ impl DisplayPrefs {
             "engine_auto": self.engine_auto,
             "opening_tree_path": self.opening_tree_path,
             "opening_book_path": self.opening_book_path,
+            "last_database_dir": self.last_database_dir.as_ref().map(|path| path.display().to_string()),
             "prep_recent_limit": self.prep_recent_limit,
             "show_empty_pgn_tags": self.show_empty_pgn_tags,
             "hover_moves": self.hover_moves,
@@ -970,6 +982,7 @@ mod tests {
             engine_auto: false,
             opening_tree_path: "/tmp/masters.pgn".to_string(),
             opening_book_path: "/tmp/perfect.abk".to_string(),
+            last_database_dir: Some(PathBuf::from("/tmp/databases")),
             prep_recent_limit: 25,
             show_empty_pgn_tags: true,
             hover_moves: true,
@@ -1024,6 +1037,21 @@ mod tests {
             DisplayPrefs::from_json(r#"{"engine_view":"nonsense"}"#).engine_view,
             "both"
         );
+    }
+
+    #[test]
+    fn display_prefs_remember_the_last_database_directory() {
+        let parsed = DisplayPrefs::from_json(r#"{"last_database_dir":"/home/tester/Chess"}"#);
+        assert_eq!(
+            parsed.last_database_dir.as_deref(),
+            Some(std::path::Path::new("/home/tester/Chess"))
+        );
+        assert!(parsed.to_json().contains("last_database_dir"));
+        assert_eq!(
+            DisplayPrefs::from_json(r#"{"last_database_dir":"  "}"#).last_database_dir,
+            None
+        );
+        assert_eq!(DisplayPrefs::default().last_database_dir, None);
     }
 
     #[test]

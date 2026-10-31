@@ -239,8 +239,8 @@ local paths are supplied. No database content is committed.
 
 ## Exporting and writing (`src/cbh/writer.rs`)
 
-**File → Save database as CBH…** (and `cbh::write_database`) writes a complete
-classic multi-file database from the ordered session:
+**File → Save database as… → Classic CBH** (and `cbh::write_database`) writes a
+complete classic multi-file database from the ordered session:
 
 - streams `.cbh` (46-byte header records), `.cbg` (move streams in mode 0, 4,
   5, or 10), and `.cba` (annotations in depth-first stored move order) to

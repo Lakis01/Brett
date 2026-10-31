@@ -403,6 +403,7 @@ struct PendingPgnExport {
     path: PathBuf,
     games: usize,
     estimate: u64,
+    close_after: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -410,6 +411,7 @@ struct PendingScidExport {
     path: PathBuf,
     games: usize,
     existing: Vec<PathBuf>,
+    close_after: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -417,6 +419,99 @@ struct PendingCbhExport {
     path: PathBuf,
     games: usize,
     existing: Vec<PathBuf>,
+    close_after: bool,
+}
+
+/// A database container Brett can open, and (except for 2CBH) write.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DatabaseFormat {
+    Pgn,
+    Scid,
+    Cbh,
+    TwoCbh,
+}
+
+impl DatabaseFormat {
+    /// Formats offered when the user has to choose a save format.
+    const WRITABLE: [Self; 3] = [Self::Pgn, Self::Scid, Self::Cbh];
+
+    fn from_path(path: &Path) -> Self {
+        match path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "si4" | "si3" => Self::Scid,
+            "cbh" | "cbv" => Self::Cbh,
+            "2cbh" | "2cbg" | "2cba" | "2lid" => Self::TwoCbh,
+            _ => Self::Pgn,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Pgn => "PGN (plain text, portable)",
+            Self::Scid => "SCID4 database (.si4)",
+            Self::Cbh => "Classic ChessBase database (.cbh)",
+            Self::TwoCbh => "ChessBase 2CBH (read-only)",
+        }
+    }
+
+    fn extension(self) -> &'static str {
+        match self {
+            Self::Pgn => "pgn",
+            Self::Scid => "si4",
+            Self::Cbh => "cbh",
+            Self::TwoCbh => "2cbh",
+        }
+    }
+
+    fn filter_name(self) -> &'static str {
+        match self {
+            Self::Pgn => "PGN files",
+            Self::Scid => "SCID4 database",
+            Self::Cbh => "Classic ChessBase database",
+            Self::TwoCbh => "ChessBase 2CBH database",
+        }
+    }
+
+    fn short_label(self) -> &'static str {
+        match self {
+            Self::Pgn => "PGN",
+            Self::Scid => "SCID",
+            Self::Cbh => "CBH",
+            Self::TwoCbh => "2CBH",
+        }
+    }
+
+    fn is_writable(self) -> bool {
+        !matches!(self, Self::TwoCbh)
+    }
+}
+
+/// Default save path for a database in `format`. When the format matches the
+/// open source, append `-saved` so Save never overwrites the read-only source.
+fn database_save_default_path(
+    stem: &str,
+    source: Option<&Path>,
+    directory: &Path,
+    format: DatabaseFormat,
+) -> PathBuf {
+    let stem = stem.trim();
+    let stem = if stem.is_empty() {
+        "Brett Database"
+    } else {
+        stem
+    };
+    let same_format = source.is_some_and(|path| DatabaseFormat::from_path(path) == format);
+    let stem = if same_format {
+        format!("{stem}-saved")
+    } else {
+        stem.to_string()
+    };
+    directory.join(format!("{stem}.{}", format.extension()))
 }
 
 /// Small dependency-free calendar used by the Date PGN tag.
@@ -505,6 +600,26 @@ pub struct App {
     index_job: Option<PathBuf>,
     index_status: String,
     confirm_large_index: bool,
+    /// Folder of the last database opened or saved. Database pickers start
+    /// here so the user usually lands in the right directory.
+    last_database_dir: Option<PathBuf>,
+    /// Last writable database path chosen in this session. Save database
+    /// writes here without asking again.
+    database_save_path: Option<PathBuf>,
+    /// The game list changed independently of the current game's edits.
+    session_dirty: bool,
+    /// The window close request is waiting for Save / Discard / Cancel.
+    close_confirm_open: bool,
+    /// Close the window on the next frame, after a successful save or a
+    /// confirmed discard.
+    pending_window_close: bool,
+    /// The in-app format/path chooser for Save database or Save database as.
+    save_database_dialog_open: bool,
+    save_database_as: bool,
+    save_database_format: DatabaseFormat,
+    save_database_path: String,
+    save_database_close_after: bool,
+    save_database_error: String,
     /// Optional default opening-tree database, indexed separately from the
     /// currently open database.
     tree_path: String,
@@ -809,6 +924,17 @@ impl App {
             index_job: None,
             index_status: "No position index yet.".to_string(),
             confirm_large_index: false,
+            last_database_dir: display_prefs.last_database_dir.clone(),
+            database_save_path: None,
+            session_dirty: false,
+            close_confirm_open: false,
+            pending_window_close: false,
+            save_database_dialog_open: false,
+            save_database_as: false,
+            save_database_format: DatabaseFormat::Pgn,
+            save_database_path: String::new(),
+            save_database_close_after: false,
+            save_database_error: String::new(),
             tree_path: display_prefs.opening_tree_path.clone(),
             tree_index: None,
             tree_index_rx: None,
@@ -1422,6 +1548,8 @@ impl App {
         self.library = Some(library.clone());
         self.edited.clear();
         self.dirty = false;
+        self.session_dirty = false;
+        self.database_save_path = None;
         self.current_slot = None;
         self.current = None;
         self.print_diagrams.clear();
@@ -1482,6 +1610,7 @@ impl App {
                 self.index_status
             );
         }
+        self.remember_database_dir(path);
     }
 
     /// Build the player directory in the background for a very large database.
@@ -1592,6 +1721,7 @@ impl App {
                 });
                 self.views_open = true;
                 self.status = format!("Opened {} as a database view.", games_label(count));
+                self.remember_database_dir(path);
             }
             Err(err) => self.status = format!("Could not open {}: {err}", path.display()),
         }
@@ -1612,6 +1742,7 @@ impl App {
         match pending.target {
             DropTarget::Main => {
                 let id = self.session.insert_game(pending.game, insert_at);
+                self.session_dirty = true;
                 self.select_slot(id);
                 self.status = format!(
                     "{} added {}.",
@@ -1645,6 +1776,9 @@ impl App {
         match pending.target {
             DropTarget::Main => match self.session.merge_library(pending.library, &self.edited) {
                 Ok(report) => {
+                    if report.added > 0 {
+                        self.session_dirty = true;
+                    }
                     self.status = format!(
                         "Merged {}: {} added, {} duplicates skipped.",
                         pending.label,
@@ -1679,14 +1813,280 @@ impl App {
         }
     }
 
-    fn start_pgn_export(&mut self) {
+    fn current_database_format(&self) -> Option<DatabaseFormat> {
+        self.database_save_path
+            .as_deref()
+            .map(DatabaseFormat::from_path)
+            .or_else(|| {
+                self.library
+                    .as_ref()
+                    .map(|library| DatabaseFormat::from_path(library.path()))
+            })
+    }
+
+    fn database_stem(&self) -> String {
+        self.library
+            .as_ref()
+            .map(|library| library.path())
+            .or(self.database_save_path.as_deref())
+            .and_then(Path::file_stem)
+            .map(|stem| stem.to_string_lossy().trim().to_string())
+            .filter(|stem| !stem.is_empty())
+            .unwrap_or_else(|| "Brett Database".to_string())
+    }
+
+    fn default_database_save_path(&self, format: DatabaseFormat) -> PathBuf {
+        // Once this session has a writable target in the chosen format, use
+        // it again instead of growing a "-saved" suffix on every Save As.
+        if let Some(path) = self
+            .database_save_path
+            .as_deref()
+            .filter(|path| DatabaseFormat::from_path(path) == format)
+        {
+            return path.to_path_buf();
+        }
+        let directory = self
+            .last_database_dir
+            .clone()
+            .unwrap_or_else(default_database_dir);
+        database_save_default_path(
+            &self.database_stem(),
+            self.library.as_ref().map(|library| library.path()),
+            &directory,
+            format,
+        )
+    }
+
+    fn finish_saved_database(&mut self, path: &Path, close_after: bool) {
+        self.database_save_path = Some(path.to_path_buf());
+        self.session_dirty = false;
+        if self.current_slot.is_some() {
+            self.dirty = false;
+        }
+        self.remember_database_dir(path);
+        if close_after {
+            self.pending_window_close = true;
+        }
+    }
+
+    fn start_format_save(
+        &mut self,
+        format: DatabaseFormat,
+        target: Option<PathBuf>,
+        close_after: bool,
+    ) {
+        match format {
+            DatabaseFormat::Pgn => self.start_pgn_save(target, close_after),
+            DatabaseFormat::Scid => self.start_scid_save(target, close_after),
+            DatabaseFormat::Cbh => self.start_cbh_save(target, close_after),
+            DatabaseFormat::TwoCbh => {
+                self.status =
+                    "2CBH writing is not implemented yet. Choose PGN, SCID4, or classic CBH."
+                        .to_string();
+            }
+        }
+    }
+
+    /// Save in the current database's format. A new database, or a 2CBH source,
+    /// opens the format chooser. A session that already has a writable target
+    /// writes there without asking again.
+    fn save_database_now(&mut self, close_after: bool) {
         if self.session.is_empty() {
-            self.status = "There are no games to export.".to_string();
+            self.status = "There are no games to save.".to_string();
             return;
         }
-        let default = self.default_pgn_export_path();
-        let Some(mut path) = save_pgn_dialog(&default) else {
+        if let Some(format) = self.current_database_format() {
+            if !format.is_writable() {
+                self.status =
+                    "2CBH is read-only in Brett. Choose another format to save a copy.".to_string();
+                self.open_save_database_dialog(false, close_after, DatabaseFormat::Pgn);
+                return;
+            }
+            if let Some(path) = self
+                .database_save_path
+                .clone()
+                .filter(|path| DatabaseFormat::from_path(path) == format)
+            {
+                self.start_format_save(format, Some(path), close_after);
+                return;
+            }
+            let default = self.default_database_save_path(format);
+            let Some(path) = save_format_dialog(format, &default) else {
+                self.status = "Save cancelled.".to_string();
+                return;
+            };
+            self.start_format_save(format, Some(path), close_after);
             return;
+        }
+        self.open_save_database_dialog(false, close_after, DatabaseFormat::Pgn);
+    }
+
+    fn save_database_as_now(&mut self, close_after: bool) {
+        if self.session.is_empty() {
+            self.status = "There are no games to save.".to_string();
+            return;
+        }
+        let format = self
+            .current_database_format()
+            .filter(|format| format.is_writable())
+            .unwrap_or(DatabaseFormat::Pgn);
+        self.open_save_database_dialog(true, close_after, format);
+    }
+
+    fn open_save_database_dialog(
+        &mut self,
+        as_mode: bool,
+        close_after: bool,
+        format: DatabaseFormat,
+    ) {
+        self.save_database_as = as_mode;
+        self.save_database_format = format;
+        self.save_database_path = self
+            .default_database_save_path(format)
+            .display()
+            .to_string();
+        self.save_database_close_after = close_after;
+        self.save_database_error.clear();
+        self.save_database_dialog_open = true;
+    }
+
+    fn refresh_save_database_path(&mut self, previous: DatabaseFormat) {
+        let path = PathBuf::from(self.save_database_path.trim());
+        if path.as_os_str().is_empty() {
+            self.save_database_path = self
+                .default_database_save_path(self.save_database_format)
+                .display()
+                .to_string();
+        } else if path.extension().is_none()
+            || path
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case(previous.extension()))
+        {
+            self.save_database_path = path
+                .with_extension(self.save_database_format.extension())
+                .display()
+                .to_string();
+        }
+    }
+
+    fn save_database_dialog(&mut self, ctx: &egui::Context) {
+        if !self.save_database_dialog_open {
+            return;
+        }
+        let previous_format = self.save_database_format;
+        let title = if self.save_database_as {
+            "Save database as"
+        } else {
+            "Save database"
+        };
+        let mut open = true;
+        let mut save = false;
+        let mut cancel = false;
+        let mut browse = false;
+        egui::Window::new(title)
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.set_min_width(560.0);
+                ui.label(RichText::new("Format").strong());
+                for format in DatabaseFormat::WRITABLE {
+                    ui.radio_value(&mut self.save_database_format, format, format.label());
+                }
+                ui.add_enabled(
+                    false,
+                    egui::RadioButton::new(
+                        false,
+                        "ChessBase 2CBH (the current standard; writing is not implemented yet)",
+                    ),
+                );
+                ui.add_space(6.0);
+                ui.label("File");
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.save_database_path)
+                            .desired_width(440.0),
+                    );
+                    if ui.button("Browse…").clicked() {
+                        browse = true;
+                    }
+                });
+                ui.label(
+                    RichText::new(
+                        "2CBH is the standard ChessBase format, but Brett can only read it for now. PGN, SCID4, and classic CBH are writable.",
+                    )
+                    .small()
+                    .weak(),
+                );
+                if !self.save_database_error.is_empty() {
+                    ui.add_space(4.0);
+                    ui.label(RichText::new(&self.save_database_error).small().color(GOLD));
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Save").clicked() {
+                        save = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+
+        if previous_format != self.save_database_format {
+            self.refresh_save_database_path(previous_format);
+        }
+        if browse {
+            let default = PathBuf::from(self.save_database_path.trim());
+            let default = if default.as_os_str().is_empty() {
+                self.default_database_save_path(self.save_database_format)
+            } else {
+                default
+            };
+            if let Some(path) = save_format_dialog(self.save_database_format, &default) {
+                self.save_database_path = path.display().to_string();
+            }
+        }
+        if save {
+            let mut path = PathBuf::from(self.save_database_path.trim());
+            if path.as_os_str().is_empty() {
+                self.save_database_error = "Choose a file path.".to_string();
+            } else {
+                if !path.extension().is_some_and(|extension| {
+                    extension.eq_ignore_ascii_case(self.save_database_format.extension())
+                }) {
+                    path.set_extension(self.save_database_format.extension());
+                }
+                let format = self.save_database_format;
+                let close_after = self.save_database_close_after;
+                self.save_database_dialog_open = false;
+                self.save_database_close_after = false;
+                self.save_database_error.clear();
+                self.start_format_save(format, Some(path), close_after);
+            }
+        } else if cancel || !open {
+            self.save_database_dialog_open = false;
+            self.save_database_close_after = false;
+            self.save_database_error.clear();
+            self.status = "Save cancelled.".to_string();
+        }
+    }
+
+    fn start_pgn_save(&mut self, target: Option<PathBuf>, close_after: bool) {
+        if self.session.is_empty() {
+            self.status = "There are no games to save.".to_string();
+            return;
+        }
+        let mut path = match target {
+            Some(path) => path,
+            None => {
+                let default = self.default_database_save_path(DatabaseFormat::Pgn);
+                let Some(path) = save_format_dialog(DatabaseFormat::Pgn, &default) else {
+                    self.status = "Save cancelled.".to_string();
+                    return;
+                };
+                path
+            }
         };
         if path.extension().is_none() {
             path.set_extension("pgn");
@@ -1710,25 +2110,12 @@ impl App {
                 path,
                 games,
                 estimate,
+                close_after,
             });
-            self.status = format!("Confirm the export of {} games.", games_label(games));
+            self.status = format!("Confirm saving {} games.", games_label(games));
         } else {
-            self.write_pgn_export(&path);
+            self.write_pgn_export(&path, close_after);
         }
-    }
-
-    fn default_pgn_export_path(&self) -> PathBuf {
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("."));
-        let stem = self
-            .library
-            .as_ref()
-            .and_then(|library| library.path().file_stem())
-            .map(|stem| stem.to_string_lossy().trim().to_string())
-            .filter(|stem| !stem.is_empty())
-            .unwrap_or_else(|| "brett-export".to_string());
-        home.join(format!("{stem}-export.pgn"))
     }
 
     fn pgn_export_estimate(&self) -> u64 {
@@ -1756,13 +2143,15 @@ impl App {
         )
     }
 
-    fn write_pgn_export(&mut self, path: &std::path::Path) {
+    fn write_pgn_export(&mut self, path: &std::path::Path, close_after: bool) {
+        self.persist_current_edit();
         match self.try_write_pgn_export(path) {
             Ok(games) => {
-                self.status = format!("Exported {} to {}.", games_label(games), path.display());
+                self.status = format!("Saved {} to {}.", games_label(games), path.display());
+                self.finish_saved_database(path, close_after);
             }
             Err(err) => {
-                self.status = format!("PGN export failed: {err}");
+                self.status = format!("PGN save failed: {err}");
             }
         }
     }
@@ -1855,10 +2244,10 @@ impl App {
             });
         if confirm {
             self.pending_pgn_export = None;
-            self.write_pgn_export(&pending.path);
+            self.write_pgn_export(&pending.path, pending.close_after);
         } else if cancel || !open {
             self.pending_pgn_export = None;
-            self.status = "PGN export cancelled.".to_string();
+            self.status = "Save cancelled.".to_string();
         }
     }
 
@@ -1908,21 +2297,28 @@ impl App {
             });
         if confirm {
             self.pending_scid_export = None;
-            self.write_scid_export(&pending.path);
+            self.write_scid_export(&pending.path, pending.close_after);
         } else if cancel || !open {
             self.pending_scid_export = None;
-            self.status = "SCID export cancelled.".to_string();
+            self.status = "Save cancelled.".to_string();
         }
     }
 
-    fn start_scid_export(&mut self) {
+    fn start_scid_save(&mut self, target: Option<PathBuf>, close_after: bool) {
         if self.session.is_empty() {
-            self.status = "There are no games to export.".to_string();
+            self.status = "There are no games to save.".to_string();
             return;
         }
-        let default = self.default_scid_export_path();
-        let Some(mut path) = save_scid_dialog(&default) else {
-            return;
+        let mut path = match target {
+            Some(path) => path,
+            None => {
+                let default = self.default_database_save_path(DatabaseFormat::Scid);
+                let Some(path) = save_format_dialog(DatabaseFormat::Scid, &default) else {
+                    self.status = "Save cancelled.".to_string();
+                    return;
+                };
+                path
+            }
         };
         if !path
             .extension()
@@ -1949,32 +2345,19 @@ impl App {
             .collect();
         let games = self.session.len();
         if existing.is_empty() {
-            self.write_scid_export(&path);
+            self.write_scid_export(&path, close_after);
         } else {
             self.pending_scid_export = Some(PendingScidExport {
                 path,
                 games,
                 existing,
+                close_after,
             });
             self.status = format!(
                 "Confirm replacing the existing SCID database for {}.",
                 games_label(games)
             );
         }
-    }
-
-    fn default_scid_export_path(&self) -> PathBuf {
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("."));
-        let stem = self
-            .library
-            .as_ref()
-            .and_then(|library| library.path().file_stem())
-            .map(|stem| stem.to_string_lossy().trim().to_string())
-            .filter(|stem| !stem.is_empty())
-            .unwrap_or_else(|| "brett-export".to_string());
-        home.join(format!("{stem}-export.si4"))
     }
 
     fn scid_export_would_overwrite_source(&self, path: &std::path::Path) -> bool {
@@ -1993,18 +2376,20 @@ impl App {
         })
     }
 
-    fn write_scid_export(&mut self, path: &std::path::Path) {
+    fn write_scid_export(&mut self, path: &std::path::Path, close_after: bool) {
+        self.persist_current_edit();
         match self.try_write_scid_export(path) {
             Ok(report) => {
                 self.status = format!(
-                    "Exported {} to {} ({}).",
+                    "Saved {} to {} ({}).",
                     games_label(report.games),
                     path.display(),
                     human_bytes(report.bytes)
                 );
+                self.finish_saved_database(path, close_after);
             }
             Err(err) => {
-                self.status = format!("SCID export failed: {err}");
+                self.status = format!("SCID save failed: {err}");
             }
         }
     }
@@ -2077,21 +2462,28 @@ impl App {
             });
         if confirm {
             self.pending_cbh_export = None;
-            self.write_cbh_export(&pending.path);
+            self.write_cbh_export(&pending.path, pending.close_after);
         } else if cancel || !open {
             self.pending_cbh_export = None;
-            self.status = "CBH export cancelled.".to_string();
+            self.status = "Save cancelled.".to_string();
         }
     }
 
-    fn start_cbh_export(&mut self) {
+    fn start_cbh_save(&mut self, target: Option<PathBuf>, close_after: bool) {
         if self.session.is_empty() {
-            self.status = "There are no games to export.".to_string();
+            self.status = "There are no games to save.".to_string();
             return;
         }
-        let default = self.default_cbh_export_path();
-        let Some(mut path) = save_cbh_dialog(&default) else {
-            return;
+        let mut path = match target {
+            Some(path) => path,
+            None => {
+                let default = self.default_database_save_path(DatabaseFormat::Cbh);
+                let Some(path) = save_format_dialog(DatabaseFormat::Cbh, &default) else {
+                    self.status = "Save cancelled.".to_string();
+                    return;
+                };
+                path
+            }
         };
         if !path
             .extension()
@@ -2115,32 +2507,19 @@ impl App {
         let existing = crate::cbh::existing_companion_files(&path);
         let games = self.session.len();
         if existing.is_empty() {
-            self.write_cbh_export(&path);
+            self.write_cbh_export(&path, close_after);
         } else {
             self.pending_cbh_export = Some(PendingCbhExport {
                 path,
                 games,
                 existing,
+                close_after,
             });
             self.status = format!(
                 "Confirm replacing the existing CBH database for {}.",
                 games_label(games)
             );
         }
-    }
-
-    fn default_cbh_export_path(&self) -> PathBuf {
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("."));
-        let stem = self
-            .library
-            .as_ref()
-            .and_then(|library| library.path().file_stem())
-            .map(|stem| stem.to_string_lossy().trim().to_string())
-            .filter(|stem| !stem.is_empty())
-            .unwrap_or_else(|| "brett-export".to_string());
-        home.join(format!("{stem}-export.cbh"))
     }
 
     fn cbh_export_would_overwrite_source(&self, path: &std::path::Path) -> bool {
@@ -2164,18 +2543,20 @@ impl App {
         false
     }
 
-    fn write_cbh_export(&mut self, path: &std::path::Path) {
+    fn write_cbh_export(&mut self, path: &std::path::Path, close_after: bool) {
+        self.persist_current_edit();
         match self.try_write_cbh_export(path) {
             Ok(report) => {
                 self.status = format!(
-                    "Exported {} to {} ({}).",
+                    "Saved {} to {} ({}).",
                     games_label(report.games),
                     path.display(),
                     human_bytes(report.bytes)
                 );
+                self.finish_saved_database(path, close_after);
             }
             Err(err) => {
-                self.status = format!("CBH export failed: {err}");
+                self.status = format!("CBH save failed: {err}");
             }
         }
     }
@@ -2431,6 +2812,7 @@ impl App {
 
         let ids: Vec<usize> = self.session.slots().iter().map(|slot| slot.id).collect();
         let current_slot = self.current_slot;
+        let mut session_changed = false;
         for id in ids {
             if current_slot == Some(id)
                 && let Some(game) = self.current.as_mut()
@@ -2453,7 +2835,11 @@ impl App {
             if outcome == crate::eco::ClassifyOutcome::Updated {
                 self.session.update_headers(id, &game);
                 self.edited.insert(id, game);
+                session_changed = true;
             }
+        }
+        if session_changed {
+            self.session_dirty = true;
         }
 
         let msg = format!(
@@ -2946,6 +3332,24 @@ impl App {
         Some((base + i64::from(self.reference_offset)).clamp(50, 4_000) as u32)
     }
 
+    fn remember_database_dir(&mut self, path: &Path) {
+        let Some(parent) = path.parent() else {
+            return;
+        };
+        let parent = if parent.as_os_str().is_empty() {
+            std::env::current_dir().ok()
+        } else {
+            Some(parent.to_path_buf())
+        };
+        let Some(parent) = parent else {
+            return;
+        };
+        if self.last_database_dir.as_ref() != Some(&parent) {
+            self.last_database_dir = Some(parent);
+            self.save_display_prefs();
+        }
+    }
+
     fn save_display_prefs(&mut self) {
         let prefs = DisplayPrefs {
             rating_priority: self.rating_priority,
@@ -2954,6 +3358,7 @@ impl App {
             engine_auto: self.engine_auto,
             opening_tree_path: self.tree_path.clone(),
             opening_book_path: self.book_path.clone(),
+            last_database_dir: self.last_database_dir.clone(),
             prep_recent_limit: self.prep_recent_limit.clamp(1, 50),
             show_empty_pgn_tags: self.show_empty_pgn_tags,
             hover_moves: self.hover_moves,
@@ -5050,6 +5455,98 @@ impl App {
         }
     }
 
+    fn has_unsaved_changes(&self) -> bool {
+        self.dirty || self.session_dirty
+    }
+
+    /// Intercept a window-close request. Modified databases ask first; a
+    /// cancelled save leaves the window open.
+    fn handle_close_request(&mut self, ctx: &egui::Context) {
+        if !ctx.input(|input| input.viewport().close_requested()) {
+            return;
+        }
+        if self.close_confirm_open
+            || self.save_database_dialog_open
+            || self.pending_pgn_export.is_some()
+            || self.pending_scid_export.is_some()
+            || self.pending_cbh_export.is_some()
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            return;
+        }
+        if self.has_unsaved_changes() {
+            self.close_confirm_open = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        } else {
+            self.pending_window_close = true;
+        }
+    }
+
+    fn close_confirmation_dialog(&mut self, ctx: &egui::Context) {
+        if !self.close_confirm_open {
+            return;
+        }
+        let mut open = true;
+        let mut save = false;
+        let mut discard = false;
+        let mut cancel = false;
+        let can_save = !self.session.is_empty();
+        egui::Window::new("Unsaved changes")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.set_min_width(420.0);
+                ui.label("This database has unsaved changes. Save before closing?");
+                ui.label(
+                    RichText::new(
+                        "Save database keeps the current format. A 2CBH source is read-only, so Brett will ask for a writable copy.",
+                    )
+                    .small()
+                    .weak(),
+                );
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(can_save, egui::Button::new("Save"))
+                        .on_disabled_hover_text("There are no games to save.")
+                        .clicked()
+                    {
+                        save = true;
+                    }
+                    if ui.button("Discard changes").clicked() {
+                        discard = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+
+        if save {
+            self.close_confirm_open = false;
+            self.save_database_now(true);
+        } else if discard {
+            self.close_confirm_open = false;
+            self.dirty = false;
+            self.session_dirty = false;
+            self.pending_window_close = true;
+        } else if cancel || !open {
+            self.close_confirm_open = false;
+        }
+    }
+
+    /// Copy the live current game into `edited` before a whole-database save.
+    /// The dirty flag stays set until the target file is actually written.
+    fn persist_current_edit(&mut self) {
+        if !self.dirty {
+            return;
+        }
+        if let (Some(id), Some(game)) = (self.current_slot, self.current.as_ref()) {
+            self.edited.insert(id, game.clone());
+        }
+    }
+
     /// Keep the row's cached headers in sync while the selected game is being
     /// edited. The game tree itself stays in `edited` until navigation.
     fn sync_current_slot(&mut self) {
@@ -5374,19 +5871,19 @@ impl App {
             egui::MenuBar::new().ui(ui, |ui| {
                 ui.menu_button("File", |ui| {
                     if ui.button("Open database…").clicked() {
-                        if let Some(path) = open_dialog() {
+                        if let Some(path) = open_dialog(self.last_database_dir.as_deref()) {
                             self.load_file(&path);
                         }
                         ui.close();
                     }
                     if ui.button("Open database view…").clicked() {
-                        if let Some(path) = open_dialog() {
+                        if let Some(path) = open_dialog(self.last_database_dir.as_deref()) {
                             self.open_database_view(&path);
                         }
                         ui.close();
                     }
                     if ui.button("Merge database into current list…").clicked() {
-                        if let Some(path) = open_dialog()
+                        if let Some(path) = open_dialog(self.last_database_dir.as_deref())
                             && let Ok(library) = open_library(&path)
                         {
                             self.pending_merge = Some(PendingMerge {
@@ -5400,37 +5897,27 @@ impl App {
                     if ui
                         .add_enabled(
                             !self.session.is_empty(),
-                            egui::Button::new("Save database as PGN…"),
+                            egui::Button::new("Save database"),
+                        )
+                        .on_hover_text(
+                            "Save in the current database format. A new database asks for a format.",
                         )
                         .clicked()
                     {
-                        self.start_pgn_export();
+                        self.save_database_now(false);
                         ui.close();
                     }
                     if ui
                         .add_enabled(
                             !self.session.is_empty(),
-                            egui::Button::new("Save database as SCID…"),
+                            egui::Button::new("Save database as…"),
                         )
                         .on_hover_text(
-                            "Write a SCID4 .si4 database with its .sn4 and .sg4 companions",
+                            "Choose PGN, SCID4, or classic CBH. 2CBH is read-only in Brett for now.",
                         )
                         .clicked()
                     {
-                        self.start_scid_export();
-                        ui.close();
-                    }
-                    if ui
-                        .add_enabled(
-                            !self.session.is_empty(),
-                            egui::Button::new("Save database as CBH…"),
-                        )
-                        .on_hover_text(
-                            "Write a classic ChessBase .cbh database with its .cbg, .cba, .cbp, .cbt, .cbc, and .cbs companions",
-                        )
-                        .clicked()
-                    {
-                        self.start_cbh_export();
+                        self.save_database_as_now(false);
                         ui.close();
                     }
                     if ui
@@ -5986,6 +6473,7 @@ impl App {
         if let Some((id, insertion)) = reorder
             && self.session.move_slot(id, insertion)
         {
+            self.session_dirty = true;
             self.status = "Game moved in the current list.".to_string();
         }
         if let Some((view_index, game_id, insert_at)) = external_drop
@@ -6803,7 +7291,7 @@ impl App {
             reference_path.clear();
             reference_enabled = false;
         }
-        if choose_reference && let Some(path) = open_dialog() {
+        if choose_reference && let Some(path) = open_dialog(None) {
             reference_path = path.display().to_string();
             reference_enabled = true;
         }
@@ -8298,7 +8786,7 @@ impl App {
         if build_index {
             self.request_index_build();
         }
-        if choose_tree && let Some(path) = open_dialog() {
+        if choose_tree && let Some(path) = open_dialog(None) {
             self.tree_path = path.display().to_string();
             self.save_display_prefs();
             self.start_tree_index(path);
@@ -8312,7 +8800,7 @@ impl App {
             self.tree_status = "Using the current database for the opening tree.".to_string();
             self.save_display_prefs();
         }
-        if choose_book && let Some(path) = open_dialog() {
+        if choose_book && let Some(path) = open_dialog(None) {
             self.book_path = path.display().to_string();
             self.save_display_prefs();
             self.start_book(path);
@@ -9393,15 +9881,6 @@ impl App {
                     ui.separator();
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui
-                        .button("Open…")
-                        .on_hover_text("Open a PGN, SCID, classic CBH, or 2CBH database")
-                        .clicked()
-                        && let Some(path) = open_dialog()
-                    {
-                        self.load_file(&path);
-                    }
-
                     if let Some(game) = self.current.as_ref() {
                         let fen = fen_string(&game.nodes[self.node].pos);
                         let width = (ui.available_width() - 8.0).max(80.0);
@@ -9703,7 +10182,7 @@ impl App {
             });
 
         self.views_open = open;
-        if open_request && let Some(path) = open_dialog() {
+        if open_request && let Some(path) = open_dialog(self.last_database_dir.as_deref()) {
             self.open_database_view(&path);
         }
         if let Some(index) = close_view
@@ -10398,7 +10877,7 @@ impl App {
                 });
             });
 
-        if choose_correspondence && let Some(path) = open_dialog() {
+        if choose_correspondence && let Some(path) = open_dialog(None) {
             self.settings_correspondence_path = path.display().to_string();
             self.settings_correspondence_enabled = true;
         }
@@ -10481,6 +10960,12 @@ impl App {
 }
 
 impl eframe::App for App {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // `logic` also runs while the window is minimized, so a close request
+        // cannot slip through without the unsaved-changes prompt.
+        self.handle_close_request(ctx);
+    }
+
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.poll_open();
@@ -10718,6 +11203,12 @@ impl eframe::App for App {
         self.pending_game_drop_dialog(&ctx);
         self.pending_merge_dialog(&ctx);
         self.pending_open_dialog(&ctx);
+        self.save_database_dialog(&ctx);
+        self.close_confirmation_dialog(&ctx);
+        if self.pending_window_close {
+            self.pending_window_close = false;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
     }
 }
 
@@ -14563,80 +15054,63 @@ fn default_correspondence_path() -> Option<PathBuf> {
         .find(|path| path.exists())
 }
 
-fn open_dialog() -> Option<std::path::PathBuf> {
+fn open_dialog(initial_dir: Option<&Path>) -> Option<std::path::PathBuf> {
     use std::process::Command;
 
-    let dialogs: [(&str, &[&str]); 2] = [
-        (
-            "zenity",
-            &[
-                "--file-selection",
-                "--title=Open chess database",
-                "--file-filter=Chess databases | *.pgn *.PGN *.si4 *.si3 *.cbh *.CBH *.2cbh *.2cbg *.2cba *.2lid",
-                "--file-filter=PGN files | *.pgn *.PGN",
-                "--file-filter=SCID databases | *.si4 *.si3",
-                "--file-filter=ChessBase databases | *.cbh *.CBH *.2cbh *.2cbg *.2cba *.2lid",
-                "--file-filter=All files | *",
-            ],
-        ),
-        (
-            "kdialog",
-            &[
-                "--getopenfilename",
-                ".",
-                "*.pgn *.PGN *.si4 *.si3 *.cbh *.CBH *.2cbh *.2cbg *.2cba *.2lid|Chess databases",
-            ],
-        ),
+    let mut zenity = vec![
+        "--file-selection".to_string(),
+        "--title=Open chess database".to_string(),
+        "--file-filter=Chess databases | *.pgn *.PGN *.si4 *.si3 *.cbh *.CBH *.2cbh *.2cbg *.2cba *.2lid".to_string(),
+        "--file-filter=PGN files | *.pgn *.PGN".to_string(),
+        "--file-filter=SCID databases | *.si4 *.si3".to_string(),
+        "--file-filter=ChessBase databases | *.cbh *.CBH *.2cbh *.2cbg *.2cba *.2lid".to_string(),
+        "--file-filter=All files | *".to_string(),
     ];
-
-    for (program, args) in dialogs {
-        match Command::new(program).args(args).output() {
-            Ok(out) if out.status.success() => {
-                let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                return (!path.is_empty()).then(|| std::path::PathBuf::from(path));
-            }
-            // The dialog ran but the user cancelled it.
-            Ok(_) => return None,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(_) => return None,
+    if let Some(dir) = initial_dir.filter(|path| path.is_dir()) {
+        zenity.push(format!("--filename={}", dir.display()));
+    }
+    match Command::new("zenity").args(&zenity).output() {
+        Ok(out) if out.status.success() => {
+            let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            return (!path.is_empty()).then(|| std::path::PathBuf::from(path));
         }
+        // The dialog ran but the user cancelled it.
+        Ok(_) => return None,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return None,
     }
 
-    None
+    let start = initial_dir
+        .filter(|path| path.is_dir())
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| ".".to_string());
+    let kdialog = [
+        "--getopenfilename",
+        start.as_str(),
+        "*.pgn *.PGN *.si4 *.si3 *.cbh *.CBH *.2cbh *.2cbg *.2cba *.2lid|Chess databases",
+    ];
+    match Command::new("kdialog").args(kdialog).output() {
+        Ok(out) if out.status.success() => {
+            let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            (!path.is_empty()).then(|| std::path::PathBuf::from(path))
+        }
+        _ => None,
+    }
 }
 
-/// Native Save As dialog for a PGN export.
-fn save_pgn_dialog(default_path: &std::path::Path) -> Option<std::path::PathBuf> {
+/// Native Save As dialog for one database format. SCID and classic CBH
+/// overwrite confirmation is handled in-app because their companion files
+/// must be replaced together.
+fn save_format_dialog(
+    format: DatabaseFormat,
+    default_path: &std::path::Path,
+) -> Option<std::path::PathBuf> {
     save_database_dialog(
         default_path,
-        "Save database as PGN",
-        "PGN files",
-        "*.pgn",
-        true,
-    )
-}
-
-/// Native Save As dialog for a SCID4 export. Overwriting is confirmed in-app
-/// because all three companion files must be replaced together.
-fn save_scid_dialog(default_path: &std::path::Path) -> Option<std::path::PathBuf> {
-    save_database_dialog(
-        default_path,
-        "Save database as SCID",
-        "SCID4 database",
-        "*.si4",
-        false,
-    )
-}
-
-/// Native Save As dialog for a classic ChessBase CBH export. Overwriting is
-/// confirmed in-app because the companion files are replaced together.
-fn save_cbh_dialog(default_path: &std::path::Path) -> Option<std::path::PathBuf> {
-    save_database_dialog(
-        default_path,
-        "Save database as CBH",
-        "ChessBase database",
-        "*.cbh",
-        false,
+        &format!("Save database as {}", format.short_label()),
+        format.filter_name(),
+        &format!("*.{}", format.extension()),
+        format == DatabaseFormat::Pgn,
     )
 }
 
@@ -14652,14 +15126,29 @@ fn save_print_dialog(default_path: &std::path::Path) -> Option<std::path::PathBu
 }
 
 fn default_print_path(stem: Option<&str>) -> PathBuf {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
+    let directory = documents_path();
     let stem = stem
         .map(str::trim)
         .filter(|stem| !stem.is_empty())
         .unwrap_or("brett");
-    home.join(format!("{stem}-print.typ"))
+    directory.join(format!("{stem}-print.typ"))
+}
+
+/// User's Documents folder, falling back to the home directory when it does
+/// not exist. Print exports default here so a compiled PDF is easy to find.
+fn documents_path() -> PathBuf {
+    home_path("Documents")
+        .filter(|path| path.is_dir())
+        .or_else(|| home_path(""))
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// Fallback folder for the first database save, before any open or save has
+/// established a remembered directory.
+fn default_database_dir() -> PathBuf {
+    home_path("")
+        .filter(|path| path.is_dir())
+        .unwrap_or_else(|| PathBuf::from("."))
 }
 
 fn print_owner() -> String {
@@ -14883,6 +15372,17 @@ mod tests {
             index_job: None,
             index_status: String::new(),
             confirm_large_index: false,
+            last_database_dir: None,
+            database_save_path: None,
+            session_dirty: false,
+            close_confirm_open: false,
+            pending_window_close: false,
+            save_database_dialog_open: false,
+            save_database_as: false,
+            save_database_format: DatabaseFormat::Pgn,
+            save_database_path: String::new(),
+            save_database_close_after: false,
+            save_database_error: String::new(),
             tree_path: String::new(),
             tree_index: None,
             tree_index_rx: None,
@@ -16209,19 +16709,170 @@ mod tests {
     }
 
     #[test]
-    fn default_print_path_uses_the_library_stem_and_falls_back_to_brett() {
+    fn default_print_path_uses_documents_and_the_library_stem() {
         let home = std::env::var_os("HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("."));
         assert_eq!(
             default_print_path(Some("Mega Database 2026")),
-            home.join("Mega Database 2026-print.typ")
+            home.join("Documents/Mega Database 2026-print.typ")
         );
         assert_eq!(
             default_print_path(Some("   ")),
-            home.join("brett-print.typ")
+            home.join("Documents/brett-print.typ")
         );
-        assert_eq!(default_print_path(None), home.join("brett-print.typ"));
+        assert_eq!(
+            default_print_path(None),
+            home.join("Documents/brett-print.typ")
+        );
+    }
+
+    #[test]
+    fn database_format_maps_extensions_and_keeps_2cbh_read_only() {
+        assert_eq!(
+            DatabaseFormat::from_path(Path::new("games.pgn")),
+            DatabaseFormat::Pgn
+        );
+        assert_eq!(
+            DatabaseFormat::from_path(Path::new("games.si4")),
+            DatabaseFormat::Scid
+        );
+        assert_eq!(
+            DatabaseFormat::from_path(Path::new("games.cbh")),
+            DatabaseFormat::Cbh
+        );
+        assert_eq!(
+            DatabaseFormat::from_path(Path::new("games.cbv")),
+            DatabaseFormat::Cbh
+        );
+        assert_eq!(
+            DatabaseFormat::from_path(Path::new("games.2cbh")),
+            DatabaseFormat::TwoCbh
+        );
+        assert!(!DatabaseFormat::TwoCbh.is_writable());
+        assert!(DatabaseFormat::Pgn.is_writable());
+        assert!(DatabaseFormat::Scid.is_writable());
+        assert!(DatabaseFormat::Cbh.is_writable());
+    }
+
+    #[test]
+    fn database_save_default_path_avoids_overwriting_the_open_source() {
+        let dir = Path::new("/tmp/brett-databases");
+        assert_eq!(
+            database_save_default_path(
+                "Mega Database 2026",
+                Some(Path::new("/db/Mega.2cbh")),
+                dir,
+                DatabaseFormat::Pgn
+            ),
+            dir.join("Mega Database 2026.pgn")
+        );
+        assert_eq!(
+            database_save_default_path(
+                "Mega Database 2026",
+                Some(Path::new("/db/Mega.cbh")),
+                dir,
+                DatabaseFormat::Cbh
+            ),
+            dir.join("Mega Database 2026-saved.cbh")
+        );
+        assert_eq!(
+            database_save_default_path("Brett Database", None, dir, DatabaseFormat::Pgn),
+            dir.join("Brett Database.pgn")
+        );
+    }
+
+    #[test]
+    fn saving_snapshots_the_current_game_edit() {
+        let mut app = test_app();
+        let id = app.session.insert_game(app.current.clone().unwrap(), None);
+        app.current_slot = Some(id);
+        app.current
+            .as_mut()
+            .unwrap()
+            .set_header("Event", "Saved event".to_string());
+        app.dirty = true;
+
+        app.persist_current_edit();
+
+        assert_eq!(
+            app.edited.get(&id).unwrap().header("Event"),
+            Some("Saved event")
+        );
+        assert!(app.dirty, "the edit is not saved until the file is written");
+    }
+
+    #[test]
+    fn save_as_reuses_the_current_writable_target() {
+        let mut app = test_app();
+        app.last_database_dir = Some(PathBuf::from("/tmp/brett-databases"));
+        app.database_save_path = Some(PathBuf::from("/tmp/brett-databases/My Database.pgn"));
+
+        assert_eq!(
+            app.default_database_save_path(DatabaseFormat::Pgn),
+            PathBuf::from("/tmp/brett-databases/My Database.pgn")
+        );
+        assert_eq!(
+            app.default_database_save_path(DatabaseFormat::Scid),
+            PathBuf::from("/tmp/brett-databases/My Database.si4")
+        );
+    }
+
+    #[test]
+    fn unsaved_changes_include_game_edits_and_session_changes() {
+        let mut app = test_app();
+        assert!(!app.has_unsaved_changes());
+        app.dirty = true;
+        assert!(app.has_unsaved_changes());
+        app.dirty = false;
+        app.session_dirty = true;
+        assert!(app.has_unsaved_changes());
+    }
+
+    fn close_request_input() -> egui::RawInput {
+        let mut input = egui::RawInput::default();
+        let mut viewport = egui::ViewportInfo::default();
+        viewport.events.push(egui::ViewportEvent::Close);
+        input.viewports.insert(egui::ViewportId::ROOT, viewport);
+        input
+    }
+
+    #[test]
+    fn close_request_is_cancelled_when_the_database_is_modified() {
+        let ctx = egui::Context::default();
+        let mut app = test_app();
+        app.dirty = true;
+
+        let mut output = ctx.run_ui(close_request_input(), |ui| {
+            app.handle_close_request(ui.ctx());
+        });
+        output.textures_delta.clear();
+
+        assert!(app.close_confirm_open);
+        assert!(
+            output.viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .contains(&egui::ViewportCommand::CancelClose)
+        );
+    }
+
+    #[test]
+    fn close_request_without_edits_does_not_prompt() {
+        let ctx = egui::Context::default();
+        let mut app = test_app();
+
+        let mut output = ctx.run_ui(close_request_input(), |ui| {
+            app.handle_close_request(ui.ctx());
+        });
+        output.textures_delta.clear();
+
+        assert!(!app.close_confirm_open);
+        assert!(app.pending_window_close);
+        assert!(
+            !output.viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .contains(&egui::ViewportCommand::CancelClose)
+        );
     }
 
     #[test]

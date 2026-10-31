@@ -13,8 +13,8 @@ moves-panel interaction polish is complete. Item 8's cloud, opening-tree,
 reference-source, and native-book parts are done; M2b mega-scale ingest remains,
 with the first safety pass now keeping huge archives responsive and avoiding
 automatic full indexing. Item 9's editable session, database views,
-reorder/merge, PGN export, and native SCID writer are done; the classic CBH
-writer remains. Item 10 is no longer blocked: the current ICCF SCID source is available
+reorder/merge, PGN export, native SCID writer, classic CBH writer, and unified
+**Save database** / **Save database as…** flow are done. Item 10 is no longer blocked: the current ICCF SCID source is available
 and the automatic correspondence reference is integrated; only an optional
 refresh remains. Deferred predictor refinements are recorded under item 6, and
 native player-title display is queued as item 15. Item 18's trend backend,
@@ -24,10 +24,14 @@ moves-panel display remain. Items
 now includes the FIDE-profile link. Item 22 records the player clock-usage
 analysis idea for the player profile/preparation view. Item 23 adds the
 clickable Site → OpenStreetMap search (settled provider); item 24
-records the Open-vs-Load audit: the bottom bar is reduced to a single **Open…**
-picker, and the Tree-tab path rows are read-only labels with **Choose…**,
+records the Open-vs-Load audit: the bottom-bar database picker was removed, so
+**File → Open database…** and drag-and-drop are the only ways to open a
+database, and the Tree-tab path rows are read-only labels with **Choose…**,
 **Clear**, and **Current DB**. Clocks are now shown by default and both the
-clock and evaluation-bar toggles live in Settings.
+clock and evaluation-bar toggles live in Settings. The 2026-10-31 pass also
+replaced the separate PGN/SCID/CBH save entries with **Save database** and
+**Save database as…**, remembers the last database folder, and asks before
+closing a modified database.
 
 **Decision log (2026-10-28):**
 
@@ -66,7 +70,9 @@ clock and evaluation-bar toggles live in Settings.
 - **2CBH:** the current ChessBase container reader is implemented in
   `src/twocbh/` and wired into Open. It covers standard chess, Chess960,
   headers, names, and nested variations. Annotation items and the writer remain
-  deferred; treat 2CBH as a separate format from classic CBH.
+  deferred; treat 2CBH as a separate format from classic CBH. The save dialog
+  presents 2CBH as the standard but read-only, and steers saves to PGN, SCID4,
+  or classic CBH.
 - **Item 19:** request written redistribution permission from the Scid authors;
   keep the pack local-only and out of releases until then.
 - **Chessable:** deferred; the local note is too ambiguous to schedule.
@@ -87,10 +93,12 @@ clock and evaluation-bar toggles live in Settings.
   no API key, uses open data, and avoids Google Maps Platform terms. Google
   Maps was rejected because it is less privacy-preserving. Add a provider
   setting only if users ask for both (item 23).
-- **Open vs Load:** the bottom bar now has only **Open…**; the typed-path
-  field and **Load** button were removed. The Tree-tab opening-book and
-  opening-tree rows are now read-only path labels with **Choose…**, **Clear**,
-  and **Current DB**; their redundant **Load** buttons are gone (item 24).
+- **Open vs Load:** the typed-path field and **Load** button were removed, then
+  the remaining bottom-bar **Open…** quick action was removed too. Database
+  opening now lives in **File → Open database…** and drag-and-drop. The
+  Tree-tab opening-book and opening-tree rows are read-only path labels with
+  **Choose…**, **Clear**, and **Current DB**; their redundant **Load** buttons
+  are gone (item 24).
 - **Clocks and evaluation bar:** clocks are visible by default. Both the clock
   and evaluation-bar toggles moved from the Board menu and bottom bar into
   **Settings → Display**; the board strips remain the only clock surface.
@@ -385,15 +393,20 @@ between the main list and a view, with an **Insert here** / **Append** prompt;
 dragging a database handle onto another database merges it. Merge rejects
 duplicates with order-insensitive, transliterated player-name matching plus
 first-move verification. External file drops ask whether to open, merge into
-the current database, or open in a view. **File → Save database as PGN…**
-streams the session in order, preserves comments, clocks, NAGs, and
-variations, and asks for confirmation before exports estimated at 100 MB or
-more. Both the native SCID4 writer (**File → Save database as SCID…**) and the
-native classic CBH writer (**File → Save database as CBH…**) are implemented
-and validated.
+the current database, or open in a view.
+
+**File → Save database** writes the session in its current format and reuses
+the current writable target; a new database asks for PGN, SCID4, or classic
+CBH. **File → Save database as…** always opens the format chooser. A 2CBH
+source is read-only, so Save steers to a writable copy. PGN saves stream the
+session in order, preserve comments, clocks, NAGs, and variations, and ask for
+confirmation before exports estimated at 100 MB or more. The native SCID4 and
+classic CBH writers are implemented and validated. The last database folder is
+remembered for Open and Save As, and closing a modified database asks whether
+to save, discard, or cancel; a cancelled save keeps the window open.
 
 - **Classic CBH writer (done):** native classic `.cbh` export from **File →
-  Save database as CBH…** (`src/cbh/writer.rs`) writes `.cbh`, `.cbg`, `.cba`,
+  Save database as… → Classic CBH** (`src/cbh/writer.rs`) writes `.cbh`, `.cbg`, `.cba`,
   `.cbp`, `.cbt`, `.cbc`, and `.cbs` (plus `.cbj` when `.cbg` or `.cba` reaches
   4 GiB or `force_wide` is enabled), encodes compact `PieceLists` move streams
   in modes 0/4/5/10, preserves headers, names, comments, NAGs, evaluations,
@@ -404,8 +417,8 @@ and validated.
   target a writer, but writing waits for ChessBase compatibility tests. Do not
   fold 2CBH into the classic CBH writer; the containers and validation fixtures
   are different.
-- **SCID writer (done):** native SCID4 export from **File → Save database as
-  SCID…** builds the compressed namebase and stable IDs, encodes index
+- **SCID writer (done):** native SCID4 export from **File → Save database as…
+  → SCID4** builds the compressed namebase and stable IDs, encodes index
   flags/offsets, inverts the compact move stream, preserves
   comments/NAGs/variations and custom starts, and atomically replaces the
   `.si4`/`.sn4`/`.sg4` triple with rollback. Round-trips through `ScidLibrary`
@@ -906,11 +919,11 @@ path.
 
 ## 24. Open vs Load control consolidation
 
-**Status:** implemented 2026-10-29. The typed path field and **Load** button are
-gone; a single **Open…** picker loads a database. The File menu keeps **Open
-database…**. The Tree tab’s opening-book and opening-tree path rows are now
-read-only labels with **Choose…**, **Clear**, and **Current DB**; their
-redundant **Load** buttons were removed.
+**Status:** implemented 2026-10-29, revised 2026-10-31. The typed path field,
+**Load** button, and bottom-bar **Open…** quick action are gone. **File → Open
+database…** and drag-and-drop load a database. The Tree tab’s opening-book and
+opening-tree path rows are read-only labels with **Choose…**, **Clear**, and
+**Current DB**; their redundant **Load** buttons were removed.
 
 **Goal:** the app exposed **File → Open database…**, a bottom-bar **Load** +
 **Open…** pair, and Tree-tab **Load** / **Choose…** / **Current DB** controls.
@@ -919,8 +932,8 @@ Decide which distinctions are real and remove the rest.
 - Audit result: the bottom-bar **Load** only applied the typed path; **Open…**
   opened the file picker. Both called `load_file`, so the typed path was the
   only unique behavior and the user chose to drop it. Keep the picker.
-- Keep **File → Open database…** as the menu entry and the bottom-bar
-  **Open…** as the quick action; they open the same picker.
+- Keep **File → Open database…** as the menu entry; the bottom-bar quick
+  action was removed once it proved redundant.
 - Tree-tab auxiliary rows are a separate configuration surface: keep
   **Choose…** / **Clear** / **Current DB**. The **Load** buttons were removed
   in the follow-up pass: the path is displayed read-only and only the picker or
@@ -931,7 +944,7 @@ Decide which distinctions are real and remove the rest.
   discoverability, and a small stable surface over visual polish; incremental
   UI cleanup is welcome after the functional audit.
 
-**Depends on:** `src/app.rs` menu bar, bottom bar, and Tree tab.
+**Depends on:** `src/app.rs` menu bar and Tree tab.
 
 ## 25. Typst / LaTeX export for printing
 
@@ -952,8 +965,9 @@ reproduce:
 
 - A4 portrait, two-column body flow, with a slim page header showing the
   database/source, owner, date, and page number.
-- A compact game heading: ECO code at the right, color squares before the
-  player names, players and Elos stacked, then event, site, round, and date.
+- A compact game heading: the bare ECO code at the right without an `ECO`
+  prefix, color squares before the player names, players and Elos stacked, then
+  event, site, round, and date.
 - Mainline moves in bold, wrapped as prose; variations and comments indented
   below the move where they occur, with the variation line bracketed and its
   source game cited inside the comment.
