@@ -22,6 +22,7 @@ pub mod pgn;
 pub mod photos;
 pub mod players;
 pub mod position;
+pub mod print;
 pub mod recent;
 pub mod review;
 pub mod review_book;
