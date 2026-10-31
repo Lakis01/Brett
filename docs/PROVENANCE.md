@@ -1,9 +1,9 @@
 # Provenance audit: SCID, CBH, CBV, and fixtures
 
-**Audit date:** 2026-10-28
+**Audit date:** 2026-10-31
 **Scope:** the native SCID reader/writer, the classic ChessBase CBH reader,
-the `.cbv` container path, the photo-pack converter, and the committed format
-fixtures.
+the current ChessBase 2CBH reader, the `.cbv` container path, the photo-pack
+converter, and the committed format fixtures.
 **Status:** complete for the current tree. This is an engineering provenance
 record, not legal advice.
 
@@ -30,6 +30,8 @@ is. This audit separates the two deliberately.
 | SCID fixtures | `fixtures/scid/opera.{si4,sn4,sg4}` | Generated with the `pgnscid` build tool from the public-domain Opera Game in `fixtures/opera.pgn` | Generated data only | Committed fixture contains one public-domain game plus Brett-authored annotation markers. SCID tools are not redistributed. |
 | Classic CBH reader | `src/cbh/` | Independent decoder, annotation mapping, entity-name handling, and tests; validated against the MIT `cbvault` reader | Four 256-byte move-encoding tables from MIT `cbvault` (`src/cbh/tables.rs`) | Brett MIT plus the MIT table notice in `THIRD_PARTY_NOTICES.md`. |
 | Classic CBH fixtures | `src/cbh/tests.rs` | Synthetic database generated at test time; the personal validation sample lives under git-ignored `fixtures/local/` and is never redistributed | Generated data only | No third-party database content committed. |
+| Current 2CBH reader | `src/twocbh/` | Independent clean-room decoder: container framing, `.2lid` names, header mapping, generated move-token table, standard and Chess960 starts, castling, promotions, en passant, and nested variations | None. The 65,536-entry token table is generated from move geometry; no ChessBase table dump, binary, or code is used | Brett MIT. Real-database validation is env-gated and its files are not committed. |
+| 2CBH fixtures and local checks | `src/twocbh/tests.rs`, `tests/twocbh_local.rs` | Synthetic byte-level databases generated at test time; the real-file checks read local paths from environment variables and skip when absent | Generated data only | No third-party database content committed. |
 | `.cbv` / `.cbz` container path | `src/cbv.rs` | Uses the `cbvault-format` 0.1.4 crate to materialise members, then opens the extracted classic database through `src/cbh/` | Links `cbvault-format` (MIT) | MIT. `cbvault-format`'s classic reader is a port of `cbformat` in `oschess-cb-bridge` at commit `ca9e8f8e`, which is MIT. |
 | Photo-pack converter | `scripts/convert_spf.py` | Brett-authored BPF1/WebP converter; input is Scid's `Player_photos.zip` | None | Converter is Brett MIT. The photo data has no explicit redistribution licence and remains local-only. |
 | Champion data and crowns | `src/champions.rs`, `docs/CHAMPIONS.md` | Hand-authored from public championship records | None | Brett MIT. |
@@ -60,10 +62,14 @@ MIT-era commit, and the AGPL boundary explicitly.
 
 ## What was checked
 
-- `git log --follow` for `src/scid.rs` and `src/cbh/` to identify the commits
-  that introduced each reader and writer.
-- Source headers and comments in `src/scid.rs`, `src/cbh/`, and `src/cbv.rs`
-  for attribution, porting, or copied-code markers.
+- `git log --follow` for `src/scid.rs`, `src/cbh/`, and `src/twocbh/` to
+  identify the commits that introduced each reader and writer.
+- Source headers and comments in `src/scid.rs`, `src/cbh/`, `src/twocbh/`, and
+  `src/cbv.rs` for attribution, porting, or copied-code markers.
+- The 2CBH token generator was checked against independently observed token
+  entries and regenerates tokens 1–49,196 byte-for-byte without reading a
+  ChessBase table. The validation databases are local only and are never
+  copied into the tree.
 - `cargo tree` and `Cargo.lock` for every SCID/CBH-related crate in the
   dependency graph. The only match is `cbvault-format`.
 - The `cbvault-format` source tree for upstream notices and the exact ported
@@ -82,9 +88,9 @@ MIT-era commit, and the AGPL boundary explicitly.
 - Format facts may legitimately resemble other implementations. The audit
   distinguishes copied expression (tables, comments, code structure) from
   independently written code that implements the same published layout.
-- The personal classic-CBH validation sample is not in the repository, so its
-  contents cannot be audited from a clean checkout; only the synthetic test
-  database is reproducible.
+- The personal classic-CBH and 2CBH validation samples are not in the
+  repository, so their contents cannot be audited from a clean checkout; only
+  the synthetic test databases are reproducible.
 - Licence texts and upstream statements were read on 2026-10-28. A future
   upstream relicence does not retroactively change the MIT grant at
   `ca9e8f8e`, but new ports must be re-audited.
@@ -99,5 +105,5 @@ MIT-era commit, and the AGPL boundary explicitly.
   compatible licence and record it here.
 - Keep personal databases under `fixtures/local/` and out of commits and
   release artefacts.
-- Re-run this audit before the classic CBH writer lands and before any release
-  that adds a new database format.
+- Re-run this audit before the classic CBH writer changes, before any 2CBH
+  writer lands, and before any release that adds a new database format.

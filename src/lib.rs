@@ -29,5 +29,6 @@ pub mod scid;
 pub mod session;
 pub mod settings;
 pub mod titles;
+pub mod twocbh;
 pub mod ui;
 pub mod wiki;

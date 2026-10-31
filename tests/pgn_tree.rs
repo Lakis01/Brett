@@ -198,6 +198,31 @@ fn custom_start_position_is_honoured() {
 }
 
 #[test]
+fn chess960_variant_imports_castling_with_960_rook() {
+    let pgn = br#"[Event "960"]
+[Site "?"]
+[Date "2026.01.01"]
+[Round "1"]
+[White "A"]
+[Black "B"]
+[Result "*"]
+[FEN "qnbnrkrb/pppppppp/8/8/8/8/PPPPPPPP/QNBNRKRB w GEge - 0 1"]
+[Variant "Fischerandom"]
+[SetUp "1"]
+
+1. d4 d5 2. Nbc3 b6 3. O-O Ne6 *
+"#;
+    let games = domain::parse_pgn(pgn).unwrap();
+    assert_eq!(games.len(), 1);
+    let g = &games[0];
+    assert!(g.errors.is_empty(), "{:?}", g.errors);
+    assert_eq!(g.mainline_len(), 6);
+    let castle = find(g, "O-O");
+    assert_eq!(g.nodes[castle].mv.as_ref().unwrap().uci, "f1g1");
+    assert_eq!(g.nodes[castle].pos.turn(), Color::Black);
+}
+
+#[test]
 fn null_moves_are_accepted() {
     let pgn = br#"[Event "Analysis"]
 [White "A"]

@@ -37,6 +37,7 @@ use crate::settings::{
     RatingPriority,
 };
 use crate::titles;
+use crate::twocbh::TwoCbhLibrary;
 use crate::ui::board::{self, BoardEvent, BoardState};
 use crate::ui::eval_bar;
 use crate::ui::fonts;
@@ -5277,7 +5278,7 @@ impl App {
                         ui.close();
                     }
                     ui.separator();
-                    ui.label("Or drop a .pgn, .si4, .si3, or .cbh onto the window.");
+                    ui.label("Or drop a .pgn, .si4, .si3, .cbh, or .2cbh onto the window.");
                 });
 
                 ui.menu_button("Board", |ui| {
@@ -5996,7 +5997,7 @@ impl App {
                 );
                 ui.add(
                     egui::TextEdit::singleline(&mut self.reference_path)
-                        .hint_text("/path/to/masters.pgn, reference.si4, or database.cbh")
+                        .hint_text("/path/to/masters.pgn, reference.si4, database.cbh, or database.2cbh")
                         .desired_width(f32::INFINITY),
                 );
                 ui.horizontal_wrapped(|ui| {
@@ -6502,7 +6503,7 @@ impl App {
                             ui.add(
                                 egui::TextEdit::singleline(&mut reference_path)
                                     .desired_width(width)
-                                    .hint_text("e.g. Mega Database (.pgn, .si4, .cbh)"),
+                                    .hint_text("e.g. Mega Database (.pgn, .si4, .cbh, .2cbh)"),
                             );
                             if ui.button("Choose…").clicked() {
                                 choose_reference = true;
@@ -9174,7 +9175,7 @@ impl App {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if ui
                         .button("Open…")
-                        .on_hover_text("Open a PGN, SCID, or classic CBH database")
+                        .on_hover_text("Open a PGN, SCID, classic CBH, or 2CBH database")
                         .clicked()
                         && let Some(path) = open_dialog()
                     {
@@ -10242,7 +10243,9 @@ impl App {
                 ui.add_space(6.0);
                 ui.label("Piece set: cburnett by Colin M. L. Burnett, CC BY-SA 3.0.");
                 ui.label("Rules and SAN: cozy-chess. PGN: Brett's own streaming parser.");
-                ui.label("SCID and classic CBH readers: independent native implementations.");
+                ui.label(
+                    "SCID, classic CBH, and 2CBH readers: independent native implementations.",
+                );
                 ui.label(
                     "Player photos: optional Scid Player_photos pack derived from \
                      scid/PlayerData/Player_photos.zip; not part of Brett's MIT source \
@@ -13880,6 +13883,8 @@ fn open_library(path: &std::path::Path) -> anyhow::Result<Arc<dyn GameLibrary>> 
         CbhLibrary::open_cbv(path).map(|library| Arc::new(library) as Arc<dyn GameLibrary>)
     } else if extension == "cbh" {
         CbhLibrary::open(path).map(|library| Arc::new(library) as Arc<dyn GameLibrary>)
+    } else if matches!(extension.as_str(), "2cbh" | "2cbg" | "2cba" | "2lid") {
+        TwoCbhLibrary::open(path).map(|library| Arc::new(library) as Arc<dyn GameLibrary>)
     } else {
         PgnLibrary::build(path.to_path_buf())
             .map(|library| Arc::new(library) as Arc<dyn GameLibrary>)
@@ -14305,10 +14310,10 @@ fn open_dialog() -> Option<std::path::PathBuf> {
             &[
                 "--file-selection",
                 "--title=Open chess database",
-                "--file-filter=Chess databases | *.pgn *.PGN *.si4 *.si3 *.cbh *.CBH",
+                "--file-filter=Chess databases | *.pgn *.PGN *.si4 *.si3 *.cbh *.CBH *.2cbh *.2cbg *.2cba *.2lid",
                 "--file-filter=PGN files | *.pgn *.PGN",
                 "--file-filter=SCID databases | *.si4 *.si3",
-                "--file-filter=ChessBase databases | *.cbh *.CBH",
+                "--file-filter=ChessBase databases | *.cbh *.CBH *.2cbh *.2cbg *.2cba *.2lid",
                 "--file-filter=All files | *",
             ],
         ),
@@ -14317,7 +14322,7 @@ fn open_dialog() -> Option<std::path::PathBuf> {
             &[
                 "--getopenfilename",
                 ".",
-                "*.pgn *.PGN *.si4 *.si3 *.cbh *.CBH|Chess databases",
+                "*.pgn *.PGN *.si4 *.si3 *.cbh *.CBH *.2cbh *.2cbg *.2cba *.2lid|Chess databases",
             ],
         ),
     ];

@@ -63,8 +63,10 @@ clock and evaluation-bar toggles live in Settings.
   moves are excluded from accuracy.
 - **Item 22:** add a player clock-usage analysis brainstorm for the player
   profile/preparation view; no implementation is scheduled yet.
-- **2CBH:** intended, but blocked on a sample file. Treat it as a new container
-  format, separate from the validated classic multi-file CBH reader/writer.
+- **2CBH:** the current ChessBase container reader is implemented in
+  `src/twocbh/` and wired into Open. It covers standard chess, Chess960,
+  headers, names, and nested variations. Annotation items and the writer remain
+  deferred; treat 2CBH as a separate format from classic CBH.
 - **Item 19:** request written redistribution permission from the Scid authors;
   keep the pack local-only and out of releases until then.
 - **Chessable:** deferred; the local note is too ambiguous to schedule.
@@ -275,14 +277,17 @@ on the loaded player database.
 
 **Depends on:** current player book. **Unblocks:** reliable preparation.
 
-## 7. Classic CBH database support
+## 7. Classic CBH and current 2CBH database support
 
-**Status:** implemented in `src/cbh/` and wired into the normal database
-opening path. The native reader is read-only and works behind `GameLibrary`,
-so the Games, Players, Tree, and position-index paths need no format-specific
-UI. Format details and validation results are in [CBH.md](CBH.md).
+**Status:** classic CBH is implemented in `src/cbh/` and wired into the normal
+database opening path. The current 2CBH reader is implemented in `src/twocbh/`
+and wired into Open and the file filters. Both are read-only and work behind
+`GameLibrary`, so the Games, Players, Tree, and position-index paths need no
+format-specific UI. 2CBH writing and `.2cba` annotations remain deferred.
+Format details and validation results are in [CBH.md](CBH.md).
 
-**Goal:** read the older multi-file ChessBase CBH format (not CBH2/2CBH).
+**Goal:** read the older multi-file ChessBase CBH format and the current 2CBH
+container. They are separate formats with separate readers.
 
 A local sample classic multi-file database was used during development (under
 the git-ignored `fixtures/local/` tree; never redistributed). It is a classic
@@ -290,10 +295,14 @@ multi-file database (`.cba`, `.cbb`, `.cbc`, `.cbe`, `.cbg`,
 `.cbgi`, `.cbh`, `.cbj`, `.cbm`, `.cbp`, `.cbs`, `.cbt`, `.cbtt`, `.flags`,
 `.ini`), not a 2CBH container.
 
-**2CBH:** the local note that says "cbh (2cbh)" is confirmed to mean a real
-2CBH container is wanted, but the work is blocked until a sample file is
-available. Do not extend this validated classic reader speculatively; 2CBH is
-a separate format reader/writer with its own fixtures and provenance.
+**2CBH (reader done, writer deferred):** the local note that says "cbh
+(2cbh)" means the current ChessBase container. The reader in `src/twocbh/`
+decodes the 192-byte headers, `.2lid` names, `.2cbg` token streams, standard
+and Chess960 starts, castling, promotions, en passant, and nested variations.
+It is validated against Update 01 (10,738 games, zero move/header mismatches),
+`9601.2cbh` (21/21 mainlines, seven starts), a 16-variation game, and targeted
+Mega records. `.2cba` annotation items and 2CBH writing are not implemented;
+do not fabricate comments or fold 2CBH into the classic writer.
 
 Implemented:
 
@@ -391,8 +400,10 @@ and validated.
   drawing/time/medal tokens, variations, custom starts, and Chess960, and
   atomically replaces existing companion sets with rollback. Round-trips
   through both `CbhLibrary` and `cbvault_format::cbh`.
-- **2CBH writer (separate):** blocked on a sample file. Do not fold 2CBH into
-  the classic CBH writer; the containers and validation fixtures are different.
+- **2CBH writer (separate, deferred):** the reader is complete enough to
+  target a writer, but writing waits for ChessBase compatibility tests. Do not
+  fold 2CBH into the classic CBH writer; the containers and validation fixtures
+  are different.
 - **SCID writer (done):** native SCID4 export from **File → Save database as
   SCID…** builds the compressed namebase and stable IDs, encodes index
   flags/offsets, inverts the compact move stream, preserves

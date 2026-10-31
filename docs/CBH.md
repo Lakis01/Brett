@@ -1,14 +1,16 @@
-# Native classic ChessBase CBH support
+# Native ChessBase CBH and 2CBH support
 
-Brett reads and writes the older multi-file ChessBase database format directly.
-This is the classic `.cbh` format, not CBH2/2CBH. Opening or exporting a
-database does not require ChessBase, Wine, or a converter, and opening a
-database never writes to the source files.
+Brett reads the current multi-file ChessBase 2CBH format and reads and writes
+the older classic CBH format directly. Opening a database does not require
+ChessBase, Wine, or a converter, and opening a database never writes to the
+source files.
 
-The implementation is native Rust in `src/cbh/`. It was written from the
-published on-disk layout and independent format references; no GPL converter
-code is linked or copied. Translation-table and reference provenance is in
-[THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md).
+The classic implementation is native Rust in `src/cbh/`. The 2CBH reader is
+native Rust in `src/twocbh/`. Both were written from observed on-disk layout
+and independent format references; no ChessBase code, binary, or token-table
+dump is linked or copied. Translation-table and reference provenance is in
+[THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md) and
+[PROVENANCE.md](PROVENANCE.md).
 
 ## Files
 
@@ -136,6 +138,104 @@ uses the generic loader for CBH just as it does for SCID. The index format is
 identical to PGN and SCID. The cache is keyed by the canonical `.cbh` path and
 its fingerprint combines the lengths and newest modification time of the
 header, move, annotation, name, and wide-offset files under the base name.
+
+## Current ChessBase 2CBH support (`src/twocbh/`)
+
+2CBH is a different container from classic CBH. A database is a set of files
+sharing one base name:
+
+| File | Contents |
+| --- | --- |
+| `.2cbh` | 192-byte header records; record 0 is the file header |
+| `.2cbg` | Move records |
+| `.2cba` | Annotation records (framing validated; item structure not decoded) |
+| `.2lid` | Inline player, event, and source names |
+| `.2lcd`, `.2lgd` | ChessBase's own derived indexes, ignored |
+
+`TwoCbhFile::open` accepts the `.2cbh` path or a companion file. It validates
+the 192-byte record size, the record count at `0x10` (which includes record 0),
+the `0x26` generation, and the move/annotation file headers. Opening a
+database never writes to it.
+
+Each game header record supplies the player, event, and source name ids, flags,
+round/subround, result, Elos, Chess960 start marker, game id, beauty score, and
+packed date. Player names are stored as last name, first name; a two-letter
+first name gets the conventional trailing period. Elo `0` is omitted. A packed
+date with a zero month or day renders `??`; the file does not always carry a
+full date (Mega record 3, for example, stores only `1475`).
+
+`TwoCbhLibrary` builds the normal `IndexedGame` list and is wired into the
+application's Open dialog and `open_library` dispatch. It refuses to index more
+than `MAX_INDEXED_GAMES = 2_000_000` slots, because the current in-memory game
+list is not viable for the 11.7-million-game Mega database. The full Mega file
+remains readable one record at a time through `TwoCbhFile::load_game`.
+
+### Move records
+
+A `.2cbg` record starts with a magic, a content length `A`, a trailing length
+`B`, and eight unknown bytes. Content begins at `+24` with a little-endian kind
+word:
+
+- kind `1`: standard chess, followed by the `0xfffc` start marker and tokens;
+- kind `2`: Chess960, followed by `0xfffb`, the Scharnagl start id, `0xfffc`,
+  and tokens.
+
+`A` counts the kind word and the tokens *before* the final `0xffff`; that final
+terminator sits immediately after the content area, followed by `B` zero bytes
+and a 64-bit trailer equal to `34 + A + B`. `0xffff` ends a line, `0xfffd`
+marks the move that the following variation replaces, and `0x0000` is a null
+move. Variation blocks follow the mainline terminator, deepest last; they are
+replayed in reverse marker order so the stored order becomes PGN order.
+
+The token table has 65,536 entries of eight little-endian 16-bit fields:
+`[from, to, piece, aux, b3, b2, special6, special7]`. Brett generates entries
+1–49,196 independently from move geometry:
+
+- ordinary king, queen, knight, bishop, and rook moves for both colors;
+- pawn pushes, captures, promotions, and en passant;
+- orthodox castling tokens 45,353–45,356;
+- Chess960 castling tokens 45,357–49,196, two per start id and color.
+
+Squares are stored as `file * 8 + rank` and converted at decode time. Castling
+is recognized by `special6 & 7 == 5`; the rook comes from the position's
+castling rights, not from the king destination, because a Chess960 `b3` token
+can otherwise name the wrong rook. Promotions use `special6`, and en passant is
+identified by `aux == 0`, `b2 == b3`, a nonzero `b3`, and a nonzero `special7`.
+
+### Validation
+
+The 2CBH reader was checked against local databases that are not committed:
+
+- **MegaBase2026 Update 01:** 10,738 games, zero mainline move mismatches and
+  zero header mismatches against the complete PGN export.
+- **`9601.2cbh`:** 21/21 mainlines match the GMT-M Chess960 PGN, covering seven
+  distinct Scharnagl start positions. The generated start id matches every
+  game; three FENs differ only in castling spelling (`HAha` versus `KQkq`)
+  while the positions and moves match.
+- **Nested-variation game:** the mainline and the complete 16-variation tree
+  match the PGN tree, ignoring variation order; all 112 tokens are consumed.
+- **Mega Database 2026:** record 3 loads directly without indexing the file,
+  proving targeted access to the 11.7-million-record container.
+- **Synthetic suite:** `src/twocbh/tests.rs` generates byte-level fixtures for
+  standard moves, promotions, en passant, Chess960, nested variations, headers,
+  deleted/text records, and malformed records.
+
+The env-gated `tests/twocbh_local.rs` reproduces the real-file checks when the
+local paths are supplied. No database content is committed.
+
+### Limits
+
+- Only 2CBH generation `0x26` is accepted. The older `0x22` generation is not
+  verified.
+- `.2cba` annotation items are not decoded; comments and NAGs are not
+  fabricated. The annotation offset is recorded so the framing can be added
+  without changing the game model.
+- Writing 2CBH is deferred until the reader and ChessBase compatibility tests
+  are complete. Classic CBH export remains available.
+- The library index is capped at 2,000,000 slots; targeted `TwoCbhFile` access
+  is the path for larger databases.
+- Unknown `.2cbg` record kinds and damaged streams are reported as game errors
+  or load errors without preventing the rest of the database from opening.
 
 ## Exporting and writing (`src/cbh/writer.rs`)
 

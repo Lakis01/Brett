@@ -495,11 +495,21 @@ struct Builder {
 impl Builder {
     fn new(headers: Vec<(String, String)>) -> Self {
         let mut errors = Vec::new();
+        let mode = if headers.iter().any(|(key, value)| {
+            key.eq_ignore_ascii_case("Variant") && {
+                let value = value.to_ascii_lowercase();
+                value.contains("chess960") || value.contains("fischer")
+            }
+        }) {
+            CastlingMode::Chess960
+        } else {
+            CastlingMode::Standard
+        };
         let start = headers
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case("FEN"))
             .and_then(|(_, v)| Fen::from_ascii(v.as_bytes()).ok())
-            .and_then(|fen| fen.into_position(CastlingMode::Standard).ok());
+            .and_then(|fen| fen.into_position(mode).ok());
 
         let pos = match start {
             Some(pos) => pos,
@@ -549,7 +559,7 @@ impl Builder {
             if color == Color::Black {
                 setup.fullmoves = NonZeroU32::new(setup.fullmoves.get() + 1).unwrap();
             }
-            match Chess::from_setup(setup, CastlingMode::Standard) {
+            match Chess::from_setup(setup, pos.castling_mode()) {
                 Ok(after) => {
                     let ply = Ply {
                         san: "--".to_string(),
@@ -591,7 +601,7 @@ impl Builder {
 
         let ply = Ply {
             san: san_plus.to_string(),
-            uci: UciMove::from_move(mv, CastlingMode::Standard).to_string(),
+            uci: UciMove::from_move(mv, pos.castling_mode()).to_string(),
             number,
             color,
         };
