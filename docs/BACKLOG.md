@@ -948,8 +948,11 @@ reproduce:
   and one at the final position), with file/rank coordinates and a side-to-move
   marker. The user chooses these with the equivalent of right-click → add
   diagram; do not hard-code only the final position.
-- A `(Diagram)` placeholder is acceptable when a diagram cannot be rendered,
-  but a real board image is the default.
+- The `(Diagram)` text in the reference is **only a column-break marker**: the
+  diagram did not fit at the bottom of the left column, so the real board was
+  placed at the top of the next column. It is not a placeholder fallback. The
+  exporter must always emit the actual board; when it does not fit, break to
+  the next column or page and keep the diagram with its intended position.
 
 **Implementation order:** implement **Typst first**, then LaTeX. Typst gives
 the simpler source generator, faster compile cycle, and easier two-column
