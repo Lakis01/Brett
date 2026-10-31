@@ -151,9 +151,6 @@ fn source_with_diagram_dir(document: &PrintDocument, diagram_dir: &str) -> Strin
         "\n#block(above: 0.4em)[#text(weight: \"bold\", {})]\n",
         typst_string(&document.game.result)
     ));
-    if !document.diagrams.is_empty() {
-        out.push_str("#block(above: 0.6em)[#text(size: 7pt, fill: luma(110), \"Board pieces: cburnett by Colin M. L. Burnett, CC BY-SA 3.0.\")]\n");
-    }
     out
 }
 
@@ -164,7 +161,6 @@ fn write_heading(document: &PrintDocument, out: &mut String) {
     let black_elo = header(document, "BlackElo").filter(|elo| !elo.trim().is_empty());
     let eco = header(document, "ECO")
         .filter(|code| !code.trim().is_empty())
-        .map(|code| format!("ECO {code}"))
         .unwrap_or_default();
     let event_line = ["Event", "Site", "Round"]
         .iter()
@@ -194,7 +190,7 @@ fn write_heading(document: &PrintDocument, out: &mut String) {
     out.push_str("    ],\n");
     out.push_str(&format!(
         "    [#text(size: 10pt, weight: \"bold\", fill: luma(60), {})],\n",
-        typst_string(&eco)
+        typst_string(eco)
     ));
     out.push_str("  )\n");
 

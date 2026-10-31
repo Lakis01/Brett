@@ -142,7 +142,7 @@ Expected: FAIL because the renderer is missing.
 
 - [ ] **Step 3: Implement the renderer and writer**
 
-Use `#set page(paper: "a4", columns: 2, margin: ..., header: ...)`; `#set text` with a DejaVu/Liberation fallback; `#text(weight: "bold", "...")` for moves; `#text("...")` for all user text; `#block(inset: (left: 1.2em * depth))` for variations; `#block(breakable: false)[#image("...", width: 86%)]` for diagrams. Write `diagram-01.svg`, `diagram-02.svg`, … into `<stem>_diagrams/`, overwriting only `diagram-*.svg` files. Add a small cburnett attribution line when diagrams exist. Compile with `BRETT_TYPST` or `typst` only from `compile_pdf`.
+Use `#set page(paper: "a4", columns: 2, margin: ..., header: ...)`; `#set text` with a DejaVu/Liberation fallback; `#text(weight: "bold", "...")` for moves; `#text("...")` for all user text; `#block(inset: (left: 1.2em * depth))` for variations; `#block(breakable: false)[#image("...", width: 86%)]` for diagrams. Write `diagram-01.svg`, `diagram-02.svg`, … into `<stem>_diagrams/`, overwriting only `diagram-*.svg` files. Do not add a visible cburnett attribution line; each SVG keeps its attribution comment. Compile with `BRETT_TYPST` or `typst` only from `compile_pdf`.
 
 - [ ] **Step 4: Run the tests and verify they pass**
 

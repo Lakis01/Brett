@@ -282,7 +282,9 @@ fn typst_source_has_a_compact_heading_bold_moves_and_a_result() {
     assert!(source.contains("Duke Karl and Count Isouard"));
     assert!(source.contains("Casual Game"));
     assert!(source.contains("Paris FRA"));
-    assert!(source.contains("ECO C41"));
+    assert!(source.contains("\"C41\""));
+    assert!(!source.contains("ECO C41"));
+    assert!(!source.contains("Board pieces"));
     assert!(source.contains("column-gutter: 1em"));
     assert!(source.contains("fill: white, stroke: 0.6pt + luma(60)"));
     assert!(source.contains("fill: black"));
@@ -302,11 +304,12 @@ fn typst_heading_stacks_players_and_keeps_their_elos_next_to_the_eco() {
     let white_elo = source.find("\"2789\"").unwrap();
     let black = source.find("\"Black Player\"").unwrap();
     let black_elo = source.find("\"2698\"").unwrap();
-    let eco = source.find("\"ECO C83\"").unwrap();
+    let eco = source.find("\"C83\"").unwrap();
     assert!(white < white_elo);
     assert!(white_elo < black);
     assert!(black < black_elo);
     assert!(black_elo < eco);
+    assert!(!source.contains("ECO C83"));
 }
 
 #[test]

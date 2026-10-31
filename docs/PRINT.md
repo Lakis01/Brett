@@ -15,10 +15,11 @@ kept, edited, or compiled later.
 4. Pick the `.typ` path and, if wanted, enable **Compile a PDF with Typst**.
 5. Select **Export**.
 
-The default path is `$HOME/<library-stem>-print.typ`, falling back to
-`$HOME/brett-print.typ` when no database is open. Diagram markers are cleared
-when another game is selected, so they always belong to the game currently on
-screen.
+The default path is `$HOME/Documents/<library-stem>-print.typ`. If the
+Documents folder does not exist, Brett uses `$HOME`; with no database open it
+uses `brett-print.typ`. A compiled PDF is written beside the `.typ` source, so
+it lands in Documents as well. Diagram markers are cleared when another game is
+selected, so they always belong to the game currently on screen.
 
 ## Output layout
 
@@ -44,7 +45,8 @@ position produces an actual board.
 - A slim running header with the database/source name, owner, date, and page
   number.
 - A compact game heading with color squares, stacked White and Black rows with
-  their Elos, an ECO gutter, and event, site, round, and date.
+  their Elos, and event, site, round, and date. The ECO code appears by itself
+  in the right-hand gutter, without an `ECO` prefix.
 - Mainline moves in bold and wrapped as prose; variations are indented,
   bracketed, and numbered; comments and clock/evaluation notes are indented
   below the move they belong to.
@@ -100,7 +102,8 @@ The board renderer is Brett-authored MIT code. The piece artwork is the
 **cburnett** set by Colin M. L. Burnett, licensed under
 [CC BY-SA 3.0](https://creativecommons.org/licenses/by-sa/3.0/). The SVG
 originals in `assets/pieces/` are embedded into every generated diagram, and
-each SVG carries an attribution comment. See
+each SVG carries an attribution comment. The printed page does not show a
+visible attribution line. See
 [`THIRD_PARTY_NOTICES.md`](../THIRD_PARTY_NOTICES.md) and
 [`PROVENANCE.md`](PROVENANCE.md) before redistributing exported diagrams.
 
