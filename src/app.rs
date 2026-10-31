@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{self, TryRecvError};
@@ -394,6 +394,7 @@ struct RecentPreview {
     return_node: usize,
     return_tab: RightTab,
     return_orientation: Color,
+    return_print_diagrams: BTreeSet<usize>,
     label: String,
 }
 
@@ -683,6 +684,14 @@ pub struct App {
     pending_pgn_export: Option<PendingPgnExport>,
     pending_scid_export: Option<PendingScidExport>,
     pending_cbh_export: Option<PendingCbhExport>,
+    /// Node ids where the user asked for a printed diagram. The final
+    /// position is controlled separately by `print_export_include_final`.
+    print_diagrams: BTreeSet<usize>,
+    print_export_open: bool,
+    print_export_path: String,
+    print_export_include_final: bool,
+    print_export_compile_pdf: bool,
+    print_export_status: String,
     classify_openings_open: bool,
     classify_overwrite: bool,
     classify_status: String,
@@ -963,6 +972,12 @@ impl App {
             pending_pgn_export: None,
             pending_scid_export: None,
             pending_cbh_export: None,
+            print_diagrams: BTreeSet::new(),
+            print_export_open: false,
+            print_export_path: String::new(),
+            print_export_include_final: true,
+            print_export_compile_pdf: false,
+            print_export_status: String::new(),
             classify_openings_open: false,
             classify_overwrite: false,
             classify_status: String::new(),
@@ -1409,6 +1424,7 @@ impl App {
         self.dirty = false;
         self.current_slot = None;
         self.current = None;
+        self.print_diagrams.clear();
         self.clear_engine_results();
         self.goto(0);
         self.left_tab = LeftTab::Games;
@@ -2178,6 +2194,184 @@ impl App {
                 .map(|id| self.session.load(id, &self.edited)),
         )
         .map_err(|err| format!("{err:#}"))
+    }
+
+    fn start_print_export(&mut self) {
+        if self.current.is_none() {
+            self.status = "Open a game first.".to_string();
+            return;
+        }
+        self.print_export_path = self.default_print_export_path().display().to_string();
+        self.print_export_include_final = true;
+        self.print_export_compile_pdf = false;
+        self.print_export_status.clear();
+        self.print_export_open = true;
+    }
+
+    fn default_print_export_path(&self) -> PathBuf {
+        let stem = self
+            .library
+            .as_ref()
+            .and_then(|library| library.path().file_stem())
+            .map(|stem| stem.to_string_lossy());
+        default_print_path(stem.as_deref())
+    }
+
+    fn print_source_label(&self) -> String {
+        self.library
+            .as_ref()
+            .and_then(|library| library.path().file_name())
+            .map(|name| name.to_string_lossy().into_owned())
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or_else(|| "Brett".to_string())
+    }
+
+    fn export_current_game_as_typst(&mut self) {
+        let Some(game) = self.current.clone() else {
+            self.print_export_status = "Open a game first.".to_string();
+            return;
+        };
+        let raw = self.print_export_path.trim().to_string();
+        if raw.is_empty() {
+            self.print_export_status = "Choose a .typ output path.".to_string();
+            return;
+        }
+        let mut path = PathBuf::from(raw);
+        if path.extension().is_none() {
+            path.set_extension("typ");
+        }
+        if is_read_only_export_target(&path) {
+            self.print_export_status =
+                "That folder is read-only in Brett. Choose a path outside the source collection."
+                    .to_string();
+            return;
+        }
+
+        let meta = crate::print::PrintMeta {
+            source: self.print_source_label(),
+            owner: print_owner(),
+            date: print_date(),
+        };
+        let document = crate::print::build_document(
+            &game,
+            meta,
+            &self.print_diagrams,
+            self.print_export_include_final,
+        );
+        let bundle = match crate::print::typst::write_bundle(&path, &document) {
+            Ok(bundle) => bundle,
+            Err(err) => {
+                self.print_export_status = format!("Could not write the Typst source: {err:#}");
+                return;
+            }
+        };
+        self.print_export_path = path.display().to_string();
+        let mut status = format!(
+            "Wrote {} and {} diagram(s).",
+            bundle.source.display(),
+            bundle.diagrams.len()
+        );
+        if self.print_export_compile_pdf {
+            let pdf = path.with_extension("pdf");
+            match crate::print::typst::compile_pdf(&bundle.source, &pdf) {
+                Ok(()) => status.push_str(&format!(" Compiled {}.", pdf.display())),
+                Err(err) => status.push_str(&format!(" PDF not compiled: {err:#}")),
+            }
+        }
+        self.status = status.clone();
+        self.print_export_status = status;
+    }
+
+    fn print_export_dialog(&mut self, ctx: &egui::Context) {
+        if !self.print_export_open {
+            return;
+        }
+        let has_current = self.current.is_some();
+        let game_label = self
+            .current
+            .as_ref()
+            .map(|game| format!("{} – {}", game.white(), game.black()))
+            .unwrap_or_else(|| "No game open".to_string());
+        let mut open = true;
+        let mut export = false;
+        let mut cancel = false;
+        let mut browse = false;
+        egui::Window::new("Export current game as Typst")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.set_min_width(520.0);
+                ui.label(RichText::new(game_label).strong());
+                ui.add_space(6.0);
+                ui.label("Typst source file");
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.print_export_path)
+                            .desired_width(390.0),
+                    );
+                    if ui.button("Browse…").clicked() {
+                        browse = true;
+                    }
+                });
+                ui.label(
+                    RichText::new(
+                        "The board diagrams are written to a folder named after the file.",
+                    )
+                    .small()
+                    .weak(),
+                );
+                ui.add_space(6.0);
+                ui.checkbox(
+                    &mut self.print_export_include_final,
+                    "Include the final position diagram",
+                );
+                ui.checkbox(
+                    &mut self.print_export_compile_pdf,
+                    "Compile a PDF with Typst (optional)",
+                );
+                ui.label(
+                    RichText::new("Uses BRETT_TYPST or the local typst binary.")
+                        .small()
+                        .weak(),
+                );
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(has_current, egui::Button::new("Export"))
+                        .clicked()
+                    {
+                        export = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+                if !self.print_export_status.is_empty() {
+                    ui.add_space(6.0);
+                    ui.label(RichText::new(&self.print_export_status).small().color(GOLD));
+                }
+            });
+        if browse {
+            let default = PathBuf::from(self.print_export_path.trim());
+            let default = if default.as_os_str().is_empty() {
+                self.default_print_export_path()
+            } else {
+                default
+            };
+            if let Some(path) = save_print_dialog(&default) {
+                self.print_export_path = path.display().to_string();
+            }
+        }
+        if export {
+            self.export_current_game_as_typst();
+        } else if cancel || !open {
+            self.print_export_open = false;
+            self.print_export_status.clear();
+        }
+        if !cancel {
+            self.print_export_open = open;
+        }
     }
 
     pub fn classify_current_game_opening(
@@ -4200,6 +4394,7 @@ impl App {
         self.annotation_editor = None;
         self.annotation_focus = false;
         self.reset_branch_state();
+        self.print_diagrams.clear();
         self.current = Some(game);
         self.current_slot = None;
         self.dirty = false;
@@ -4796,6 +4991,7 @@ impl App {
         if self.current_slot == Some(id) && self.current.is_some() && self.prep.is_none() {
             return;
         }
+        self.print_diagrams.clear();
         self.clear_review();
         self.reset_branch_state();
         self.recent_preview = None;
@@ -5235,6 +5431,19 @@ impl App {
                         .clicked()
                     {
                         self.start_cbh_export();
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(
+                            self.current.is_some(),
+                            egui::Button::new("Export current game as Typst…"),
+                        )
+                        .on_hover_text(
+                            "Write print-ready Typst source with SVG diagrams, and optionally compile a PDF",
+                        )
+                        .clicked()
+                    {
+                        self.start_print_export();
                         ui.close();
                     }
                     if ui
@@ -7390,6 +7599,7 @@ impl App {
         let mut tag_add_value: Option<(&'static str, String)> = None;
         let mut date_clicked: Option<egui::Pos2> = None;
         let mut hover_preview = None;
+        let mut diagram_toggle = None;
 
         game_header_card(
             ui,
@@ -7490,9 +7700,15 @@ impl App {
                             &mut nag_action,
                             &mut hover_preview,
                             self.hover_moves,
+                            &self.print_diagrams,
+                            &mut diagram_toggle,
                         );
                     });
             });
+
+        if let Some(node) = diagram_toggle {
+            toggle_diagram(&mut self.print_diagrams, node);
+        }
 
         ui.add_space(8.0);
 
@@ -8931,6 +9147,7 @@ impl App {
         let return_node = self.node;
         let return_tab = self.right_tab;
         let return_orientation = self.orientation;
+        let return_print_diagrams = self.print_diagrams.clone();
         if self.dirty
             && let (Some(slot), Some(current)) = (self.current_slot, self.current.take())
         {
@@ -8947,9 +9164,11 @@ impl App {
             return_node,
             return_tab,
             return_orientation,
+            return_print_diagrams,
             label: label.clone(),
         });
         self.reset_branch_state();
+        self.print_diagrams.clear();
         self.current = Some(game);
         self.current_slot = None;
         self.dirty = false;
@@ -8976,6 +9195,7 @@ impl App {
         self.reset_branch_state();
         self.current = preview.return_game;
         self.current_slot = preview.return_slot;
+        self.print_diagrams = preview.return_print_diagrams;
         self.dirty = false;
         self.orientation = preview.return_orientation;
         self.focus_right_tab(preview.return_tab);
@@ -10489,6 +10709,7 @@ impl eframe::App for App {
         self.pgn_export_dialog(&ctx);
         self.scid_export_dialog(&ctx);
         self.cbh_export_dialog(&ctx);
+        self.print_export_dialog(&ctx);
         self.classify_openings_dialog(&ctx);
         self.index_confirmation_dialog(&ctx);
         self.branch_choice_dialog(&ctx);
@@ -12553,6 +12774,8 @@ fn render_move_tokens_flat(
     nag_action: &mut Option<(usize, Option<u8>)>,
     hover_preview: &mut Option<HoverPreview>,
     allow_hover: bool,
+    diagrams: &BTreeSet<usize>,
+    diagram_toggle: &mut Option<usize>,
 ) {
     let mut depth = 0usize;
     let mut last_move: Option<(u32, Color)> = None;
@@ -12619,7 +12842,15 @@ fn render_move_tokens_flat(
                     if response.clicked() {
                         *clicked = Some(*node);
                     }
-                    move_context_menu(&response, *node, game, nag_action, open_editor);
+                    move_context_menu(
+                        &response,
+                        *node,
+                        game,
+                        nag_action,
+                        open_editor,
+                        diagrams,
+                        diagram_toggle,
+                    );
 
                     let symbols = nag_symbols(&game.nodes[*node].nags);
                     if !symbols.is_empty() {
@@ -12627,7 +12858,20 @@ fn render_move_tokens_flat(
                         if response.clicked() {
                             *open_editor = Some(*node);
                         }
-                        move_context_menu(&response, *node, game, nag_action, open_editor);
+                        move_context_menu(
+                            &response,
+                            *node,
+                            game,
+                            nag_action,
+                            open_editor,
+                            diagrams,
+                            diagram_toggle,
+                        );
+                    }
+
+                    if diagrams.contains(node) {
+                        ui.label(RichText::new("▣").small().color(GOLD))
+                            .on_hover_text("A diagram will be printed after this move");
                     }
 
                     let comment = game.nodes[*node].comment.trim();
@@ -12717,6 +12961,8 @@ fn move_context_menu(
     game: &Game,
     nag_action: &mut Option<(usize, Option<u8>)>,
     open_editor: &mut Option<usize>,
+    diagrams: &BTreeSet<usize>,
+    diagram_toggle: &mut Option<usize>,
 ) {
     response.context_menu(|ui| {
         ui.set_min_width(260.0);
@@ -12742,6 +12988,22 @@ fn move_context_menu(
         }
         if ui.button("Clear annotations").clicked() {
             *nag_action = Some((node, None));
+            ui.close();
+        }
+        ui.separator();
+        let (label, hint) = if diagrams.contains(&node) {
+            (
+                "Remove diagram after this move",
+                "Stop printing a board diagram at this position",
+            )
+        } else {
+            (
+                "Add diagram after this move",
+                "Print a board diagram at this position",
+            )
+        };
+        if ui.button(label).on_hover_text(hint).clicked() {
+            *diagram_toggle = Some(node);
             ui.close();
         }
     });
@@ -14378,6 +14640,53 @@ fn save_cbh_dialog(default_path: &std::path::Path) -> Option<std::path::PathBuf>
     )
 }
 
+/// Native Save As dialog for a Typst print export.
+fn save_print_dialog(default_path: &std::path::Path) -> Option<std::path::PathBuf> {
+    save_database_dialog(
+        default_path,
+        "Export current game as Typst",
+        "Typst source",
+        "*.typ",
+        false,
+    )
+}
+
+fn default_print_path(stem: Option<&str>) -> PathBuf {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let stem = stem
+        .map(str::trim)
+        .filter(|stem| !stem.is_empty())
+        .unwrap_or("brett");
+    home.join(format!("{stem}-print.typ"))
+}
+
+fn print_owner() -> String {
+    std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .ok()
+        .map(|owner| owner.trim().to_string())
+        .filter(|owner| !owner.is_empty())
+        .unwrap_or_else(|| "Brett".to_string())
+}
+
+fn print_date() -> String {
+    let today = players::today();
+    format!(
+        "{:04}-{:02}-{:02}",
+        today / 10_000,
+        (today / 100) % 100,
+        today % 100
+    )
+}
+
+fn toggle_diagram(diagrams: &mut BTreeSet<usize>, node: usize) {
+    if !diagrams.remove(&node) {
+        diagrams.insert(node);
+    }
+}
+
 fn save_database_dialog(
     default_path: &std::path::Path,
     title: &str,
@@ -14720,6 +15029,12 @@ mod tests {
             pending_pgn_export: None,
             pending_scid_export: None,
             pending_cbh_export: None,
+            print_diagrams: BTreeSet::new(),
+            print_export_open: false,
+            print_export_path: String::new(),
+            print_export_include_final: true,
+            print_export_compile_pdf: false,
+            print_export_status: String::new(),
             classify_openings_open: false,
             classify_overwrite: false,
             classify_status: String::new(),
@@ -15891,5 +16206,69 @@ mod tests {
 
         app.invalidate_current_review_cache();
         assert!(app.review_cache.is_empty());
+    }
+
+    #[test]
+    fn default_print_path_uses_the_library_stem_and_falls_back_to_brett() {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."));
+        assert_eq!(
+            default_print_path(Some("Mega Database 2026")),
+            home.join("Mega Database 2026-print.typ")
+        );
+        assert_eq!(
+            default_print_path(Some("   ")),
+            home.join("brett-print.typ")
+        );
+        assert_eq!(default_print_path(None), home.join("brett-print.typ"));
+    }
+
+    #[test]
+    fn toggling_a_diagram_adds_then_removes_the_node() {
+        let mut diagrams = BTreeSet::new();
+        toggle_diagram(&mut diagrams, 4);
+        assert!(diagrams.contains(&4));
+        toggle_diagram(&mut diagrams, 4);
+        assert!(!diagrams.contains(&4));
+    }
+
+    #[test]
+    fn exporting_the_current_game_writes_typst_and_diagram_assets() {
+        let mut app = test_app();
+        let dir = std::env::temp_dir().join(format!(
+            "brett-print-export-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("opera.typ");
+        app.print_export_path = path.display().to_string();
+        let node = app.current.as_ref().unwrap().mainline()[2];
+        app.print_diagrams.insert(node);
+        app.print_export_include_final = true;
+
+        app.export_current_game_as_typst();
+
+        assert!(path.exists());
+        assert!(
+            app.print_export_status.starts_with("Wrote "),
+            "{}",
+            app.print_export_status
+        );
+        assert_eq!(app.print_export_path, path.display().to_string());
+        let diagrams = dir.join("opera_diagrams");
+        assert!(diagrams.join("diagram-01.svg").exists());
+        assert!(diagrams.join("diagram-02.svg").exists());
+
+        let source = std::fs::read_to_string(&path).unwrap();
+        assert!(source.contains("opera_diagrams/diagram-01.svg"));
+        assert!(source.contains("opera_diagrams/diagram-02.svg"));
+        assert!(!source.contains("(Diagram)"));
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
