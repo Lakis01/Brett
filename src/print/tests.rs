@@ -204,3 +204,57 @@ fn output_is_deterministic() {
     let second = build_document(&game, meta(), &selected, true);
     assert_eq!(first, second);
 }
+
+#[test]
+fn board_svg_contains_squares_coordinates_pieces_and_attribution() {
+    let svg = crate::print::board::board_svg(&crate::chess::Chess::default());
+
+    assert_eq!(svg.matches("class=\"square\"").count(), 64);
+    for file in ["a", "b", "c", "d", "e", "f", "g", "h"] {
+        assert_eq!(
+            svg.matches(&format!(">{file}<")).count(),
+            2,
+            "file {file} should be labelled above and below the board"
+        );
+    }
+    for rank in ["1", "2", "3", "4", "5", "6", "7", "8"] {
+        assert_eq!(
+            svg.matches(&format!(">{rank}<")).count(),
+            2,
+            "rank {rank} should be labelled on both sides"
+        );
+    }
+    assert_eq!(svg.matches("class=\"piece\"").count(), 32);
+    assert!(svg.contains("class=\"side-to-move\""));
+    assert!(svg.contains("data-side-to-move=\"white\""));
+    assert!(
+        svg.contains("M22.5 11.63V6"),
+        "the cburnett king artwork should be embedded"
+    );
+    assert!(svg.contains("Colin M. L. Burnett"));
+    assert!(svg.contains("CC BY-SA 3.0"));
+    assert!(svg.contains("viewBox=\"0 0 420 420\""));
+}
+
+#[test]
+fn side_to_move_marker_follows_the_position() {
+    let game = parse(
+        "[Event \"Marker\"]\n[Site \"?\"]\n[Date \"2026.01.01\"]\n[Round \"1\"]\n[White \"A\"]\n[Black \"B\"]\n[Result \"*\"]\n\n1. e4 *\n",
+    );
+
+    let white = crate::print::board::board_svg(&game.nodes[0].pos);
+    let black = crate::print::board::board_svg(&game.nodes[1].pos);
+    assert!(white.contains("data-side-to-move=\"white\""));
+    assert!(black.contains("data-side-to-move=\"black\""));
+}
+
+#[test]
+fn build_document_embeds_the_board_in_every_diagram() {
+    let game = opera();
+    let doc = build_document(&game, meta(), &BTreeSet::new(), true);
+
+    assert_eq!(doc.diagrams.len(), 1);
+    assert!(doc.diagrams[0].svg.starts_with("<svg"));
+    assert!(doc.diagrams[0].svg.contains("class=\"square\""));
+    assert!(doc.diagrams[0].svg.contains("class=\"piece\""));
+}

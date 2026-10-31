@@ -10,6 +10,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::chess::{Chess, Color, EnPassantMode, Fen};
 use crate::domain::{self, Game, Node, PgnEval};
 
+mod board;
+
 #[cfg(test)]
 mod tests;
 
@@ -104,11 +106,27 @@ pub fn build_document(
 
     let diagrams: Vec<Diagram> = nodes
         .iter()
-        .map(|&node| Diagram {
-            node,
-            fen: diagram_fen(game, node),
-            caption: diagram_caption(game, node, final_node),
-            svg: String::new(),
+        .map(|&node| {
+            let (fen, svg) = match game.nodes.get(node) {
+                Some(node) => (
+                    Fen::from_position(&node.pos, EnPassantMode::Legal).to_string(),
+                    board::board_svg(&node.pos),
+                ),
+                // A malformed empty game still gets a well-defined board.
+                None => {
+                    let start = Chess::default();
+                    (
+                        Fen::from_position(&start, EnPassantMode::Legal).to_string(),
+                        board::board_svg(&start),
+                    )
+                }
+            };
+            Diagram {
+                node,
+                fen,
+                caption: diagram_caption(game, node, final_node),
+                svg,
+            }
         })
         .collect();
 
@@ -286,14 +304,6 @@ fn start_fen(game: &Game) -> Option<String> {
     let root = game.nodes.first()?;
     let fen = Fen::from_position(&root.pos, EnPassantMode::Legal).to_string();
     (fen != STANDARD_START_FEN).then_some(fen)
-}
-
-fn diagram_fen(game: &Game, node: usize) -> String {
-    match game.nodes.get(node) {
-        Some(node) => Fen::from_position(&node.pos, EnPassantMode::Legal).to_string(),
-        // A malformed empty game still gets a well-defined board.
-        None => Fen::from_position(&Chess::default(), EnPassantMode::Legal).to_string(),
-    }
 }
 
 fn diagram_caption(game: &Game, node: usize, final_node: usize) -> String {
