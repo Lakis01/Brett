@@ -921,3 +921,53 @@ Decide which distinctions are real and remove the rest.
   UI cleanup is welcome after the functional audit.
 
 **Depends on:** `src/app.rs` menu bar, bottom bar, and Tree tab.
+
+## 25. Typst / LaTeX export for printing
+
+**Status:** backlog only. No implementation is scheduled yet.
+
+**Goal:** export one game or a selected set of games as print-ready Typst or
+LaTeX source, with an optional compiled PDF, so games, annotations, and
+diagrams can be printed or included in preparation notes without a screenshot
+workflow.
+
+**Visual blueprint (2026-10-31):** match the ChessBase '26 printout supplied
+by the project owner. The reference image is kept locally at
+`~/Pictures/Screenshots/Screenshot_20261031_061139.png` and is **not**
+committed (it contains ChessBase output and game content). The layout to
+reproduce:
+
+- A4 portrait, two-column body flow, with a slim page header showing the
+  database/source, owner, date, and page number.
+- A compact game heading: ECO code at the right, color squares before the
+  player names, players and Elos stacked, then event, site, round, and date.
+- Mainline moves in bold, wrapped as prose; variations and comments indented
+  below the move where they occur, with the variation line bracketed and its
+  source game cited inside the comment.
+- Board diagrams at user-chosen plies (the reference has one after the opening
+  and one at the final position), with file/rank coordinates and a side-to-move
+  marker. The user chooses these with the equivalent of right-click → add
+  diagram; do not hard-code only the final position.
+- A `(Diagram)` placeholder is acceptable when a diagram cannot be rendered,
+  but a real board image is the default.
+
+**Implementation order:** implement **Typst first**, then LaTeX. Typst gives
+the simpler source generator, faster compile cycle, and easier two-column
+layout; Brett can render each diagram once as SVG/PNG and embed the same asset
+in both backends. LaTeX follows with the same document model and diagram
+assets, using a standard chess package only if it can be documented as an
+optional dependency. Do not make either format the hidden intermediate for the
+other.
+
+- Offer **Typst** and **LaTeX** as separate export targets; do not make one the
+  hidden intermediate format for the other.
+- Preserve the exported PGN content faithfully: headers, comments, NAGs,
+  variations, clock/eval annotations, and custom start positions.
+- Render the board as a diagram at chosen plies (default: final position, plus
+  optional key positions), and include a move list with readable annotations.
+- Keep the generated source self-contained and dependency-light. Document the
+  required Typst package or LaTeX packages and provide a plain fallback.
+- Never require a network connection or upload games. Invoke a local compiler
+  only when the user asks for a PDF, and report a missing compiler clearly.
+- Add tests for source escaping (player names, comments, URLs, Unicode),
+  variation nesting, custom starts, Chess960, and deterministic output.
