@@ -935,7 +935,9 @@ Decide which distinctions are real and remove the rest.
 
 ## 25. Typst / LaTeX export for printing
 
-**Status:** backlog only. No implementation is scheduled yet.
+**Status:** Typst target implemented (2026-10-31); LaTeX target remains backlog.
+See [`PRINT.md`](PRINT.md) for the user-facing workflow, output layout, compiler
+options, and attribution.
 
 **Goal:** export one game or a selected set of games as print-ready Typst or
 LaTeX source, with an optional compiled PDF, so games, annotations, and

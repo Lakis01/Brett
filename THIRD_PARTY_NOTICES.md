@@ -8,10 +8,12 @@ The chess piece artwork in `assets/pieces/` is the **cburnett** set.
 - **Licence:** Creative Commons Attribution-ShareAlike 3.0 Unported
   (CC BY-SA 3.0) — <https://creativecommons.org/licenses/by-sa/3.0/>
 - **Source:** <https://github.com/lichess-org/lila/tree/master/public/piece/cburnett>
-- **Modifications:** rasterised from the SVG originals to 160 × 160 transparent
-  PNGs with `rsvg-convert`.
+- **Modifications:** the SVG originals are kept and embedded directly in the
+  print exporter's board diagrams; 160 × 160 transparent PNGs were rasterised
+  from them with `rsvg-convert` for the on-screen board.
 
-The piece artwork remains under CC BY-SA 3.0 and is not covered by the
+Every generated print diagram carries an attribution comment for the piece
+artwork. The artwork remains under CC BY-SA 3.0 and is not covered by the
 project's MIT licence. See `assets/pieces/README.md` for details.
 
 ## DejaVu Sans font

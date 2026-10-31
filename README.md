@@ -70,6 +70,11 @@ ICCF server games under ICCF's terms, and comply with ICCF's terms. See
   with headers, comments, clocks, NAGs, variations, and custom starts. Existing
   triples are backed up and restored if the replacement fails; source databases
   are never overwritten.
+- **Typst print export** for the current game. **File → Export current game as
+  Typst…** writes A4, two-column source with a bold mainline, indented
+  variations and comments, and real SVG board diagrams at user-chosen plies.
+  Typst can compile a PDF locally when requested. See
+  [docs/PRINT.md](docs/PRINT.md).
 - **Classic ChessBase CBH** databases through a native, read-only reader
   (`src/cbh/`). Brett opens the `.cbh` header file and its `.cbg` moves,
   `.cba` annotations, and `.cbp`/`.cbt`/`.cbc`/`.cbs` names directly. This is
@@ -432,6 +437,7 @@ never writes to the source database.
 | `src/session.rs` | Editable ordered session, database views, reorder/merge, PGN export |
 | `src/settings.rs` | Persistent engine, cloud, reference-database, display, and preparation settings |
 | `src/review.rs` | Sequential game review, move grading, accuracy, eval chart data |
+| `src/print/` | Backend-neutral print document, SVG board diagrams, Typst renderer and bundle writer |
 | `src/app.rs` | egui application, tabs, preparation flow, annotation editor |
 | `src/ui/fonts.rs` | Embedded DejaVu Sans fallback for chess symbols |
 | `docs/` | Data safety, position-index format, preparation model, SCID/CBH readers, provenance audit, photo provenance, backlog |
