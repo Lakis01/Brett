@@ -429,6 +429,49 @@ fn rejects_overlong_names() {
 }
 
 #[test]
+fn annotation_loss_is_blocked_by_default() {
+    let dir = TempDir::new();
+    let path = dir.path().join("annotated.2cbh");
+    let game = parse_one("[White \"Annotated\"]\n\n1. e4 {comment} e5 *");
+    assert!(crate::twocbh::has_unsupported_annotations(&game));
+
+    let err = write_database(&path, vec![Ok(game.clone())]).unwrap_err();
+    let message = format!("{err:#}");
+    assert!(message.contains("comment"));
+    assert!(message.contains("allow_annotation_loss"));
+    assert!(message.contains("game 0 (Annotated"), "{message}");
+    assert!(message.contains("at node 1"), "{message}");
+    assert!(!path.exists());
+
+    let report = write_database_with_options(
+        &path,
+        TwoCbhWriteOptions {
+            allow_annotation_loss: true,
+        },
+        vec![Ok(game)],
+    )
+    .unwrap();
+    assert_eq!(report.games, 1);
+    let got = TwoCbhLibrary::open(&path).unwrap().load(0).unwrap();
+    assert!(got.nodes.iter().all(|node| node.comment.is_empty()));
+}
+
+#[test]
+fn every_annotation_kind_is_guarded() {
+    for (pgn, feature) in [
+        ("1. e4! e5 *", "NAG"),
+        ("1. e4 {[%clk 0:05:00]} e5 *", "clock"),
+        ("1. e4 {[%eval 0.3]} e5 *", "evaluation"),
+    ] {
+        let dir = TempDir::new();
+        let path = dir.path().join("guarded.2cbh");
+        let game = parse_one(pgn);
+        let err = write_database(&path, vec![Ok(game)]).unwrap_err();
+        assert!(format!("{err:#}").contains(feature), "{pgn}");
+    }
+}
+
+#[test]
 fn records_are_aligned_and_framed() {
     let dir = TempDir::new();
     let path = dir.path().join("aligned.2cbh");

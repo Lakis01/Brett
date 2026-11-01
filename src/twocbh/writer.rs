@@ -58,6 +58,30 @@ pub struct TwoCbhWriteOptions {
     pub allow_annotation_loss: bool,
 }
 
+/// Whether `game` carries comments, NAGs, clocks, or evaluations that the
+/// first 2CBH writer pass does not preserve.
+pub fn has_unsupported_annotations(game: &Game) -> bool {
+    first_unsupported_annotation(game).is_some()
+}
+
+/// The first annotation the writer cannot represent, as its feature name and
+/// node index.
+fn first_unsupported_annotation(game: &Game) -> Option<(&'static str, usize)> {
+    game.nodes.iter().enumerate().find_map(|(node, value)| {
+        if !value.comment.trim().is_empty() {
+            Some(("comment", node))
+        } else if !value.nags.is_empty() {
+            Some(("NAG", node))
+        } else if value.clock.is_some() {
+            Some(("clock", node))
+        } else if value.eval.is_some() {
+            Some(("evaluation", node))
+        } else {
+            None
+        }
+    })
+}
+
 /// Return the four core companion paths for a `.2cbh` path or bare stem.
 pub fn core_companion_files(path: &Path) -> [PathBuf; 4] {
     let stem = lenient_stem(path);
@@ -732,13 +756,12 @@ struct TwoCbhWriter {
     cbg_offset: u64,
     cba_offset: u64,
     games: u32,
+    options: TwoCbhWriteOptions,
     guard: TempGuard,
 }
 
 impl TwoCbhWriter {
-    fn create(stem: &Path, _options: TwoCbhWriteOptions) -> Result<Self> {
-        // The annotation-loss guard added in Task 5 reads `_options`; accepting
-        // it now keeps the public API stable across the skeleton and the guard.
+    fn create(stem: &Path, options: TwoCbhWriteOptions) -> Result<Self> {
         let unique = format!(
             "{}-{}",
             std::process::id(),
@@ -804,6 +827,7 @@ impl TwoCbhWriter {
             cbg_offset: CBG_HEADER,
             cba_offset: CBG_HEADER,
             games: 0,
+            options,
             guard,
         })
     }
@@ -811,6 +835,17 @@ impl TwoCbhWriter {
     /// Encode, stream, and index one game.
     fn add_game(&mut self, game: &Game) -> Result<()> {
         let index = self.games;
+        if !self.options.allow_annotation_loss
+            && let Some((feature, node)) = first_unsupported_annotation(game)
+        {
+            bail!(
+                "game {index} ({white} - {black}) has a {feature} at node {node}; \
+                 the first 2CBH writer does not preserve annotations \
+                 (pass allow_annotation_loss to override)",
+                white = game.white(),
+                black = game.black()
+            );
+        }
         let EncodedMoves {
             start_id,
             mut tokens,
