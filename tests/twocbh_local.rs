@@ -35,6 +35,19 @@ fn tree(game: &Game, node: usize) -> String {
     lines.join("")
 }
 
+/// The full move tree in stored child order, so variation ordering is compared.
+fn tree_ordered(game: &Game, node: usize) -> String {
+    game.nodes[node]
+        .children
+        .iter()
+        .map(|&child| {
+            let uci = &game.nodes[child].mv.as_ref().unwrap().uci;
+            format!("({uci} {})", tree_ordered(game, child))
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
 #[test]
 fn writer_round_trips_update01_sample() {
     let Some(cbh) = env_path("BRETT_2CBH_UPDATE01") else {
@@ -60,6 +73,14 @@ fn writer_round_trips_update01_sample() {
         .take(take)
         .collect();
     assert_eq!(games.len(), take, "not enough writable games in the sample");
+    // The ordered-tree comparison must not be vacuous: the sample has to
+    // contain at least one branching variation for sibling order to matter.
+    assert!(
+        games
+            .iter()
+            .any(|game| game.nodes.iter().any(|node| node.children.len() > 1)),
+        "sample has no branching variation to order-check"
+    );
 
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -92,6 +113,11 @@ fn writer_round_trips_update01_sample() {
         );
         assert_eq!(uci(&got), uci(want), "game {index} mainline");
         assert_eq!(tree(&got, 0), tree(want, 0), "game {index} tree");
+        assert_eq!(
+            tree_ordered(&got, 0),
+            tree_ordered(want, 0),
+            "game {index} ordered tree"
+        );
         for key in [
             "White",
             "Black",
