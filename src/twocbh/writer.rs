@@ -13,7 +13,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 
-use crate::domain::Game;
+use crate::chess::{
+    CastlingMode, Chess, Color, EnPassantMode, Fen, File as ChessFile, Move, Position, Rank, Role,
+    SanPlus, Square, UciMove,
+};
+use crate::domain::{Game, Ply};
+
+use super::moves;
+use super::tokens::table;
 
 use super::{CBG_MAGIC, LID_FIRST, LID_STRIDE, RECORD_SIZE, sibling};
 
@@ -179,6 +186,253 @@ fn record_key(index: u64, content: &[u8]) -> u64 {
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
     if hash == 0 { 1 } else { hash }
+}
+
+/// The start position a game is encoded against.
+enum Start {
+    Standard,
+    Chess960(u16),
+}
+
+#[derive(Debug)]
+#[allow(dead_code)] // Task 4 reads these fields when it writes the move record.
+struct EncodedMoves {
+    start_id: Option<u16>,
+    tokens: Vec<u16>,
+}
+
+/// Pick the 2CBH start encoding that matches `game`'s root position.
+fn detect_start(game: &Game) -> Result<Start> {
+    let root = &game.nodes[0].pos;
+    let fen = start_fen_prefix(root);
+    let variant = game
+        .header("Variant")
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    let variant_960 = variant.contains("960") || variant.contains("fischer");
+    let variant_standard = variant.is_empty() || variant == "standard" || variant == "chess";
+    if !variant_960 && !variant_standard {
+        bail!("2CBH export does not support variant {variant:?}");
+    }
+
+    if variant_960 || root.castling_mode().is_chess960() {
+        if !root.castling_mode().is_chess960() {
+            bail!("2CBH variant tag says Chess960 but the start position uses standard castling");
+        }
+        for id in 0..960u16 {
+            if start_fen_prefix(&moves::start_position_960(id)?) == fen {
+                return Ok(Start::Chess960(id));
+            }
+        }
+        bail!("2CBH export start position is not standard chess or Chess960: {fen}");
+    }
+
+    if root.castling_mode() != CastlingMode::Standard || fen != start_fen_prefix(&Chess::default())
+    {
+        bail!("2CBH export start position is not standard chess or Chess960: {fen}");
+    }
+    Ok(Start::Standard)
+}
+
+/// The first four FEN fields, ignoring clocks and move numbers.
+fn start_fen_prefix(pos: &Chess) -> String {
+    Fen::from_position(pos, EnPassantMode::Legal)
+        .to_string()
+        .split_whitespace()
+        .take(4)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[allow(dead_code)] // Task 4 calls this from `add_game`.
+fn encode_game_moves(game: &Game) -> Result<EncodedMoves> {
+    let start = detect_start(game)?;
+    let start_id = match start {
+        Start::Standard => None,
+        Start::Chess960(id) => Some(id),
+    };
+    let mut tokens = Vec::new();
+    if let Some(&first) = game.nodes[0].children.first() {
+        encode_line(game, first, false, start_id, &mut tokens)?;
+    }
+    Ok(EncodedMoves { start_id, tokens })
+}
+
+fn encode_move(before: &Chess, mv: Move, chess960_start: Option<u16>) -> Result<u16> {
+    if let (Move::Castle { king, rook }, Some(start_id)) = (mv, chess960_start) {
+        let color_offset = if before.turn() == Color::Black { 2 } else { 0 };
+        let side_offset = if rook.file() > king.file() { 1 } else { 0 };
+        return Ok(45_357 + start_id * 4 + color_offset + side_offset);
+    }
+    let entry = move_entry(before, mv)?;
+    table().token_for(entry).with_context(|| {
+        format!(
+            "cannot encode move {mv} for 2CBH in position {}",
+            Fen::from_position(before, EnPassantMode::Legal)
+        )
+    })
+}
+
+/// The eight stored fields for one move, before the token table lookup.
+fn move_entry(before: &Chess, mv: Move) -> Result<[u16; 8]> {
+    let mover = before.turn();
+    let mover_bit = if mover == Color::Black { 8 } else { 0 };
+    let captured_bit = if mover == Color::White { 8 } else { 0 };
+    match mv {
+        Move::Normal {
+            role,
+            from,
+            capture,
+            to,
+            promotion,
+        } => {
+            let from = u16::from(moves::to_stored_square(from));
+            let to = u16::from(moves::to_stored_square(to));
+            let piece = role_code(role) | mover_bit;
+            let aux = match capture {
+                Some(Role::Pawn) if promotion.is_some() => role_code(Role::Queen) | captured_bit,
+                Some(captured) => role_code(captured) | captured_bit,
+                None => 0,
+            };
+            match promotion {
+                Some(promoted) => Ok([
+                    from,
+                    to,
+                    piece,
+                    aux,
+                    to,
+                    to,
+                    role_code(promoted) | mover_bit,
+                    piece,
+                ]),
+                None => Ok([from, to, piece, aux, 0, 0, 0, 0]),
+            }
+        }
+        Move::EnPassant { from, to } => {
+            let from = u16::from(moves::to_stored_square(from));
+            let to = u16::from(moves::to_stored_square(to));
+            let captured = if mover == Color::White {
+                to - 1
+            } else {
+                to + 1
+            };
+            let special7 = if mover == Color::White { 14 } else { 6 };
+            Ok([
+                from,
+                to,
+                role_code(Role::Pawn) | mover_bit,
+                0,
+                captured,
+                captured,
+                0,
+                special7,
+            ])
+        }
+        Move::Castle { king, rook } => {
+            let back = mover.fold_wb(Rank::First, Rank::Eighth);
+            let (king_file, rook_file) = if rook.file() > king.file() {
+                (ChessFile::G, ChessFile::F)
+            } else {
+                (ChessFile::C, ChessFile::D)
+            };
+            Ok([
+                u16::from(moves::to_stored_square(king)),
+                u16::from(moves::to_stored_square(Square::from_coords(
+                    king_file, back,
+                ))),
+                role_code(Role::King) | mover_bit,
+                0,
+                u16::from(moves::to_stored_square(rook)),
+                u16::from(moves::to_stored_square(Square::from_coords(
+                    rook_file, back,
+                ))),
+                role_code(Role::Rook) | mover_bit,
+                0,
+            ])
+        }
+        Move::Put { role, to } => {
+            bail!("2CBH cannot encode the drop {role:?}@{to}")
+        }
+    }
+}
+
+fn role_code(role: Role) -> u16 {
+    match role {
+        Role::King => 1,
+        Role::Queen => 2,
+        Role::Knight => 3,
+        Role::Bishop => 4,
+        Role::Rook => 5,
+        Role::Pawn => 6,
+    }
+}
+
+fn resolve_ply(before: &Chess, ply: &Ply) -> Result<Option<Move>> {
+    if ply.uci == "0000" || ply.san == "--" {
+        return Ok(None);
+    }
+    if let Ok(uci) = UciMove::from_ascii(ply.uci.as_bytes())
+        && let Ok(mv) = uci.to_move(before)
+        && !matches!(mv, Move::Put { .. })
+    {
+        return Ok(Some(mv));
+    }
+    if let Ok(san_plus) = SanPlus::from_ascii(ply.san.as_bytes())
+        && let Ok(mv) = san_plus.san.to_move(before)
+        && !matches!(mv, Move::Put { .. })
+    {
+        return Ok(Some(mv));
+    }
+    bail!(
+        "cannot resolve move {} (UCI {}) in position {}",
+        ply.san,
+        ply.uci,
+        Fen::from_position(before, EnPassantMode::Legal)
+    )
+}
+
+fn encode_line(
+    game: &Game,
+    start: usize,
+    skip_first_branch: bool,
+    chess960_start: Option<u16>,
+    tokens: &mut Vec<u16>,
+) -> Result<()> {
+    let mut current = Some(start);
+    let mut branch_points = Vec::new();
+    let mut first = true;
+
+    while let Some(node) = current {
+        let parent = game.nodes[node].parent.context("move has no parent")?;
+        let before = &game.nodes[parent].pos;
+        let ply = game.nodes[node].mv.as_ref().context("node has no move")?;
+        match resolve_ply(before, ply)? {
+            Some(mv) => tokens.push(encode_move(before, mv, chess960_start)?),
+            None => tokens.push(0),
+        }
+
+        if !(skip_first_branch && first) {
+            let children = &game.nodes[parent].children;
+            if children.len() > 1 && children[0] == node {
+                for _ in 1..children.len() {
+                    tokens.push(0xfffd);
+                }
+                branch_points.push(node);
+            }
+        }
+        first = false;
+        current = game.nodes[node].children.first().copied();
+    }
+
+    tokens.push(0xffff);
+    for branch in branch_points.into_iter().rev() {
+        let parent = game.nodes[branch].parent.context("branch has no parent")?;
+        for &sibling in game.nodes[parent].children[1..].iter().rev() {
+            encode_line(game, sibling, true, chess960_start, tokens)?;
+        }
+    }
+    Ok(())
 }
 
 struct TwoCbhWriter {

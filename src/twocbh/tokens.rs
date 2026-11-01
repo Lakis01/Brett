@@ -51,7 +51,6 @@ const SLIDER_DIRS: [(i8, i8); 8] = [
 /// A generated token table with one spare slot for token zero.
 pub(super) struct TokenTable {
     entries: Box<[[u16; 8]]>,
-    #[allow(dead_code)] // the 2CBH writer consumes it in the next task
     by_entry: HashMap<[u16; 8], u16>,
 }
 
@@ -83,7 +82,6 @@ impl TokenTable {
         self.entries[usize::from(token)]
     }
 
-    #[allow(dead_code)] // the 2CBH writer consumes it in the next task
     pub(super) fn token_for(&self, entry: [u16; 8]) -> Option<u16> {
         self.by_entry.get(&entry).copied()
     }

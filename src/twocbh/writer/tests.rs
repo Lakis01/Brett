@@ -1,4 +1,5 @@
 use super::*;
+use crate::domain;
 use crate::domain::Game;
 use crate::twocbh::TwoCbhFile;
 use anyhow::Result;
@@ -111,4 +112,133 @@ fn removes_stale_derived_indexes_and_preserves_unrelated_files() {
     assert!(!path.with_extension("2lcd").exists());
     assert!(!path.with_extension("2lgd").exists());
     assert_eq!(std::fs::read(path.with_extension("ini")).unwrap(), b"keep");
+}
+
+fn parse_one(pgn: &str) -> Game {
+    domain::parse_pgn(pgn.as_bytes()).unwrap().remove(0)
+}
+
+fn ordered_tree(game: &Game, node: usize) -> String {
+    game.nodes[node]
+        .children
+        .iter()
+        .map(|&child| {
+            let uci = &game.nodes[child].mv.as_ref().unwrap().uci;
+            format!("({uci} {})", ordered_tree(game, child))
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+fn uci_line(game: &Game) -> Vec<String> {
+    game.mainline()
+        .iter()
+        .map(|&id| game.nodes[id].mv.as_ref().unwrap().uci.clone())
+        .collect()
+}
+
+fn decode(encoded: &EncodedMoves, start_id: Option<u16>) -> Game {
+    let mut decoded = Game::default();
+    if let Some(id) = start_id {
+        decoded.nodes[0].pos = crate::twocbh::moves::start_position_960(id).unwrap();
+    }
+    crate::twocbh::moves::decode_moves(&mut decoded, &encoded.tokens, start_id.is_some()).unwrap();
+    decoded
+}
+
+#[test]
+fn encodes_and_decodes_a_standard_mainline() {
+    let game = parse_one("1. e4 e5 2. Nf3 Nc6 3. Bb5 *");
+    let encoded = encode_game_moves(&game).unwrap();
+    assert_eq!(encoded.start_id, None);
+    assert_eq!(encoded.tokens.last(), Some(&0xffff));
+
+    let decoded = decode(&encoded, None);
+    assert_eq!(uci_line(&decoded), uci_line(&game));
+    assert_eq!(ordered_tree(&decoded, 0), ordered_tree(&game, 0));
+}
+
+#[test]
+fn variation_markers_follow_the_replaced_move_and_round_trip() {
+    let game = parse_one(
+        "1. e4 (1. d4 d5) (1. c4 e5) e5 (1... c5 2. Nf3 (2. Nc3 Nc6)) \
+         2. Nf3 Nc6 (2... Nf6) 3. Bb5 *",
+    );
+    let encoded = encode_game_moves(&game).unwrap();
+    // Two root alternatives: both markers follow the first mainline move.
+    assert_eq!(encoded.tokens[1], 0xfffd);
+    assert_eq!(encoded.tokens[2], 0xfffd);
+
+    let decoded = decode(&encoded, None);
+    assert_eq!(uci_line(&decoded), uci_line(&game));
+    assert_eq!(ordered_tree(&decoded, 0), ordered_tree(&game, 0));
+}
+
+#[test]
+fn special_moves_round_trip() {
+    for pgn in [
+        // En passant, then a capture promotion.
+        "1. e4 a6 2. e5 d5 3. exd6 Nf6 4. dxc7 Nbd7 5. cxd8=Q *",
+        // Quiet promotion (a8 is empty after ...Rb8).
+        "1. a4 b5 2. axb5 a6 3. bxa6 Nc6 4. a7 Rb8 5. a8=Q *",
+        "1. e4 e5 2. Nf3 Nc6 3. Bc4 Bc5 4. O-O *",
+        "1. d4 d5 2. Nc3 Nc6 3. Bf4 Bf5 4. Qd2 Qd7 5. O-O-O *",
+        "1. e4 e5 2. -- *",
+    ] {
+        let game = parse_one(pgn);
+        let encoded = encode_game_moves(&game).unwrap();
+        let decoded = decode(&encoded, None);
+        assert!(decoded.errors.is_empty(), "{pgn}: {:?}", decoded.errors);
+        assert_eq!(uci_line(&decoded), uci_line(&game), "{pgn}");
+        assert_eq!(ordered_tree(&decoded, 0), ordered_tree(&game, 0), "{pgn}");
+    }
+}
+
+#[test]
+fn chess960_start_and_castling_round_trip() {
+    let standard_board = parse_one(
+        "[Variant \"Chess960\"]\n\
+         [FEN \"rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1\"]\n\n\
+         1. e4 e5 2. Nf3 Nc6 3. Bc4 Bc5 4. O-O *",
+    );
+    let encoded = encode_game_moves(&standard_board).unwrap();
+    assert_eq!(encoded.start_id, Some(518));
+    let decoded = decode(&encoded, Some(518));
+    assert_eq!(ordered_tree(&decoded, 0), ordered_tree(&standard_board, 0));
+
+    let non_standard = parse_one(
+        "[Variant \"Chess960\"]\n\
+         [FEN \"bbqnnrkr/pppppppp/8/8/8/8/PPPPPPPP/BBQNNRKR w KQkq - 0 1\"]\n\n\
+         1. f4 f5 2. Rf2 d5 3. O-O *",
+    );
+    let encoded = encode_game_moves(&non_standard).unwrap();
+    assert_eq!(encoded.start_id, Some(0));
+    let decoded = decode(&encoded, Some(0));
+    assert_eq!(ordered_tree(&decoded, 0), ordered_tree(&non_standard, 0));
+    assert_eq!(
+        uci_line(&decoded).last().map(String::as_str),
+        Some("g1h1"),
+        "SP0 kingside castling must survive as Chess960 castling"
+    );
+}
+
+#[test]
+fn rejects_custom_fen_and_unsupported_variants() {
+    let custom = parse_one("[FEN \"8/8/8/8/8/8/4K3/7k w - - 0 1\"]\n\n*");
+    let err = encode_game_moves(&custom).unwrap_err();
+    assert!(format!("{err:#}").contains("standard chess or Chess960"));
+
+    let crazyhouse = parse_one("[Variant \"Crazyhouse\"]\n\n1. e4 *");
+    let err = encode_game_moves(&crazyhouse).unwrap_err();
+    assert!(format!("{err:#}").contains("variant"));
+}
+
+#[test]
+fn rejects_unresolvable_moves() {
+    let mut game = parse_one("1. e4 e5 *");
+    let node = game.mainline()[0];
+    game.nodes[node].mv.as_mut().unwrap().uci = "e2e5".to_string();
+    game.nodes[node].mv.as_mut().unwrap().san = "Z9".to_string();
+    let err = encode_game_moves(&game).unwrap_err();
+    assert!(format!("{err:#}").contains("cannot resolve move"));
 }

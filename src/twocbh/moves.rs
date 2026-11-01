@@ -327,6 +327,11 @@ pub(super) fn from_stored_square(code: u8) -> Square {
     )
 }
 
+/// The inverse of [`from_stored_square`]: `file * 8 + rank`.
+pub(super) fn to_stored_square(square: Square) -> u8 {
+    (square.file().to_u32() as u8) * 8 + (square.rank().to_u32() as u8)
+}
+
 /// The FEN tag for a decoded start position.
 pub(super) fn start_fen(pos: &Chess) -> String {
     Fen::from_position(pos, EnPassantMode::Legal).to_string()
