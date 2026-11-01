@@ -11,6 +11,7 @@
 //! Coordinates in the table are ChessBase's *stored* squares: `file * 8 + rank`.
 //! They are converted to Brett squares at decode time.
 
+use std::collections::HashMap;
 use std::ops::Index;
 use std::sync::LazyLock;
 
@@ -50,6 +51,7 @@ const SLIDER_DIRS: [(i8, i8); 8] = [
 /// A generated token table with one spare slot for token zero.
 pub(super) struct TokenTable {
     entries: Box<[[u16; 8]]>,
+    by_entry: HashMap<[u16; 8], u16>,
 }
 
 impl TokenTable {
@@ -59,8 +61,15 @@ impl TokenTable {
         build_main(&mut entries, &mut at);
         build_castling_960(&mut entries, &mut at);
         debug_assert_eq!(at, 49_197);
+        let mut by_entry = HashMap::new();
+        for token in 1..=49_196u16 {
+            // Keep the first token for duplicate geometry.  The orthodox castling
+            // entries are generated before the Chess960 block, so they win.
+            by_entry.entry(entries[usize::from(token)]).or_insert(token);
+        }
         Self {
             entries: entries.into_boxed_slice(),
+            by_entry,
         }
     }
 
@@ -71,6 +80,10 @@ impl TokenTable {
 
     pub(super) fn entry(&self, token: u16) -> [u16; 8] {
         self.entries[usize::from(token)]
+    }
+
+    pub(super) fn token_for(&self, entry: [u16; 8]) -> Option<u16> {
+        self.by_entry.get(&entry).copied()
     }
 }
 
@@ -373,5 +386,23 @@ mod tests {
         assert_eq!(table().entry(0), [0; 8]);
         assert_eq!(table().entry(49_196), [15, 55, 9, 0, 23, 47, 13, 0]);
         assert_eq!(table().entry(49_197), [0; 8]);
+    }
+
+    #[test]
+    fn inverse_lookup_round_trips_every_generated_entry() {
+        for token in 1..=49_196u16 {
+            let entry = table().entry(token);
+            let got = table().token_for(entry).expect("generated entry has a token");
+            assert_eq!(table().entry(got), entry, "token {token}");
+        }
+        assert_eq!(table().token_for([0; 8]), None);
+    }
+
+    #[test]
+    fn orthodox_castling_uses_the_fixed_tokens() {
+        assert_eq!(table().token_for([32, 16, 1, 0, 0, 24, 5, 0]), Some(45_353));
+        assert_eq!(table().token_for([32, 48, 1, 0, 56, 40, 5, 0]), Some(45_354));
+        assert_eq!(table().token_for([39, 23, 9, 0, 7, 31, 13, 0]), Some(45_355));
+        assert_eq!(table().token_for([39, 55, 9, 0, 63, 47, 13, 0]), Some(45_356));
     }
 }
