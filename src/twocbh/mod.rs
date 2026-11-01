@@ -23,9 +23,15 @@
 
 mod moves;
 mod tokens;
+pub mod writer;
 
 #[cfg(test)]
 mod tests;
+
+pub use writer::{
+    ALL_EXTENSIONS, CORE_EXTENSIONS, DERIVED_EXTENSIONS, TwoCbhWriteOptions, TwoCbhWriteReport,
+    core_companion_files, existing_companion_files, write_database, write_database_with_options,
+};
 
 use std::ffi::OsString;
 use std::fs::{self, File};
