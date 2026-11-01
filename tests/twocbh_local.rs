@@ -36,6 +36,94 @@ fn tree(game: &Game, node: usize) -> String {
 }
 
 #[test]
+fn writer_round_trips_update01_sample() {
+    let Some(cbh) = env_path("BRETT_2CBH_UPDATE01") else {
+        return;
+    };
+    let source = TwoCbhLibrary::open(&cbh).unwrap();
+    // Update01 has no FEN or Variant tags, but filter out any unsupported
+    // start so this stays a round-trip test if the local sample changes.
+    let take = 50;
+    let games: Vec<Game> = (0..source.len())
+        .filter_map(|index| source.load(index).ok())
+        .filter(|game| {
+            game.header("FEN").is_none()
+                && game.header("Variant").is_none()
+                && ["White", "Black", "Event", "Site", "Date", "Round", "Result"]
+                    .iter()
+                    .all(|key| game.header(key).is_some())
+                && game
+                    .errors
+                    .iter()
+                    .all(|error| error.contains("marked deleted"))
+        })
+        .take(take)
+        .collect();
+    assert_eq!(games.len(), take, "not enough writable games in the sample");
+
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("brett-2cbh-roundtrip-{stamp}"));
+    std::fs::create_dir_all(&dir).unwrap();
+    let target = dir.join("roundtrip.2cbh");
+
+    let report = brett::twocbh::write_database_with_options(
+        &target,
+        brett::twocbh::TwoCbhWriteOptions {
+            allow_annotation_loss: true,
+        },
+        games.iter().cloned().map(Ok),
+    )
+    .unwrap();
+    assert_eq!(report.games, take);
+
+    let written = TwoCbhLibrary::open(&target).unwrap();
+    assert_eq!(written.len(), take);
+    for (index, want) in games.iter().enumerate() {
+        let got = written.load(index).unwrap();
+        assert!(
+            got.errors
+                .iter()
+                .all(|error| error.contains("marked deleted")),
+            "game {index}: {:?}",
+            got.errors
+        );
+        assert_eq!(uci(&got), uci(want), "game {index} mainline");
+        assert_eq!(tree(&got, 0), tree(want, 0), "game {index} tree");
+        for key in [
+            "White",
+            "Black",
+            "Event",
+            "Site",
+            "Date",
+            "Round",
+            "Result",
+            "WhiteElo",
+            "BlackElo",
+            "WhiteFideId",
+            "BlackFideId",
+            "GameId",
+            "Beauty",
+            "SourceTitle",
+            "Source",
+        ] {
+            assert_eq!(
+                got.header(key).unwrap_or(""),
+                want.header(key).unwrap_or(""),
+                "game {index} {key}"
+            );
+        }
+    }
+
+    for companion in brett::twocbh::existing_companion_files(&target) {
+        let _ = std::fs::remove_file(companion);
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
 fn update01_matches_the_pgn_mainlines() {
     let Some(cbh) = env_path("BRETT_2CBH_UPDATE01") else {
         return;
