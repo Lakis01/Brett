@@ -75,11 +75,11 @@ ICCF server games under ICCF's terms, and comply with ICCF's terms. See
   variations and comments, and real SVG board diagrams at user-chosen plies.
   Typst can compile a PDF locally when requested. See
   [docs/PRINT.md](docs/PRINT.md).
-- **ChessBase 2CBH** databases through a native, read-only reader
-  (`src/twocbh/`). This is the current ChessBase container. Brett decodes
-  headers, names, standard chess, Chess960, and nested variations; `.2cba`
-  annotation items are not decoded yet, so comments and NAGs are not
-  fabricated. Writing 2CBH is deferred until compatibility tests are ready.
+- **ChessBase 2CBH** databases through a native reader and writer
+  (`src/twocbh/`). This is the current ChessBase container. Brett reads and
+  writes moves, variations, headers, names, standard chess, Chess960, and
+  nested variations. `.2cba` annotation items are not decoded yet, so
+  comments, NAGs, clocks, and evaluations are not written.
 - **Classic ChessBase CBH** databases through a native reader and writer
   (`src/cbh/`). Brett opens the `.cbh` header file and its `.cbg` moves,
   `.cba` annotations, and `.cbp`/`.cbt`/`.cbc`/`.cbs` names directly. This is
@@ -506,12 +506,14 @@ never writes to the source database.
 - **Database editing and export (done).** Drag rows to reorder the current
   list, drag games between internal database views, and drag a database onto
   another to merge it. **File → Save database** writes the session in its
-  current format; **Save database as…** chooses PGN, SCID4, or classic CBH.
-  A new database asks for a format, and 2CBH is shown as read-only. Saves
-  preserve headers, comments, clocks, NAGs, and variations; exports estimated
-  at 100 MB or more ask for confirmation first. The last database folder is
-  remembered for Open and Save As, and closing a modified database asks
-  whether to save, discard, or cancel.
+  current format; **Save database as…** chooses PGN, SCID4, classic CBH, or
+  2CBH. A new database asks for a format, and 2CBH is writable: the first
+  writer preserves moves, variations, and metadata but not comments, NAGs,
+  clocks, or evaluations. Saves preserve headers, comments, clocks, NAGs, and
+  variations for the other formats; exports estimated at 100 MB or more ask
+  for confirmation first. The last database folder is remembered for Open and
+  Save As, and closing a modified database asks whether to save, discard, or
+  cancel.
 - **Opening-tree files and reference sources (done).** A separate PGN, SCID,
   or classic CBH opening-tree database can be indexed for the Tree tab and
   saved as the default. The Refs tab can point preparation at the current
@@ -524,12 +526,13 @@ The detailed queue and acceptance criteria are in
 
 ## Data safety
 
-Source PGN, SCID, and classic CBH collections are **read-only**. Brett opens
-them for reading only. Derived indexes and imported games go to
-`$XDG_CACHE_HOME/brett/`, and personal preferences go to
-`$XDG_CONFIG_HOME/brett/`; nothing is written next to a source database. PGN
-exports default to the home directory, refuse to overwrite the open source
-file, and refuse targets inside the protected source roots. The conventional
+Source PGN, SCID, classic CBH, and 2CBH collections are **read-only**. Brett
+opens them for reading only, and exports to any of these formats are writable.
+Derived indexes and imported games go to `$XDG_CACHE_HOME/brett/`, and
+personal preferences go to `$XDG_CONFIG_HOME/brett/`; nothing is written next
+to a source database. PGN exports default to the home directory, refuse to
+overwrite the open source file, and refuse targets inside the protected source
+roots. The conventional
 `$HOME/Chess Databases` and `$HOME/Downloads/CBH` directories are protected
 automatically when they exist; add more with `BRETT_READ_ONLY_ROOTS`.
 

@@ -1,15 +1,16 @@
 # Native ChessBase CBH and 2CBH support
 
-Brett reads the current multi-file ChessBase 2CBH format and reads and writes
-the older classic CBH format directly. Opening a database does not require
-ChessBase, Wine, or a converter, and opening a database never writes to the
-source files.
+Brett reads and writes the current multi-file ChessBase 2CBH container (moves,
+variations, and metadata) and reads and writes the older classic CBH format
+directly. 2CBH comments, NAGs, clocks, and evaluations are not written yet.
+Opening a database does not require ChessBase, Wine, or a converter, and
+opening a database never writes to the source files.
 
-The classic implementation is native Rust in `src/cbh/`. The 2CBH reader is
-native Rust in `src/twocbh/`. Both were written from observed on-disk layout
-and independent format references; no ChessBase code, binary, or token-table
-dump is linked or copied. Translation-table and reference provenance is in
-[THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md) and
+The classic implementation is native Rust in `src/cbh/`. The 2CBH reader and
+writer are native Rust in `src/twocbh/`. Both were written from observed
+on-disk layout and independent format references; no ChessBase code, binary,
+or token-table dump is linked or copied. Translation-table and reference
+provenance is in [THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md) and
 [PROVENANCE.md](PROVENANCE.md).
 
 ## Files
@@ -223,6 +224,38 @@ The 2CBH reader was checked against local databases that are not committed:
 The env-gated `tests/twocbh_local.rs` reproduces the real-file checks when the
 local paths are supplied. No database content is committed.
 
+### Writing 2CBH
+
+`twocbh::write_database` and `write_database_with_options` in
+`src/twocbh/writer.rs` write a fresh database at a `.2cbh` path or bare stem.
+An export produces the four core files:
+
+| File | Contents |
+| --- | --- |
+| `.2cbh` | 192-byte header records |
+| `.2cbg` | Encoded move records |
+| `.2cba` | Framed annotation records (empty annotation content) |
+| `.2lid` | Inline player, event, and source names |
+
+The writer streams to temporary files beside the target, replaces the existing
+companion set atomically with rollback, and removes stale derived `.2lcd` and
+`.2lgd` indexes so ChessBase rebuilds them. It preserves moves, variations,
+headers, names, custom starts, Chess960, castling, promotions, en passant,
+null moves, and the deleted flag. Comments, NAGs, clocks, and evaluations are
+not written, so the library refuses annotation loss unless
+`TwoCbhWriteOptions { allow_annotation_loss: true }` is passed.
+
+Generate a database for manual ChessBase validation with:
+
+```sh
+cargo run --example twocbh_sample -- /tmp/brett-2cbh-sample.2cbh
+```
+
+The sample writes six games (metadata, variations, promotion, Chess960 on the
+standard board, a deleted game, and a null move), reopens the result, asserts
+six games and the four core files, and prints the absolute path plus a short
+ChessBase checklist.
+
 ### Limits
 
 - Only 2CBH generation `0x26` is accepted. The older `0x22` generation is not
@@ -230,8 +263,8 @@ local paths are supplied. No database content is committed.
 - `.2cba` annotation items are not decoded; comments and NAGs are not
   fabricated. The annotation offset is recorded so the framing can be added
   without changing the game model.
-- Writing 2CBH is deferred until the reader and ChessBase compatibility tests
-  are complete. Classic CBH export remains available.
+- Writing 2CBH is implemented in `src/twocbh/writer.rs`; annotation writing is
+  deferred.
 - The library index is capped at 2,000,000 slots; targeted `TwoCbhFile` access
   is the path for larger databases.
 - Unknown `.2cbg` record kinds and damaged streams are reported as game errors

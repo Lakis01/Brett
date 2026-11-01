@@ -13,9 +13,10 @@ moves-panel interaction polish is complete. Item 8's cloud, opening-tree,
 reference-source, and native-book parts are done; M2b mega-scale ingest remains,
 with the first safety pass now keeping huge archives responsive and avoiding
 automatic full indexing. Item 9's editable session, database views,
-reorder/merge, PGN export, native SCID writer, classic CBH writer, and unified
-**Save database** / **Save database as…** flow are done. Item 10 is no longer blocked: the current ICCF SCID source is available
-and the automatic correspondence reference is integrated; only an optional
+reorder/merge, PGN export, native SCID writer, classic CBH writer, 2CBH writer,
+and unified **Save database** / **Save database as…** flow are done. Item 10 is
+no longer blocked: the current ICCF SCID source is available and the automatic
+correspondence reference is integrated; only an optional
 refresh remains. Deferred predictor refinements are recorded under item 6, and
 native player-title display is queued as item 15. Item 18's trend backend,
 Tree badge column, and Settings controls are implemented; the sparkline and
@@ -67,12 +68,11 @@ closing a modified database.
   moves are excluded from accuracy.
 - **Item 22:** add a player clock-usage analysis brainstorm for the player
   profile/preparation view; no implementation is scheduled yet.
-- **2CBH:** the current ChessBase container reader is implemented in
-  `src/twocbh/` and wired into Open. It covers standard chess, Chess960,
-  headers, names, and nested variations. Annotation items and the writer remain
-  deferred; treat 2CBH as a separate format from classic CBH. The save dialog
-  presents 2CBH as the standard but read-only, and steers saves to PGN, SCID4,
-  or classic CBH.
+- **2CBH:** the current ChessBase container reader and writer are implemented
+  in `src/twocbh/` and wired into Open and Save As. The container-first writer
+  covers standard chess, Chess960, headers, names, nested variations, and the
+  deleted flag; comments, NAGs, clocks, and evaluations are deferred. Treat
+  2CBH as a separate format from classic CBH.
 - **Item 19:** request written redistribution permission from the Scid authors;
   keep the pack local-only and out of releases until then.
 - **Chessable:** deferred; the local note is too ambiguous to schedule.
@@ -288,11 +288,11 @@ on the loaded player database.
 ## 7. Classic CBH and current 2CBH database support
 
 **Status:** classic CBH is implemented in `src/cbh/` and wired into the normal
-database opening path. The current 2CBH reader is implemented in `src/twocbh/`
-and wired into Open and the file filters. Both are read-only and work behind
-`GameLibrary`, so the Games, Players, Tree, and position-index paths need no
-format-specific UI. 2CBH writing and `.2cba` annotations remain deferred.
-Format details and validation results are in [CBH.md](CBH.md).
+database opening path. The current 2CBH reader and container-first writer are
+implemented in `src/twocbh/` and wired into Open, Save As, and the file
+filters. Both work behind `GameLibrary`, so the Games, Players, Tree, and
+position-index paths need no format-specific UI. `.2cba` annotations remain
+deferred. Format details and validation results are in [CBH.md](CBH.md).
 
 **Goal:** read the older multi-file ChessBase CBH format and the current 2CBH
 container. They are separate formats with separate readers.
@@ -303,14 +303,18 @@ multi-file database (`.cba`, `.cbb`, `.cbc`, `.cbe`, `.cbg`,
 `.cbgi`, `.cbh`, `.cbj`, `.cbm`, `.cbp`, `.cbs`, `.cbt`, `.cbtt`, `.flags`,
 `.ini`), not a 2CBH container.
 
-**2CBH (reader done, writer deferred):** the local note that says "cbh
-(2cbh)" means the current ChessBase container. The reader in `src/twocbh/`
-decodes the 192-byte headers, `.2lid` names, `.2cbg` token streams, standard
-and Chess960 starts, castling, promotions, en passant, and nested variations.
-It is validated against Update 01 (10,738 games, zero move/header mismatches),
-`9601.2cbh` (21/21 mainlines, seven starts), a 16-variation game, and targeted
-Mega records. `.2cba` annotation items and 2CBH writing are not implemented;
-do not fabricate comments or fold 2CBH into the classic writer.
+**2CBH (container-first reader and writer implemented):** the local note that
+says "cbh (2cbh)" means the current ChessBase container. The reader in
+`src/twocbh/` decodes the 192-byte headers, `.2lid` names, `.2cbg` token
+streams, standard and Chess960 starts, castling, promotions, en passant, and
+nested variations. It is validated against Update 01 (10,738 games, zero
+move/header mismatches), `9601.2cbh` (21/21 mainlines, seven starts), a
+16-variation game, and targeted Mega records. The container-first writer in
+`src/twocbh/writer.rs` preserves moves, variations, headers, names, custom
+starts, Chess960, promotions, en passant, null moves, and the deleted flag.
+`.2cba` annotation items and annotation writing remain deferred; comments,
+NAGs, clocks, and evaluations are not written. Do not fabricate comments or
+fold 2CBH into the classic writer.
 
 Implemented:
 
@@ -396,14 +400,16 @@ first-move verification. External file drops ask whether to open, merge into
 the current database, or open in a view.
 
 **File → Save database** writes the session in its current format and reuses
-the current writable target; a new database asks for PGN, SCID4, or classic
-CBH. **File → Save database as…** always opens the format chooser. A 2CBH
-source is read-only, so Save steers to a writable copy. PGN saves stream the
-session in order, preserve comments, clocks, NAGs, and variations, and ask for
-confirmation before exports estimated at 100 MB or more. The native SCID4 and
-classic CBH writers are implemented and validated. The last database folder is
-remembered for Open and Save As, and closing a modified database asks whether
-to save, discard, or cancel; a cancelled save keeps the window open.
+the current writable target; a new database asks for PGN, SCID4, classic CBH,
+or 2CBH. **File → Save database as…** always opens the format chooser. 2CBH is
+writable, but saving over the open source is refused, so Save steers to a
+writable copy. PGN saves stream the session in order, preserve comments,
+clocks, NAGs, and variations, and ask for confirmation before exports
+estimated at 100 MB or more. The native SCID4, classic CBH, and 2CBH writers
+are implemented; the first 2CBH pass awaits manual ChessBase validation. The
+last database folder is remembered for Open and Save As, and closing a
+modified database asks whether to save, discard, or cancel; a cancelled save
+keeps the window open.
 
 - **Classic CBH writer (done):** native classic `.cbh` export from **File →
   Save database as… → Classic CBH** (`src/cbh/writer.rs`) writes `.cbh`, `.cbg`, `.cba`,
@@ -413,10 +419,15 @@ to save, discard, or cancel; a cancelled save keeps the window open.
   drawing/time/medal tokens, variations, custom starts, and Chess960, and
   atomically replaces existing companion sets with rollback. Round-trips
   through both `CbhLibrary` and `cbvault_format::cbh`.
-- **2CBH writer (separate, deferred):** the reader is complete enough to
-  target a writer, but writing waits for ChessBase compatibility tests. Do not
-  fold 2CBH into the classic CBH writer; the containers and validation fixtures
-  are different.
+- **2CBH writer (separate, container-first, done):** native `.2cbh`, `.2cbg`,
+  `.2cba`, and `.2lid` export from **File → Save database as… → 2CBH**
+  (`src/twocbh/writer.rs`) preserves moves, variations, headers, names, custom
+  starts, Chess960, castling, promotions, en passant, null moves, and the
+  deleted flag, atomically replaces the companion set, and removes stale
+  `.2lcd`/`.2lgd` indexes. Comments, NAGs, clocks, and evaluations are
+  deferred. Round-trips through `TwoCbhLibrary`; manual ChessBase validation
+  uses `examples/twocbh_sample.rs`. Do not fold 2CBH into the classic CBH
+  writer; the containers and validation fixtures are different.
 - **SCID writer (done):** native SCID4 export from **File → Save database as…
   → SCID4** builds the compressed namebase and stable IDs, encodes index
   flags/offsets, inverts the compact move stream, preserves
