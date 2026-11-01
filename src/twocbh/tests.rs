@@ -272,7 +272,7 @@ fn write_player(block: &mut [u8], last: &str, first: &str, fide: u32) {
 }
 
 fn write_event(block: &mut [u8], place: &str, title: &str) {
-    let total = 32 + place.len() + title.len() + 72;
+    let total = 12 + place.len() + title.len() + 104;
     block[0..4].copy_from_slice(&(total as u32).to_le_bytes());
     let mut at = 4;
     for text in [place, title] {

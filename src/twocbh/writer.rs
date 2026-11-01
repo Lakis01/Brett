@@ -6,6 +6,7 @@
 //! and replaced atomically, rolling back on error.  Derived `.2lcd`/`.2lgd`
 //! indexes are removed with the backups so ChessBase rebuilds them.
 
+use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -22,7 +23,11 @@ use crate::domain::{Game, Ply};
 use super::moves;
 use super::tokens::table;
 
-use super::{CBG_MAGIC, LID_FIRST, LID_STRIDE, RECORD_SIZE, sibling};
+use super::{
+    CBG_MAGIC, LID_EVENT, LID_FIRST, LID_SOURCE, LID_STRIDE, RECORD_SIZE, START_ID_BASE, sibling,
+};
+
+const LID_PLAYER: usize = 0;
 
 /// The four files that make up a 2CBH database.
 pub const CORE_EXTENSIONS: [&str; 4] = ["2cbh", "2cbg", "2cba", "2lid"];
@@ -97,14 +102,16 @@ where
         bail!("2CBH export directory {} does not exist", parent.display());
     }
 
-    let writer = TwoCbhWriter::create(&stem, options)?;
-    if let Some(game) = games.into_iter().next() {
-        let game = game?;
-        bail!(
-            "2CBH game writing is not implemented yet (refusing to drop {} - {})",
-            game.white(),
-            game.black()
-        );
+    let mut writer = TwoCbhWriter::create(&stem, options)?;
+    for (index, game) in games.into_iter().enumerate() {
+        let game = game.with_context(|| format!("reading 2CBH game {index}"))?;
+        writer.add_game(&game).with_context(|| {
+            format!(
+                "writing 2CBH game {index} ({} - {})",
+                game.white(),
+                game.black()
+            )
+        })?;
     }
     writer.finish()
 }
@@ -148,7 +155,6 @@ fn core_path(stem: &Path, ext: &str) -> PathBuf {
 }
 
 /// Frame one `.2cbg` or `.2cba` record at `offset` with the 2CBH padding rule.
-#[allow(dead_code)] // Task 4 calls this from `add_game`.
 fn frame_record(
     content: &[u8],
     terminator: [u8; 2],
@@ -178,7 +184,6 @@ fn frame_record(
 }
 
 /// Deterministic non-zero opaque key for one `.2cbg` record.
-#[allow(dead_code)] // Task 4 uses this for `.2cbg` record keys.
 fn record_key(index: u64, content: &[u8]) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
     for byte in index.to_le_bytes().iter().chain(content) {
@@ -195,7 +200,6 @@ enum Start {
 }
 
 #[derive(Debug)]
-#[allow(dead_code)] // Task 4 reads these fields when it writes the move record.
 struct EncodedMoves {
     start_id: Option<u16>,
     tokens: Vec<u16>,
@@ -245,7 +249,6 @@ fn start_fen_prefix(pos: &Chess) -> String {
         .join(" ")
 }
 
-#[allow(dead_code)] // Task 4 calls this from `add_game`.
 fn encode_game_moves(game: &Game) -> Result<EncodedMoves> {
     let start = detect_start(game)?;
     let start_id = match start {
@@ -435,6 +438,285 @@ fn encode_line(
     Ok(())
 }
 
+type PlayerKey = (String, String, Option<u32>);
+type EventKey = (String, String);
+type SourceKey = (String, String);
+
+/// A keyed list of `.2lid` name records and their block ids.
+#[derive(Default)]
+struct Interner<K> {
+    records: Vec<Vec<u8>>,
+    ids: HashMap<K, u32>,
+}
+
+impl<K: Eq + std::hash::Hash> Interner<K> {
+    fn intern(&mut self, key: K, build: impl FnOnce() -> Result<Vec<u8>>) -> Result<u32> {
+        if let Some(&id) = self.ids.get(&key) {
+            return Ok(id);
+        }
+        let record = build()?;
+        let id = u32::try_from(self.records.len()).context("2LID name table is full")?;
+        self.records.push(record);
+        self.ids.insert(key, id);
+        Ok(id)
+    }
+
+    fn id(&self, key: &K) -> Option<u32> {
+        self.ids.get(key).copied()
+    }
+
+    fn record(&self, id: u32) -> &[u8] {
+        &self.records[id as usize]
+    }
+
+    fn len(&self) -> u32 {
+        self.records.len() as u32
+    }
+}
+
+/// The inline player, event, and source name blocks written to `.2lid`.
+#[derive(Default)]
+struct NameTables {
+    players: Interner<PlayerKey>,
+    events: Interner<EventKey>,
+    sources: Interner<SourceKey>,
+}
+
+impl NameTables {
+    fn intern_player(
+        &mut self,
+        lid: &mut File,
+        name: Option<&str>,
+        fide: Option<&str>,
+    ) -> Result<u32> {
+        let key = player_key(name, fide);
+        let id = self.players.intern(key.clone(), || player_record(&key))?;
+        write_lid_block(lid, id, LID_PLAYER, self.players.record(id))?;
+        Ok(id)
+    }
+
+    fn intern_event(
+        &mut self,
+        lid: &mut File,
+        site: Option<&str>,
+        event: Option<&str>,
+    ) -> Result<u32> {
+        let key = event_key(site, event);
+        let id = self.events.intern(key.clone(), || event_record(&key))?;
+        write_lid_block(lid, id, LID_EVENT, self.events.record(id))?;
+        Ok(id)
+    }
+
+    fn intern_source(
+        &mut self,
+        lid: &mut File,
+        title: Option<&str>,
+        publisher: Option<&str>,
+    ) -> Result<u32> {
+        let key = source_key(title, publisher);
+        let id = self.sources.intern(key.clone(), || source_record(&key))?;
+        write_lid_block(lid, id, LID_SOURCE, self.sources.record(id))?;
+        Ok(id)
+    }
+
+    fn player_id(&self, name: Option<&str>, fide: Option<&str>) -> Result<u32> {
+        let key = player_key(name, fide);
+        self.players
+            .id(&key)
+            .with_context(|| format!("2LID player {key:?} was not interned"))
+    }
+
+    fn event_id(&self, site: Option<&str>, event: Option<&str>) -> Result<u32> {
+        let key = event_key(site, event);
+        self.events
+            .id(&key)
+            .with_context(|| format!("2LID event {key:?} was not interned"))
+    }
+
+    fn source_id(&self, title: Option<&str>, publisher: Option<&str>) -> Result<u32> {
+        let key = source_key(title, publisher);
+        self.sources
+            .id(&key)
+            .with_context(|| format!("2LID source {key:?} was not interned"))
+    }
+
+    fn block_count(&self) -> u32 {
+        self.players
+            .len()
+            .max(self.events.len())
+            .max(self.sources.len())
+            .max(1)
+    }
+
+    fn event_count(&self) -> u32 {
+        self.events.len()
+    }
+}
+
+fn write_lid_block(lid: &mut File, id: u32, offset: usize, record: &[u8]) -> Result<()> {
+    let at = LID_FIRST + id as usize * LID_STRIDE + offset;
+    lid.seek(SeekFrom::Start(at as u64))?;
+    lid.write_all(record)?;
+    Ok(())
+}
+
+fn clean_name(name: Option<&str>) -> String {
+    let name = name.unwrap_or("").trim();
+    if name == "?" {
+        String::new()
+    } else {
+        name.to_string()
+    }
+}
+
+fn split_player_name(name: Option<&str>) -> (String, String) {
+    let name = clean_name(name);
+    match name.split_once(',') {
+        Some((last, first)) => (clean_name(Some(last)), clean_name(Some(first))),
+        None => (name, String::new()),
+    }
+}
+
+fn parse_fide(raw: Option<&str>) -> Option<u32> {
+    let raw = raw?.trim();
+    if raw.is_empty() || raw == "?" {
+        return None;
+    }
+    raw.parse::<u32>().ok().filter(|&id| id != 0)
+}
+
+fn player_key(name: Option<&str>, fide: Option<&str>) -> PlayerKey {
+    let (last, first) = split_player_name(name);
+    (last, first, parse_fide(fide))
+}
+
+fn event_key(site: Option<&str>, event: Option<&str>) -> EventKey {
+    (clean_name(site), clean_name(event))
+}
+
+fn source_key(title: Option<&str>, publisher: Option<&str>) -> SourceKey {
+    (clean_name(title), clean_name(publisher))
+}
+
+fn player_record(key: &PlayerKey) -> Result<Vec<u8>> {
+    let (last, first, fide) = key;
+    let total = 32 + last.len() + first.len();
+    if total > 0x400 {
+        bail!("2LID player name {last}, {first} is too long ({total} bytes; at most 1024)");
+    }
+    let mut record = Vec::with_capacity(total);
+    record.extend_from_slice(&(total as u32).to_le_bytes());
+    record.extend_from_slice(&(last.len() as u32).to_le_bytes());
+    record.extend_from_slice(last.as_bytes());
+    record.extend_from_slice(&(first.len() as u32).to_le_bytes());
+    record.extend_from_slice(first.as_bytes());
+    record.extend_from_slice(&[0u8; 8]);
+    record.extend_from_slice(&1u32.to_le_bytes());
+    record.extend_from_slice(&8u32.to_le_bytes());
+    record.extend_from_slice(&fide.unwrap_or(u32::MAX).to_le_bytes());
+    debug_assert_eq!(record.len(), total);
+    Ok(record)
+}
+
+fn event_record(key: &EventKey) -> Result<Vec<u8>> {
+    let (place, title) = key;
+    let total = 12 + place.len() + title.len() + 104;
+    if total > 0x460 {
+        bail!("2LID event name {place} - {title} is too long ({total} bytes; at most 1120)");
+    }
+    let mut record = Vec::with_capacity(total);
+    record.extend_from_slice(&(total as u32).to_le_bytes());
+    record.extend_from_slice(&(place.len() as u32).to_le_bytes());
+    record.extend_from_slice(place.as_bytes());
+    record.extend_from_slice(&(title.len() as u32).to_le_bytes());
+    record.extend_from_slice(title.as_bytes());
+    record.resize(total, 0);
+    debug_assert_eq!(record.len(), total);
+    Ok(record)
+}
+
+fn source_record(key: &SourceKey) -> Result<Vec<u8>> {
+    let (title, publisher) = key;
+    let total = 20 + title.len() + publisher.len();
+    if total > 0x82A {
+        bail!("2LID source name {title} - {publisher} is too long ({total} bytes; at most 2090)");
+    }
+    let mut record = Vec::with_capacity(total);
+    record.extend_from_slice(&(total as u32).to_le_bytes());
+    record.extend_from_slice(&(title.len() as u32).to_le_bytes());
+    record.extend_from_slice(title.as_bytes());
+    record.extend_from_slice(&(publisher.len() as u32).to_le_bytes());
+    record.extend_from_slice(publisher.as_bytes());
+    record.resize(total, 0);
+    debug_assert_eq!(record.len(), total);
+    Ok(record)
+}
+
+fn is_deleted(game: &Game) -> bool {
+    game.header("Deleted").is_some_and(|value| {
+        let value = value.trim();
+        value == "1" || value.eq_ignore_ascii_case("true")
+    }) || game
+        .errors
+        .iter()
+        .any(|error| error.contains("marked deleted"))
+}
+
+fn encode_date(raw: Option<&str>) -> u32 {
+    let Some(raw) = raw else {
+        return 0;
+    };
+    let mut parts = raw.trim().split(['.', '-', '/']);
+    let year = parse_date_part(parts.next(), 0xfff);
+    let month = parse_date_part(parts.next(), 12);
+    let day = parse_date_part(parts.next(), 31);
+    (year << 9) | (month << 5) | day
+}
+
+fn parse_date_part(raw: Option<&str>, max: u32) -> u32 {
+    raw.and_then(|part| part.trim().parse::<u32>().ok())
+        .filter(|&value| value <= max)
+        .unwrap_or(0)
+}
+
+fn encode_result(result: &str) -> u8 {
+    match result.trim() {
+        "0-1" => 0,
+        "1/2-1/2" => 1,
+        "1-0" => 2,
+        _ => 3,
+    }
+}
+
+fn encode_round(round: Option<&str>, board: Option<&str>) -> (u16, u32) {
+    let round = round
+        .map(str::trim)
+        .filter(|text| !text.is_empty() && *text != "?");
+    let board = board
+        .map(str::trim)
+        .filter(|text| !text.is_empty() && *text != "?");
+    let mut parts = round.unwrap_or("").split(['.', '/', '(']);
+    let main = parts.next().and_then(parse_round_part).unwrap_or(0);
+    let sub = parts
+        .next()
+        .and_then(parse_round_part)
+        .or_else(|| board.and_then(parse_round_part))
+        .unwrap_or(0);
+    (main.min(u32::from(u16::MAX)) as u16, sub)
+}
+
+fn parse_round_part(part: &str) -> Option<u32> {
+    part.trim().trim_end_matches(')').trim().parse().ok()
+}
+
+fn parse_elo(raw: Option<&str>) -> u32 {
+    raw.and_then(|text| text.trim().parse().ok()).unwrap_or(0)
+}
+
+fn parse_u64_header(raw: Option<&str>) -> u64 {
+    raw.and_then(|text| text.trim().parse().ok()).unwrap_or(0)
+}
+
 struct TwoCbhWriter {
     stem: PathBuf,
     unique: String,
@@ -446,11 +728,10 @@ struct TwoCbhWriter {
     cbg_file: Option<BufWriter<File>>,
     cba_file: Option<BufWriter<File>>,
     lid_file: Option<File>,
+    names: NameTables,
     cbg_offset: u64,
     cba_offset: u64,
     games: u32,
-    block_count: u32,
-    event_count: u32,
     guard: TempGuard,
 }
 
@@ -519,13 +800,152 @@ impl TwoCbhWriter {
             cbg_file: Some(cbg_file),
             cba_file: Some(cba_file),
             lid_file: Some(lid_file),
+            names: NameTables::default(),
             cbg_offset: CBG_HEADER,
             cba_offset: CBG_HEADER,
             games: 0,
-            block_count: 1,
-            event_count: 0,
             guard,
         })
+    }
+
+    /// Encode, stream, and index one game.
+    fn add_game(&mut self, game: &Game) -> Result<()> {
+        let index = self.games;
+        let EncodedMoves {
+            start_id,
+            mut tokens,
+        } = encode_game_moves(game).with_context(|| {
+            format!(
+                "encoding 2CBH game {index} ({} - {})",
+                game.white(),
+                game.black()
+            )
+        })?;
+
+        let base_padding = if tokens.is_empty() {
+            194
+        } else {
+            assert_eq!(
+                tokens.pop(),
+                Some(0xffff),
+                "2CBH move stream must end with a line terminator"
+            );
+            98
+        };
+
+        let mut content = Vec::with_capacity(8 + tokens.len() * 2);
+        match start_id {
+            None => {
+                content.extend_from_slice(&1u16.to_le_bytes());
+                content.extend_from_slice(&0xfffcu16.to_le_bytes());
+            }
+            Some(id) => {
+                content.extend_from_slice(&2u16.to_le_bytes());
+                content.extend_from_slice(&0xfffbu16.to_le_bytes());
+                content.extend_from_slice(&id.to_le_bytes());
+                content.extend_from_slice(&0xfffcu16.to_le_bytes());
+            }
+        }
+        for token in &tokens {
+            content.extend_from_slice(&token.to_le_bytes());
+        }
+
+        let cbg_offset = self.cbg_offset;
+        let key = record_key(u64::from(index), &content);
+        let record = frame_record(&content, [0xff, 0xff], base_padding, key, cbg_offset);
+        self.cbg_file
+            .as_mut()
+            .context("2CBG temporary file is already closed")?
+            .write_all(&record)?;
+        self.cbg_offset += record.len() as u64;
+
+        let cba_offset = self.cba_offset;
+        let record = frame_record(
+            &[0x00, 0x20, 0xff, 0xff],
+            [0xff, 0x7f],
+            194,
+            0x7fff_ffff,
+            cba_offset,
+        );
+        self.cba_file
+            .as_mut()
+            .context("2CBA temporary file is already closed")?
+            .write_all(&record)?;
+        self.cba_offset += record.len() as u64;
+
+        {
+            let lid = self
+                .lid_file
+                .as_mut()
+                .context("2LID temporary file is already closed")?;
+            self.names
+                .intern_player(lid, game.header("White"), game.header("WhiteFideId"))?;
+            self.names
+                .intern_player(lid, game.header("Black"), game.header("BlackFideId"))?;
+            self.names
+                .intern_event(lid, game.header("Site"), game.header("Event"))?;
+            self.names
+                .intern_source(lid, game.header("SourceTitle"), game.header("Source"))?;
+        }
+
+        let record = self.game_record(game, cbg_offset, cba_offset, start_id)?;
+        self.cbh_file
+            .as_mut()
+            .context("2CBH temporary file is already closed")?
+            .write_all(&record)?;
+        self.games = self
+            .games
+            .checked_add(1)
+            .context("2CBH game count overflow")?;
+        Ok(())
+    }
+
+    /// Build the 192-byte `.2cbh` record for one already-interned game.
+    fn game_record(
+        &self,
+        game: &Game,
+        cbg_offset: u64,
+        cba_offset: u64,
+        start_id: Option<u16>,
+    ) -> Result<[u8; RECORD_SIZE]> {
+        let white = self
+            .names
+            .player_id(game.header("White"), game.header("WhiteFideId"))?;
+        let black = self
+            .names
+            .player_id(game.header("Black"), game.header("BlackFideId"))?;
+        let event = self
+            .names
+            .event_id(game.header("Site"), game.header("Event"))?;
+        let source = self
+            .names
+            .source_id(game.header("SourceTitle"), game.header("Source"))?;
+        let (round, subround) = encode_round(game.header("Round"), game.header("Board"));
+
+        let mut record = [0u8; RECORD_SIZE];
+        record[0] = if is_deleted(game) { 0x81 } else { 0x01 };
+        record[1..4].copy_from_slice(&[0, 1, 1]);
+        record[0x08..0x10].copy_from_slice(&cbg_offset.to_le_bytes());
+        record[0x10..0x18].copy_from_slice(&cba_offset.to_le_bytes());
+        record[0x18..0x1c].copy_from_slice(&white.to_le_bytes());
+        record[0x20..0x24].copy_from_slice(&black.to_le_bytes());
+        record[0x28..0x2c].copy_from_slice(&event.to_le_bytes());
+        record[0x30..0x34].copy_from_slice(&2u32.to_le_bytes());
+        record[0x38..0x3c].copy_from_slice(&source.to_le_bytes());
+        record[0x40..0x50].fill(0xff);
+        let packed = (u32::from(round) << 16) | u32::from(encode_result(game.result()));
+        record[0x58..0x5c].copy_from_slice(&packed.to_le_bytes());
+        record[0x5c..0x60].copy_from_slice(&subround.to_le_bytes());
+        record[0x60..0x64].copy_from_slice(&parse_elo(game.header("WhiteElo")).to_le_bytes());
+        record[0x70..0x74].copy_from_slice(&parse_elo(game.header("BlackElo")).to_le_bytes());
+        if let Some(start_id) = start_id {
+            record[0x80..0x84]
+                .copy_from_slice(&(START_ID_BASE + u32::from(start_id)).to_le_bytes());
+        }
+        record[0x98..0xa0].copy_from_slice(&parse_u64_header(game.header("GameId")).to_le_bytes());
+        record[0xb0..0xb8].copy_from_slice(&parse_u64_header(game.header("Beauty")).to_le_bytes());
+        record[0xbc..0xc0].copy_from_slice(&encode_date(game.header("Date")).to_le_bytes());
+        Ok(record)
     }
 
     fn finish(mut self) -> Result<TwoCbhWriteReport> {
@@ -572,14 +992,16 @@ impl TwoCbhWriter {
         cba_file.flush()?;
         drop(cba_file);
 
+        let block_count = self.names.block_count();
+        let event_count = self.names.event_count();
         let mut lid_file = self
             .lid_file
             .take()
             .context("2LID temporary file is already closed")?;
-        let lid_len = LID_FIRST as u64 + u64::from(self.block_count) * LID_STRIDE as u64;
+        let lid_len = LID_FIRST as u64 + u64::from(block_count) * LID_STRIDE as u64;
         lid_file.set_len(lid_len)?;
         lid_file.seek(SeekFrom::Start(0))?;
-        lid_file.write_all(&lid_header(self.block_count, self.event_count))?;
+        lid_file.write_all(&lid_header(block_count, event_count))?;
         lid_file.flush()?;
         drop(lid_file);
 

@@ -1,7 +1,7 @@
 use super::*;
 use crate::domain;
 use crate::domain::Game;
-use crate::twocbh::TwoCbhFile;
+use crate::twocbh::{TwoCbhFile, TwoCbhLibrary};
 use anyhow::Result;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -241,4 +241,248 @@ fn rejects_unresolvable_moves() {
     game.nodes[node].mv.as_mut().unwrap().san = "Z9".to_string();
     let err = encode_game_moves(&game).unwrap_err();
     assert!(format!("{err:#}").contains("cannot resolve move"));
+}
+
+#[test]
+fn writes_and_reopens_metadata_and_names() {
+    let dir = TempDir::new();
+    let path = dir.path().join("meta.2cbh");
+    let game = parse_one(
+        "[Event \"Test Event\"]\n\
+         [Site \"Test City\"]\n\
+         [Date \"2024.01.02\"]\n\
+         [Round \"3.2\"]\n\
+         [White \"Doe, Jane\"]\n\
+         [Black \"Roe, Richard\"]\n\
+         [Result \"1-0\"]\n\
+         [WhiteElo \"2500\"]\n\
+         [BlackElo \"2400\"]\n\
+         [WhiteFideId \"123456\"]\n\
+         [BlackFideId \"654321\"]\n\
+         [GameId \"42\"]\n\
+         [Beauty \"7\"]\n\
+         [SourceTitle \"Test Source\"]\n\
+         [Source \"Publisher\"]\n\
+         [Deleted \"1\"]\n\n\
+         1. e4 e5 *",
+    );
+
+    let report = write_database(&path, vec![Ok(game)]).unwrap();
+    assert_eq!(report.games, 1);
+
+    let cbh = std::fs::read(&path).unwrap();
+    let record = &cbh[192..384];
+    assert_eq!(record[0], 0x81);
+    assert_eq!(&record[1..4], &[0, 1, 1]);
+    assert_eq!(
+        u32::from_le_bytes(record[0x18..0x1c].try_into().unwrap()),
+        0
+    );
+    assert_eq!(
+        u32::from_le_bytes(record[0x20..0x24].try_into().unwrap()),
+        1
+    );
+    assert_eq!(
+        u32::from_le_bytes(record[0x28..0x2c].try_into().unwrap()),
+        0
+    );
+    assert_eq!(
+        u32::from_le_bytes(record[0x38..0x3c].try_into().unwrap()),
+        0
+    );
+    assert_eq!(
+        u32::from_le_bytes(record[0x30..0x34].try_into().unwrap()),
+        2
+    );
+    assert_eq!(&record[0x40..0x50], &[0xff; 16]);
+    assert_eq!(
+        u32::from_le_bytes(record[0x58..0x5c].try_into().unwrap()),
+        (3 << 16) | 2
+    );
+    assert_eq!(
+        u32::from_le_bytes(record[0x5c..0x60].try_into().unwrap()),
+        2
+    );
+    assert_eq!(
+        u32::from_le_bytes(record[0x60..0x64].try_into().unwrap()),
+        2500
+    );
+    assert_eq!(
+        u32::from_le_bytes(record[0x70..0x74].try_into().unwrap()),
+        2400
+    );
+    assert_eq!(
+        u32::from_le_bytes(record[0x80..0x84].try_into().unwrap()),
+        0
+    );
+    assert_eq!(
+        u64::from_le_bytes(record[0x98..0xa0].try_into().unwrap()),
+        42
+    );
+    assert_eq!(
+        u64::from_le_bytes(record[0xb0..0xb8].try_into().unwrap()),
+        7
+    );
+    assert_eq!(
+        u32::from_le_bytes(record[0xbc..0xc0].try_into().unwrap()),
+        (2024 << 9) | (1 << 5) | 2
+    );
+
+    let library = TwoCbhLibrary::open(&path).unwrap();
+    assert_eq!(library.len(), 1);
+    let got = library.load(0).unwrap();
+    assert_eq!(got.white(), "Doe, Jane");
+    assert_eq!(got.black(), "Roe, Richard");
+    assert_eq!(got.header("Event"), Some("Test Event"));
+    assert_eq!(got.header("Site"), Some("Test City"));
+    assert_eq!(got.date(), "2024.01.02");
+    assert_eq!(got.header("Round"), Some("3.2"));
+    assert_eq!(got.result(), "1-0");
+    assert_eq!(got.header("WhiteElo"), Some("2500"));
+    assert_eq!(got.header("BlackElo"), Some("2400"));
+    assert_eq!(got.header("WhiteFideId"), Some("123456"));
+    assert_eq!(got.header("BlackFideId"), Some("654321"));
+    assert_eq!(got.header("GameId"), Some("42"));
+    assert_eq!(got.header("Beauty"), Some("7"));
+    assert_eq!(got.header("SourceTitle"), Some("Test Source"));
+    assert_eq!(got.header("Source"), Some("Publisher"));
+    assert!(got.errors.iter().any(|e| e.contains("marked deleted")));
+
+    let lid = std::fs::read(path.with_extension("2lid")).unwrap();
+    assert_eq!(u32::from_be_bytes(lid[0x10..0x14].try_into().unwrap()), 3);
+    assert_eq!(u32::from_be_bytes(lid[0x24..0x28].try_into().unwrap()), 1);
+
+    let block = 0xB8;
+    let player_len = u32::from_le_bytes(lid[block..block + 4].try_into().unwrap());
+    assert_eq!(player_len as usize, 32 + "Doe".len() + "Jane".len());
+    let event_at = block + 0x400;
+    let event_len = u32::from_le_bytes(lid[event_at..event_at + 4].try_into().unwrap());
+    assert_eq!(
+        event_len as usize,
+        12 + "Test City".len() + "Test Event".len() + 104
+    );
+    let source_at = block + 0x860;
+    let source_len = u32::from_le_bytes(lid[source_at..source_at + 4].try_into().unwrap());
+    assert_eq!(
+        source_len as usize,
+        20 + "Test Source".len() + "Publisher".len()
+    );
+}
+
+#[test]
+fn writes_and_reopens_an_empty_game() {
+    let dir = TempDir::new();
+    let path = dir.path().join("empty-game.2cbh");
+    let game = parse_one("[White \"Empty\"]\n[Black \"Game\"]\n[Result \"*\"]\n\n*");
+
+    write_database(&path, vec![Ok(game)]).unwrap();
+
+    let library = TwoCbhLibrary::open(&path).unwrap();
+    assert_eq!(library.len(), 1);
+    let got = library.load(0).unwrap();
+    assert!(got.errors.is_empty(), "{:?}", got.errors);
+    assert_eq!(got.mainline_len(), 0);
+    assert_eq!(got.header("PlyCount"), Some("0"));
+}
+
+#[test]
+fn keeps_duplicate_names_with_distinct_fide_ids() {
+    let dir = TempDir::new();
+    let path = dir.path().join("dupes.2cbh");
+    let make = |fide: &str| {
+        let mut game = parse_one("1. e4 e5 *");
+        game.set_header("White", "Doe, Jane".to_string());
+        game.set_header("WhiteFideId", fide.to_string());
+        game
+    };
+    write_database(&path, vec![Ok(make("111")), Ok(make("222"))]).unwrap();
+
+    let library = TwoCbhLibrary::open(&path).unwrap();
+    assert_eq!(library.load(0).unwrap().header("WhiteFideId"), Some("111"));
+    assert_eq!(library.load(1).unwrap().header("WhiteFideId"), Some("222"));
+}
+
+#[test]
+fn preserves_utf8_names() {
+    let dir = TempDir::new();
+    let path = dir.path().join("utf8.2cbh");
+    let mut game = parse_one("1. e4 e5 *");
+    game.set_header("White", "Müller, Jörg".to_string());
+    game.set_header("Black", "Ābols, Jānis".to_string());
+    write_database(&path, vec![Ok(game)]).unwrap();
+
+    let library = TwoCbhLibrary::open(&path).unwrap();
+    let got = library.load(0).unwrap();
+    assert_eq!(got.white(), "Müller, Jörg");
+    assert_eq!(got.black(), "Ābols, Jānis");
+}
+
+#[test]
+fn rejects_overlong_names() {
+    let dir = TempDir::new();
+    let path = dir.path().join("long.2cbh");
+    let mut game = parse_one("1. e4 e5 *");
+    game.set_header("White", "A".repeat(0x400));
+    let err = write_database(&path, vec![Ok(game)]).unwrap_err();
+    assert!(format!("{err:#}").contains("too long"));
+    assert!(!path.exists());
+}
+
+#[test]
+fn records_are_aligned_and_framed() {
+    let dir = TempDir::new();
+    let path = dir.path().join("aligned.2cbh");
+    write_database(
+        &path,
+        vec![Ok(parse_one("1. e4 e5 *")), Ok(parse_one("1. d4 d5 *"))],
+    )
+    .unwrap();
+
+    let cbh = std::fs::read(&path).unwrap();
+    let cbg = std::fs::read(path.with_extension("2cbg")).unwrap();
+    let cba = std::fs::read(path.with_extension("2cba")).unwrap();
+    assert_eq!(cbh.len(), 192 * 3);
+
+    for id in 1..=2usize {
+        let record = &cbh[id * 192..(id + 1) * 192];
+        let cbg_offset = u64::from_le_bytes(record[8..16].try_into().unwrap());
+        let cba_offset = u64::from_le_bytes(record[16..24].try_into().unwrap());
+        // The file header is 12 bytes, so the first record starts at 12;
+        // each record's end is aligned so the next record starts 8-aligned.
+        if id == 1 {
+            assert_eq!(cbg_offset, 12);
+            assert_eq!(cba_offset, 12);
+        }
+
+        let a = u32::from_le_bytes(
+            cbg[cbg_offset as usize + 8..cbg_offset as usize + 12]
+                .try_into()
+                .unwrap(),
+        ) as u64;
+        let b = u32::from_le_bytes(
+            cbg[cbg_offset as usize + 12..cbg_offset as usize + 16]
+                .try_into()
+                .unwrap(),
+        ) as u64;
+        assert_eq!((cbg_offset + 34 + a + b) % 8, 0);
+        let ca = u32::from_le_bytes(
+            cba[cba_offset as usize + 8..cba_offset as usize + 12]
+                .try_into()
+                .unwrap(),
+        ) as u64;
+        let cb = u32::from_le_bytes(
+            cba[cba_offset as usize + 12..cba_offset as usize + 16]
+                .try_into()
+                .unwrap(),
+        ) as u64;
+        assert_eq!((cba_offset + 34 + ca + cb) % 8, 0);
+        assert_eq!(
+            &cba[cba_offset as usize + 24..cba_offset as usize + 28],
+            &[0x00, 0x20, 0xff, 0xff]
+        );
+        assert_eq!(
+            &cba[cba_offset as usize + 28..cba_offset as usize + 30],
+            &[0xff, 0x7f]
+        );
+    }
 }
