@@ -51,6 +51,7 @@ const SLIDER_DIRS: [(i8, i8); 8] = [
 /// A generated token table with one spare slot for token zero.
 pub(super) struct TokenTable {
     entries: Box<[[u16; 8]]>,
+    #[allow(dead_code)] // the 2CBH writer consumes it in the next task
     by_entry: HashMap<[u16; 8], u16>,
 }
 
@@ -82,6 +83,7 @@ impl TokenTable {
         self.entries[usize::from(token)]
     }
 
+    #[allow(dead_code)] // the 2CBH writer consumes it in the next task
     pub(super) fn token_for(&self, entry: [u16; 8]) -> Option<u16> {
         self.by_entry.get(&entry).copied()
     }
@@ -392,7 +394,9 @@ mod tests {
     fn inverse_lookup_round_trips_every_generated_entry() {
         for token in 1..=49_196u16 {
             let entry = table().entry(token);
-            let got = table().token_for(entry).expect("generated entry has a token");
+            let got = table()
+                .token_for(entry)
+                .expect("generated entry has a token");
             assert_eq!(table().entry(got), entry, "token {token}");
         }
         assert_eq!(table().token_for([0; 8]), None);
@@ -401,8 +405,17 @@ mod tests {
     #[test]
     fn orthodox_castling_uses_the_fixed_tokens() {
         assert_eq!(table().token_for([32, 16, 1, 0, 0, 24, 5, 0]), Some(45_353));
-        assert_eq!(table().token_for([32, 48, 1, 0, 56, 40, 5, 0]), Some(45_354));
-        assert_eq!(table().token_for([39, 23, 9, 0, 7, 31, 13, 0]), Some(45_355));
-        assert_eq!(table().token_for([39, 55, 9, 0, 63, 47, 13, 0]), Some(45_356));
+        assert_eq!(
+            table().token_for([32, 48, 1, 0, 56, 40, 5, 0]),
+            Some(45_354)
+        );
+        assert_eq!(
+            table().token_for([39, 23, 9, 0, 7, 31, 13, 0]),
+            Some(45_355)
+        );
+        assert_eq!(
+            table().token_for([39, 55, 9, 0, 63, 47, 13, 0]),
+            Some(45_356)
+        );
     }
 }
