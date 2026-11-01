@@ -422,7 +422,17 @@ struct PendingCbhExport {
     close_after: bool,
 }
 
-/// A database container Brett can open, and (except for 2CBH) write.
+#[derive(Clone, Debug)]
+struct PendingTwoCbhExport {
+    path: PathBuf,
+    games: usize,
+    existing: Vec<PathBuf>,
+    annotations: bool,
+    close_after: bool,
+}
+
+/// A database container Brett can open and write. 2CBH writing covers moves,
+/// variations, and metadata; annotations are not written yet.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DatabaseFormat {
     Pgn,
@@ -433,7 +443,7 @@ enum DatabaseFormat {
 
 impl DatabaseFormat {
     /// Formats offered when the user has to choose a save format.
-    const WRITABLE: [Self; 3] = [Self::Pgn, Self::Scid, Self::Cbh];
+    const WRITABLE: [Self; 4] = [Self::Pgn, Self::Scid, Self::Cbh, Self::TwoCbh];
 
     fn from_path(path: &Path) -> Self {
         match path
@@ -455,7 +465,7 @@ impl DatabaseFormat {
             Self::Pgn => "PGN (plain text, portable)",
             Self::Scid => "SCID4 database (.si4)",
             Self::Cbh => "Classic ChessBase database (.cbh)",
-            Self::TwoCbh => "ChessBase 2CBH (read-only)",
+            Self::TwoCbh => "ChessBase 2CBH database (.2cbh)",
         }
     }
 
@@ -487,7 +497,7 @@ impl DatabaseFormat {
     }
 
     fn is_writable(self) -> bool {
-        !matches!(self, Self::TwoCbh)
+        Self::WRITABLE.contains(&self)
     }
 }
 
@@ -799,6 +809,7 @@ pub struct App {
     pending_pgn_export: Option<PendingPgnExport>,
     pending_scid_export: Option<PendingScidExport>,
     pending_cbh_export: Option<PendingCbhExport>,
+    pending_two_cbh_export: Option<PendingTwoCbhExport>,
     /// Node ids where the user asked for a printed diagram. The final
     /// position is controlled separately by `print_export_include_final`.
     print_diagrams: BTreeSet<usize>,
@@ -1098,6 +1109,7 @@ impl App {
             pending_pgn_export: None,
             pending_scid_export: None,
             pending_cbh_export: None,
+            pending_two_cbh_export: None,
             print_diagrams: BTreeSet::new(),
             print_export_open: false,
             print_export_path: String::new(),
@@ -1879,29 +1891,18 @@ impl App {
             DatabaseFormat::Pgn => self.start_pgn_save(target, close_after),
             DatabaseFormat::Scid => self.start_scid_save(target, close_after),
             DatabaseFormat::Cbh => self.start_cbh_save(target, close_after),
-            DatabaseFormat::TwoCbh => {
-                self.status =
-                    "2CBH writing is not implemented yet. Choose PGN, SCID4, or classic CBH."
-                        .to_string();
-            }
+            DatabaseFormat::TwoCbh => self.start_two_cbh_save(target, close_after),
         }
     }
 
-    /// Save in the current database's format. A new database, or a 2CBH source,
-    /// opens the format chooser. A session that already has a writable target
-    /// writes there without asking again.
+    /// Save in the current database's format. A new database opens the format
+    /// chooser; an existing writable target saves directly.
     fn save_database_now(&mut self, close_after: bool) {
         if self.session.is_empty() {
             self.status = "There are no games to save.".to_string();
             return;
         }
         if let Some(format) = self.current_database_format() {
-            if !format.is_writable() {
-                self.status =
-                    "2CBH is read-only in Brett. Choose another format to save a copy.".to_string();
-                self.open_save_database_dialog(false, close_after, DatabaseFormat::Pgn);
-                return;
-            }
             if let Some(path) = self
                 .database_save_path
                 .clone()
@@ -1993,13 +1994,6 @@ impl App {
                 for format in DatabaseFormat::WRITABLE {
                     ui.radio_value(&mut self.save_database_format, format, format.label());
                 }
-                ui.add_enabled(
-                    false,
-                    egui::RadioButton::new(
-                        false,
-                        "ChessBase 2CBH (the current standard; writing is not implemented yet)",
-                    ),
-                );
                 ui.add_space(6.0);
                 ui.label("File");
                 ui.horizontal(|ui| {
@@ -2011,13 +2005,15 @@ impl App {
                         browse = true;
                     }
                 });
-                ui.label(
-                    RichText::new(
-                        "2CBH is the standard ChessBase format, but Brett can only read it for now. PGN, SCID4, and classic CBH are writable.",
-                    )
-                    .small()
-                    .weak(),
-                );
+                if self.save_database_format == DatabaseFormat::TwoCbh {
+                    ui.label(
+                        RichText::new(
+                            "2CBH writes moves, variations, and metadata. Comments, NAGs, clocks, and evaluations are not written yet.",
+                        )
+                        .small()
+                        .weak(),
+                    );
+                }
                 if !self.save_database_error.is_empty() {
                     ui.add_space(4.0);
                     ui.label(RichText::new(&self.save_database_error).small().color(GOLD));
@@ -2571,6 +2567,217 @@ impl App {
         let ids: Vec<usize> = self.session.slots().iter().map(|slot| slot.id).collect();
         crate::cbh::write_database(
             path,
+            ids.into_iter()
+                .map(|id| self.session.load(id, &self.edited)),
+        )
+        .map_err(|err| format!("{err:#}"))
+    }
+
+    fn two_cbh_export_dialog(&mut self, ctx: &egui::Context) {
+        let Some(pending) = self.pending_two_cbh_export.clone() else {
+            return;
+        };
+        let title = if pending.existing.is_empty() {
+            "Write 2CBH database"
+        } else {
+            "Replace 2CBH database"
+        };
+        let mut open = true;
+        let mut confirm = false;
+        let mut cancel = false;
+        egui::Window::new(title)
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.label(format!(
+                    "This will write {} to:",
+                    games_label(pending.games)
+                ));
+                ui.label(RichText::new(pending.path.display().to_string()).monospace());
+                ui.add_space(6.0);
+                if pending.annotations {
+                    ui.label(
+                        RichText::new(
+                            "Comments, NAGs, clocks, and evaluations are not written by the first 2CBH writer. They will be lost in this export.",
+                        )
+                        .strong(),
+                    );
+                }
+                if !pending.existing.is_empty() {
+                    ui.label(
+                        RichText::new(
+                            "A 2CBH database is a four-file set. These existing companion files will be replaced together:",
+                        )
+                        .strong(),
+                    );
+                    for path in &pending.existing {
+                        ui.label(RichText::new(path.display().to_string()).monospace());
+                    }
+                }
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(
+                        "Stale .2lcd/.2lgd indexes are removed so ChessBase rebuilds them.",
+                    )
+                    .weak(),
+                );
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Write database").clicked() {
+                        confirm = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        if confirm {
+            self.pending_two_cbh_export = None;
+            self.write_two_cbh_export(&pending.path, pending.annotations, pending.close_after);
+        } else if cancel || !open {
+            self.pending_two_cbh_export = None;
+            self.status = "Save cancelled.".to_string();
+        }
+    }
+
+    fn start_two_cbh_save(&mut self, target: Option<PathBuf>, close_after: bool) {
+        if self.session.is_empty() {
+            self.status = "There are no games to save.".to_string();
+            return;
+        }
+        self.persist_current_edit();
+        let mut path = match target {
+            Some(path) => path,
+            None => {
+                let default = self.default_database_save_path(DatabaseFormat::TwoCbh);
+                let Some(path) = save_format_dialog(DatabaseFormat::TwoCbh, &default) else {
+                    self.status = "Save cancelled.".to_string();
+                    return;
+                };
+                path
+            }
+        };
+        let core_extension = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| {
+                crate::twocbh::CORE_EXTENSIONS
+                    .iter()
+                    .any(|core| extension.eq_ignore_ascii_case(core))
+            });
+        if path.extension().is_none() || core_extension {
+            path.set_extension("2cbh");
+        }
+        if is_read_only_export_target(&path) {
+            self.status =
+                "That folder is read-only in Brett. Choose a path outside the source collection."
+                    .to_string();
+            return;
+        }
+        if self.two_cbh_export_would_overwrite_source(&path) {
+            self.status =
+                "Refusing to overwrite the open source database. Choose a new file.".to_string();
+            return;
+        }
+
+        let existing = crate::twocbh::existing_companion_files(&path);
+        let annotations = match self.session_has_annotations() {
+            Ok(annotations) => annotations,
+            Err(err) => {
+                self.status = format!("2CBH save failed: {err}");
+                return;
+            }
+        };
+        let games = self.session.len();
+        if existing.is_empty() && !annotations {
+            self.write_two_cbh_export(&path, false, close_after);
+        } else {
+            self.pending_two_cbh_export = Some(PendingTwoCbhExport {
+                path,
+                games,
+                existing,
+                annotations,
+                close_after,
+            });
+            self.status = format!(
+                "Confirm writing the 2CBH database for {}.",
+                games_label(games)
+            );
+        }
+    }
+
+    fn session_has_annotations(&self) -> Result<bool, String> {
+        for slot in self.session.slots() {
+            let game = self
+                .session
+                .load(slot.id, &self.edited)
+                .map_err(|err| format!("{err:#}"))?;
+            if crate::twocbh::has_unsupported_annotations(&game) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn two_cbh_export_would_overwrite_source(&self, path: &std::path::Path) -> bool {
+        let Some(library) = &self.library else {
+            return false;
+        };
+        let source = library.path();
+        let mut protected = vec![source.to_path_buf()];
+        for extension in crate::twocbh::ALL_EXTENSIONS {
+            protected.push(source.with_extension(extension));
+        }
+        for extension in crate::twocbh::ALL_EXTENSIONS {
+            let target = path.with_extension(extension);
+            if protected
+                .iter()
+                .any(|source_file| same_file_path(&target, source_file))
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn write_two_cbh_export(
+        &mut self,
+        path: &std::path::Path,
+        allow_annotation_loss: bool,
+        close_after: bool,
+    ) {
+        self.persist_current_edit();
+        match self.try_write_two_cbh_export(path, allow_annotation_loss) {
+            Ok(report) => {
+                self.status = format!(
+                    "Saved {} to {} ({}).",
+                    games_label(report.games),
+                    path.display(),
+                    human_bytes(report.bytes)
+                );
+                self.finish_saved_database(path, close_after);
+            }
+            Err(err) => {
+                self.status = format!("2CBH save failed: {err}");
+            }
+        }
+    }
+
+    fn try_write_two_cbh_export(
+        &self,
+        path: &std::path::Path,
+        allow_annotation_loss: bool,
+    ) -> Result<crate::twocbh::TwoCbhWriteReport, String> {
+        crate::session::ensure_unique_ids(&self.session)
+            .map_err(|err| format!("checking the session: {err:#}"))?;
+
+        let ids: Vec<usize> = self.session.slots().iter().map(|slot| slot.id).collect();
+        crate::twocbh::write_database_with_options(
+            path,
+            crate::twocbh::TwoCbhWriteOptions {
+                allow_annotation_loss,
+            },
             ids.into_iter()
                 .map(|id| self.session.load(id, &self.edited)),
         )
@@ -5470,6 +5677,7 @@ impl App {
             || self.pending_pgn_export.is_some()
             || self.pending_scid_export.is_some()
             || self.pending_cbh_export.is_some()
+            || self.pending_two_cbh_export.is_some()
         {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             return;
@@ -5500,7 +5708,7 @@ impl App {
                 ui.label("This database has unsaved changes. Save before closing?");
                 ui.label(
                     RichText::new(
-                        "Save database keeps the current format. A 2CBH source is read-only, so Brett will ask for a writable copy.",
+                        "Save database keeps the current format. 2CBH writes moves, variations, and metadata; comments, NAGs, clocks, and evaluations are not written yet.",
                     )
                     .small()
                     .weak(),
@@ -5913,7 +6121,7 @@ impl App {
                             egui::Button::new("Save database as…"),
                         )
                         .on_hover_text(
-                            "Choose PGN, SCID4, or classic CBH. 2CBH is read-only in Brett for now.",
+                            "Choose PGN, SCID4, classic CBH, or 2CBH. 2CBH writes moves, variations, and metadata only.",
                         )
                         .clicked()
                     {
@@ -11194,6 +11402,7 @@ impl eframe::App for App {
         self.pgn_export_dialog(&ctx);
         self.scid_export_dialog(&ctx);
         self.cbh_export_dialog(&ctx);
+        self.two_cbh_export_dialog(&ctx);
         self.print_export_dialog(&ctx);
         self.classify_openings_dialog(&ctx);
         self.index_confirmation_dialog(&ctx);
@@ -15529,6 +15738,7 @@ mod tests {
             pending_pgn_export: None,
             pending_scid_export: None,
             pending_cbh_export: None,
+            pending_two_cbh_export: None,
             print_diagrams: BTreeSet::new(),
             print_export_open: false,
             print_export_path: String::new(),
@@ -15789,6 +15999,163 @@ mod tests {
         for companion in crate::cbh::existing_companion_files(&path) {
             let _ = std::fs::remove_file(companion);
         }
+    }
+
+    #[test]
+    fn exports_session_games_as_two_cbh_database() {
+        let mut app = test_app();
+        let first = domain::parse_pgn(b"[White \"First\"]\n[Black \"Black\"]\n\n1. e4 e5 *\n")
+            .unwrap()
+            .remove(0);
+        let second = domain::parse_pgn(b"[White \"Second\"]\n[Black \"Black\"]\n\n1. d4 d5 *\n")
+            .unwrap()
+            .remove(0);
+        app.session.insert_game(first, None);
+        app.session.insert_game(second, None);
+
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "brett-2cbh-export-{}-{stamp}.2cbh",
+            std::process::id()
+        ));
+
+        let report = app.try_write_two_cbh_export(&path, false).unwrap();
+        assert_eq!(report.games, 2);
+        for companion in crate::twocbh::core_companion_files(&path) {
+            assert!(companion.exists(), "missing {}", companion.display());
+        }
+
+        let library = crate::twocbh::TwoCbhLibrary::open(&path).unwrap();
+        assert_eq!(library.len(), 2);
+        assert_eq!(library.load(0).unwrap().white(), "First");
+        assert_eq!(library.load(1).unwrap().white(), "Second");
+
+        for companion in crate::twocbh::existing_companion_files(&path) {
+            let _ = std::fs::remove_file(companion);
+        }
+    }
+
+    #[test]
+    fn two_cbh_save_waits_for_annotation_confirmation() {
+        let mut app = test_app();
+        // The Opera fixture has comments and a NAG.
+        let game = app.current.clone().unwrap();
+        app.session.insert_game(game, None);
+
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "brett-2cbh-confirm-{}-{stamp}.2cbh",
+            std::process::id()
+        ));
+
+        app.start_two_cbh_save(Some(path.clone()), false);
+
+        let pending = app.pending_two_cbh_export.as_ref().unwrap();
+        assert!(pending.annotations);
+        assert_eq!(pending.games, 1);
+        assert!(!path.exists());
+
+        // Confirming the dialog passes the annotation-loss flag through.
+        app.pending_two_cbh_export = None;
+        app.write_two_cbh_export(&path, true, false);
+        let library = crate::twocbh::TwoCbhLibrary::open(&path).unwrap();
+        assert_eq!(library.len(), 1);
+        assert_eq!(library.load(0).unwrap().white(), "Paul Morphy");
+
+        for companion in crate::twocbh::existing_companion_files(&path) {
+            let _ = std::fs::remove_file(companion);
+        }
+    }
+
+    #[test]
+    fn two_cbh_save_normalizes_core_extensions_but_rejects_other_extensions() {
+        let mut app = test_app();
+        let game = domain::parse_pgn(b"[White \"A\"]\n[Black \"B\"]\n\n1. e4 *\n")
+            .unwrap()
+            .remove(0);
+        app.session.insert_game(game, None);
+
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("brett-2cbh-target-{}-{stamp}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        app.start_two_cbh_save(Some(dir.join("named.2cbg")), false);
+        assert!(dir.join("named.2cbh").exists());
+        assert!(app.status.starts_with("Saved "), "{}", app.status);
+
+        app.start_two_cbh_save(Some(dir.join("bare")), false);
+        assert!(dir.join("bare.2cbh").exists());
+
+        app.start_two_cbh_save(Some(dir.join("wrong.txt")), false);
+        assert!(!dir.join("wrong.txt").exists());
+        assert!(
+            app.status.starts_with("2CBH save failed:"),
+            "{}",
+            app.status
+        );
+
+        for companion in crate::twocbh::existing_companion_files(&dir.join("named.2cbh")) {
+            let _ = std::fs::remove_file(companion);
+        }
+        for companion in crate::twocbh::existing_companion_files(&dir.join("bare.2cbh")) {
+            let _ = std::fs::remove_file(companion);
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn two_cbh_export_lists_companion_files() {
+        let base = PathBuf::from("/tmp/example.2cbh");
+        assert_eq!(
+            crate::twocbh::core_companion_files(&base),
+            [
+                PathBuf::from("/tmp/example.2cbh"),
+                PathBuf::from("/tmp/example.2cbg"),
+                PathBuf::from("/tmp/example.2cba"),
+                PathBuf::from("/tmp/example.2lid"),
+            ]
+        );
+    }
+
+    #[test]
+    fn two_cbh_export_protects_the_open_source() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("brett-2cbh-source-{stamp}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("source.2cbh");
+        crate::twocbh::write_database(&source, Vec::<anyhow::Result<Game>>::new()).unwrap();
+
+        let mut app = test_app();
+        app.library = Some(std::sync::Arc::new(
+            crate::twocbh::TwoCbhLibrary::open(&source).unwrap(),
+        ));
+        assert!(app.two_cbh_export_would_overwrite_source(&source));
+        assert!(app.two_cbh_export_would_overwrite_source(&source.with_extension("2cbg")));
+        for extension in crate::twocbh::ALL_EXTENSIONS {
+            assert!(
+                app.two_cbh_export_would_overwrite_source(&source.with_extension(extension)),
+                "source .{extension} is not protected"
+            );
+        }
+        assert!(!app.two_cbh_export_would_overwrite_source(&dir.join("copy.2cbh")));
+
+        for companion in crate::twocbh::existing_companion_files(&source) {
+            let _ = std::fs::remove_file(companion);
+        }
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -16728,31 +17095,14 @@ mod tests {
     }
 
     #[test]
-    fn database_format_maps_extensions_and_keeps_2cbh_read_only() {
-        assert_eq!(
-            DatabaseFormat::from_path(Path::new("games.pgn")),
-            DatabaseFormat::Pgn
-        );
-        assert_eq!(
-            DatabaseFormat::from_path(Path::new("games.si4")),
-            DatabaseFormat::Scid
-        );
-        assert_eq!(
-            DatabaseFormat::from_path(Path::new("games.cbh")),
-            DatabaseFormat::Cbh
-        );
-        assert_eq!(
-            DatabaseFormat::from_path(Path::new("games.cbv")),
-            DatabaseFormat::Cbh
-        );
+    fn database_format_makes_2cbh_writable() {
         assert_eq!(
             DatabaseFormat::from_path(Path::new("games.2cbh")),
             DatabaseFormat::TwoCbh
         );
-        assert!(!DatabaseFormat::TwoCbh.is_writable());
-        assert!(DatabaseFormat::Pgn.is_writable());
-        assert!(DatabaseFormat::Scid.is_writable());
-        assert!(DatabaseFormat::Cbh.is_writable());
+        assert!(DatabaseFormat::TwoCbh.is_writable());
+        assert_eq!(DatabaseFormat::WRITABLE.len(), 4);
+        assert!(DatabaseFormat::WRITABLE.contains(&DatabaseFormat::TwoCbh));
     }
 
     #[test]
