@@ -11,6 +11,42 @@ use serde_json::{Value, json};
 
 use crate::engine::EngineOptions;
 
+/// Configuration for an individual engine slot (Hotkeys 1, 2, 3).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EngineSlotConfig {
+    pub path: Option<PathBuf>,
+    pub threads: u32,
+    pub hash_mb: u32,
+    pub enabled: bool,
+}
+
+impl Default for EngineSlotConfig {
+    fn default() -> Self {
+        Self {
+            path: None,
+            threads: 1,
+            hash_mb: 16,
+            enabled: false,
+        }
+    }
+}
+
+impl EngineSlotConfig {
+    pub fn resolved_path(&self, fallback: Option<PathBuf>) -> PathBuf {
+        self.path
+            .clone()
+            .or(fallback)
+            .unwrap_or_else(crate::engine::default_engine_path)
+    }
+
+    pub fn options(&self) -> EngineOptions {
+        EngineOptions {
+            threads: self.threads.clamp(1, 256),
+            hash_mb: self.hash_mb.clamp(1, 32_768),
+        }
+    }
+}
+
 /// Engine settings saved between Brett sessions.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EnginePrefs {
@@ -23,6 +59,8 @@ pub struct EnginePrefs {
     pub cache_engine_analysis: bool,
     /// Whether fine-grained Stockfish quality comparison is used to supersede entries.
     pub heuristic_supersede: bool,
+    /// Up to 3 parallel engine slots, bound to hotkeys 1, 2, 3.
+    pub engines: [EngineSlotConfig; 3],
 }
 
 impl Default for EnginePrefs {
@@ -33,22 +71,68 @@ impl Default for EnginePrefs {
             hash_mb: 16,
             cache_engine_analysis: true,
             heuristic_supersede: true,
+            engines: [
+                EngineSlotConfig {
+                    path: None,
+                    threads: 1,
+                    hash_mb: 16,
+                    enabled: true,
+                },
+                EngineSlotConfig {
+                    path: None,
+                    threads: 1,
+                    hash_mb: 16,
+                    enabled: false,
+                },
+                EngineSlotConfig {
+                    path: None,
+                    threads: 1,
+                    hash_mb: 16,
+                    enabled: false,
+                },
+            ],
         }
     }
 }
 
 impl EnginePrefs {
+    pub fn new(
+        path: Option<PathBuf>,
+        threads: u32,
+        hash_mb: u32,
+        cache_engine_analysis: bool,
+        heuristic_supersede: bool,
+    ) -> Self {
+        let engines = [
+            EngineSlotConfig {
+                path: path.clone(),
+                threads,
+                hash_mb,
+                enabled: true,
+            },
+            EngineSlotConfig::default(),
+            EngineSlotConfig::default(),
+        ];
+        Self {
+            path,
+            threads,
+            hash_mb,
+            cache_engine_analysis,
+            heuristic_supersede,
+            engines,
+        }
+    }
+
     pub fn resolved_path(&self) -> PathBuf {
-        self.path
+        self.engines[0]
+            .path
             .clone()
+            .or_else(|| self.path.clone())
             .unwrap_or_else(crate::engine::default_engine_path)
     }
 
     pub fn options(&self) -> EngineOptions {
-        EngineOptions {
-            threads: self.threads.clamp(1, 256),
-            hash_mb: self.hash_mb.clamp(1, 32_768),
-        }
+        self.engines[0].options()
     }
 
     /// Parse a config file. Unknown or malformed fields fall back to defaults;
@@ -79,22 +163,80 @@ impl EnginePrefs {
             .get("heuristic_supersede")
             .and_then(Value::as_bool)
             .unwrap_or(true);
+
+        let mut engines = [
+            EngineSlotConfig {
+                path: path.clone(),
+                threads,
+                hash_mb,
+                enabled: true,
+            },
+            EngineSlotConfig::default(),
+            EngineSlotConfig::default(),
+        ];
+
+        if let Some(arr) = value.get("engines").and_then(Value::as_array) {
+            for (i, item) in arr.iter().take(3).enumerate() {
+                let p = item
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|p| !p.is_empty())
+                    .map(PathBuf::from);
+                let t = item
+                    .get("threads")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(1)
+                    .clamp(1, 256) as u32;
+                let h = item
+                    .get("hash_mb")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(16)
+                    .clamp(1, 32_768) as u32;
+                let en = item
+                    .get("enabled")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(i == 0);
+                engines[i] = EngineSlotConfig {
+                    path: p,
+                    threads: t,
+                    hash_mb: h,
+                    enabled: en,
+                };
+            }
+        }
+
         Self {
             path,
             threads,
             hash_mb,
             cache_engine_analysis,
             heuristic_supersede,
+            engines,
         }
     }
 
     pub fn to_json(&self) -> String {
+        let engines_json: Vec<Value> = self
+            .engines
+            .iter()
+            .map(|e| {
+                json!({
+                    "path": e.path.as_ref().map(|path| path.display().to_string()),
+                    "threads": e.threads,
+                    "hash_mb": e.hash_mb,
+                    "enabled": e.enabled,
+                })
+            })
+            .collect();
+
         serde_json::to_string_pretty(&json!({
             "engine_path": self.path.as_ref().map(|path| path.display().to_string()),
             "threads": self.threads,
             "hash_mb": self.hash_mb,
             "cache_engine_analysis": self.cache_engine_analysis,
             "heuristic_supersede": self.heuristic_supersede,
+            "engines": engines_json,
         }))
         .unwrap_or_default()
     }
@@ -1058,13 +1200,13 @@ mod tests {
 
     #[test]
     fn engine_prefs_round_trip() {
-        let prefs = EnginePrefs {
-            path: Some(PathBuf::from("/opt/engines/stockfish")),
-            threads: 6,
-            hash_mb: 1024,
-            cache_engine_analysis: true,
-            heuristic_supersede: true,
-        };
+        let prefs = EnginePrefs::new(
+            Some(PathBuf::from("/opt/engines/stockfish")),
+            6,
+            1024,
+            true,
+            true,
+        );
         assert_eq!(EnginePrefs::from_json(&prefs.to_json()), prefs);
     }
 
@@ -1074,18 +1216,46 @@ mod tests {
         assert!(default_prefs.cache_engine_analysis);
         assert!(default_prefs.heuristic_supersede);
 
-        let custom = EnginePrefs {
-            path: None,
-            threads: 4,
-            hash_mb: 256,
-            cache_engine_analysis: false,
-            heuristic_supersede: false,
-        };
+        let custom = EnginePrefs::new(None, 4, 256, false, false);
         let json = custom.to_json();
         let loaded = EnginePrefs::from_json(&json);
         assert_eq!(loaded, custom);
         assert!(!loaded.cache_engine_analysis);
         assert!(!loaded.heuristic_supersede);
+    }
+
+    #[test]
+    fn engine_slots_round_trip() {
+        let mut prefs = EnginePrefs::default();
+        prefs.engines[0] = EngineSlotConfig {
+            path: Some(PathBuf::from("/usr/bin/stockfish")),
+            threads: 4,
+            hash_mb: 256,
+            enabled: true,
+        };
+        prefs.engines[1] = EngineSlotConfig {
+            path: Some(PathBuf::from("/usr/bin/lc0")),
+            threads: 2,
+            hash_mb: 128,
+            enabled: true,
+        };
+        prefs.engines[2] = EngineSlotConfig {
+            path: Some(PathBuf::from("/usr/bin/komodo")),
+            threads: 2,
+            hash_mb: 64,
+            enabled: false,
+        };
+        let json = prefs.to_json();
+        let loaded = EnginePrefs::from_json(&json);
+        assert_eq!(loaded, prefs);
+        assert_eq!(
+            loaded.engines[0].path,
+            Some(PathBuf::from("/usr/bin/stockfish"))
+        );
+        assert!(loaded.engines[0].enabled);
+        assert_eq!(loaded.engines[1].path, Some(PathBuf::from("/usr/bin/lc0")));
+        assert!(loaded.engines[1].enabled);
+        assert!(!loaded.engines[2].enabled);
     }
 
     #[test]
@@ -1342,13 +1512,13 @@ mod tests {
                 .as_nanos()
         ));
         let path = dir.join("brett/engine.json");
-        let prefs = EnginePrefs {
-            path: Some(PathBuf::from("/opt/engines/stockfish")),
-            threads: 4,
-            hash_mb: 256,
-            cache_engine_analysis: true,
-            heuristic_supersede: true,
-        };
+        let prefs = EnginePrefs::new(
+            Some(PathBuf::from("/opt/engines/stockfish")),
+            4,
+            256,
+            true,
+            true,
+        );
         assert_eq!(EnginePrefs::load_from(&path), EnginePrefs::default());
         prefs.save_to(&path).unwrap();
         assert_eq!(EnginePrefs::load_from(&path), prefs);
@@ -1358,13 +1528,13 @@ mod tests {
     #[test]
     fn settings_bundle_round_trip() {
         let bundle = SettingsBundle {
-            engine: EnginePrefs {
-                path: Some(PathBuf::from("/usr/bin/stockfish")),
-                threads: 8,
-                hash_mb: 512,
-                cache_engine_analysis: true,
-                heuristic_supersede: false,
-            },
+            engine: EnginePrefs::new(
+                Some(PathBuf::from("/usr/bin/stockfish")),
+                8,
+                512,
+                true,
+                false,
+            ),
             references: CloudPrefs {
                 lichess_token: Some("token123".to_string()),
                 lichess_username: Some("grandmaster".to_string()),

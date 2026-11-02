@@ -268,6 +268,64 @@ impl EngineLimitMode {
     }
 }
 
+pub struct EngineSlotState {
+    pub enabled: bool,
+    pub path: String,
+    pub threads: u32,
+    pub hash_mb: u32,
+    pub engine: Option<EngineHandle>,
+    pub name: String,
+    pub ready: bool,
+    pub searching: bool,
+    pub request: u64,
+    pub fen: Option<String>,
+    pub infos: BTreeMap<usize, EngineInfo>,
+    pub bestmove: Option<String>,
+    pub status: String,
+    pub debouncer: crate::analysis_cache::AnalysisDebouncer,
+}
+
+impl EngineSlotState {
+    pub fn new(enabled: bool, path: String, threads: u32, hash_mb: u32) -> Self {
+        Self {
+            enabled,
+            path,
+            threads,
+            hash_mb,
+            engine: None,
+            name: String::new(),
+            ready: false,
+            searching: false,
+            request: 0,
+            fen: None,
+            infos: BTreeMap::new(),
+            bestmove: None,
+            status: "Engine not started.".to_string(),
+            debouncer: crate::analysis_cache::AnalysisDebouncer::new(),
+        }
+    }
+
+    pub fn short_name(&self, idx: usize) -> String {
+        if !self.name.is_empty() {
+            self.name
+                .split_whitespace()
+                .next()
+                .unwrap_or("Engine")
+                .to_string()
+        } else if !self.path.trim().is_empty() {
+            Path::new(&self.path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("Engine")
+                .to_string()
+        } else if idx == 0 {
+            "Stockfish".to_string()
+        } else {
+            format!("Engine {}", idx + 1)
+        }
+    }
+}
+
 enum PlayerBookMessage {
     Progress { done: usize, total: usize },
     Done(Result<PlayerBook, String>),
@@ -825,7 +883,8 @@ pub struct App {
     cached_analyses: Vec<crate::analysis_cache::CachedAnalysis>,
     lichess_token: Option<String>,
     explorer_source: cloud::ExplorerSource,
-    engine: Option<EngineHandle>,
+    engine_slots: [EngineSlotState; 3],
+    selected_engine_slot: usize,
     engine_view: EngineView,
     engine_status: String,
     engine_name: String,
@@ -848,7 +907,6 @@ pub struct App {
     cache_engine_analysis: bool,
     heuristic_supersede: bool,
     analysis_cache: Option<crate::analysis_cache::AnalysisCacheHandle>,
-    analysis_debouncer: crate::analysis_cache::AnalysisDebouncer,
     review_engine: Option<EngineHandle>,
     review: Option<ReviewState>,
     review_open: bool,
@@ -1144,7 +1202,39 @@ impl App {
             cached_analyses: Vec::new(),
             lichess_token: cloud_prefs.lichess_token,
             explorer_source: cloud_prefs.explorer_source,
-            engine: None,
+            engine_slots: [
+                EngineSlotState::new(
+                    engine_prefs.engines[0].enabled,
+                    engine_prefs.engines[0]
+                        .path
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| engine_prefs.resolved_path().display().to_string()),
+                    engine_prefs.engines[0].threads,
+                    engine_prefs.engines[0].hash_mb,
+                ),
+                EngineSlotState::new(
+                    engine_prefs.engines[1].enabled,
+                    engine_prefs.engines[1]
+                        .path
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default(),
+                    engine_prefs.engines[1].threads,
+                    engine_prefs.engines[1].hash_mb,
+                ),
+                EngineSlotState::new(
+                    engine_prefs.engines[2].enabled,
+                    engine_prefs.engines[2]
+                        .path
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default(),
+                    engine_prefs.engines[2].threads,
+                    engine_prefs.engines[2].hash_mb,
+                ),
+            ],
+            selected_engine_slot: 0,
             engine_view: EngineView::from_config(&display_prefs.engine_view),
             engine_status: "Engine not started.".to_string(),
             engine_name: String::new(),
@@ -1170,7 +1260,6 @@ impl App {
                 None,
                 engine_prefs.heuristic_supersede,
             )),
-            analysis_debouncer: crate::analysis_cache::AnalysisDebouncer::new(),
             review_engine: None,
             review: None,
             review_open: false,
@@ -3928,6 +4017,7 @@ impl App {
             }
         }
 
+        self.save_engine_prefs();
         self.save_display_prefs();
         self.save_reference_prefs();
         if wiki_changed {
@@ -3950,6 +4040,16 @@ impl App {
     }
 
     fn apply_imported_settings(&mut self, bundle: &crate::settings::SettingsBundle) {
+        for (i, slot) in self.engine_slots.iter_mut().enumerate() {
+            slot.path = bundle.engine.engines[i]
+                .path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default();
+            slot.threads = bundle.engine.engines[i].threads;
+            slot.hash_mb = bundle.engine.engines[i].hash_mb;
+            slot.enabled = bundle.engine.engines[i].enabled;
+        }
         self.engine_path = bundle.engine.resolved_path().display().to_string();
         self.engine_threads = bundle.engine.threads;
         self.engine_hash_mb = bundle.engine.hash_mb;
@@ -4325,17 +4425,6 @@ impl App {
         }
     }
 
-    fn flush_engine_cache(&mut self) {
-        if let Some(batch) = self.analysis_debouncer.flush()
-            && let Some(cache) = &self.analysis_cache
-            && let Some(first) = batch.first()
-        {
-            let pos_hash = first.pos_hash;
-            cache.store_batch(batch.clone());
-            self.record_cache_written(pos_hash, &batch);
-        }
-    }
-
     fn engine_limit(&self) -> SearchLimit {
         match self.engine_limit_mode {
             EngineLimitMode::Infinite => SearchLimit::Infinite,
@@ -4363,14 +4452,226 @@ impl App {
     }
 
     fn engine_settings_pending(&self) -> bool {
-        self.engine.as_ref().is_some_and(|engine| {
-            engine.path() != self.engine_path() || engine.options() != self.engine_options()
+        let slot = &self.engine_slots[self.selected_engine_slot];
+        slot.engine.as_ref().is_some_and(|engine| {
+            let path = if slot.path.trim().is_empty() {
+                if self.selected_engine_slot == 0 {
+                    crate::engine::default_engine_path()
+                } else {
+                    PathBuf::new()
+                }
+            } else {
+                PathBuf::from(slot.path.trim())
+            };
+            let options = EngineOptions {
+                threads: slot.threads.clamp(1, 256),
+                hash_mb: slot.hash_mb.clamp(1, 32_768),
+            };
+            engine.path() != path || engine.options() != options
         })
+    }
+
+    fn ensure_engine_slot(&mut self, idx: usize) -> bool {
+        if idx >= 3 || self.engine_view == EngineView::Cloud {
+            return false;
+        }
+        let path_str = self.engine_slots[idx].path.trim();
+        let path = if path_str.is_empty() {
+            if idx == 0 {
+                crate::engine::default_engine_path()
+            } else {
+                return false;
+            }
+        } else {
+            PathBuf::from(path_str)
+        };
+        let options = EngineOptions {
+            threads: self.engine_slots[idx].threads.clamp(1, 256),
+            hash_mb: self.engine_slots[idx].hash_mb.clamp(1, 32_768),
+        };
+        let needs_start = match &self.engine_slots[idx].engine {
+            Some(e) => e.path() != path || e.options() != options,
+            None => true,
+        };
+        if needs_start {
+            if let Some(e) = self.engine_slots[idx].engine.take() {
+                e.stop();
+            }
+            match EngineHandle::spawn_with_options(&path, options) {
+                Ok(engine) => {
+                    self.engine_slots[idx].engine = Some(engine);
+                    self.engine_slots[idx].ready = false;
+                    self.engine_slots[idx].name.clear();
+                    self.engine_slots[idx].status = format!("Starting Engine {}…", idx + 1);
+                    if idx == 0 {
+                        self.engine_ready = false;
+                        self.engine_status = self.engine_slots[0].status.clone();
+                    }
+                    true
+                }
+                Err(err) => {
+                    self.engine_slots[idx].status = format!("Engine {} error: {err:#}", idx + 1);
+                    if idx == 0 {
+                        self.engine_status = self.engine_slots[0].status.clone();
+                    }
+                    false
+                }
+            }
+        } else {
+            true
+        }
+    }
+
+    fn ensure_engine(&mut self) -> bool {
+        if self.engine_view == EngineView::Cloud {
+            self.engine_status = "Cloud-only mode: local engine is off.".to_string();
+            return false;
+        }
+        let mut any_ok = false;
+        for i in 0..3 {
+            if self.engine_slots[i].enabled && self.ensure_engine_slot(i) {
+                any_ok = true;
+            }
+        }
+        any_ok
+    }
+
+    fn toggle_engine_slot(&mut self, idx: usize) {
+        if idx >= 3 {
+            return;
+        }
+        self.engine_slots[idx].enabled = !self.engine_slots[idx].enabled;
+        let is_enabled = self.engine_slots[idx].enabled;
+        let name = self.engine_slots[idx].short_name(idx);
+        if is_enabled {
+            self.status = format!("Engine {} ({name}) [Hotkey {}] turned ON", idx + 1, idx + 1);
+            if self.engine_view != EngineView::Cloud {
+                if !self.ensure_engine_slot(idx) {
+                    self.status = format!("Engine {} ({name}) failed to start", idx + 1);
+                } else if let Some(fen) = self.current_fen() {
+                    let multipv = self.engine_multipv;
+                    let limit = self.engine_limit();
+                    if let Some(engine) = self.engine_slots[idx].engine.as_mut() {
+                        let request = engine.analyze(fen.clone(), multipv, limit);
+                        self.engine_slots[idx].request = request;
+                        self.engine_slots[idx].fen = Some(fen);
+                        self.engine_slots[idx].infos.clear();
+                        self.engine_slots[idx].bestmove = None;
+                        self.engine_slots[idx].searching = true;
+                    }
+                }
+            }
+        } else {
+            self.status = format!("Engine {} ({name}) [Hotkey {}] turned OFF", idx + 1, idx + 1);
+            self.stop_engine_slot(idx);
+        }
+        self.engine_searching = self.engine_slots.iter().any(|s| s.searching);
+        self.save_engine_prefs();
+    }
+
+    fn save_engine_prefs(&mut self) {
+        let engines = [
+            crate::settings::EngineSlotConfig {
+                path: if self.engine_slots[0].path.trim().is_empty() {
+                    None
+                } else {
+                    Some(PathBuf::from(self.engine_slots[0].path.trim()))
+                },
+                threads: self.engine_slots[0].threads,
+                hash_mb: self.engine_slots[0].hash_mb,
+                enabled: self.engine_slots[0].enabled,
+            },
+            crate::settings::EngineSlotConfig {
+                path: if self.engine_slots[1].path.trim().is_empty() {
+                    None
+                } else {
+                    Some(PathBuf::from(self.engine_slots[1].path.trim()))
+                },
+                threads: self.engine_slots[1].threads,
+                hash_mb: self.engine_slots[1].hash_mb,
+                enabled: self.engine_slots[1].enabled,
+            },
+            crate::settings::EngineSlotConfig {
+                path: if self.engine_slots[2].path.trim().is_empty() {
+                    None
+                } else {
+                    Some(PathBuf::from(self.engine_slots[2].path.trim()))
+                },
+                threads: self.engine_slots[2].threads,
+                hash_mb: self.engine_slots[2].hash_mb,
+                enabled: self.engine_slots[2].enabled,
+            },
+        ];
+        let prefs = crate::settings::EnginePrefs {
+            path: engines[0].path.clone(),
+            threads: engines[0].threads,
+            hash_mb: engines[0].hash_mb,
+            cache_engine_analysis: self.cache_engine_analysis,
+            heuristic_supersede: self.heuristic_supersede,
+            engines,
+        };
+        if let Err(err) = prefs.save() {
+            self.status = format!("Could not save engine settings: {err:#}");
+        }
+    }
+
+    fn flush_engine_slot_cache(&mut self, idx: usize) {
+        if idx >= 3 {
+            return;
+        }
+        if let Some(batch) = self.engine_slots[idx].debouncer.flush()
+            && let Some(cache) = &self.analysis_cache
+            && let Some(first) = batch.first()
+        {
+            let pos_hash = first.pos_hash;
+            cache.store_batch(batch.clone());
+            self.record_cache_written(pos_hash, &batch);
+        }
+    }
+
+    fn flush_all_engine_caches(&mut self) {
+        for i in 0..3 {
+            self.flush_engine_slot_cache(i);
+        }
+    }
+
+    fn stop_engine_slot(&mut self, idx: usize) {
+        if idx >= 3 {
+            return;
+        }
+        if let Some(engine) = &self.engine_slots[idx].engine {
+            engine.stop();
+        }
+        if self.cache_engine_analysis {
+            self.flush_engine_slot_cache(idx);
+        }
+        self.engine_slots[idx].searching = false;
+        self.engine_slots[idx].status = "Stopped.".to_string();
+        if idx == 0 {
+            self.engine_status = "Stopped.".to_string();
+        }
+        self.engine_searching = self.engine_slots.iter().any(|s| s.searching);
+    }
+
+    fn stop_all_engines(&mut self) {
+        for i in 0..3 {
+            self.stop_engine_slot(i);
+        }
+        self.engine_searching = false;
+        self.engine_status = "Stopped.".to_string();
     }
 
     fn reset_engine_events(&mut self) {
         if self.cache_engine_analysis {
-            self.flush_engine_cache();
+            self.flush_all_engine_caches();
+        }
+        for i in 0..3 {
+            self.engine_slots[i].request = 0;
+            self.engine_slots[i].fen = None;
+            self.engine_slots[i].infos.clear();
+            self.engine_slots[i].bestmove = None;
+            self.engine_slots[i].searching = false;
+            self.engine_slots[i].ready = false;
         }
         self.engine_request = 0;
         self.engine_fen = None;
@@ -4380,95 +4681,17 @@ impl App {
         self.engine_ready = false;
     }
 
-    /// Start the engine lazily with the current executable and resource
-    /// settings. If the settings changed, the old process is replaced.
-    fn ensure_engine(&mut self) -> bool {
-        if self.engine_view == EngineView::Cloud {
-            self.engine_status = "Cloud-only mode: local engine is off.".to_string();
-            return false;
-        }
-        let path = self.engine_path();
-        let options = self.engine_options();
-        if let Some(engine) = &self.engine {
-            if engine.path() == path && engine.options() == options {
-                return true;
-            }
-            self.engine = None;
-            self.reset_engine_events();
-            self.engine_name.clear();
-        }
-        match EngineHandle::spawn_with_options(&path, options) {
-            Ok(engine) => {
-                self.engine = Some(engine);
-                self.reset_engine_events();
-                self.engine_name.clear();
-                self.engine_status = format!("Starting {}…", path.display());
-                true
-            }
-            Err(err) => {
-                self.engine_status = format!("Engine unavailable: {err:#}");
-                false
-            }
-        }
-    }
-
-    /// Save the current engine selection and replace both engine processes.
-    fn apply_engine_settings(&mut self) {
-        if self.engine_view == EngineView::Cloud {
-            self.drop_local_engines();
-            return;
-        }
-        self.engine_path = self.engine_path().display().to_string();
-        self.engine_threads = self.engine_options().threads;
-        self.engine_hash_mb = self.engine_options().hash_mb;
-        let was_running = self.engine.is_some();
-        if let Some(engine) = &self.engine {
-            engine.stop();
-        }
-        if let Some(engine) = &self.review_engine {
-            engine.stop();
-        }
-        self.engine = None;
-        self.review_engine = None;
-        self.reset_engine_events();
-        self.engine_name.clear();
-
-        let review_was_running = self.review.as_ref().is_some_and(|review| review.running);
-        if review_was_running {
-            self.cancel_review();
-            self.review_status = "Review canceled: engine settings changed.".to_string();
-        }
-
-        let prefs = EnginePrefs {
-            path: Some(self.engine_path()),
-            threads: self.engine_options().threads,
-            hash_mb: self.engine_options().hash_mb,
-            cache_engine_analysis: self.cache_engine_analysis,
-            heuristic_supersede: self.heuristic_supersede,
-        };
-        self.analysis_cache = Some(crate::analysis_cache::AnalysisCacheHandle::spawn(
-            None,
-            self.heuristic_supersede,
-        ));
-        if let Err(err) = prefs.save() {
-            self.status = format!("Could not save engine settings: {err:#}");
-        } else if let Some(path) = crate::settings::config_path() {
-            self.status = format!("Engine settings saved to {}.", path.display());
-        }
-
-        if was_running || self.right_tab_visible(RightTab::Engine) {
-            self.ensure_engine();
-        } else {
-            self.engine_status = "Engine settings saved.".to_string();
-        }
-    }
-
     fn clear_engine_results(&mut self) {
         if self.cache_engine_analysis {
-            self.flush_engine_cache();
+            self.flush_all_engine_caches();
         }
-        if let Some(engine) = &self.engine {
-            engine.stop();
+        self.stop_all_engines();
+        for i in 0..3 {
+            self.engine_slots[i].request = 0;
+            self.engine_slots[i].fen = None;
+            self.engine_slots[i].infos.clear();
+            self.engine_slots[i].bestmove = None;
+            self.engine_slots[i].searching = false;
         }
         self.engine_request = 0;
         self.engine_fen = None;
@@ -4477,11 +4700,22 @@ impl App {
         self.engine_searching = false;
     }
 
-    /// Stop and drop both local engine processes. Used when the Engine tab
+    /// Stop and drop all local engine processes. Used when the Engine tab
     /// switches to Cloud-only mode.
     fn drop_local_engines(&mut self) {
-        if let Some(engine) = self.engine.take() {
-            engine.stop();
+        for i in 0..3 {
+            if let Some(engine) = self.engine_slots[i].engine.take() {
+                engine.stop();
+            }
+            if self.cache_engine_analysis {
+                self.flush_engine_slot_cache(i);
+            }
+            self.engine_slots[i].searching = false;
+            self.engine_slots[i].ready = false;
+            self.engine_slots[i].name.clear();
+            self.engine_slots[i].infos.clear();
+            self.engine_slots[i].bestmove = None;
+            self.engine_slots[i].status = "Off.".to_string();
         }
         if let Some(engine) = self.review_engine.take() {
             engine.stop();
@@ -4489,7 +4723,9 @@ impl App {
         self.reset_engine_events();
         self.engine_name.clear();
         self.engine_searching = false;
-        self.engine_status = "Cloud-only mode: local engine is off.".to_string();
+        self.engine_ready = false;
+        self.engine_infos.clear();
+        self.engine_status = "Cloud-only mode: local engines are off.".to_string();
         if self.review.as_ref().is_some_and(|review| review.running) {
             if let Some(review) = &mut self.review {
                 review.cancel();
@@ -4497,6 +4733,36 @@ impl App {
             self.review_status = "Review stopped: Cloud-only mode.".to_string();
         }
         self.review_open = false;
+    }
+
+    /// Save the current engine selection and replace both engine processes.
+    fn apply_engine_settings(&mut self) {
+        if self.engine_view == EngineView::Cloud {
+            self.drop_local_engines();
+            return;
+        }
+        self.stop_all_engines();
+        if let Some(engine) = &self.review_engine {
+            engine.stop();
+        }
+        self.review_engine = None;
+        let review_was_running = self.review.as_ref().is_some_and(|review| review.running);
+        if review_was_running {
+            self.cancel_review();
+            self.review_status = "Review canceled: engine settings changed.".to_string();
+        }
+
+        self.save_engine_prefs();
+
+        self.analysis_cache = Some(crate::analysis_cache::AnalysisCacheHandle::spawn(
+            None,
+            self.heuristic_supersede,
+        ));
+        if self.right_tab_visible(RightTab::Engine) {
+            self.ensure_engine();
+        } else {
+            self.engine_status = "Engine settings saved.".to_string();
+        }
     }
 
     fn request_engine_analysis(&mut self) {
@@ -4511,22 +4777,31 @@ impl App {
         };
         let multipv = self.engine_multipv;
         let limit = self.engine_limit();
-        let Some(engine) = self.engine.as_mut() else {
-            return;
-        };
-        let request = engine.analyze(fen.clone(), multipv, limit);
-        self.engine_request = request;
-        self.engine_fen = Some(fen);
-        self.engine_infos.clear();
-        self.engine_bestmove = None;
-        self.engine_searching = true;
-        self.engine_status = match limit {
-            SearchLimit::Infinite => "Searching (infinite)…".to_string(),
-            SearchLimit::Depth(depth) => format!("Searching to depth {depth}…"),
-            SearchLimit::MoveTime(time) => {
-                format!("Searching for {} ms…", time.as_millis())
+
+        for i in 0..3 {
+            if !self.engine_slots[i].enabled {
+                continue;
             }
-        };
+            if let Some(engine) = self.engine_slots[i].engine.as_mut() {
+                let request = engine.analyze(fen.clone(), multipv, limit);
+                self.engine_slots[i].request = request;
+                self.engine_slots[i].fen = Some(fen.clone());
+                self.engine_slots[i].infos.clear();
+                self.engine_slots[i].bestmove = None;
+                self.engine_slots[i].searching = true;
+                self.engine_slots[i].status = match limit {
+                    SearchLimit::Infinite => "Searching (infinite)…".to_string(),
+                    SearchLimit::Depth(depth) => format!("Searching to depth {depth}…"),
+                    SearchLimit::MoveTime(time) => {
+                        format!("Searching for {} ms…", time.as_millis())
+                    }
+                };
+            }
+        }
+        self.engine_searching = self.engine_slots.iter().any(|s| s.searching);
+        self.engine_infos = self.engine_slots[0].infos.clone();
+        self.engine_bestmove = self.engine_slots[0].bestmove.clone();
+        self.engine_status = self.engine_slots[0].status.clone();
     }
 
     fn maybe_engine_analysis(&mut self) {
@@ -4537,131 +4812,176 @@ impl App {
         if !wants_engine || self.engine_view == EngineView::Cloud {
             return;
         }
-        if self.engine.is_none() {
+        let any_running = self.engine_slots.iter().any(|s| s.engine.is_some());
+        if !any_running {
             if self.engine_status.starts_with("Engine unavailable") {
                 return;
             }
             self.ensure_engine();
             return;
         }
-        if !self.engine_ready || !self.engine_auto {
+        let any_ready = self.engine_slots.iter().any(|s| s.enabled && s.ready);
+        if !any_ready || !self.engine_auto {
             return;
         }
         let Some(fen) = self.current_fen() else {
             return;
         };
-        if self.engine_fen.as_deref() != Some(fen.as_str()) {
+        let needs_search = self
+            .engine_slots
+            .iter()
+            .any(|s| s.enabled && s.fen.as_deref() != Some(fen.as_str()));
+        if needs_search {
             self.request_engine_analysis();
         }
     }
 
     fn poll_engine(&mut self) {
         if self.engine_view == EngineView::Cloud {
-            if self.engine.is_some() || self.review_engine.is_some() {
+            if self.engine_slots.iter().any(|s| s.engine.is_some()) || self.review_engine.is_some() {
                 self.drop_local_engines();
             }
             return;
         }
-        let Some(engine) = self.engine.as_ref() else {
-            return;
-        };
-        let mut events = Vec::new();
-        while let Some(event) = engine.try_recv() {
-            events.push(event);
-        }
-        for event in events {
-            match event {
-                EngineEvent::Name(name) => self.engine_name = name,
-                EngineEvent::Ready => {
-                    self.engine_ready = true;
-                    self.engine_status = if self.engine_name.is_empty() {
-                        "Engine ready.".to_string()
-                    } else {
-                        format!("{} ready.", self.engine_name)
-                    };
-                }
-                EngineEvent::Info { request, info } => {
-                    if request == self.engine_request {
-                        self.engine_infos.insert(info.multipv, info.clone());
-                        if self.cache_engine_analysis
-                            && !info.pv.is_empty()
-                            && info.score.is_some()
-                            && info.depth > 0
-                            && let Some(pos) = self.current_position()
-                        {
-                            let pos_hash = pos.position_hash();
-                            let family =
-                                crate::analysis_cache::parse_engine_identity(&self.engine_name)
-                                    .family;
-                            let (score_cp, score_mate) = match info.score {
-                                Some(Score::Cp(cp)) => (Some(cp), None),
-                                Some(Score::Mate(m)) => (None, Some(m)),
-                                None => (None, None),
-                            };
-                            let identity =
-                                crate::analysis_cache::parse_engine_identity(&self.engine_name);
-                            let quality_score = crate::analysis_cache::compute_quality_rating(
-                                family,
-                                identity.baseline_elo,
-                                info.depth,
-                                info.seldepth,
-                                info.nodes,
-                                score_mate,
-                            );
-                            let analyzed_at = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_secs();
-                            let cached = crate::analysis_cache::CachedAnalysis {
-                                pos_hash,
-                                fen: self.engine_fen.clone().unwrap_or_default(),
-                                engine_family: family,
-                                engine_name: self.engine_name.clone(),
-                                multipv: info.multipv,
-                                depth: info.depth,
-                                seldepth: info.seldepth,
-                                score_cp,
-                                score_mate,
-                                nodes: info.nodes,
-                                time_ms: info.time_ms,
-                                nps: info.nps,
-                                pv: info.pv.clone(),
-                                quality_score,
-                                analyzed_at,
-                            };
-                            if let Some(batch) =
-                                self.analysis_debouncer.push(cached, Instant::now())
-                                && let Some(cache) = &self.analysis_cache
+
+        for idx in 0..3 {
+            let Some(engine) = self.engine_slots[idx].engine.as_ref() else {
+                continue;
+            };
+            let mut events = Vec::new();
+            while let Some(event) = engine.try_recv() {
+                events.push(event);
+            }
+            for event in events {
+                match event {
+                    EngineEvent::Name(name) => {
+                        self.engine_slots[idx].name = name.clone();
+                        if idx == 0 {
+                            self.engine_name = name;
+                        }
+                    }
+                    EngineEvent::Ready => {
+                        self.engine_slots[idx].ready = true;
+                        self.engine_slots[idx].status = if self.engine_slots[idx].name.is_empty() {
+                            format!("Engine {} ready.", idx + 1)
+                        } else {
+                            format!("{} ready.", self.engine_slots[idx].name)
+                        };
+                        if idx == 0 {
+                            self.engine_ready = true;
+                            self.engine_status = self.engine_slots[0].status.clone();
+                        }
+                    }
+                    EngineEvent::Info { request, info } => {
+                        if request == self.engine_slots[idx].request {
+                            self.engine_slots[idx].infos.insert(info.multipv, info.clone());
+                            if idx == 0 {
+                                self.engine_infos.insert(info.multipv, info.clone());
+                            }
+                            if self.cache_engine_analysis
+                                && !info.pv.is_empty()
+                                && info.score.is_some()
+                                && info.depth > 0
+                                && let Some(pos) = self.current_position()
                             {
-                                cache.store_batch(batch.clone());
-                                self.record_cache_written(pos_hash, &batch);
+                                let pos_hash = pos.position_hash();
+                                let family = crate::analysis_cache::parse_engine_identity(
+                                    &self.engine_slots[idx].name,
+                                )
+                                .family;
+                                let (score_cp, score_mate) = match info.score {
+                                    Some(Score::Cp(cp)) => (Some(cp), None),
+                                    Some(Score::Mate(m)) => (None, Some(m)),
+                                    None => (None, None),
+                                };
+                                let identity = crate::analysis_cache::parse_engine_identity(
+                                    &self.engine_slots[idx].name,
+                                );
+                                let quality_score = crate::analysis_cache::compute_quality_rating(
+                                    family,
+                                    identity.baseline_elo,
+                                    info.depth,
+                                    info.seldepth,
+                                    info.nodes,
+                                    score_mate,
+                                );
+                                let analyzed_at = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_secs();
+                                let cached = crate::analysis_cache::CachedAnalysis {
+                                    pos_hash,
+                                    fen: self.engine_slots[idx]
+                                        .fen
+                                        .clone()
+                                        .unwrap_or_default(),
+                                    engine_family: family,
+                                    engine_name: self.engine_slots[idx].name.clone(),
+                                    multipv: info.multipv,
+                                    depth: info.depth,
+                                    seldepth: info.seldepth,
+                                    score_cp,
+                                    score_mate,
+                                    nodes: info.nodes,
+                                    time_ms: info.time_ms,
+                                    nps: info.nps,
+                                    pv: info.pv.clone(),
+                                    quality_score,
+                                    analyzed_at,
+                                };
+                                if let Some(batch) = self.engine_slots[idx]
+                                    .debouncer
+                                    .push(cached, Instant::now())
+                                    && let Some(cache) = &self.analysis_cache
+                                {
+                                    cache.store_batch(batch.clone());
+                                    self.record_cache_written(pos_hash, &batch);
+                                }
                             }
                         }
                     }
-                }
-                EngineEvent::BestMove { request, best, .. } => {
-                    if request == self.engine_request {
-                        self.engine_searching = false;
-                        self.engine_bestmove = Some(best);
-                        self.engine_status = "Analysis complete.".to_string();
-                        if self.cache_engine_analysis {
-                            self.flush_engine_cache();
+                    EngineEvent::BestMove { request, best, .. } => {
+                        if request == self.engine_slots[idx].request {
+                            self.engine_slots[idx].searching = false;
+                            self.engine_slots[idx].bestmove = Some(best.clone());
+                            self.engine_slots[idx].status = "Analysis complete.".to_string();
+                            if idx == 0 {
+                                self.engine_searching =
+                                    self.engine_slots.iter().any(|s| s.searching);
+                                self.engine_bestmove = Some(best);
+                                self.engine_status = "Analysis complete.".to_string();
+                            }
+                            if self.cache_engine_analysis {
+                                self.flush_engine_slot_cache(idx);
+                            }
+                        }
+                    }
+                    EngineEvent::Error(err) => {
+                        self.engine_slots[idx].status =
+                            format!("Engine {} error: {err}", idx + 1);
+                        if idx == 0 {
+                            self.engine_status = self.engine_slots[0].status.clone();
+                        }
+                    }
+                    EngineEvent::Exited => {
+                        self.engine_slots[idx].engine = None;
+                        self.engine_slots[idx].ready = false;
+                        self.engine_slots[idx].searching = false;
+                        self.engine_slots[idx].infos.clear();
+                        self.engine_slots[idx].bestmove = None;
+                        if idx == 0 {
+                            self.engine_ready = false;
+                            self.engine_searching =
+                                self.engine_slots.iter().any(|s| s.searching);
+                            self.engine_infos.clear();
+                            self.engine_bestmove = None;
+                            self.engine_status = "Engine exited.".to_string();
                         }
                     }
                 }
-                EngineEvent::Error(err) => {
-                    self.engine_status = format!("Engine error: {err}");
-                }
-                EngineEvent::Exited => {
-                    self.engine = None;
-                    self.engine_ready = false;
-                    self.engine_searching = false;
-                    self.engine_infos.clear();
-                    self.engine_bestmove = None;
-                    self.engine_status = "Engine exited.".to_string();
-                }
             }
         }
+        self.engine_searching = self.engine_slots.iter().any(|s| s.searching);
     }
 
     fn review_limit(&self) -> SearchLimit {
@@ -6398,6 +6718,24 @@ impl App {
         if self.branch_choice.is_some() {
             self.handle_branch_keys(ctx);
             return;
+        }
+
+        let (k1, k2, k3) = ctx.input(|i| {
+            let alt_or_ctrl = i.modifiers.alt || i.modifiers.ctrl || i.modifiers.command;
+            (
+                i.key_pressed(Key::Num1) || (alt_or_ctrl && i.key_pressed(Key::Num1)),
+                i.key_pressed(Key::Num2) || (alt_or_ctrl && i.key_pressed(Key::Num2)),
+                i.key_pressed(Key::Num3) || (alt_or_ctrl && i.key_pressed(Key::Num3)),
+            )
+        });
+        if k1 {
+            self.toggle_engine_slot(0);
+        }
+        if k2 {
+            self.toggle_engine_slot(1);
+        }
+        if k3 {
+            self.toggle_engine_slot(2);
         }
         let (
             right,
@@ -8196,7 +8534,7 @@ impl App {
                         ui.label(
                             RichText::new(if self.engine_ready {
                                 "ready"
-                            } else if self.engine.is_some() {
+                            } else if self.engine_slots.iter().any(|s| s.engine.is_some()) {
                                 "starting"
                             } else {
                                 "stopped"
@@ -8207,6 +8545,27 @@ impl App {
                     });
                 });
                 if engine_view != EngineView::Cloud {
+                    ui.horizontal_wrapped(|ui| {
+                        for idx in 0..3 {
+                            let is_on = self.engine_slots[idx].enabled;
+                            let name = self.engine_slots[idx].short_name(idx);
+                            let btn_text = if is_on {
+                                format!("[{}] {} 🟢", idx + 1, name)
+                            } else {
+                                format!("[{}] {} ⚫", idx + 1, name)
+                            };
+                            let resp = ui.selectable_label(is_on, btn_text);
+                            if resp.clicked() {
+                                self.toggle_engine_slot(idx);
+                            }
+                            resp.on_hover_text(format!(
+                                "Hotkey {}: Toggle Engine {} on/off",
+                                idx + 1,
+                                idx + 1
+                            ));
+                        }
+                    });
+                    ui.add_space(2.0);
                     ui.label(
                         RichText::new(if self.engine_name.is_empty() {
                             "UCI engine"
@@ -8267,14 +8626,30 @@ impl App {
                     });
                     if self.engine_settings_open {
                         ui.horizontal(|ui| {
+                            ui.label(RichText::new("Configure engine:").strong());
+                            for idx in 0..3 {
+                                let name = self.engine_slots[idx].short_name(idx);
+                                let is_sel = self.selected_engine_slot == idx;
+                                if ui.selectable_label(is_sel, format!("[{}] {}", idx + 1, name)).clicked() {
+                                    self.selected_engine_slot = idx;
+                                }
+                            }
+                        });
+                        let sel = self.selected_engine_slot;
+                        ui.horizontal(|ui| {
                             ui.label("Executable");
                             let width = (ui.available_width() - 8.0).max(120.0);
+                            let hint = if sel == 0 {
+                                "/usr/bin/stockfish"
+                            } else {
+                                "Path to engine executable"
+                            };
                             ui.add(
-                                egui::TextEdit::singleline(&mut self.engine_path)
+                                egui::TextEdit::singleline(&mut self.engine_slots[sel].path)
                                     .desired_width(width)
-                                    .hint_text("/usr/bin/stockfish"),
+                                    .hint_text(hint),
                             )
-                            .on_hover_text("Path to any UCI-compatible engine");
+                            .on_hover_text(format!("Path to UCI-compatible engine for Slot {}", sel + 1));
                         });
                         ui.horizontal_wrapped(|ui| {
                             if ui.button("Browse…").clicked() {
@@ -8287,14 +8662,17 @@ impl App {
                                 )
                                 .clicked()
                             {
-                                self.engine_path = crate::engine::default_engine_path()
+                                self.engine_slots[sel].path = crate::engine::default_engine_path()
                                     .display()
                                     .to_string();
+                                if sel == 0 {
+                                    self.engine_path = self.engine_slots[0].path.clone();
+                                }
                             }
                             if ui
                                 .button("Apply & restart")
                                 .on_hover_text(
-                                    "Save the executable, threads, and hash size, then restart the engine",
+                                    "Save the executable, threads, and hash size, then restart local engines",
                                 )
                                 .clicked()
                             {
@@ -8304,7 +8682,7 @@ impl App {
                         ui.horizontal_wrapped(|ui| {
                             ui.label("Threads");
                             ui.add(
-                                egui::DragValue::new(&mut self.engine_threads)
+                                egui::DragValue::new(&mut self.engine_slots[sel].threads)
                                     .range(1..=256)
                                     .speed(1),
                             )
@@ -8313,7 +8691,7 @@ impl App {
                             );
                             ui.label("Hash / RAM");
                             ui.add(
-                                egui::DragValue::new(&mut self.engine_hash_mb)
+                                egui::DragValue::new(&mut self.engine_slots[sel].hash_mb)
                                     .range(1..=32_768)
                                     .suffix(" MB")
                                     .speed(64),
@@ -8322,7 +8700,7 @@ impl App {
                                 "UCI Hash option: transposition-table memory in megabytes.",
                             );
                         });
-                        if let Some(engine) = &self.engine {
+                        if let Some(engine) = &self.engine_slots[sel].engine {
                             let active = engine.options();
                             ui.label(
                                 RichText::new(format!(
@@ -8431,7 +8809,7 @@ impl App {
                                     .small()
                                     .color(GOLD),
                             );
-                        } else if self.engine.is_none() {
+                        } else if !self.engine_slots.iter().any(|s| s.engine.is_some()) {
                             ui.label(
                                 RichText::new(
                                     "The engine starts when analysis is requested or Apply is pressed.",
@@ -8535,7 +8913,7 @@ impl App {
                         {
                             stop = true;
                         }
-                        if self.engine.is_none() && ui.button("Start engine").clicked() {
+                        if !self.engine_slots.iter().any(|s| s.engine.is_some()) && ui.button("Start engine").clicked() {
                             start = true;
                         }
 
@@ -8593,7 +8971,11 @@ impl App {
             }
         }
         if browse_engine && let Some(path) = open_engine_dialog() {
-            self.engine_path = path.display().to_string();
+            let sel = self.selected_engine_slot;
+            self.engine_slots[sel].path = path.display().to_string();
+            if sel == 0 {
+                self.engine_path = path.display().to_string();
+            }
         }
         if apply_engine {
             self.apply_engine_settings();
@@ -8605,14 +8987,7 @@ impl App {
             self.request_engine_analysis();
         }
         if stop {
-            if let Some(engine) = &self.engine {
-                engine.stop();
-            }
-            if self.cache_engine_analysis {
-                self.flush_engine_cache();
-            }
-            self.engine_searching = false;
-            self.engine_status = "Stopped.".to_string();
+            self.stop_all_engines();
         }
 
         ui.add_space(8.0);
@@ -8627,61 +9002,106 @@ impl App {
 
         let mut hover_preview = None;
         if engine_view != EngineView::Cloud {
-            let infos: Vec<EngineInfo> = self.engine_infos.values().cloned().collect();
-            if infos.is_empty() {
+            let active_slots: Vec<usize> = (0..3)
+                .filter(|&i| self.engine_slots[i].enabled)
+                .collect();
+            if active_slots.is_empty() {
                 ui.label(
-                    RichText::new(if self.engine_searching {
-                        "Waiting for engine output…"
-                    } else {
-                        "No analysis yet. Press Analyze."
-                    })
-                    .weak()
-                    .italics(),
+                    RichText::new("No engines enabled. Press 1, 2, or 3 to toggle an engine.")
+                        .weak()
+                        .italics(),
                 );
             } else {
-                for info in infos {
-                    let score = engine_score_label(info.score, pos.turn());
-                    let color = engine_eval_color(info.score, pos.turn());
-                    let steps = pv_steps(&pos, &info.pv, 14);
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(
-                            RichText::new(format!("Engine PV {}", info.multipv))
-                                .small()
-                                .weak(),
-                        );
-                        ui.label(RichText::new(score).monospace().strong().color(color));
-                        ui.label(RichText::new(format!("d{}", info.depth)).small().weak());
-                        if steps.is_empty() {
-                            ui.label(RichText::new("…").weak());
-                        }
-                        pv_steps_ui(ui, &steps, &info.pv, &mut hover_preview, &mut clicked_line);
-                    });
-                    let mut stats = Vec::new();
-                    if let Some(nodes) = info.nodes {
-                        stats.push(format!("{nodes} nodes"));
-                    }
-                    if let Some(time) = info.time_ms
-                        && time > 0
-                    {
-                        stats.push(format!("{time} ms"));
-                    }
-                    if let Some(nps) = info.nps {
-                        stats.push(format!("{nps} nps"));
-                    }
-                    if !stats.is_empty() {
-                        ui.label(RichText::new(stats.join(" · ")).small().weak());
-                    }
-                    ui.add_space(3.0);
-                }
-            }
+                for &idx in &active_slots {
+                    let slot = &self.engine_slots[idx];
+                    let slot_name = slot.short_name(idx);
+                    egui::Frame::new()
+                        .fill(ui.visuals().extreme_bg_color)
+                        .corner_radius(6.0)
+                        .stroke(Stroke::new(1.0, BORDER))
+                        .inner_margin(6.0)
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new(format!("[{}] {}", idx + 1, slot_name))
+                                        .strong(),
+                                );
+                                if slot.searching {
+                                    ui.spinner();
+                                }
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    ui.label(
+                                        RichText::new(if slot.ready {
+                                            "ready"
+                                        } else if slot.engine.is_some() {
+                                            "starting"
+                                        } else {
+                                            "stopped"
+                                        })
+                                        .small()
+                                        .weak(),
+                                    );
+                                });
+                            });
+                            let infos: Vec<EngineInfo> = slot.infos.values().cloned().collect();
+                            if infos.is_empty() {
+                                ui.label(
+                                    RichText::new(if slot.searching {
+                                        "Waiting for engine output…"
+                                    } else {
+                                        "No analysis yet. Press Analyze."
+                                    })
+                                    .weak()
+                                    .italics(),
+                                );
+                            } else {
+                                for info in infos {
+                                    let score = engine_score_label(info.score, pos.turn());
+                                    let color = engine_eval_color(info.score, pos.turn());
+                                    let steps = pv_steps(&pos, &info.pv, 14);
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.label(
+                                            RichText::new(format!("PV {}", info.multipv))
+                                                .small()
+                                                .weak(),
+                                        );
+                                        ui.label(RichText::new(score).monospace().strong().color(color));
+                                        ui.label(RichText::new(format!("d{}", info.depth)).small().weak());
+                                        if steps.is_empty() {
+                                            ui.label(RichText::new("…").weak());
+                                        }
+                                        pv_steps_ui(ui, &steps, &info.pv, &mut hover_preview, &mut clicked_line);
+                                    });
+                                    let mut stats = Vec::new();
+                                    if let Some(nodes) = info.nodes {
+                                        stats.push(format!("{nodes} nodes"));
+                                    }
+                                    if let Some(time) = info.time_ms
+                                        && time > 0
+                                    {
+                                        stats.push(format!("{time} ms"));
+                                    }
+                                    if let Some(nps) = info.nps {
+                                        stats.push(format!("{nps} nps"));
+                                    }
+                                    if !stats.is_empty() {
+                                        ui.label(RichText::new(stats.join(" · ")).small().weak());
+                                    }
+                                    ui.add_space(2.0);
+                                }
+                            }
 
-            if let Some(best) = &self.engine_bestmove {
-                ui.label(
-                    RichText::new(format!("bestmove {best}"))
-                        .monospace()
-                        .small()
-                        .weak(),
-                );
+                            if let Some(best) = &slot.bestmove {
+                                ui.label(
+                                    RichText::new(format!("bestmove {best}"))
+                                        .monospace()
+                                        .small()
+                                        .weak(),
+                                );
+                            }
+                        });
+                    ui.add_space(4.0);
+                }
             }
         }
 
@@ -11560,6 +11980,7 @@ impl App {
         let mut close = false;
         let mut choose_correspondence = false;
         let mut use_default_correspondence = false;
+        let mut choose_engine_idx = None;
 
         egui::Window::new("Settings")
             .open(&mut open)
@@ -11865,6 +12286,67 @@ impl App {
                     .weak(),
                 );
 
+                ui.add_space(8.0);
+                ui.separator();
+                ui.heading("Analysis engines & hotkeys (1, 2, 3)");
+                ui.label(
+                    RichText::new(
+                        "Configure up to 3 analysis engines. Press hotkeys 1, 2, or 3 (or Alt+1, 2, 3) to toggle each engine on/off at any time during analysis.",
+                    )
+                    .small()
+                    .weak(),
+                );
+                for idx in 0..3 {
+                    ui.group(|ui| {
+                        let name = self.engine_slots[idx].short_name(idx);
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(format!("Engine slot {} [Hotkey {}]: {}", idx + 1, idx + 1, name)).strong());
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                ui.checkbox(&mut self.engine_slots[idx].enabled, "Active");
+                            });
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Executable");
+                            let width = (ui.available_width() - 170.0).max(120.0);
+                            let hint = if idx == 0 {
+                                "/usr/bin/stockfish"
+                            } else {
+                                "Path to engine executable"
+                            };
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.engine_slots[idx].path)
+                                    .desired_width(width)
+                                    .hint_text(hint),
+                            );
+                            if ui.button("Browse…").clicked() {
+                                choose_engine_idx = Some(idx);
+                            }
+                            if idx == 0 && ui.button("Default").on_hover_text("Reset to default Stockfish").clicked() {
+                                self.engine_slots[0].path = crate::engine::default_engine_path()
+                                    .display()
+                                    .to_string();
+                            }
+                        });
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label("Threads");
+                            ui.add(
+                                egui::DragValue::new(&mut self.engine_slots[idx].threads)
+                                    .range(1..=256)
+                                    .speed(1),
+                            );
+                            ui.add_space(8.0);
+                            ui.label("Hash / RAM");
+                            ui.add(
+                                egui::DragValue::new(&mut self.engine_slots[idx].hash_mb)
+                                    .range(1..=32_768)
+                                    .suffix(" MB")
+                                    .speed(64),
+                            );
+                        });
+                    });
+                    ui.add_space(3.0);
+                }
+
                 if !self.settings_status.is_empty() {
                     ui.add_space(4.0);
                     ui.label(
@@ -11886,6 +12368,12 @@ impl App {
                 });
             });
 
+        if let Some(idx) = choose_engine_idx && let Some(path) = open_engine_dialog() {
+            self.engine_slots[idx].path = path.display().to_string();
+            if idx == 0 {
+                self.engine_path = path.display().to_string();
+            }
+        }
         if choose_correspondence && let Some(path) = open_dialog(None) {
             self.settings_correspondence_path = path.display().to_string();
             self.settings_correspondence_enabled = true;
@@ -12089,7 +12577,7 @@ impl eframe::App for App {
         {
             ctx.request_repaint_after(Duration::from_millis(150));
         }
-        if self.engine_searching || (self.engine.is_some() && !self.engine_ready) {
+        if self.engine_searching || self.engine_slots.iter().any(|s| s.engine.is_some() && !s.ready) {
             ctx.request_repaint_after(Duration::from_millis(80));
         }
         if self.review.as_ref().is_some_and(|review| review.running) {
@@ -12100,7141 +12588,5 @@ impl eframe::App for App {
             i.raw
                 .dropped_files
                 .iter()
-                .map(|f| f.path().to_path_buf())
-                .collect()
-        });
-        if let Some(path) = dropped.first() {
-            self.handle_dropped_file(path);
-        }
-
-        // Hover previews are re-established by whichever candidate is under
-        // the pointer during this frame. Clearing first makes the board snap
-        // back to the selected game node as soon as the pointer leaves.
-        self.hover_preview = None;
-
-        self.handle_keys(&ctx);
-        self.menu_bar(ui);
-        self.database_panel(ui);
-        if self.online_reference_open {
-            self.online_reference_panel(ui);
-        }
-        self.moves_panel(ui);
-        self.sync_current_slot();
-        self.bottom_bar(ui);
-
-        egui::CentralPanel::default_margins().show(ui, |ui| {
-            let avail = ui.available_size();
-            let top_strip_h = if self.show_player_photos && self.photos.is_some() {
-                self.photo_size.pixels() + 8.0
-            } else {
-                27.0
-            };
-            let bottom_strip_h = if self.show_player_photos && self.photos.is_some() {
-                self.photo_size.pixels() + 8.0
-            } else {
-                27.0
-            };
-            let vertical_padding = top_strip_h + bottom_strip_h + 20.0;
-            let bar_extra = if self.engine_bar {
-                eval_bar::WIDTH + eval_bar::GAP
-            } else {
-                0.0
-            };
-            let side = ((avail.x - bar_extra - 8.0).min(avail.y - vertical_padding)).max(120.0);
-            ui.with_layout(Layout::top_down(Align::Center), |ui| {
-                ui.add_space(6.0);
-                let hover = self.hover_preview.as_ref();
-                let board_eval = self.current_board_eval();
-                let board_meta = self.game().map(|game| {
-                    let node = &game.nodes[self.node];
-                    let top_color = self.orientation.other();
-                    let bottom_color = self.orientation;
-                    let show_clocks = self.show_clocks && game.has_clocks();
-                    let badge = |color: Color| PlayerBadge {
-                        name: if color == Color::White {
-                            game.white().to_string()
-                        } else {
-                            game.black().to_string()
-                        },
-                        title: player_title(game, color).map(str::to_string),
-                        country: player_country(game, color).map(|c| c.badge),
-                        fide_id: player_fide_id(game, color).map(str::to_string),
-                        rating: player_rating(
-                            game,
-                            color,
-                            self.rating_priority,
-                            self.show_all_ratings,
-                        ),
-                        team: team_for(game, color).map(str::to_string),
-                        clock: if show_clocks {
-                            game.clock_for(self.node, color)
-                        } else {
-                            None
-                        },
-                        color,
-                    };
-                    BoardMeta {
-                        pos: hover
-                            .map(|preview| preview.pos.clone())
-                            .unwrap_or_else(|| node.pos.clone()),
-                        last_move: hover
-                            .map(|preview| preview.last_move)
-                            .unwrap_or_else(|| domain::last_move_squares(node)),
-                        top: badge(top_color),
-                        bottom: badge(bottom_color),
-                        show_clocks,
-                    }
-                });
-                if let Some(meta) = board_meta {
-                    let ctx = ui.ctx().clone();
-                    let top_photo = self.photo_texture(&ctx, &meta.top.name);
-                    let bottom_photo = self.photo_texture(&ctx, &meta.bottom.name);
-                    let top_champion = champions::champion(&meta.top.name, self.champion_lineage);
-                    let bottom_champion =
-                        champions::champion(&meta.bottom.name, self.champion_lineage);
-                    let top_action = player_strip(
-                        ui,
-                        side,
-                        &meta.top,
-                        meta.show_clocks,
-                        top_photo.as_ref(),
-                        self.photo_size,
-                        top_champion,
-                        None,
-                    );
-                    ui.add_space(2.0);
-                    let event = if self.engine_bar {
-                        let mut event = None;
-                        let bar_response = ui.allocate_ui_with_layout(
-                            vec2(side + eval_bar::WIDTH + eval_bar::GAP, side),
-                            Layout::left_to_right(Align::Center),
-                            |ui| {
-                                ui.spacing_mut().item_spacing.x = eval_bar::GAP;
-                                eval_bar::draw(ui, board_eval, side);
-                                event = board::draw(
-                                    ui,
-                                    &self.textures,
-                                    BoardState {
-                                        pos: &meta.pos,
-                                        orientation: self.orientation,
-                                        last_move: meta.last_move,
-                                        selected: self.selected,
-                                        targets: &self.targets,
-                                        drag_from: self.drag_from,
-                                    },
-                                    side,
-                                );
-                            },
-                        );
-                        bar_response.response.context_menu(|ui| {
-                            if ui.button("Hide evaluation bar").clicked() {
-                                self.engine_bar = false;
-                                self.save_display_prefs();
-                                ui.close();
-                            }
-                        });
-                        event
-                    } else {
-                        board::draw(
-                            ui,
-                            &self.textures,
-                            BoardState {
-                                pos: &meta.pos,
-                                orientation: self.orientation,
-                                last_move: meta.last_move,
-                                selected: self.selected,
-                                targets: &self.targets,
-                                drag_from: self.drag_from,
-                            },
-                            side,
-                        )
-                    };
-                    ui.add_space(2.0);
-                    let move_counter_text = self.current.as_ref().map(|g| {
-                        format!(
-                            "move {} / {}",
-                            full_moves(depth_of(g, self.node)),
-                            full_moves(g.mainline_len())
-                        )
-                    });
-                    let bottom_action = player_strip(
-                        ui,
-                        side,
-                        &meta.bottom,
-                        meta.show_clocks,
-                        bottom_photo.as_ref(),
-                        self.photo_size,
-                        bottom_champion,
-                        move_counter_text.as_deref(),
-                    );
-                    if top_action.photo_clicked {
-                        self.photo_viewer = Some(meta.top.name.clone());
-                    }
-                    if top_action.name_clicked {
-                        self.open_player_profile(&meta.top.name);
-                    }
-                    if bottom_action.photo_clicked {
-                        self.photo_viewer = Some(meta.bottom.name.clone());
-                    }
-                    if bottom_action.name_clicked {
-                        self.open_player_profile(&meta.bottom.name);
-                    }
-                    ui.add_space(4.0);
-                    if let Some(event) = event {
-                        self.handle_board_event(event);
-                    }
-                } else {
-                    ui.add_space(40.0);
-                    ui.label(RichText::new("Drop a chess database here").heading());
-                    ui.label(
-                        RichText::new(
-                            "PGN, SCID4/3, or classic ChessBase · or use File → Open database…",
-                        )
-                        .weak(),
-                    );
-                }
-            });
-        });
-
-        self.about(&ctx);
-        self.cache_info_dialog(&ctx);
-        self.photo_viewer_window(&ctx);
-        self.settings_dialog(&ctx);
-        self.online_dialog(&ctx);
-        self.pgn_export_dialog(&ctx);
-        self.scid_export_dialog(&ctx);
-        self.cbh_export_dialog(&ctx);
-        self.two_cbh_export_dialog(&ctx);
-        self.print_export_dialog(&ctx);
-        self.setup_dialog(&ctx);
-        self.classify_openings_dialog(&ctx);
-        self.index_confirmation_dialog(&ctx);
-        self.branch_choice_dialog(&ctx);
-        self.date_picker_dialog(&ctx);
-        self.database_views_window(&ctx);
-        self.pending_game_drop_dialog(&ctx);
-        self.pending_merge_dialog(&ctx);
-        self.pending_open_dialog(&ctx);
-        self.save_database_dialog(&ctx);
-        self.close_confirmation_dialog(&ctx);
-        if self.pending_window_close {
-            self.pending_window_close = false;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-struct PlayerStripAction {
-    photo_clicked: bool,
-    name_clicked: bool,
-}
-
-/// Player name, rating and (optionally) clock above/below the board.
-#[allow(clippy::too_many_arguments)]
-fn player_strip(
-    ui: &mut Ui,
-    side: f32,
-    player: &PlayerBadge,
-    show_clock: bool,
-    photo: Option<&egui::TextureHandle>,
-    photo_size: PhotoSize,
-    champion: Option<&'static champions::Champion>,
-    move_counter: Option<&str>,
-) -> PlayerStripAction {
-    let has_team = player
-        .team
-        .as_ref()
-        .is_some_and(|team| !team.trim().is_empty());
-    let has_photo = photo.is_some();
-    let avatar_px = photo_size.pixels();
-    let height = if has_photo {
-        avatar_px + 8.0
-    } else if has_team {
-        34.0
-    } else {
-        27.0
-    };
-    let (rect, response) = ui.allocate_exact_size(vec2(side, height), Sense::hover());
-    let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, 6.0, Color32::from_rgb(0x1F, 0x22, 0x25));
-
-    let mut photo_clicked = false;
-    let text_left = if let Some(texture) = photo {
-        let avatar = egui::Rect::from_min_size(
-            pos2(rect.left() + 4.0, rect.top() + 4.0),
-            vec2(avatar_px, avatar_px),
-        );
-        painter.rect_filled(avatar, 5.0, Color32::from_rgb(0x2C, 0x30, 0x34));
-        painter.image(
-            texture.id(),
-            avatar,
-            egui::Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
-            Color32::WHITE,
-        );
-        painter.rect_stroke(
-            avatar,
-            5.0,
-            Stroke::new(1.0, Color32::from_gray(95)),
-            StrokeKind::Inside,
-        );
-        let photo_response = ui.interact(avatar, response.id.with("photo"), Sense::click());
-        if photo_response.hovered() {
-            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-        }
-        photo_clicked = photo_response.clicked();
-        rect.left() + avatar_px + 12.0
-    } else {
-        let dot = pos2(rect.left() + 12.0, rect.center().y);
-        let fill = match player.color {
-            Color::White => Color32::from_gray(235),
-            Color::Black => Color32::from_gray(35),
-        };
-        painter.circle_filled(dot, 4.5, fill);
-        painter.circle_stroke(dot, 4.5, Stroke::new(1.0, Color32::from_gray(135)));
-        rect.left() + 23.0
-    };
-
-    let mut label = LayoutJob::default();
-    if let Some(title) = &player.title {
-        label.append(
-            title,
-            0.0,
-            TextFormat {
-                font_id: FontId::proportional(12.0),
-                color: GOLD,
-                ..Default::default()
-            },
-        );
-        label.append(
-            " ",
-            0.0,
-            TextFormat {
-                font_id: FontId::proportional(14.0),
-                color: Color32::from_gray(226),
-                ..Default::default()
-            },
-        );
-    }
-    label.append(
-        &player.name,
-        0.0,
-        TextFormat {
-            font_id: FontId::proportional(14.0),
-            color: Color32::from_gray(226),
-            ..Default::default()
-        },
-    );
-    if let Some(country) = player.country {
-        let format = TextFormat {
-            font_id: FontId::proportional(11.0),
-            color: Color32::from_gray(150),
-            ..Default::default()
-        };
-        label.append(" · ", 0.0, format.clone());
-        label.append(country, 0.0, format);
-    }
-    if champion.is_some() {
-        label.append(
-            " 👑",
-            0.0,
-            TextFormat {
-                font_id: FontId::proportional(14.0),
-                color: GOLD,
-                ..Default::default()
-            },
-        );
-    }
-    if let Some(rating) = &player.rating {
-        label.append(
-            &format!("  ({rating})"),
-            0.0,
-            TextFormat {
-                font_id: FontId::proportional(13.0),
-                color: Color32::from_gray(165),
-                ..Default::default()
-            },
-        );
-    }
-    let right_limit = if move_counter.is_some() {
-        (rect.center().x - 45.0).max(text_left + 40.0)
-    } else if show_clock {
-        rect.right() - 104.0
-    } else {
-        rect.right() - 8.0
-    };
-    let name_clip = egui::Rect::from_min_max(rect.min, pos2(right_limit, rect.bottom()));
-    let name_painter = ui.painter_at(name_clip);
-    let name_galley = name_painter.layout_job(label);
-    let name_y = if has_photo {
-        rect.center().y - 15.0
-    } else if has_team {
-        rect.top() + 5.0
-    } else {
-        rect.center().y - name_galley.size().y / 2.0
-    };
-    let crown_hovered = champion.is_some_and(|champion| {
-        crown_hover(
-            ui,
-            &name_galley,
-            pos2(text_left, name_y),
-            response.id.with("crown"),
-            champion,
-        )
-    });
-    name_painter.galley(
-        pos2(text_left, name_y),
-        name_galley.clone(),
-        Color32::from_gray(226),
-    );
-    let name_hit_rect = egui::Rect::from_min_size(pos2(text_left, name_y), name_galley.size());
-    let name_response = ui.interact(
-        name_hit_rect.expand2(vec2(2.0, 2.0)),
-        response.id.with("name"),
-        Sense::click(),
-    );
-    if name_response.hovered() && !crown_hovered {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-        name_response
-            .clone()
-            .on_hover_text(format!("Click to view {}'s profile", player.name));
-    }
-    let name_clicked = name_response.clicked();
-
-    if let Some(team) = player.team.as_ref().filter(|team| !team.trim().is_empty()) {
-        let team_galley = name_painter.layout_no_wrap(
-            team.trim().to_string(),
-            FontId::proportional(10.5),
-            Color32::from_gray(145),
-        );
-        let team_y = if has_photo {
-            name_y + 20.0
-        } else {
-            rect.top() + 20.0
-        };
-        name_painter.galley(
-            pos2(text_left, team_y),
-            team_galley,
-            Color32::from_gray(145),
-        );
-    }
-
-    if let Some(counter) = move_counter {
-        let counter_galley = painter.layout_no_wrap(
-            counter.to_string(),
-            FontId::proportional(11.5),
-            Color32::from_gray(155),
-        );
-        let counter_pos = pos2(
-            rect.center().x - counter_galley.size().x / 2.0,
-            rect.center().y - counter_galley.size().y / 2.0,
-        );
-        painter.galley(counter_pos, counter_galley, Color32::from_gray(155));
-    }
-
-    if show_clock {
-        let text = player
-            .clock
-            .map(Clock::display)
-            .unwrap_or_else(|| "--:--".to_string());
-        let color = if player.clock.is_some() {
-            Color32::from_rgb(0xE8, 0xE4, 0xD8)
-        } else {
-            Color32::from_gray(120)
-        };
-        let clock_galley = painter.layout_no_wrap(text, FontId::monospace(14.0), color);
-        let clock_rect = egui::Rect::from_min_size(
-            pos2(
-                rect.right() - clock_galley.size().x - 10.0,
-                rect.center().y - clock_galley.size().y / 2.0,
-            ),
-            clock_galley.size(),
-        );
-        painter.rect_filled(
-            clock_rect.expand2(vec2(7.0, 3.0)),
-            4.0,
-            Color32::from_rgb(0x2A, 0x2E, 0x32),
-        );
-        painter.galley(clock_rect.min, clock_galley, color);
-    }
-
-    if !crown_hovered && !name_response.hovered() {
-        response.on_hover_text(format!(
-            "{} · {}{}{} · {}",
-            color_name(player.color),
-            player
-                .title
-                .as_deref()
-                .map(|title| format!("{title} "))
-                .unwrap_or_default(),
-            player.name,
-            player
-                .fide_id
-                .as_deref()
-                .map(|id| format!(" · FIDE {id}"))
-                .unwrap_or_default(),
-            player.rating.as_deref().unwrap_or("no rating")
-        ));
-    }
-    PlayerStripAction {
-        photo_clicked,
-        name_clicked,
-    }
-}
-
-/// Make a crown glyph painted as part of a larger text layout interactive, so
-/// the tooltip can explain the reign without splitting the player label into
-/// several widgets. Returns whether the pointer is over the crown.
-fn crown_hover(
-    ui: &Ui,
-    galley: &egui::Galley,
-    origin: egui::Pos2,
-    id: egui::Id,
-    champion: &champions::Champion,
-) -> bool {
-    let Some(rect) = crown_rect(galley, origin) else {
-        return false;
-    };
-    let response = ui.interact(rect, id, Sense::hover());
-    let hovered = response.hovered();
-    response.on_hover_text(champion.tooltip());
-    hovered
-}
-
-/// Bounding box of the crown glyph inside a laid-out player label.
-fn crown_rect(galley: &egui::Galley, origin: egui::Pos2) -> Option<egui::Rect> {
-    for placed in &galley.rows {
-        for glyph in &placed.row.glyphs {
-            if glyph.chr == '👑' {
-                return Some(
-                    egui::Rect::from_min_size(
-                        origin + placed.pos.to_vec2() + glyph.pos.to_vec2()
-                            - vec2(0.0, glyph.font_ascent),
-                        vec2(glyph.advance_width, glyph.font_height),
-                    )
-                    .expand(2.0),
-                );
-            }
-        }
-    }
-    None
-}
-
-/// Position after a single UCI move, together with the squares to highlight.
-fn preview_after_uci(pos: &Chess, text: &str) -> Option<HoverPreview> {
-    let uci = UciMove::from_ascii(text.as_bytes()).ok()?;
-    preview_after_uci_move(pos, uci)
-}
-
-fn preview_after_uci_move(pos: &Chess, uci: UciMove) -> Option<HoverPreview> {
-    let mv = uci.to_move(pos).ok()?;
-    let after = pos.clone().play(mv).ok()?;
-    Some(HoverPreview {
-        pos: after,
-        last_move: uci.from().zip(uci.to()),
-    })
-}
-
-fn preview_after_move(pos: &Chess, mv: Move) -> Option<HoverPreview> {
-    preview_after_uci_move(pos, UciMove::from_move(mv, CastlingMode::Standard))
-}
-
-/// Convert a UCI principal variation into figurine SAN moves, keeping the
-/// position after each prefix so the UI can preview deeper plies.
-fn pv_steps(pos: &Chess, pv: &[String], limit: usize) -> Vec<PvStep> {
-    let mut pos = pos.clone();
-    let mut out = Vec::new();
-    for text in pv.iter().take(limit) {
-        let Ok(uci) = UciMove::from_ascii(text.as_bytes()) else {
-            break;
-        };
-        let Ok(mv) = uci.to_move(&pos) else {
-            break;
-        };
-        let number = pos.fullmoves().get();
-        let color = pos.turn();
-        let san = SanPlus::from_move(pos.clone(), mv).to_string();
-        let Ok(next) = pos.clone().play(mv) else {
-            break;
-        };
-        out.push(PvStep {
-            san: domain::figurine_san(&san),
-            number,
-            color,
-            preview: HoverPreview {
-                pos: next.clone(),
-                last_move: uci.from().zip(uci.to()),
-            },
-        });
-        pos = next;
-    }
-    out
-}
-
-/// PGN-style move-number prefix for one principal-variation step. Black's
-/// reply to White's move of the same number stays bare, matching normal PGN.
-fn pv_move_prefix(step: &PvStep, previous: Option<&PvStep>) -> Option<String> {
-    match step.color {
-        Color::White => Some(format!("{}.", step.number)),
-        Color::Black => {
-            let follows_white = previous.is_some_and(|previous| {
-                previous.color == Color::White && previous.number == step.number
-            });
-            (!follows_white).then(|| format!("{}...", step.number))
-        }
-    }
-}
-
-/// One principal variation as numbered SAN text. Used by the line-formatting
-/// tests; the Cloud Engine renders the same steps as clickable labels.
-#[cfg(test)]
-fn pv_line_text(steps: &[PvStep]) -> String {
-    let mut parts = Vec::with_capacity(steps.len() * 2);
-    let mut previous = None;
-    for step in steps {
-        if let Some(prefix) = pv_move_prefix(step, previous) {
-            parts.push(prefix);
-        }
-        parts.push(step.san.clone());
-        previous = Some(step);
-    }
-    parts.join(" ")
-}
-
-/// Render clickable SAN moves with real move numbers. The caller supplies the
-/// label for the line (for example `Engine PV 1`), which keeps analysis-line
-/// numbering separate from chess move numbers.
-fn pv_steps_ui(
-    ui: &mut Ui,
-    steps: &[PvStep],
-    pv: &[String],
-    hover_preview: &mut Option<HoverPreview>,
-    clicked_line: &mut Option<Vec<String>>,
-) {
-    pv_steps_ui_sized(ui, steps, pv, hover_preview, clicked_line, false, None);
-}
-
-/// Compact variant used inside the Cloud Engine table. It keeps every move
-/// clickable and hover-previewable while taking less vertical space. The first
-/// move is the candidate move, so the caller can color it by its quality.
-fn pv_steps_ui_compact(
-    ui: &mut Ui,
-    steps: &[PvStep],
-    pv: &[String],
-    hover_preview: &mut Option<HoverPreview>,
-    clicked_line: &mut Option<Vec<String>>,
-    first_color: Option<Color32>,
-) {
-    pv_steps_ui_sized(
-        ui,
-        steps,
-        pv,
-        hover_preview,
-        clicked_line,
-        true,
-        first_color,
-    );
-}
-
-fn pv_steps_ui_sized(
-    ui: &mut Ui,
-    steps: &[PvStep],
-    pv: &[String],
-    hover_preview: &mut Option<HoverPreview>,
-    clicked_line: &mut Option<Vec<String>>,
-    compact: bool,
-    first_color: Option<Color32>,
-) {
-    let mut previous = None;
-    for (step_index, step) in steps.iter().enumerate() {
-        // Use normal PGN numbering in both layouts: a Black move is numbered
-        // only when it starts the line, then White's next number covers the
-        // reply. `compact` only changes the text size.
-        let prefix = pv_move_prefix(step, previous);
-        if let Some(prefix) = prefix {
-            let text = RichText::new(prefix)
-                .monospace()
-                .color(Color32::from_gray(128));
-            ui.label(if compact { text.small() } else { text });
-        }
-        let mut text = RichText::new(&step.san).monospace();
-        if step_index == 0
-            && let Some(color) = first_color
-        {
-            text = text.color(color);
-        }
-        let response = ui
-            .selectable_label(false, if compact { text.small() } else { text })
-            .on_hover_text("Hover to preview · click to play up to here");
-        if response.hovered() {
-            *hover_preview = Some(step.preview.clone());
-        }
-        if response.clicked()
-            && let Some(line) = pv.get(..=step_index)
-        {
-            *clicked_line = Some(line.to_vec());
-        }
-        previous = Some(step);
-    }
-}
-
-/// Rating shown beside a player's name. The preferred source is configurable;
-/// Elo, DWZ, and USCF all act as fallbacks for one another. When `all` is
-/// true, every available rating is included in priority order.
-fn player_rating(game: &Game, color: Color, priority: RatingPriority, all: bool) -> Option<String> {
-    let mut ratings = Vec::new();
-    for (key, label) in priority.tags(color) {
-        let Some(value) = game
-            .header(key)
-            .and_then(|value| value.trim().parse::<u32>().ok())
-            .filter(|value| *value > 0)
-        else {
-            continue;
-        };
-        ratings.push((label, value));
-        if !all {
-            break;
-        }
-    }
-    if ratings.is_empty() {
-        return None;
-    }
-    if ratings.len() == 1 {
-        let (label, value) = ratings[0];
-        return if label == "Elo" {
-            Some(value.to_string())
-        } else {
-            Some(format!("{label} {value}"))
-        };
-    }
-    Some(
-        ratings
-            .iter()
-            .map(|(label, value)| format!("{value} {label}"))
-            .collect::<Vec<_>>()
-            .join(" · "),
-    )
-}
-
-fn engine_score_label(score: Option<Score>, turn: Color) -> String {
-    match score {
-        Some(Score::Cp(cp)) => {
-            let white = if turn == Color::White { cp } else { -cp };
-            format!("{:+.2}", white as f64 / 100.0)
-        }
-        Some(Score::Mate(mate)) => {
-            let white = if turn == Color::White { mate } else { -mate };
-            format!("#{white}")
-        }
-        None => "—".to_string(),
-    }
-}
-
-fn quality_nag(quality: Quality) -> Option<u8> {
-    match quality {
-        Quality::Best => Some(3),      // ‼ / very good
-        Quality::Excellent => Some(1), // !
-        Quality::Good => None,
-        Quality::Inaccuracy => Some(6), // ?!
-        Quality::Mistake => Some(2),    // ?
-        Quality::Blunder => Some(4),    // ??
-        Quality::Forced | Quality::Unknown => None,
-    }
-}
-
-fn quality_color(quality: Quality) -> Color32 {
-    match quality {
-        Quality::Best => Color32::from_rgb(0x7E, 0xD3, 0x8A),
-        Quality::Excellent => Color32::from_rgb(0x9C, 0xD3, 0x93),
-        Quality::Good => Color32::from_rgb(0xB8, 0xC4, 0xA8),
-        Quality::Inaccuracy => Color32::from_rgb(0xE8, 0xC4, 0x6A),
-        Quality::Mistake => Color32::from_rgb(0xE8, 0x99, 0x5A),
-        Quality::Blunder => Color32::from_rgb(0xE0, 0x6C, 0x6C),
-        Quality::Forced => Color32::from_gray(155),
-        Quality::Unknown => Color32::from_gray(135),
-    }
-}
-
-/// Small white-perspective evaluation chart. Mates are clamped to the top and
-/// bottom so one forced mate does not flatten the rest of the game.
-fn review_graph(ui: &mut Ui, review: &ReviewState) {
-    let width = ui.available_width().max(160.0);
-    let (rect, _) = ui.allocate_exact_size(vec2(width, 96.0), Sense::hover());
-    let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, 6.0, Color32::from_rgb(0x18, 0x1A, 0x1C));
-    painter.rect_stroke(rect, 6.0, Stroke::new(1.0, BORDER), StrokeKind::Inside);
-    let middle = rect.center().y;
-    painter.line_segment(
-        [
-            pos2(rect.left() + 6.0, middle),
-            pos2(rect.right() - 6.0, middle),
-        ],
-        Stroke::new(1.0, Color32::from_gray(62)),
-    );
-    painter.text(
-        pos2(rect.left() + 7.0, rect.top() + 4.0),
-        Align2::LEFT_TOP,
-        "+8",
-        FontId::monospace(9.0),
-        Color32::from_gray(95),
-    );
-    painter.text(
-        pos2(rect.left() + 7.0, rect.bottom() - 4.0),
-        Align2::LEFT_BOTTOM,
-        "−8",
-        FontId::monospace(9.0),
-        Color32::from_gray(95),
-    );
-
-    let points = review.eval_points();
-    if points.is_empty() {
-        painter.text(
-            rect.center(),
-            Align2::CENTER_CENTER,
-            "Waiting for evaluations…",
-            FontId::proportional(11.0),
-            Color32::from_gray(110),
-        );
-        return;
-    }
-
-    let denominator = review.total().max(2).saturating_sub(1) as f32;
-    let scale = (rect.height() / 2.0 - 10.0) / 800.0;
-    let position = |index: usize, cp: f64| {
-        pos2(
-            rect.left() + 8.0 + (index as f32 / denominator) * (rect.width() - 16.0),
-            middle - (cp.clamp(-800.0, 800.0) as f32) * scale,
-        )
-    };
-    let mut previous = None;
-    for &(index, cp) in &points {
-        let point = position(index, cp);
-        if let Some(previous) = previous {
-            painter.line_segment(
-                [previous, point],
-                Stroke::new(1.5, Color32::from_rgb(0xC9, 0xB4, 0x7A)),
-            );
-        }
-        previous = Some(point);
-    }
-    if let Some(&(index, cp)) = points.last() {
-        painter.circle_filled(position(index, cp), 3.0, GOLD);
-    }
-}
-
-fn white_cp_color(white_cp: i32) -> Color32 {
-    if white_cp > 20 {
-        Color32::from_rgb(0x9E, 0xD8, 0xA8)
-    } else if white_cp < -20 {
-        Color32::from_rgb(0xE0, 0xA0, 0xA0)
-    } else {
-        Color32::from_gray(190)
-    }
-}
-
-fn engine_eval_color(score: Option<Score>, turn: Color) -> Color32 {
-    match score {
-        Some(Score::Mate(_)) => GOLD,
-        Some(Score::Cp(cp)) => {
-            let white = if turn == Color::White { cp } else { -cp };
-            white_cp_color(white)
-        }
-        None => Color32::from_gray(150),
-    }
-}
-
-const COMMON_PGN_TAGS: &[&str] = &[
-    "Event",
-    "Site",
-    "Date",
-    "Round",
-    "White",
-    "Black",
-    "Result",
-    "WhiteElo",
-    "BlackElo",
-    "WhiteDWZ",
-    "BlackDWZ",
-    "WhiteUSCF",
-    "BlackUSCF",
-    "WhiteTeam",
-    "BlackTeam",
-    "ECO",
-    "Opening",
-    "Variation",
-    "TimeControl",
-    "Termination",
-    "Annotator",
-    "EventDate",
-    "EventType",
-    "FEN",
-    "SetUp",
-];
-
-/// Tags offered as editable fields when empty fields are shown. This is the
-/// usual game metadata, so adding a game does not require one "Add tag" click
-/// per field. The seven-tag roster is always written even when absent.
-const DEFAULT_PGN_TAGS: &[&str] = &[
-    "Event",
-    "Site",
-    "Date",
-    "Round",
-    "White",
-    "WhiteElo",
-    "WhiteTeam",
-    "Black",
-    "BlackElo",
-    "BlackTeam",
-    "Result",
-    "ECO",
-    "Opening",
-];
-
-fn is_default_pgn_tag(name: &str) -> bool {
-    DEFAULT_PGN_TAGS
-        .iter()
-        .any(|tag| tag.eq_ignore_ascii_case(name))
-}
-
-fn default_pgn_tag_name(name: &str) -> Option<&'static str> {
-    DEFAULT_PGN_TAGS
-        .iter()
-        .copied()
-        .find(|tag| tag.eq_ignore_ascii_case(name))
-}
-
-/// PGN placeholders carry no information. Treating them as empty keeps a game
-/// with only `?` / `????.??.??` from filling the tag card with noise.
-fn pgn_tag_is_empty(value: &str) -> bool {
-    let value = value.trim();
-    value.is_empty() || value == "?" || value == "????.??.??"
-}
-
-/// Editable PGN tag list. Tag names are fixed labels; only the value can be
-/// changed. A field can be removed with its delete button and added back from
-/// the common-tag menu.
-#[allow(clippy::too_many_arguments)]
-fn game_tags_card(
-    ui: &mut Ui,
-    game: &Game,
-    tag_update: &mut Option<(usize, String)>,
-    tag_delete: &mut Option<usize>,
-    tag_add: &mut Option<&'static str>,
-    tag_add_value: &mut Option<(&'static str, String)>,
-    expanded: &mut bool,
-    show_empty: &mut bool,
-    board_visible: &mut bool,
-    forced_tags: &HashSet<String>,
-    date_clicked: &mut Option<egui::Pos2>,
-) {
-    let show_empty_now = *show_empty;
-    let board_present = game
-        .header("Round")
-        .map(round_and_board)
-        .and_then(|(_, board)| board)
-        .is_some();
-    let show_board = show_empty_now || board_present || *board_visible;
-    let visible = |name: &str| {
-        if forced_tags.contains(&name.to_ascii_lowercase()) {
-            return true;
-        }
-        match header_index(game, name) {
-            Some(index) => show_empty_now || !pgn_tag_is_empty(&game.headers[index].1),
-            None => show_empty_now && is_default_pgn_tag(name),
-        }
-    };
-    let event_visible = visible("Event");
-    let site_visible = visible("Site");
-    let date_visible = visible("Date");
-    let round_visible = visible("Round") || show_board;
-    let result_visible = visible("Result");
-    let eco_visible = visible("ECO");
-    let opening_visible = visible("Opening");
-
-    egui::Frame::new()
-        .fill(SURFACE)
-        .corner_radius(12.0)
-        .stroke(Stroke::new(1.0, BORDER))
-        .inner_margin(12.0)
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new(format!("PGN tags  ·  {}", game.headers.len()))
-                        .size(14.0)
-                        .strong(),
-                );
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.menu_button("+ Add tag", |ui| {
-                        let mut any = false;
-                        for &tag in COMMON_PGN_TAGS {
-                            if game.header(tag).is_none() && !inline_player_elo_tag(game, tag) {
-                                any = true;
-                                if ui.button(tag_display_name(tag)).clicked() {
-                                    *tag_add = Some(tag);
-                                    ui.close();
-                                }
-                            }
-                        }
-                        if !show_board {
-                            any = true;
-                            if ui.button("Board").clicked() {
-                                *board_visible = true;
-                                *tag_add = Some("Board");
-                                ui.close();
-                            }
-                        }
-                        if !any {
-                            ui.label(RichText::new("All common tags are present.").weak());
-                        }
-                    });
-                    let empty_label = if show_empty_now {
-                        "Hide empty"
-                    } else {
-                        "Show empty"
-                    };
-                    if ui
-                        .add(egui::Button::new(RichText::new(empty_label).small()).frame(false))
-                        .on_hover_text(if show_empty_now {
-                            "Hide fields that are absent or empty"
-                        } else {
-                            "Show the usual PGN fields even when empty"
-                        })
-                        .clicked()
-                    {
-                        *show_empty = !*show_empty;
-                    }
-                });
-            });
-            ui.label(
-                RichText::new("Click a value to edit it · click the date for a calendar")
-                    .small()
-                    .weak(),
-            );
-            ui.add_space(5.0);
-
-            if game.headers.is_empty() {
-                ui.label(RichText::new("No tags.").weak().italics());
-            }
-
-            // Event and Site share one line; Date, Round, Board, and Result
-            // share the next one. A field is omitted entirely while empty
-            // unless the user asked to see empty fields.
-            if event_visible || site_visible {
-                ui.columns(2, |columns| {
-                    if event_visible {
-                        compact_text_tag(&mut columns[0], game, "Event", tag_update, tag_add);
-                    }
-                    if site_visible {
-                        compact_text_tag(&mut columns[1], game, "Site", tag_update, tag_add);
-                    }
-                });
-                ui.add_space(3.0);
-            }
-            if date_visible || round_visible || result_visible {
-                ui.horizontal_wrapped(|ui| {
-                    ui.spacing_mut().item_spacing.x = 4.0;
-                    if date_visible {
-                        compact_date_tag(ui, game, tag_update, tag_add, date_clicked);
-                    }
-                    if round_visible {
-                        compact_round_tag(ui, game, tag_update, tag_add, show_board);
-                    }
-                    if result_visible {
-                        compact_result_tag(ui, game, tag_update, tag_add);
-                    }
-                });
-                ui.add_space(3.0);
-            }
-            if eco_visible || opening_visible {
-                compact_eco_opening_tag(ui, game, tag_update, tag_add_value);
-                ui.add_space(3.0);
-            }
-
-            for (index, (name, value)) in game.headers.iter().enumerate() {
-                if !is_default_pgn_tag(name)
-                    || is_compact_pgn_tag(name)
-                    || inline_player_elo_tag(game, name)
-                {
-                    continue;
-                }
-                if pgn_tag_is_empty(value)
-                    && !show_empty_now
-                    && !forced_tags.contains(&name.to_ascii_lowercase())
-                {
-                    continue;
-                }
-                pgn_tag_row(
-                    ui,
-                    index,
-                    name,
-                    value,
-                    game,
-                    tag_update,
-                    tag_delete,
-                    tag_add_value,
-                    show_board,
-                    date_clicked,
-                );
-                ui.add_space(3.0);
-            }
-
-            let has_default_row = game.headers.iter().any(|(name, value)| {
-                is_default_pgn_tag(name)
-                    && !is_compact_pgn_tag(name)
-                    && !inline_player_elo_tag(game, name)
-                    && (show_empty_now
-                        || !pgn_tag_is_empty(value)
-                        || forced_tags.contains(&name.to_ascii_lowercase()))
-            });
-            let has_additional_row = game.headers.iter().any(|(name, value)| {
-                !is_default_pgn_tag(name)
-                    && (show_empty_now
-                        || !pgn_tag_is_empty(value)
-                        || forced_tags.contains(&name.to_ascii_lowercase()))
-            });
-            if !event_visible
-                && !site_visible
-                && !date_visible
-                && !round_visible
-                && !result_visible
-                && !eco_visible
-                && !opening_visible
-                && !has_default_row
-                && !has_additional_row
-                && !game.headers.is_empty()
-            {
-                ui.label(
-                    RichText::new(
-                        "No non-empty fields. Use Show empty to edit the usual PGN fields.",
-                    )
-                    .small()
-                    .weak()
-                    .italics(),
-                );
-            }
-
-            if show_empty_now {
-                for &name in DEFAULT_PGN_TAGS {
-                    if is_compact_pgn_tag(name)
-                        || header_index(game, name).is_some()
-                        || inline_player_elo_tag(game, name)
-                    {
-                        continue;
-                    }
-                    missing_tag_row(ui, name, tag_add);
-                    ui.add_space(3.0);
-                }
-            }
-
-            let additional: Vec<usize> = game
-                .headers
-                .iter()
-                .enumerate()
-                .filter_map(|(index, (name, value))| {
-                    (!is_default_pgn_tag(name)
-                        && (show_empty_now
-                            || !pgn_tag_is_empty(value)
-                            || forced_tags.contains(&name.to_ascii_lowercase())))
-                    .then_some(index)
-                })
-                .collect();
-            let additional_count = additional.len();
-
-            if additional_count > 0 {
-                ui.add_space(2.0);
-                let more_label = if *expanded {
-                    "Fewer tags".to_string()
-                } else {
-                    format!("More tags ({additional_count})")
-                };
-                if ui
-                    .add(
-                        egui::Button::new(
-                            RichText::new(more_label)
-                                .small()
-                                .color(Color32::from_gray(175)),
-                        )
-                        .frame(false),
-                    )
-                    .on_hover_text(if *expanded {
-                        "Hide the additional PGN tags"
-                    } else {
-                        "Show the additional PGN tags"
-                    })
-                    .clicked()
-                {
-                    *expanded = !*expanded;
-                }
-            }
-
-            if *expanded {
-                ui.add_space(2.0);
-                egui::ScrollArea::vertical()
-                    .id_salt("additional-pgn-tags")
-                    .max_height(140.0)
-                    .auto_shrink([false, true])
-                    .show(ui, |ui| {
-                        for index in &additional {
-                            let (name, value) = &game.headers[*index];
-                            pgn_tag_row(
-                                ui,
-                                *index,
-                                name,
-                                value,
-                                game,
-                                tag_update,
-                                tag_delete,
-                                tag_add_value,
-                                show_board,
-                                date_clicked,
-                            );
-                            ui.add_space(3.0);
-                        }
-                    });
-            }
-        });
-}
-
-fn is_compact_pgn_tag(name: &str) -> bool {
-    ["Event", "Site", "Date", "Round", "Result", "ECO", "Opening"]
-        .iter()
-        .any(|tag| tag.eq_ignore_ascii_case(name))
-}
-
-fn header_index(game: &Game, name: &str) -> Option<usize> {
-    game.headers
-        .iter()
-        .position(|(key, _)| key.eq_ignore_ascii_case(name))
-}
-
-/// `WhiteElo` and `BlackElo` are edited beside the corresponding player name,
-/// not as separate full-width tag rows. If the name tag itself is absent, keep
-/// the Elo tag visible in the normal tag list so no data is hidden.
-fn inline_player_elo_tag(game: &Game, name: &str) -> bool {
-    (name.eq_ignore_ascii_case("WhiteElo") && header_index(game, "White").is_some())
-        || (name.eq_ignore_ascii_case("BlackElo") && header_index(game, "Black").is_some())
-}
-
-fn missing_tag_row(ui: &mut Ui, name: &str, tag_add: &mut Option<&'static str>) {
-    egui::Frame::new()
-        .fill(Color32::from_rgb(0x20, 0x23, 0x26))
-        .corner_radius(5.0)
-        .inner_margin(egui::Margin::symmetric(7, 3))
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                left_sized_label(
-                    ui,
-                    76.0,
-                    19.0,
-                    RichText::new(tag_display_name(name))
-                        .small()
-                        .color(Color32::from_gray(165)),
-                )
-                .on_hover_text(name);
-                ui.label(RichText::new("—").weak());
-                if ui
-                    .small_button("+")
-                    .on_hover_text(format!("Add {name}"))
-                    .clicked()
-                    && let Some(tag) = default_pgn_tag_name(name)
-                {
-                    *tag_add = Some(tag);
-                }
-            });
-        });
-}
-
-fn compact_text_tag(
-    ui: &mut Ui,
-    game: &Game,
-    name: &str,
-    tag_update: &mut Option<(usize, String)>,
-    tag_add: &mut Option<&'static str>,
-) {
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 4.0;
-        let is_site = name.eq_ignore_ascii_case("Site");
-        let label = ui.add(
-            egui::Label::new(RichText::new(tag_display_name(name)).small().weak())
-                .selectable(false)
-                .sense(if is_site {
-                    Sense::click()
-                } else {
-                    Sense::hover()
-                }),
-        );
-        if is_site && label.clicked() {
-            let site = game.header("Site").unwrap_or("").trim();
-            if !pgn_tag_is_empty(site) {
-                open_browser_url(ui.ctx(), &map_search_url(site));
-            }
-        }
-        label.on_hover_text(if is_site {
-            "Click to search this venue on OpenStreetMap in your browser"
-        } else {
-            name
-        });
-        if let Some(index) = header_index(game, name) {
-            let mut value = game.headers[index].1.clone();
-            let button_space = if is_site { 28.0 } else { 0.0 };
-            let width = (ui.available_width() - 2.0 - button_space).max(36.0);
-            let response = ui.add_sized(
-                [width, 19.0],
-                egui::TextEdit::singleline(&mut value)
-                    .id_salt(("compact-tag", name))
-                    .frame(egui::Frame::NONE)
-                    .margin(egui::Margin::ZERO)
-                    .font(FontId::monospace(12.5))
-                    .hint_text("value"),
-            );
-            if response.changed() {
-                *tag_update = Some((index, value.clone()));
-            }
-            if is_site {
-                let site = value.trim();
-                let has_site = !pgn_tag_is_empty(site);
-                if ui
-                    .add_enabled(has_site, egui::Button::new("🗺 ↗").small())
-                    .on_hover_text("Search this venue on OpenStreetMap in your browser")
-                    .clicked()
-                {
-                    open_browser_url(ui.ctx(), &map_search_url(site));
-                }
-            }
-        } else {
-            ui.label(RichText::new("—").weak());
-            if ui
-                .small_button("+")
-                .on_hover_text(format!("Add {name}"))
-                .clicked()
-                && let Some(tag) = default_pgn_tag_name(name)
-            {
-                *tag_add = Some(tag);
-            }
-        }
-    });
-}
-
-fn compact_date_tag(
-    ui: &mut Ui,
-    game: &Game,
-    tag_update: &mut Option<(usize, String)>,
-    tag_add: &mut Option<&'static str>,
-    date_clicked: &mut Option<egui::Pos2>,
-) {
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 3.0;
-        let mut open_calendar = false;
-        if ui
-            .add(egui::Label::new(RichText::new("Date").small().weak()).sense(Sense::click()))
-            .on_hover_text("Open the calendar")
-            .clicked()
-        {
-            open_calendar = true;
-        }
-        if let Some(index) = header_index(game, "Date") {
-            let mut value = game.headers[index].1.clone();
-            let response = ui.add_sized(
-                [76.0, 19.0],
-                egui::TextEdit::singleline(&mut value)
-                    .id_salt(("compact-date", index))
-                    .frame(egui::Frame::NONE)
-                    .margin(egui::Margin::ZERO)
-                    .font(FontId::monospace(12.5))
-                    .hint_text("YYYY.MM.DD"),
-            );
-            if response.changed() {
-                *tag_update = Some((index, value));
-            }
-            let response = response.on_hover_text("Type a date (YYYY.MM.DD) or use the calendar");
-            if open_calendar {
-                *date_clicked = Some(response.rect.left_bottom());
-            }
-            let calendar = ui
-                .add_sized(
-                    [18.0, 19.0],
-                    egui::Button::new(RichText::new("▦").size(12.0)).frame(false),
-                )
-                .on_hover_text("Open the calendar");
-            if calendar.clicked() {
-                *date_clicked = Some(calendar.rect.left_bottom());
-            }
-        } else {
-            ui.label(RichText::new("—").weak());
-            if ui.small_button("+").on_hover_text("Add Date").clicked() {
-                *tag_add = Some("Date");
-            }
-        }
-    });
-}
-
-fn compact_round_tag(
-    ui: &mut Ui,
-    game: &Game,
-    tag_update: &mut Option<(usize, String)>,
-    tag_add: &mut Option<&'static str>,
-    show_board: bool,
-) {
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 3.0;
-        ui.label(RichText::new("Round").small().weak());
-        if let Some(index) = header_index(game, "Round") {
-            let (mut round, board) = round_and_board(&game.headers[index].1);
-            let mut board = board.unwrap_or_default();
-            let round_response = ui.add_sized(
-                [28.0, 19.0],
-                egui::TextEdit::singleline(&mut round)
-                    .id_salt(("compact-round", index))
-                    .frame(egui::Frame::NONE)
-                    .margin(egui::Margin::ZERO)
-                    .font(FontId::monospace(12.5))
-                    .hint_text("round"),
-            );
-            let mut changed = round_response.changed();
-            if show_board {
-                ui.label(RichText::new("Board").small().weak());
-                let board_response = ui.add_sized(
-                    [28.0, 19.0],
-                    egui::TextEdit::singleline(&mut board)
-                        .id_salt(("compact-board", index))
-                        .frame(egui::Frame::NONE)
-                        .margin(egui::Margin::ZERO)
-                        .font(FontId::monospace(12.5))
-                        .hint_text("no."),
-                );
-                changed |= board_response.changed();
-            }
-            if changed {
-                *tag_update = Some((index, combine_round(&round, &board)));
-            }
-        } else {
-            ui.label(RichText::new("—").weak());
-            if ui.small_button("+").on_hover_text("Add Round").clicked() {
-                *tag_add = Some("Round");
-            }
-        }
-    });
-}
-
-fn compact_result_tag(
-    ui: &mut Ui,
-    game: &Game,
-    tag_update: &mut Option<(usize, String)>,
-    tag_add: &mut Option<&'static str>,
-) {
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 3.0;
-        ui.label(RichText::new("Result").small().weak());
-        if let Some(index) = header_index(game, "Result") {
-            let mut value = game.headers[index].1.clone();
-            let response = ui.add_sized(
-                [56.0, 19.0],
-                egui::TextEdit::singleline(&mut value)
-                    .id_salt(("compact-result", index))
-                    .frame(egui::Frame::NONE)
-                    .margin(egui::Margin::ZERO)
-                    .font(FontId::monospace(12.5))
-                    .hint_text("result"),
-            );
-            if response.changed() {
-                *tag_update = Some((index, value));
-            }
-        } else {
-            ui.label(RichText::new("—").weak());
-            if ui.small_button("+").on_hover_text("Add Result").clicked() {
-                *tag_add = Some("Result");
-            }
-        }
-    });
-}
-
-/// ECO and Opening share one row, mirroring White/WhiteElo. The ECO field is
-/// fixed narrow so four-character codes fit without stealing space from the
-/// opening name.
-fn compact_eco_opening_tag(
-    ui: &mut Ui,
-    game: &Game,
-    tag_update: &mut Option<(usize, String)>,
-    tag_add_value: &mut Option<(&'static str, String)>,
-) {
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 4.0;
-        ui.label(RichText::new("ECO").small().weak());
-        let eco_index = header_index(game, "ECO");
-        let mut eco = eco_index
-            .map(|index| game.headers[index].1.clone())
-            .unwrap_or_default();
-        let eco_response = ui.add_sized(
-            [44.0, 19.0],
-            egui::TextEdit::singleline(&mut eco)
-                .id_salt("compact-eco")
-                .frame(egui::Frame::NONE)
-                .margin(egui::Margin::ZERO)
-                .font(FontId::monospace(12.5))
-                .hint_text("ECO"),
-        );
-        if eco_response.changed() {
-            if let Some(index) = eco_index {
-                *tag_update = Some((index, eco));
-            } else if !eco.trim().is_empty() {
-                *tag_add_value = Some(("ECO", eco));
-            }
-        }
-        ui.label(RichText::new("Opening").small().weak());
-        let opening_index = header_index(game, "Opening");
-        let mut opening = opening_index
-            .map(|index| game.headers[index].1.clone())
-            .unwrap_or_default();
-        let width = (ui.available_width() - 2.0).max(60.0);
-        let opening_response = ui.add_sized(
-            [width, 19.0],
-            egui::TextEdit::singleline(&mut opening)
-                .id_salt("compact-opening")
-                .frame(egui::Frame::NONE)
-                .margin(egui::Margin::ZERO)
-                .font(FontId::monospace(12.5))
-                .hint_text("Opening"),
-        );
-        if opening_response.changed() {
-            if let Some(index) = opening_index {
-                *tag_update = Some((index, opening));
-            } else if !opening.trim().is_empty() {
-                *tag_add_value = Some(("Opening", opening));
-            }
-        }
-    });
-}
-
-#[allow(clippy::too_many_arguments)]
-fn pgn_tag_row(
-    ui: &mut Ui,
-    index: usize,
-    name: &str,
-    value: &str,
-    game: &Game,
-    tag_update: &mut Option<(usize, String)>,
-    tag_delete: &mut Option<usize>,
-    tag_add_value: &mut Option<(&'static str, String)>,
-    show_board: bool,
-    date_clicked: &mut Option<egui::Pos2>,
-) {
-    egui::Frame::new()
-        .fill(Color32::from_rgb(0x20, 0x23, 0x26))
-        .corner_radius(5.0)
-        .inner_margin(egui::Margin::symmetric(7, 3))
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 3.0;
-                left_sized_label(
-                    ui,
-                    76.0,
-                    19.0,
-                    RichText::new(tag_display_name(name))
-                        .small()
-                        .color(Color32::from_gray(165)),
-                )
-                .on_hover_text(name);
-
-                if name.eq_ignore_ascii_case("Date") {
-                    let width = (ui.available_width() - 26.0).max(40.0);
-                    let response = ui.add_sized(
-                        [width, 19.0],
-                        egui::Button::new(
-                            RichText::new(if value.trim().is_empty() {
-                                "choose date…"
-                            } else {
-                                value
-                            })
-                            .monospace()
-                            .size(12.5)
-                            .color(Color32::from_gray(220)),
-                        )
-                        .frame(false),
-                    );
-                    if response.clicked() {
-                        *date_clicked = Some(response.rect.left_bottom());
-                    }
-                    response.on_hover_text("Open the calendar");
-                } else if name.eq_ignore_ascii_case("Round") {
-                    let (mut round, board) = round_and_board(value);
-                    let mut board = board.unwrap_or_default();
-                    let round_width = 50.0;
-                    let board_width = 50.0;
-                    let round_response = ui.add_sized(
-                        [round_width, 19.0],
-                        egui::TextEdit::singleline(&mut round)
-                            .id_salt(("pgn-round", index))
-                            .frame(egui::Frame::NONE)
-                            .margin(egui::Margin::ZERO)
-                            .font(FontId::monospace(12.5))
-                            .hint_text("round"),
-                    );
-                    let mut changed = round_response.changed();
-                    if show_board {
-                        ui.label(RichText::new("Board").small().weak());
-                        let board_response = ui.add_sized(
-                            [board_width, 19.0],
-                            egui::TextEdit::singleline(&mut board)
-                                .id_salt(("pgn-board", index))
-                                .frame(egui::Frame::NONE)
-                                .margin(egui::Margin::ZERO)
-                                .font(FontId::monospace(12.5))
-                                .hint_text("board"),
-                        );
-                        changed |= board_response.changed();
-                    }
-                    if changed {
-                        *tag_update = Some((index, combine_round(&round, &board)));
-                    }
-                } else if name.eq_ignore_ascii_case("White") || name.eq_ignore_ascii_case("Black") {
-                    let (elo_tag, elo_label) = if name.eq_ignore_ascii_case("White") {
-                        ("WhiteElo", "White Elo")
-                    } else {
-                        ("BlackElo", "Black Elo")
-                    };
-                    let elo_index = header_index(game, elo_tag);
-                    let mut elo = elo_index
-                        .map(|index| game.headers[index].1.clone())
-                        .unwrap_or_default();
-                    // Keep the name, Elo field, and delete button on one line.
-                    let name_width = (ui.available_width() - 108.0).max(40.0);
-                    let mut edited = value.to_string();
-                    let response = ui.add_sized(
-                        [name_width, 19.0],
-                        egui::TextEdit::singleline(&mut edited)
-                            .id_salt(("pgn-tag", index))
-                            .frame(egui::Frame::NONE)
-                            .margin(egui::Margin::ZERO)
-                            .font(FontId::monospace(12.5))
-                            .hint_text("name"),
-                    );
-                    if response.changed() {
-                        *tag_update = Some((index, edited));
-                    }
-                    ui.label(RichText::new("Elo").small().weak())
-                        .on_hover_text(elo_label);
-                    let elo_response = egui::Frame::new()
-                        .fill(Color32::from_rgb(0x2A, 0x2E, 0x32))
-                        .corner_radius(3.0)
-                        .inner_margin(egui::Margin::symmetric(4, 1))
-                        .show(ui, |ui| {
-                            ui.add_sized(
-                                [46.0, 17.0],
-                                egui::TextEdit::singleline(&mut elo)
-                                    .id_salt(("pgn-elo", index))
-                                    .frame(egui::Frame::NONE)
-                                    .margin(egui::Margin::ZERO)
-                                    .font(FontId::monospace(12.5))
-                                    .hint_text("rating"),
-                            )
-                        })
-                        .inner;
-                    if elo_response.changed() {
-                        if let Some(elo_index) = elo_index {
-                            *tag_update = Some((elo_index, elo));
-                        } else if !elo.trim().is_empty() {
-                            *tag_add_value = Some((elo_tag, elo));
-                        }
-                    }
-                } else {
-                    let width = (ui.available_width() - 26.0).max(40.0);
-                    let mut edited = value.to_string();
-                    let response = ui.add_sized(
-                        [width, 19.0],
-                        egui::TextEdit::singleline(&mut edited)
-                            .id_salt(("pgn-tag", index))
-                            .frame(egui::Frame::NONE)
-                            .margin(egui::Margin::ZERO)
-                            .font(FontId::monospace(12.5))
-                            .hint_text("value"),
-                    );
-                    if response.changed() {
-                        *tag_update = Some((index, edited));
-                    }
-                }
-
-                let delete =
-                    egui::Button::new(RichText::new("×").size(14.0).color(Color32::from_gray(145)))
-                        .frame(false)
-                        .min_size(vec2(18.0, 18.0));
-                if ui.add(delete).on_hover_text("Remove this tag").clicked() {
-                    *tag_delete = Some(index);
-                }
-            });
-        });
-}
-
-/// Turn `WhiteElo` into `White Elo` without losing established acronyms.
-fn tag_display_name(name: &str) -> String {
-    let mut out = String::with_capacity(name.len() + 2);
-    for (index, ch) in name.char_indices() {
-        if index > 0
-            && ch.is_ascii_uppercase()
-            && let Some(previous) = name[..index].chars().next_back()
-            && (previous.is_ascii_lowercase() || previous.is_ascii_digit())
-        {
-            out.push(' ');
-        }
-        out.push(ch);
-    }
-    out
-}
-
-/// Percent-encode a query value for a URL. Unreserved RFC 3986 characters stay
-/// literal; everything else (including UTF-8 bytes) becomes `%XX`.
-fn url_encode_query(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    for byte in text.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(byte as char);
-            }
-            _ => out.push_str(&format!("%{byte:02X}")),
-        }
-    }
-    out
-}
-
-/// Search URL for the PGN `Site` tag. OpenStreetMap needs no API key and keeps
-/// the venue query out of an advertising profile.
-fn map_search_url(site: &str) -> String {
-    format!(
-        "https://www.openstreetmap.org/search?query={}",
-        url_encode_query(site.trim())
-    )
-}
-
-/// Open an external URL in the user's default browser, using the `webbrowser`
-/// crate for desktop environments and falling back to egui's platform bridge.
-fn open_browser_url(ctx: &egui::Context, url: &str) {
-    if webbrowser::open(url).is_err() {
-        ctx.open_url(egui::OpenUrl::new_tab(url));
-    }
-}
-
-/// Copy text to the clipboard, synchronizing with egui's context and
-/// directly updating the system clipboard with `arboard` as a fallback.
-fn copy_to_clipboard(ctx: &egui::Context, text: &str) {
-    ctx.copy_text(text.to_string());
-    if let Ok(mut clipboard) = arboard::Clipboard::new() {
-        let _ = clipboard.set_text(text.to_string());
-    }
-}
-
-/// Header card above the PGN move list. Date sits on the left, the tournament
-/// is centered, and the result stays on the right.
-fn game_header_card(
-    ui: &mut Ui,
-    game: &Game,
-    prep: Option<&PrepSession>,
-    priority: RatingPriority,
-    show_all_ratings: bool,
-    date_clicked: &mut Option<egui::Pos2>,
-) {
-    egui::Frame::new()
-        .fill(SURFACE)
-        .corner_radius(10.0)
-        .stroke(Stroke::new(1.0, BORDER))
-        .inner_margin(10.0)
-        .show(ui, |ui| {
-            if let Some(prep) = prep {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("PREPARATION").small().strong().color(GOLD));
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.label(
-                            RichText::new(format!("You play {}", color_name(prep.our_color)))
-                                .small()
-                                .weak(),
-                        );
-                    });
-                });
-                ui.label(RichText::new(format!("vs {}", prep.player_name)).heading());
-                ui.label(
-                    RichText::new("Make a move on the board; the opponent tree will follow.")
-                        .weak()
-                        .small(),
-                );
-                return;
-            }
-
-            let event = game.event();
-            let (round, board) = round_and_board(game.header("Round").unwrap_or(""));
-            let tag_eco = game
-                .header("ECO")
-                .map(str::trim)
-                .filter(|eco| !eco.is_empty() && *eco != "?");
-            let tag_opening = game
-                .header("Opening")
-                .map(str::trim)
-                .filter(|opening| !opening.is_empty() && *opening != "?");
-            let derived_opening = if tag_eco.is_none() || tag_opening.is_none() {
-                crate::eco::classify_game(game)
-            } else {
-                None
-            };
-            let (eco, opening, is_derived_opening) = match (tag_eco, tag_opening, derived_opening) {
-                (Some(e), Some(o), _) => (Some(e), Some(o), false),
-                (None, None, Some(d)) => (Some(d.eco.as_str()), Some(d.name.as_str()), true),
-                (Some(e), None, Some(d)) if e.eq_ignore_ascii_case(&d.eco) => {
-                    (Some(e), Some(d.name.as_str()), true)
-                }
-                (e, o, _) => (e, o, false),
-            };
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing = vec2(6.0, 4.0);
-                let response = date_chip(ui, game.date());
-                if response.clicked() {
-                    *date_clicked = Some(response.rect.left_bottom());
-                }
-                response.on_hover_text("Click to choose a date");
-                let board = board.filter(|board| !board.is_empty());
-                let show_round = !round.is_empty() && round != "?";
-                // When an Opening tag is present, the ECO moves down beside
-                // it; otherwise it stays in this compact top bar.
-                let show_eco = opening.is_none() && eco.is_some();
-                // Prefer the full Round/Board words. Only fall back to R/B
-                // when the event would otherwise be squeezed below a usable
-                // width. The result always keeps its reserved space at the
-                // right edge.
-                let round_full = format!("Round {round}");
-                let round_short = format!("R {round}");
-                let board_full = board.as_deref().map(|board| format!("Board {board}"));
-                let board_short = board.as_deref().map(|board| format!("B {board}"));
-                let chip_width = |text: &str| text.chars().count() as f32 * 6.8 + 14.0;
-                let reserve_for = |round: &str, board: Option<&str>| {
-                    let mut reserve = 70.0;
-                    if show_round {
-                        reserve += chip_width(round);
-                    }
-                    if let Some(board) = board {
-                        reserve += chip_width(board);
-                    }
-                    if show_eco {
-                        reserve += 34.0;
-                    }
-                    reserve
-                };
-                let available = ui.available_width();
-                let full_reserve = reserve_for(&round_full, board_full.as_deref());
-                let use_short = available - full_reserve < 96.0;
-                let (round_text, board_text, reserve) = if use_short {
-                    (
-                        round_short.as_str(),
-                        board_short.as_deref(),
-                        reserve_for(&round_short, board_short.as_deref()),
-                    )
-                } else {
-                    (
-                        round_full.as_str(),
-                        board_full.as_deref(),
-                        full_reserve,
-                    )
-                };
-                let event_width = (available - reserve).max(48.0);
-                ui.add_sized(
-                    [event_width, 20.0],
-                    egui::Label::new(RichText::new(event).small().strong().color(GOLD)).truncate(),
-                )
-                .on_hover_text(event);
-                if show_round {
-                    meta_chip_hover(ui, round_text, &format!("Round {round}"));
-                }
-                if let Some(board) = board_text {
-                    meta_chip_hover(ui, board, &format!("Board {board}"));
-                }
-                if show_eco && let Some(eco) = eco {
-                    meta_chip(ui, eco);
-                }
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    result_badge(ui, game.result());
-                });
-            });
-            ui.add_space(6.0);
-            header_player_row(
-                ui,
-                game.white(),
-                player_title(game, Color::White),
-                player_country(game, Color::White).map(|c| c.badge),
-                player_fide_id(game, Color::White),
-                player_rating(game, Color::White, priority, show_all_ratings),
-                team_for(game, Color::White),
-                Color::White,
-            );
-            ui.add_space(3.0);
-            header_player_row(
-                ui,
-                game.black(),
-                player_title(game, Color::Black),
-                player_country(game, Color::Black).map(|c| c.badge),
-                player_fide_id(game, Color::Black),
-                player_rating(game, Color::Black, priority, show_all_ratings),
-                team_for(game, Color::Black),
-                Color::Black,
-            );
-            if let Some(opening) = opening {
-                ui.add_space(5.0);
-                let hover = if is_derived_opening {
-                    format!(
-                        "{opening} · classified from mainline (use File → Classify openings… to write ECO and Opening tags)"
-                    )
-                } else {
-                    opening.to_string()
-                };
-                ui.horizontal_wrapped(|ui| {
-                    if let Some(eco) = eco {
-                        accent_chip(ui, eco);
-                    }
-                    ui.label(RichText::new(opening).small().weak())
-                        .on_hover_text(hover);
-                });
-            }
-        });
-}
-
-fn date_chip(ui: &mut Ui, text: &str) -> egui::Response {
-    egui::Frame::new()
-        .fill(Color32::from_rgb(0x2A, 0x2E, 0x32))
-        .corner_radius(4.0)
-        .inner_margin(egui::Margin::symmetric(6, 2))
-        .show(ui, |ui| {
-            ui.add(
-                egui::Label::new(
-                    RichText::new(text)
-                        .monospace()
-                        .small()
-                        .color(Color32::from_gray(190)),
-                )
-                .sense(Sense::click()),
-            )
-        })
-        .inner
-}
-
-#[allow(clippy::too_many_arguments)]
-fn header_player_row(
-    ui: &mut Ui,
-    name: &str,
-    title: Option<&str>,
-    country: Option<&str>,
-    fide_id: Option<&str>,
-    rating: Option<String>,
-    team: Option<&str>,
-    color: Color,
-) {
-    ui.horizontal(|ui| {
-        let (rect, _) = ui.allocate_exact_size(vec2(10.0, 10.0), Sense::hover());
-        let fill = match color {
-            Color::White => Color32::from_gray(235),
-            Color::Black => Color32::from_gray(45),
-        };
-        ui.painter().circle_filled(rect.center(), 4.0, fill);
-        ui.painter().circle_stroke(
-            rect.center(),
-            4.0,
-            Stroke::new(1.0, Color32::from_gray(120)),
-        );
-        let width = (ui.available_width() - 48.0).max(80.0);
-        ui.vertical(|ui| {
-            let mut label = LayoutJob::default();
-            if let Some(title) = title {
-                label.append(
-                    title,
-                    0.0,
-                    TextFormat {
-                        font_id: FontId::proportional(12.0),
-                        color: GOLD,
-                        ..Default::default()
-                    },
-                );
-                label.append(
-                    " ",
-                    0.0,
-                    TextFormat {
-                        font_id: FontId::proportional(15.5),
-                        color: Color32::from_gray(230),
-                        ..Default::default()
-                    },
-                );
-            }
-            label.append(
-                name,
-                0.0,
-                TextFormat {
-                    font_id: FontId::proportional(15.5),
-                    color: Color32::from_gray(230),
-                    ..Default::default()
-                },
-            );
-            if let Some(country) = country {
-                let format = TextFormat {
-                    font_id: FontId::proportional(10.5),
-                    color: Color32::from_gray(150),
-                    ..Default::default()
-                };
-                label.append(" · ", 0.0, format.clone());
-                label.append(country, 0.0, format);
-            }
-            if let Some(id) = fide_id {
-                let format = TextFormat {
-                    font_id: FontId::proportional(10.5),
-                    color: Color32::from_gray(150),
-                    ..Default::default()
-                };
-                label.append(" · ", 0.0, format.clone());
-                label.append(id, 0.0, format);
-            }
-            ui.allocate_ui_with_layout(
-                vec2(width, 21.0),
-                Layout::left_to_right(Align::Center),
-                |ui| {
-                    ui.add(egui::Label::new(label).truncate())
-                        .on_hover_text(name)
-                },
-            );
-            if let Some(team) = team.filter(|team| !team.trim().is_empty()) {
-                ui.label(
-                    RichText::new(team.trim())
-                        .small()
-                        .color(Color32::from_gray(150)),
-                )
-                .on_hover_text("Team");
-            }
-        });
-        if let Some(rating) = rating {
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                meta_chip(ui, &rating);
-            });
-        }
-    });
-}
-
-fn team_for(game: &Game, color: Color) -> Option<&str> {
-    game.header(match color {
-        Color::White => "WhiteTeam",
-        Color::Black => "BlackTeam",
-    })
-}
-
-fn title_from_tag(raw: Option<&str>) -> Option<&'static str> {
-    titles::normalize(raw?).map(titles::PlayerTitle::short)
-}
-
-fn player_title(game: &Game, color: Color) -> Option<&'static str> {
-    title_from_tag(game.header(match color {
-        Color::White => "WhiteTitle",
-        Color::Black => "BlackTitle",
-    }))
-}
-
-fn player_fide_id_from_header(raw: Option<&str>) -> Option<String> {
-    fide::from_tag(raw).map(str::to_string)
-}
-
-fn player_fide_id(game: &Game, color: Color) -> Option<&str> {
-    fide::from_tag(game.header(match color {
-        Color::White => "WhiteFideId",
-        Color::Black => "BlackFideId",
-    }))
-}
-
-fn player_country_from_header(raw: Option<&str>) -> Option<Country> {
-    country::from_header(raw)
-}
-
-fn player_country(game: &Game, color: Color) -> Option<Country> {
-    let raw = match color {
-        Color::White => game
-            .header("WhiteCountry")
-            .or_else(|| game.header("WhiteFed")),
-        Color::Black => game
-            .header("BlackCountry")
-            .or_else(|| game.header("BlackFed")),
-    };
-    country::from_header(raw)
-}
-
-/// `3.4` means round 3, board 4. A plain value is a round with no board.
-fn round_and_board(value: &str) -> (String, Option<String>) {
-    let value = value.trim();
-    if value.is_empty() {
-        return (String::new(), None);
-    }
-    match value.split_once('.') {
-        Some((round, board)) => (
-            round.trim().to_string(),
-            Some(board.trim().to_string()).filter(|board| !board.is_empty()),
-        ),
-        None => (value.to_string(), None),
-    }
-}
-
-fn combine_round(round: &str, board: &str) -> String {
-    let round = round.trim();
-    let board = board.trim();
-    if board.is_empty() {
-        round.to_string()
-    } else if round.is_empty() {
-        format!(".{board}")
-    } else {
-        format!("{round}.{board}")
-    }
-}
-
-/// Database views use `Family, Given`; preparation sentences read more
-/// naturally as `Given Family`.
-fn book_annotation_label(annotation: Option<u8>, recommendation: Option<u8>) -> String {
-    let mut label = match annotation {
-        None | Some(0) => String::new(),
-        Some(1) => "!".to_string(),
-        Some(2) => "?".to_string(),
-        Some(3) => "!!".to_string(),
-        Some(4) => "??".to_string(),
-        Some(5) => "!?".to_string(),
-        Some(6) => "?!".to_string(),
-        Some(code) => format!("#{code:02x}"),
-    };
-    if recommendation.is_some() {
-        if !label.is_empty() {
-            label.push(' ');
-        }
-        label.push('★');
-    }
-    label
-}
-
-fn compact_count(value: u64) -> String {
-    if value >= 1_000_000_000 {
-        format!("{:.2}B", value as f64 / 1_000_000_000.0)
-    } else if value >= 1_000_000 {
-        format!("{:.2}M", value as f64 / 1_000_000.0)
-    } else if value >= 10_000 {
-        format!("{:.1}k", value as f64 / 1_000.0)
-    } else {
-        value.to_string()
-    }
-}
-
-fn natural_player_name(name: &str) -> String {
-    let name = name.trim();
-    match name.split_once(',') {
-        Some((family, given)) => {
-            let family = family.trim();
-            let given = given.trim();
-            if family.is_empty() {
-                given.to_string()
-            } else if given.is_empty() {
-                family.to_string()
-            } else {
-                format!("{given} {family}")
-            }
-        }
-        None => name.to_string(),
-    }
-}
-
-fn month_name(month: u32) -> &'static str {
-    match month {
-        1 => "January",
-        2 => "February",
-        3 => "March",
-        4 => "April",
-        5 => "May",
-        6 => "June",
-        7 => "July",
-        8 => "August",
-        9 => "September",
-        10 => "October",
-        11 => "November",
-        12 => "December",
-        _ => "",
-    }
-}
-
-fn previous_month(picker: &mut DatePicker) {
-    if picker.month == 1 {
-        picker.month = 12;
-        picker.year -= 1;
-    } else {
-        picker.month -= 1;
-    }
-}
-
-fn next_month(picker: &mut DatePicker) {
-    if picker.month == 12 {
-        picker.month = 1;
-        picker.year += 1;
-    } else {
-        picker.month += 1;
-    }
-}
-
-fn days_in_month(year: i32, month: u32) -> u32 {
-    match month {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        2 if is_leap_year(year) => 29,
-        2 => 28,
-        _ => 30,
-    }
-}
-
-fn is_leap_year(year: i32) -> bool {
-    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
-}
-
-/// Monday-based weekday for the first day of a month.
-fn weekday_monday(year: i32, month: u32, day: u32) -> u32 {
-    let days = days_from_civil(year, month, day);
-    (days + 3).rem_euclid(7) as u32
-}
-
-fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
-    let year = if month <= 2 { year - 1 } else { year };
-    let era = if year >= 0 { year } else { year - 399 } / 400;
-    let year_of_era = (year - era * 400) as u32;
-    let month_prime = if month > 2 { month - 3 } else { month + 9 };
-    let day_of_year = (153 * month_prime + 2) / 5 + day - 1;
-    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
-    era as i64 * 146_097 + day_of_era as i64 - 719_468
-}
-
-fn pgn_from_ymd(year: i32, month: u32, day: u32) -> String {
-    format!("{year:04}.{month:02}.{day:02}")
-}
-
-fn left_sized_label(ui: &mut Ui, width: f32, height: f32, text: RichText) -> egui::Response {
-    ui.allocate_ui_with_layout(
-        vec2(width, height),
-        Layout::left_to_right(Align::Center),
-        |ui| ui.add(egui::Label::new(text).truncate()),
-    )
-    .inner
-}
-
-fn meta_chip(ui: &mut Ui, text: &str) {
-    meta_chip_hover(ui, text, text);
-}
-
-fn meta_chip_hover(ui: &mut Ui, text: &str, hover: &str) {
-    egui::Frame::new()
-        .fill(Color32::from_rgb(0x2A, 0x2E, 0x32))
-        .corner_radius(4.0)
-        .inner_margin(egui::Margin::symmetric(6, 2))
-        .show(ui, |ui| {
-            ui.label(
-                RichText::new(text)
-                    .monospace()
-                    .small()
-                    .color(Color32::from_gray(190)),
-            )
-            .on_hover_text(hover);
-        });
-}
-
-fn accent_chip(ui: &mut Ui, text: &str) {
-    egui::Frame::new()
-        .fill(GOLD_SOFT)
-        .corner_radius(4.0)
-        .inner_margin(egui::Margin::symmetric(6, 2))
-        .show(ui, |ui| {
-            ui.label(RichText::new(text).monospace().small().strong().color(GOLD));
-        });
-}
-
-fn result_badge(ui: &mut Ui, result: &str) {
-    let (label, fill, text) = match result {
-        "1-0" => (
-            "1–0",
-            Color32::from_rgb(0x32, 0x43, 0x34),
-            Color32::from_rgb(0xBF, 0xDF, 0xC4),
-        ),
-        "0-1" => (
-            "0–1",
-            Color32::from_rgb(0x43, 0x33, 0x33),
-            Color32::from_rgb(0xE0, 0xC0, 0xC0),
-        ),
-        "1/2-1/2" => (
-            "½–½",
-            Color32::from_rgb(0x39, 0x3B, 0x3E),
-            Color32::from_rgb(0xD0, 0xD2, 0xD4),
-        ),
-        other => (
-            other,
-            Color32::from_rgb(0x33, 0x35, 0x38),
-            Color32::from_gray(190),
-        ),
-    };
-    egui::Frame::new()
-        .fill(fill)
-        .corner_radius(4.0)
-        .inner_margin(egui::Margin::symmetric(6, 3))
-        .show(ui, |ui| {
-            ui.label(RichText::new(label).small().strong().color(text));
-        });
-}
-
-fn render_readonly_move_line(
-    ui: &mut Ui,
-    line: &domain::MoveLine,
-    game: &Game,
-    selected: usize,
-    clicked: &mut Option<usize>,
-) {
-    if line.depth > 0 {
-        ui.horizontal(|ui| {
-            ui.add_space(8.0 * line.depth as f32);
-            egui::Frame::new()
-                .fill(VARIATION_BG)
-                .corner_radius(5.0)
-                .inner_margin(5.0)
-                .show(ui, |ui| {
-                    render_readonly_move_tokens(ui, line, game, selected, clicked);
-                });
-        });
-    } else {
-        render_readonly_move_tokens(ui, line, game, selected, clicked);
-    }
-}
-
-fn render_readonly_move_tokens(
-    ui: &mut Ui,
-    line: &domain::MoveLine,
-    game: &Game,
-    selected: usize,
-    clicked: &mut Option<usize>,
-) {
-    ui.horizontal_wrapped(|ui| {
-        for token in &line.tokens {
-            match token {
-                Token::OpenParen => {
-                    ui.label(RichText::new("(").weak().small());
-                }
-                Token::CloseParen => {
-                    ui.label(RichText::new(")").weak().small());
-                }
-                Token::Move {
-                    node,
-                    number,
-                    color,
-                    san,
-                    line_start,
-                } => {
-                    let prefix = match color {
-                        Color::White => format!("{number}."),
-                        Color::Black if *line_start => format!("{number}…"),
-                        Color::Black => String::new(),
-                    };
-                    if !prefix.is_empty() {
-                        ui.label(
-                            RichText::new(prefix)
-                                .monospace()
-                                .small()
-                                .color(Color32::from_gray(135)),
-                        );
-                    }
-                    let response = move_chip(ui, *node == selected, san, line.depth > 0);
-                    if response.clicked() {
-                        *clicked = Some(*node);
-                    }
-
-                    let symbols = nag_symbols(&game.nodes[*node].nags);
-                    if !symbols.is_empty() {
-                        ui.label(RichText::new(symbols).small().strong().color(GOLD));
-                    }
-
-                    let comment = game.nodes[*node].comment.trim();
-                    if !comment.is_empty() {
-                        ui.label(
-                            RichText::new(format!("“{}”", comment_preview(comment, 48)))
-                                .italics()
-                                .small()
-                                .color(COMMENT_TEXT),
-                        )
-                        .on_hover_text(comment);
-                    }
-                }
-            }
-        }
-    });
-}
-
-/// Render the whole move tree as one continuous, wrapped PGN stream.
-///
-/// Variations stay inline inside parentheses instead of forcing the mainline
-/// onto a new line at every branch, which keeps long annotated games readable.
-#[allow(clippy::too_many_arguments)]
-fn render_move_tokens_flat(
-    ui: &mut Ui,
-    tokens: &[Token],
-    game: &Game,
-    selected: usize,
-    clicked: &mut Option<usize>,
-    open_editor: &mut Option<usize>,
-    nag_action: &mut Option<(usize, Option<u8>)>,
-    hover_preview: &mut Option<HoverPreview>,
-    allow_hover: bool,
-    diagrams: &BTreeSet<usize>,
-    diagram_toggle: &mut Option<usize>,
-) {
-    let mut depth = 0usize;
-    let mut last_move: Option<(u32, Color)> = None;
-    let mut force_number = true;
-    ui.horizontal_wrapped(|ui| {
-        ui.spacing_mut().item_spacing = vec2(2.5, 4.0);
-        for token in tokens {
-            match token {
-                Token::OpenParen => {
-                    depth += 1;
-                    force_number = true;
-                    ui.label(
-                        RichText::new("(")
-                            .monospace()
-                            .small()
-                            .color(Color32::from_gray(120)),
-                    );
-                }
-                Token::CloseParen => {
-                    depth = depth.saturating_sub(1);
-                    force_number = true;
-                    ui.label(
-                        RichText::new(")")
-                            .monospace()
-                            .small()
-                            .color(Color32::from_gray(120)),
-                    );
-                }
-                Token::Move {
-                    node,
-                    number,
-                    color,
-                    san,
-                    ..
-                } => {
-                    let prefix = match color {
-                        Color::White => format!("{number}."),
-                        Color::Black
-                            if force_number
-                                || !matches!(
-                                    last_move,
-                                    Some((previous, Color::White)) if previous == *number
-                                ) =>
-                        {
-                            format!("{number}…")
-                        }
-                        Color::Black => String::new(),
-                    };
-                    if !prefix.is_empty() {
-                        ui.label(
-                            RichText::new(prefix)
-                                .monospace()
-                                .small()
-                                .color(Color32::from_gray(128)),
-                        );
-                    }
-                    let response = move_chip(ui, *node == selected, san, depth > 0);
-                    if allow_hover && response.hovered() {
-                        *hover_preview = Some(HoverPreview {
-                            pos: game.nodes[*node].pos.clone(),
-                            last_move: domain::last_move_squares(&game.nodes[*node]),
-                        });
-                    }
-                    if response.clicked() {
-                        *clicked = Some(*node);
-                    }
-                    move_context_menu(
-                        &response,
-                        *node,
-                        game,
-                        nag_action,
-                        open_editor,
-                        diagrams,
-                        diagram_toggle,
-                    );
-
-                    let symbols = nag_symbols(&game.nodes[*node].nags);
-                    if !symbols.is_empty() {
-                        let response = annotation_chip(ui, &symbols, depth > 0);
-                        if response.clicked() {
-                            *open_editor = Some(*node);
-                        }
-                        move_context_menu(
-                            &response,
-                            *node,
-                            game,
-                            nag_action,
-                            open_editor,
-                            diagrams,
-                            diagram_toggle,
-                        );
-                    }
-
-                    if diagrams.contains(node) {
-                        ui.label(RichText::new("▣").small().color(GOLD))
-                            .on_hover_text("A diagram will be printed after this move");
-                    }
-
-                    let comment = game.nodes[*node].comment.trim();
-                    if !comment.is_empty() {
-                        let preview = comment_preview(comment, 58);
-                        let response = ui.add(
-                            egui::Label::new(
-                                RichText::new(format!("“{preview}”"))
-                                    .italics()
-                                    .small()
-                                    .color(COMMENT_TEXT),
-                            )
-                            .sense(Sense::click()),
-                        );
-                        if response.clicked() {
-                            *open_editor = Some(*node);
-                        }
-                        response
-                            .on_hover_text("Click to edit this comment")
-                            .on_hover_text(comment);
-                    }
-                    last_move = Some((*number, *color));
-                    force_number = false;
-                }
-            }
-        }
-    });
-}
-
-fn move_chip(ui: &mut Ui, selected: bool, san: &str, muted: bool) -> egui::Response {
-    let text_color = if selected {
-        Color32::WHITE
-    } else if muted {
-        Color32::from_gray(180)
-    } else {
-        Color32::from_gray(225)
-    };
-    let galley = ui.painter().layout_no_wrap(
-        domain::figurine_san(san),
-        FontId::monospace(13.5),
-        text_color,
-    );
-    let (rect, response) = ui.allocate_exact_size(galley.size() + vec2(12.0, 6.0), Sense::click());
-    let fill = if selected {
-        GOLD_SOFT
-    } else if response.hovered() {
-        Color32::from_gray(43)
-    } else {
-        Color32::TRANSPARENT
-    };
-    if fill != Color32::TRANSPARENT {
-        ui.painter().rect_filled(rect, 4.0, fill);
-    }
-    if selected {
-        ui.painter()
-            .rect_stroke(rect, 4.0, Stroke::new(1.0, GOLD), StrokeKind::Inside);
-    }
-    ui.painter()
-        .galley(rect.min + vec2(6.0, 3.0), galley, text_color);
-    response.on_hover_text("Left-click to jump · right-click to annotate")
-}
-
-fn annotation_chip(ui: &mut Ui, symbols: &str, muted: bool) -> egui::Response {
-    let color = if muted {
-        Color32::from_rgb(0xD2, 0xBC, 0x86)
-    } else {
-        GOLD
-    };
-    let galley =
-        ui.painter()
-            .layout_no_wrap(symbols.to_string(), FontId::proportional(11.5), color);
-    let (rect, response) = ui.allocate_exact_size(galley.size() + vec2(9.0, 3.0), Sense::click());
-    let fill = if response.hovered() {
-        GOLD_SOFT
-    } else {
-        Color32::from_rgb(0x33, 0x30, 0x23)
-    };
-    ui.painter().rect_filled(rect, 3.0, fill);
-    ui.painter()
-        .galley(rect.min + vec2(4.5, 1.5), galley, color);
-    response.on_hover_text("Click to edit annotations · right-click for the palette")
-}
-
-fn move_context_menu(
-    response: &egui::Response,
-    node: usize,
-    game: &Game,
-    nag_action: &mut Option<(usize, Option<u8>)>,
-    open_editor: &mut Option<usize>,
-    diagrams: &BTreeSet<usize>,
-    diagram_toggle: &mut Option<usize>,
-) {
-    response.context_menu(|ui| {
-        ui.set_min_width(260.0);
-        let san = game.nodes[node]
-            .mv
-            .as_ref()
-            .map(|ply| domain::figurine_san(&ply.san))
-            .unwrap_or_else(|| "Start position".to_string());
-        ui.label(RichText::new(format!("Annotate {san}")).strong());
-        ui.separator();
-        if node > 0 {
-            if let Some(nag) = nag_palette(ui, &game.nodes[node].nags, true) {
-                *nag_action = Some((node, Some(nag)));
-                ui.close();
-            }
-        } else {
-            ui.label(RichText::new("Annotations belong to moves.").weak());
-        }
-        ui.separator();
-        if ui.button("Edit comment and annotations…").clicked() {
-            *open_editor = Some(node);
-            ui.close();
-        }
-        if ui.button("Clear annotations").clicked() {
-            *nag_action = Some((node, None));
-            ui.close();
-        }
-        ui.separator();
-        let (label, hint) = if diagrams.contains(&node) {
-            (
-                "Remove diagram after this move",
-                "Stop printing a board diagram at this position",
-            )
-        } else {
-            (
-                "Add diagram after this move",
-                "Print a board diagram at this position",
-            )
-        };
-        if ui.button(label).on_hover_text(hint).clicked() {
-            *diagram_toggle = Some(node);
-            ui.close();
-        }
-    });
-}
-
-fn nag_palette(ui: &mut Ui, current: &[u8], compact: bool) -> Option<u8> {
-    let mut clicked = None;
-    let (button_width, button_height) = if compact { (18.0, 18.0) } else { (21.0, 20.0) };
-    for &(group, choices) in domain::NAG_GROUPS {
-        // One row per category. The buttons are deliberately compact so the
-        // whole palette fits the right-hand panel without wrapping.
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing = vec2(2.0, 2.0);
-            ui.add_sized(
-                [if compact { 42.0 } else { 64.0 }, button_height],
-                egui::Label::new(
-                    RichText::new(group)
-                        .size(if compact { 9.5 } else { 10.5 })
-                        .strong()
-                        .color(Color32::from_gray(155)),
-                ),
-            );
-            for &choice in choices {
-                let active = current.contains(&choice.code);
-                let button = egui::Button::new(
-                    RichText::new(choice.symbol)
-                        .size(if compact { 11.5 } else { 13.0 })
-                        .strong()
-                        .color(if active {
-                            Color32::from_rgb(0x19, 0x1B, 0x1D)
-                        } else {
-                            GOLD
-                        }),
-                )
-                .fill(if active {
-                    GOLD
-                } else {
-                    Color32::from_rgb(0x2A, 0x2E, 0x32)
-                })
-                .stroke(Stroke::NONE)
-                .corner_radius(4.0);
-                if ui
-                    .add_sized([button_width, button_height], button)
-                    .on_hover_text(choice.label)
-                    .clicked()
-                {
-                    clicked = Some(choice.code);
-                }
-            }
-        });
-        ui.add_space(if compact { 1.0 } else { 2.0 });
-    }
-    clicked
-}
-
-fn nag_symbols(nags: &[u8]) -> String {
-    let mut out = String::new();
-    for &nag in nags {
-        if let Some(symbol) = domain::nag_symbol(nag) {
-            if !out.is_empty() {
-                out.push(' ');
-            }
-            out.push_str(symbol);
-        }
-    }
-    out
-}
-
-fn nag_conflicts(existing: u8, new: u8) -> bool {
-    fn group(nag: u8) -> u8 {
-        match nag {
-            1..=9 => 1,
-            10..=21 => 2,
-            _ => 3,
-        }
-    }
-    let new_group = group(new);
-    new_group < 3 && group(existing) == new_group
-}
-
-fn comment_preview(comment: &str, max_chars: usize) -> String {
-    let flat = comment.split_whitespace().collect::<Vec<_>>().join(" ");
-    let mut chars = flat.chars();
-    let preview: String = chars.by_ref().take(max_chars).collect();
-    if chars.next().is_some() {
-        format!("{preview}…")
-    } else {
-        preview
-    }
-}
-
-fn depth_of(game: &Game, mut node: usize) -> usize {
-    let mut d = 0;
-    while let Some(parent) = game.nodes[node].parent {
-        node = parent;
-        d += 1;
-    }
-    d
-}
-
-/// PGN counts full moves, not plies. `1. e4 e5` is one move.
-fn full_moves(plies: usize) -> usize {
-    plies.div_ceil(2)
-}
-
-fn branch_option_label(game: &Game, node: usize) -> String {
-    let Some(ply) = game.nodes.get(node).and_then(|node| node.mv.as_ref()) else {
-        return "?".to_string();
-    };
-    let prefix = match ply.color {
-        Color::White => format!("{}.", ply.number),
-        Color::Black => format!("{}...", ply.number),
-    };
-    let mut label = format!("{prefix} {}", domain::figurine_san(&ply.san));
-    let comment = game.nodes[node].comment.trim();
-    if !comment.is_empty() {
-        label.push_str("  ·  ");
-        label.push_str(&comment_preview(comment, 44));
-    }
-    label
-}
-
-fn is_read_only_export_target(path: &std::path::Path) -> bool {
-    read_only_roots()
-        .iter()
-        .any(|root| path_is_under(path, root))
-}
-
-/// The three files that make up one SCID4 database.
-fn scid_triple(path: &std::path::Path) -> [PathBuf; 3] {
-    [
-        path.to_path_buf(),
-        path.with_extension("sn4"),
-        path.with_extension("sg4"),
-    ]
-}
-
-fn same_file_path(left: &std::path::Path, right: &std::path::Path) -> bool {
-    if left == right {
-        return true;
-    }
-    matches!(
-        (std::fs::canonicalize(left), std::fs::canonicalize(right)),
-        (Ok(left), Ok(right)) if left == right
-    )
-}
-
-fn path_is_under(path: &std::path::Path, root: &std::path::Path) -> bool {
-    let candidate = std::fs::canonicalize(path)
-        .or_else(|_| std::fs::canonicalize(path.parent().unwrap_or(std::path::Path::new("."))));
-    let root = std::fs::canonicalize(root);
-    matches!((candidate, root), (Ok(path), Ok(root)) if path.starts_with(&root))
-}
-
-fn human_bytes(bytes: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = 1024 * KB;
-    const GB: u64 = 1024 * MB;
-    if bytes >= GB {
-        format!("{:.1} GB", bytes as f64 / GB as f64)
-    } else if bytes >= MB {
-        format!("{:.0} MB", bytes as f64 / MB as f64)
-    } else if bytes >= KB {
-        format!("{:.0} KB", bytes as f64 / KB as f64)
-    } else {
-        format!("{bytes} bytes")
-    }
-}
-
-fn games_label(n: usize) -> String {
-    if n == 1 {
-        "1 game".to_string()
-    } else {
-        format!("{n} games")
-    }
-}
-
-fn positions_label(n: usize) -> String {
-    if n == 1 {
-        "1 position".to_string()
-    } else {
-        format!("{n} positions")
-    }
-}
-
-fn moves_label(n: usize) -> String {
-    if n == 1 {
-        "1 move".to_string()
-    } else {
-        format!("{n} moves")
-    }
-}
-
-#[derive(Clone, Copy)]
-struct GameRowDrag {
-    id: usize,
-}
-
-#[derive(Clone, Copy)]
-struct ViewGameDrag {
-    view: usize,
-    id: usize,
-}
-
-#[derive(Clone, Copy)]
-struct ViewDatabaseDrag {
-    view: usize,
-}
-
-/// Two-line, full-width selectable row for the game list.
-#[allow(clippy::too_many_arguments)]
-fn player_row(
-    ui: &mut Ui,
-    selected: bool,
-    name: &str,
-    title: Option<&str>,
-    country: Option<&str>,
-    fide_id: Option<&str>,
-    subtitle: &str,
-    width: f32,
-    photo: Option<&egui::TextureHandle>,
-    champion: Option<&'static champions::Champion>,
-) -> (egui::Response, bool) {
-    let (rect, response) = ui.allocate_exact_size(vec2(width, 44.0), Sense::click());
-    let visuals = ui.visuals();
-    let bg = if selected {
-        visuals.selection.bg_fill
-    } else if response.hovered() {
-        visuals.widgets.hovered.bg_fill
-    } else {
-        Color32::TRANSPARENT
-    };
-    let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, 4.0, bg);
-
-    let mut photo_clicked = false;
-    let text_left = if let Some(texture) = photo {
-        let avatar =
-            egui::Rect::from_min_size(pos2(rect.left() + 6.0, rect.top() + 6.0), vec2(34.0, 34.0));
-        painter.rect_filled(avatar, 4.0, Color32::from_rgb(0x2C, 0x30, 0x34));
-        painter.image(
-            texture.id(),
-            avatar,
-            egui::Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
-            Color32::WHITE,
-        );
-        painter.rect_stroke(
-            avatar,
-            4.0,
-            Stroke::new(1.0, Color32::from_gray(95)),
-            StrokeKind::Inside,
-        );
-        let photo_response = ui.interact(avatar, response.id.with("photo"), Sense::click());
-        if photo_response.hovered() {
-            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-        }
-        photo_clicked = photo_response.clicked();
-        rect.left() + 48.0
-    } else {
-        rect.left() + 8.0
-    };
-
-    let mut job = LayoutJob::default();
-    let name_format = TextFormat {
-        font_id: FontId::proportional(14.0),
-        color: visuals.strong_text_color(),
-        ..Default::default()
-    };
-    let title_format = TextFormat {
-        font_id: FontId::proportional(10.5),
-        color: GOLD,
-        ..Default::default()
-    };
-    let fide_format = TextFormat {
-        font_id: FontId::proportional(10.5),
-        color: visuals.weak_text_color(),
-        ..Default::default()
-    };
-    append_player_name(
-        &mut job,
-        name,
-        title,
-        country,
-        fide_id,
-        &title_format,
-        &name_format,
-        &fide_format,
-    );
-    if champion.is_some() {
-        job.append(
-            " 👑",
-            0.0,
-            TextFormat {
-                font_id: FontId::proportional(14.0),
-                color: GOLD,
-                ..Default::default()
-            },
-        );
-    }
-    let title_galley = painter.layout_job(job);
-    if let Some(champion) = champion {
-        crown_hover(
-            ui,
-            &title_galley,
-            pos2(text_left, rect.top() + 5.0),
-            response.id.with("crown"),
-            champion,
-        );
-    }
-    painter.galley(
-        pos2(text_left, rect.top() + 5.0),
-        title_galley,
-        visuals.strong_text_color(),
-    );
-    painter.text(
-        pos2(text_left, rect.top() + 23.0),
-        Align2::LEFT_TOP,
-        subtitle,
-        FontId::proportional(11.0),
-        visuals.weak_text_color(),
-    );
-    (response, photo_clicked)
-}
-
-#[derive(Clone, Copy)]
-struct RowName<'a> {
-    name: &'a str,
-    title: Option<&'a str>,
-    country: Option<&'a str>,
-    fide_id: Option<&'a str>,
-}
-
-impl<'a> RowName<'a> {
-    fn new(name: &'a str, title: Option<&'a str>) -> Self {
-        Self {
-            name,
-            title,
-            country: None,
-            fide_id: None,
-        }
-    }
-
-    fn with_country(mut self, country: Option<&'a str>) -> Self {
-        self.country = country;
-        self
-    }
-
-    fn with_fide_id(mut self, fide_id: Option<&'a str>) -> Self {
-        self.fide_id = fide_id;
-        self
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn append_player_name(
-    job: &mut LayoutJob,
-    name: &str,
-    title: Option<&str>,
-    country: Option<&str>,
-    fide_id: Option<&str>,
-    title_format: &TextFormat,
-    name_format: &TextFormat,
-    fide_format: &TextFormat,
-) {
-    if let Some(title) = title {
-        job.append(title, 0.0, title_format.clone());
-        job.append(" ", 0.0, name_format.clone());
-    }
-    job.append(name, 0.0, name_format.clone());
-    if let Some(country) = country {
-        job.append(" · ", 0.0, fide_format.clone());
-        job.append(country, 0.0, fide_format.clone());
-    }
-    if let Some(id) = fide_id {
-        job.append(" · ", 0.0, fide_format.clone());
-        job.append(id, 0.0, fide_format.clone());
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn game_row(
-    ui: &mut Ui,
-    selected: bool,
-    prefix: &str,
-    white: RowName<'_>,
-    black: Option<RowName<'_>>,
-    suffix: &str,
-    subtitle: &str,
-    width: f32,
-    height: f32,
-) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(vec2(width, height), Sense::click_and_drag());
-    let visuals = ui.visuals();
-    let bg = if selected {
-        visuals.selection.bg_fill
-    } else if response.hovered() {
-        visuals.widgets.hovered.bg_fill
-    } else {
-        Color32::TRANSPARENT
-    };
-    let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, 4.0, bg);
-
-    let name_format = TextFormat {
-        font_id: FontId::proportional(14.0),
-        color: visuals.strong_text_color(),
-        ..Default::default()
-    };
-    let title_format = TextFormat {
-        font_id: FontId::proportional(10.5),
-        color: GOLD,
-        ..Default::default()
-    };
-    let weak_format = TextFormat {
-        font_id: FontId::proportional(14.0),
-        color: visuals.weak_text_color(),
-        ..Default::default()
-    };
-    let fide_format = TextFormat {
-        font_id: FontId::proportional(10.5),
-        color: visuals.weak_text_color(),
-        ..Default::default()
-    };
-    let mut job = LayoutJob::default();
-    if !prefix.is_empty() {
-        job.append(prefix, 0.0, name_format.clone());
-    }
-    append_player_name(
-        &mut job,
-        white.name,
-        white.title,
-        white.country,
-        white.fide_id,
-        &title_format,
-        &name_format,
-        &fide_format,
-    );
-    if let Some(black) = black {
-        job.append(" – ", 0.0, weak_format);
-        append_player_name(
-            &mut job,
-            black.name,
-            black.title,
-            black.country,
-            black.fide_id,
-            &title_format,
-            &name_format,
-            &fide_format,
-        );
-    }
-    if !suffix.is_empty() {
-        job.append(suffix, 0.0, name_format);
-    }
-    job.wrap.max_width = (width - 16.0).max(24.0);
-    job.wrap.max_rows = 1;
-    job.wrap.break_anywhere = true;
-    let title_galley = painter.layout_job(job);
-    painter.galley(
-        rect.left_top() + vec2(8.0, 5.0),
-        title_galley,
-        visuals.strong_text_color(),
-    );
-    painter.text(
-        rect.left_top() + vec2(8.0, 23.0),
-        Align2::LEFT_TOP,
-        subtitle,
-        FontId::proportional(11.0),
-        visuals.weak_text_color(),
-    );
-    response
-}
-
-fn fen_string(pos: &crate::chess::Chess) -> String {
-    Fen::from_position(pos, EnPassantMode::Legal).to_string()
-}
-
-fn format_cp(cp: i32) -> String {
-    format!("{:+.2}", cp as f64 / 100.0)
-}
-
-/// Automatic local correspondence reference for the current position.
-fn correspondence_section(
-    ui: &mut Ui,
-    index: Option<&PositionIndex>,
-    pos: &Chess,
-    status: &str,
-) -> (Option<Move>, Option<HoverPreview>) {
-    let mut clicked = None;
-    let mut hover_preview = None;
-
-    egui::Frame::new()
-        .fill(SURFACE)
-        .corner_radius(10.0)
-        .stroke(Stroke::new(1.0, BORDER))
-        .inner_margin(10.0)
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.heading("Correspondence");
-                ui.label(RichText::new("automatic local reference").small().weak());
-                if let Some(index) = index {
-                    ui.label(
-                        RichText::new(games_label(index.game_count()))
-                            .small()
-                            .color(GOLD),
-                    );
-                }
-            });
-
-            let Some(index) = index else {
-                ui.label(RichText::new(status).small().weak().italics());
-                return;
-            };
-            let key = position::position_key(pos);
-            let Some(stats) = index.stats(key) else {
-                ui.label(
-                    RichText::new("No correspondence games reached this position.")
-                        .weak()
-                        .italics(),
-                );
-                return;
-            };
-            let mut moves = index.moves(key);
-            moves.sort_by(|a, b| b.games.cmp(&a.games).then_with(|| a.mv.cmp(&b.mv)));
-            if moves.is_empty() {
-                ui.label(
-                    RichText::new("No correspondence moves for this position.")
-                        .weak()
-                        .italics(),
-                );
-                return;
-            }
-
-            let elo = stats
-                .elo_avg()
-                .map(|elo| format!(" · avg Elo {elo:.0}"))
-                .unwrap_or_default();
-            ui.label(
-                RichText::new(format!(
-                    "{} games · White score {:.0}%{} · {}",
-                    stats.games,
-                    stats.score_white() * 100.0,
-                    elo,
-                    date_range(stats.first_date, stats.last_date)
-                ))
-                .small()
-                .weak(),
-            );
-            ui.add_space(3.0);
-
-            egui::Grid::new("correspondence-grid")
-                .num_columns(5)
-                .striped(true)
-                .spacing([8.0, 4.0])
-                .show(ui, |ui| {
-                    for heading in ["Move", "Games", "White", "W/D/L", "Elo"] {
-                        ui.label(RichText::new(heading).strong().small());
-                    }
-                    ui.end_row();
-                    for stat in moves.iter().take(12) {
-                        let Some(mv) = stat.to_move(pos) else {
-                            continue;
-                        };
-                        let san = stat
-                            .san(pos)
-                            .map(|san| domain::figurine_san(&san))
-                            .unwrap_or_else(|| "—".to_string());
-                        let response = ui.selectable_label(false, san).on_hover_text(format!(
-                            "Hover to preview · click to play · {} · {}",
-                            date_range(stat.first_date, stat.last_date),
-                            if stat.elo_avg().is_some() {
-                                format!("avg Elo {:.0}", stat.elo_avg().unwrap_or_default())
-                            } else {
-                                "no Elo".to_string()
-                            }
-                        ));
-                        if response.hovered() {
-                            hover_preview = preview_after_move(pos, mv);
-                        }
-                        if response.clicked() {
-                            clicked = Some(mv);
-                        }
-                        ui.label(stat.games.to_string());
-                        ui.label(format!("{:.0}%", stat.score_white() * 100.0));
-                        ui.label(format!("{}/{}/{}", stat.white, stat.draw, stat.black));
-                        ui.label(
-                            stat.elo_avg()
-                                .map(|elo| format!("{elo:.0}"))
-                                .unwrap_or_else(|| "—".to_string()),
-                        );
-                        ui.end_row();
-                    }
-                });
-            if moves.len() > 12 {
-                ui.label(
-                    RichText::new(format!(
-                        "Showing the 12 most-played of {} correspondence moves.",
-                        moves.len()
-                    ))
-                    .small()
-                    .weak(),
-                );
-            }
-        });
-
-    (clicked, hover_preview)
-}
-
-/// Merge remote cloud evaluations (chessdb.cn, Lichess cloud eval) with
-/// local cached evaluations (Stockfish, Leela, Generic).
-pub(crate) fn merge_multi_source_engine_rows(
-    snapshot: Option<&cloud::Snapshot>,
-    local: &[crate::analysis_cache::CachedAnalysis],
-    pos: &Chess,
-) -> Vec<CloudEngineRow> {
-    let chessdb = snapshot
-        .and_then(|s| s.chessdb.as_ref().ok())
-        .map(|data| data.moves.as_slice())
-        .unwrap_or_default();
-
-    let chessdb_score = |san: &str| {
-        chessdb
-            .iter()
-            .find(|mv| cloud::uci_san(pos, &mv.uci).as_deref() == Some(san))
-            .map(|mv| mv.white_score(pos.turn()))
-    };
-
-    let cloud_eval = snapshot.and_then(|s| s.cloud_eval.as_ref().ok());
-
-    // Include local analyses that have valid moves and depth
-    let qualified_local: Vec<&crate::analysis_cache::CachedAnalysis> = local
-        .iter()
-        .filter(|analysis| analysis.depth >= 1 && !analysis.pv.is_empty())
-        .collect();
-
-    struct CandidateSource {
-        uci: String,
-        san: String,
-        chessdb: Option<i32>,
-        lichess: Option<(Option<i32>, Option<i32>)>,
-        lichess_depth: Option<u32>,
-        lichess_pv: Option<Vec<String>>,
-        stockfish: Option<(Option<i32>, Option<i32>)>,
-        stockfish_depth: Option<u32>,
-        stockfish_name: Option<String>,
-        stockfish_pv: Option<Vec<String>>,
-        leela: Option<(Option<i32>, Option<i32>)>,
-        leela_depth: Option<u32>,
-        leela_name: Option<String>,
-        leela_pv: Option<Vec<String>>,
-    }
-
-    let mut candidates: Vec<CandidateSource> = Vec::new();
-
-    // 1. Process Lichess PVs
-    if let Some(eval) = cloud_eval {
-        for pv in &eval.pvs {
-            let moves: Vec<String> = pv.moves.split_whitespace().map(str::to_string).collect();
-            let Some(first) = moves.first() else { continue };
-            let san = cloud::uci_san(pos, first).unwrap_or_else(|| first.clone());
-            let entry = if let Some(existing) = candidates
-                .iter_mut()
-                .find(|c| c.san == san && c.lichess.is_none())
-            {
-                existing
-            } else {
-                candidates.push(CandidateSource {
-                    uci: first.clone(),
-                    san: san.clone(),
-                    chessdb: chessdb_score(&san),
-                    lichess: None,
-                    lichess_depth: None,
-                    lichess_pv: None,
-                    stockfish: None,
-                    stockfish_depth: None,
-                    stockfish_name: None,
-                    stockfish_pv: None,
-                    leela: None,
-                    leela_depth: None,
-                    leela_name: None,
-                    leela_pv: None,
-                });
-                candidates.last_mut().unwrap()
-            };
-            if entry.lichess.is_none() {
-                entry.lichess = Some((pv.cp, pv.mate));
-                entry.lichess_depth = Some(eval.depth);
-                entry.lichess_pv = Some(moves);
-            }
-        }
-    }
-
-    // 2. Process Qualified Local Analysis
-    for analysis in qualified_local {
-        let Some(first) = analysis.pv.first() else {
-            continue;
-        };
-        let san = cloud::uci_san(pos, first).unwrap_or_else(|| first.clone());
-        let entry = if let Some(existing) = candidates.iter_mut().find(|c| c.san == san) {
-            existing
-        } else {
-            candidates.push(CandidateSource {
-                uci: first.clone(),
-                san: san.clone(),
-                chessdb: chessdb_score(&san),
-                lichess: None,
-                lichess_depth: None,
-                lichess_pv: None,
-                stockfish: None,
-                stockfish_depth: None,
-                stockfish_name: None,
-                stockfish_pv: None,
-                leela: None,
-                leela_depth: None,
-                leela_name: None,
-                leela_pv: None,
-            });
-            candidates.last_mut().unwrap()
-        };
-
-        let sign = if pos.turn() == Color::White { 1 } else { -1 };
-        let score_cp_white = analysis.score_cp.map(|cp| cp * sign);
-        let score_mate_white = analysis.score_mate.map(|mate| mate * sign);
-
-        match analysis.engine_family {
-            crate::analysis_cache::EngineFamily::Stockfish => {
-                if entry.stockfish.is_none() || analysis.depth > entry.stockfish_depth.unwrap_or(0)
-                {
-                    entry.stockfish = Some((score_cp_white, score_mate_white));
-                    entry.stockfish_depth = Some(analysis.depth);
-                    entry.stockfish_name = Some(analysis.engine_name.clone());
-                    entry.stockfish_pv = Some(analysis.pv.clone());
-                }
-            }
-            crate::analysis_cache::EngineFamily::Leela => {
-                if entry.leela.is_none() || analysis.depth > entry.leela_depth.unwrap_or(0) {
-                    entry.leela = Some((score_cp_white, score_mate_white));
-                    entry.leela_depth = Some(analysis.depth);
-                    entry.leela_name = Some(analysis.engine_name.clone());
-                    entry.leela_pv = Some(analysis.pv.clone());
-                }
-            }
-            crate::analysis_cache::EngineFamily::Generic => {
-                if entry.stockfish.is_none() || analysis.depth > entry.stockfish_depth.unwrap_or(0)
-                {
-                    entry.stockfish = Some((score_cp_white, score_mate_white));
-                    entry.stockfish_depth = Some(analysis.depth);
-                    entry.stockfish_name = Some(analysis.engine_name.clone());
-                    entry.stockfish_pv = Some(analysis.pv.clone());
-                }
-            }
-        }
-    }
-
-    // 3. Process remaining ChessDB candidate moves
-    for mv in chessdb {
-        let san = cloud::uci_san(pos, &mv.uci).unwrap_or_else(|| mv.uci.clone());
-        if !candidates.iter().any(|c| c.san == san) {
-            candidates.push(CandidateSource {
-                uci: mv.uci.clone(),
-                san: san.clone(),
-                chessdb: Some(mv.white_score(pos.turn())),
-                lichess: None,
-                lichess_depth: None,
-                lichess_pv: Some(vec![mv.uci.clone()]),
-                stockfish: None,
-                stockfish_depth: None,
-                stockfish_name: None,
-                stockfish_pv: None,
-                leela: None,
-                leela_depth: None,
-                leela_name: None,
-                leela_pv: None,
-            });
-        }
-    }
-
-    // 4. Construct final CloudEngineRow instances with stacked variations
-    let mut rows: Vec<CloudEngineRow> = Vec::new();
-    for c in candidates {
-        let mut variations: Vec<(u32, String, Vec<String>)> = Vec::new();
-        if let Some(pv) = c.stockfish_pv {
-            let d = c.stockfish_depth.unwrap_or(0);
-            let name = c.stockfish_name.as_deref().unwrap_or("Stockfish");
-            variations.push((d, format!("{name} d{d}"), pv));
-        }
-        if let Some(pv) = c.lichess_pv {
-            let d = c.lichess_depth.unwrap_or(0);
-            variations.push((d, format!("Lichess d{d}"), pv));
-        }
-        if let Some(pv) = c.leela_pv {
-            let d = c.leela_depth.unwrap_or(0);
-            let name = c.leela_name.as_deref().unwrap_or("Leela");
-            variations.push((d, format!("{name} {d}k"), pv));
-        }
-
-        variations.sort_by_key(|a| std::cmp::Reverse(a.0));
-
-        let (variation, variation_source, alt_variation, alt_variation_source) =
-            match variations.len() {
-                0 => (vec![c.uci.clone()], None, None, None),
-                1 => {
-                    let v = variations.remove(0);
-                    (v.2, Some(v.1), None, None)
-                }
-                _ => {
-                    let primary = variations.remove(0);
-                    let secondary = variations.remove(0);
-                    (
-                        primary.2,
-                        Some(primary.1),
-                        Some(secondary.2),
-                        Some(secondary.1),
-                    )
-                }
-            };
-
-        rows.push(CloudEngineRow {
-            uci: c.uci,
-            san: c.san,
-            chessdb: c.chessdb,
-            lichess: c.lichess,
-            lichess_depth: c.lichess_depth,
-            stockfish: c.stockfish,
-            stockfish_depth: c.stockfish_depth,
-            stockfish_name: c.stockfish_name,
-            leela: c.leela,
-            leela_depth: c.leela_depth,
-            leela_name: c.leela_name,
-            variation,
-            variation_source,
-            alt_variation,
-            alt_variation_source,
-        });
-    }
-
-    cloud_sort_rows(&mut rows, pos.turn());
-    rows
-}
-
-#[cfg(test)]
-fn cloud_engine_rows(snapshot: &cloud::Snapshot, pos: &Chess) -> Vec<CloudEngineRow> {
-    merge_multi_source_engine_rows(Some(snapshot), &[], pos)
-}
-
-/// Number of leading rows that still have an engine line. Any chessdb-only
-/// rows after the last engine variation are trailing and can be folded into one
-/// compact line.
-fn cloud_primary_split(rows: &[CloudEngineRow]) -> usize {
-    rows.iter()
-        .rposition(|row| {
-            row.lichess.is_some()
-                || row.stockfish.is_some()
-                || row.leela.is_some()
-                || row.variation.len() > 1
-        })
-        .map_or(0, |index| index + 1)
-}
-
-/// Cloud Engine: chessdb.cn, Lichess cloud-eval, and local cached analysis
-/// in one compact table.
-fn cloud_engine_section(
-    ui: &mut Ui,
-    snapshot: Option<&cloud::Snapshot>,
-    local_cached: &[crate::analysis_cache::CachedAnalysis],
-    position: Option<&Chess>,
-    status: &str,
-) -> (Option<Vec<String>>, Option<HoverPreview>, bool) {
-    let mut clicked_line = None;
-    let mut hover_preview = None;
-    let mut open_cache_info = false;
-
-    egui::Frame::new()
-        .fill(SURFACE)
-        .corner_radius(10.0)
-        .stroke(Stroke::new(1.0, BORDER))
-        .inner_margin(10.0)
-        .show(ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.heading("Cloud Engine");
-                ui.label(
-                    RichText::new("chessdb.cn · Lichess cloud eval · Local cache")
-                        .small()
-                        .weak(),
-                );
-                if ui
-                    .small_button("ℹ")
-                    .on_hover_text("About local analysis storage and migration")
-                    .clicked()
-                {
-                    open_cache_info = true;
-                }
-                if let Some(Ok(eval)) = snapshot.map(|snapshot| &snapshot.cloud_eval) {
-                    ui.label(
-                        RichText::new(format!("Lichess d{} · {} PVs", eval.depth, eval.pvs.len()))
-                            .small()
-                            .color(GOLD),
-                    );
-                }
-            });
-
-            let Some(pos) = position else {
-                ui.label(RichText::new("Open a game to query cloud evaluations.").weak());
-                return;
-            };
-
-            let rows = merge_multi_source_engine_rows(snapshot, local_cached, pos);
-            let best_score = cloud_best_score(&rows, pos.turn());
-
-            if rows.is_empty() {
-                ui.label(
-                    RichText::new(if snapshot.is_none() && local_cached.is_empty() {
-                        status
-                    } else {
-                        "No engine moves for this position yet."
-                    })
-                    .weak()
-                    .italics(),
-                );
-            } else {
-                let has_chessdb = rows.iter().any(|r| r.chessdb.is_some());
-                let has_lichess = rows.iter().any(|r| r.lichess.is_some());
-                let has_stockfish = rows.iter().any(|r| r.stockfish.is_some());
-                let has_leela = rows.iter().any(|r| r.leela.is_some());
-
-                let lichess_heading = snapshot
-                    .and_then(|s| s.cloud_eval.as_ref().ok())
-                    .map(|eval| format!("Lichess (d{})", eval.depth))
-                    .unwrap_or_else(|| "Lichess".to_string());
-
-                let sf_max_depth = rows.iter().filter_map(|r| r.stockfish_depth).max();
-                let sf_heading = sf_max_depth
-                    .map(|d| format!("SF (d{d})"))
-                    .unwrap_or_else(|| "Stockfish".to_string());
-
-                let leela_max_depth = rows.iter().filter_map(|r| r.leela_depth).max();
-                let leela_heading = leela_max_depth
-                    .map(|d| format!("Lc0 ({d}k)"))
-                    .unwrap_or_else(|| "Lc0".to_string());
-
-                ui.horizontal(|ui| {
-                    if has_chessdb {
-                        left_sized_label(
-                            ui,
-                            64.0,
-                            18.0,
-                            RichText::new("chessdb").strong().small(),
-                        )
-                        .on_hover_text("chessdb.cn evaluation, White POV");
-                    }
-                    if has_lichess {
-                        left_sized_label(
-                            ui,
-                            90.0,
-                            18.0,
-                            RichText::new(lichess_heading).strong().small(),
-                        )
-                        .on_hover_text("Lichess cloud evaluation at this depth, White POV");
-                    }
-                    if has_stockfish {
-                        left_sized_label(
-                            ui,
-                            80.0,
-                            18.0,
-                            RichText::new(sf_heading).strong().small(),
-                        )
-                        .on_hover_text("Stockfish local cached evaluation, White POV");
-                    }
-                    if has_leela {
-                        left_sized_label(
-                            ui,
-                            80.0,
-                            18.0,
-                            RichText::new(leela_heading).strong().small(),
-                        )
-                        .on_hover_text("Leela Chess Zero cached evaluation, White POV");
-                    }
-                    ui.label(RichText::new("lines (deeper on top)").strong().small())
-                        .on_hover_text(
-                            "Sorted by composite score, best for side to move · Hover move to preview · click to play",
-                        );
-                });
-                ui.separator();
-
-                const PRIMARY_ROWS: usize = 8;
-                let primary_count = rows.len().min(PRIMARY_ROWS);
-                let primary = &rows[..primary_count];
-                let split = cloud_primary_split(primary);
-                let (primary_lines, trailing) = primary.split_at(split);
-
-                for row in primary_lines {
-                    cloud_row_ui(
-                        ui,
-                        row,
-                        pos,
-                        best_score,
-                        has_chessdb,
-                        has_lichess,
-                        has_stockfish,
-                        has_leela,
-                        &mut hover_preview,
-                        &mut clicked_line,
-                    );
-                }
-
-                let trailing_chessdb: Vec<&CloudEngineRow> = trailing
-                    .iter()
-                    .filter(|row| row.lichess.is_none() && row.stockfish.is_none() && row.leela.is_none())
-                    .collect();
-
-                if trailing_chessdb.len() >= 2 {
-                    ui.label(
-                        RichText::new("chessdb-only moves · no engine line")
-                            .small()
-                            .weak(),
-                    );
-                    ui.add_space(2.0);
-                    ui.horizontal_wrapped(|ui| {
-                        ui.spacing_mut().item_spacing = vec2(8.0, 3.0);
-                        for row in trailing_chessdb {
-                            cloud_compact_row_ui(
-                                ui,
-                                row,
-                                pos,
-                                best_score,
-                                &mut hover_preview,
-                                &mut clicked_line,
-                            );
-                        }
-                    });
-                } else {
-                    for row in trailing_chessdb {
-                        cloud_row_ui(
-                            ui,
-                            row,
-                            pos,
-                            best_score,
-                            has_chessdb,
-                            has_lichess,
-                            has_stockfish,
-                            has_leela,
-                            &mut hover_preview,
-                            &mut clicked_line,
-                        );
-                    }
-                }
-
-                if primary_count < rows.len() {
-                    let extra = &rows[primary_count..];
-                    egui::CollapsingHeader::new(
-                        RichText::new(format!("More moves ({})", extra.len()))
-                            .small()
-                            .weak(),
-                    )
-                    .default_open(false)
-                    .show(ui, |ui| {
-                        for row in extra {
-                            cloud_row_ui(
-                                ui,
-                                row,
-                                pos,
-                                best_score,
-                                has_chessdb,
-                                has_lichess,
-                                has_stockfish,
-                                has_leela,
-                                &mut hover_preview,
-                                &mut clicked_line,
-                            );
-                        }
-                    });
-                }
-            }
-
-            if let Some(s) = snapshot {
-                if let Err(err) = &s.chessdb {
-                    ui.label(RichText::new(format!("chessdb.cn: {err}")).small().weak());
-                }
-                if let Err(err) = &s.cloud_eval {
-                    ui.label(
-                        RichText::new(format!("Lichess cloud eval: {err}"))
-                            .small()
-                            .weak(),
-                    );
-                }
-            }
-        });
-
-    (clicked_line, hover_preview, open_cache_info)
-}
-
-/// Average the available White-POV centipawn scores from chessdb.cn, Lichess,
-/// and local cached evaluations (Stockfish, Leela).
-fn cloud_average_cp(row: &CloudEngineRow) -> Option<f64> {
-    let mut total = 0.0;
-    let mut count = 0;
-    if let Some(cp) = row.chessdb {
-        total += f64::from(cp);
-        count += 1;
-    }
-    if let Some(cp) = row.lichess.and_then(|(cp, _)| cp) {
-        total += f64::from(cp);
-        count += 1;
-    }
-    if let Some(cp) = row.stockfish.and_then(|(cp, _)| cp) {
-        total += f64::from(cp);
-        count += 1;
-    }
-    if let Some(cp) = row.leela.and_then(|(cp, _)| cp) {
-        let translated = crate::analysis_cache::leela_to_stockfish_cp(cp);
-        total += f64::from(translated);
-        count += 1;
-    }
-    (count > 0).then(|| total / f64::from(count))
-}
-
-/// A comparable White-POV score for a row. A mate dominates any
-/// centipawn score; otherwise use the average of the available cp sources.
-fn cloud_row_score(row: &CloudEngineRow) -> Option<f64> {
-    if let Some(mate) = row
-        .stockfish
-        .and_then(|(_, mate)| mate)
-        .or_else(|| row.lichess.and_then(|(_, mate)| mate))
-        .or_else(|| row.leela.and_then(|(_, mate)| mate))
-    {
-        return Some(if mate > 0 {
-            100_000.0 - f64::from(mate)
-        } else {
-            -100_000.0 - f64::from(mate)
-        });
-    }
-    cloud_average_cp(row)
-}
-
-/// Sort cloud rows by their average White-POV score, best move first for the
-/// side to move: White descends from the highest score, Black ascends from the
-/// lowest. Rows without any evaluation stay at the bottom in stable order.
-fn cloud_sort_rows(rows: &mut [CloudEngineRow], turn: Color) {
-    rows.sort_by(
-        |left, right| match (cloud_row_score(left), cloud_row_score(right)) {
-            (Some(left), Some(right)) => {
-                let order = left
-                    .partial_cmp(&right)
-                    .unwrap_or(std::cmp::Ordering::Equal);
-                if turn == Color::White {
-                    order.reverse()
-                } else {
-                    order
-                }
-            }
-            (Some(_), None) => std::cmp::Ordering::Less,
-            (None, Some(_)) => std::cmp::Ordering::Greater,
-            (None, None) => std::cmp::Ordering::Equal,
-        },
-    );
-}
-
-/// Best White-POV score among the candidate rows. White maximizes the score;
-/// Black minimizes it, so the lowest score is the baseline for Black.
-fn cloud_best_score(rows: &[CloudEngineRow], turn: Color) -> Option<f64> {
-    rows.iter()
-        .filter_map(cloud_row_score)
-        .reduce(|best, score| {
-            if turn == Color::White {
-                best.max(score)
-            } else {
-                best.min(score)
-            }
-        })
-}
-
-/// Centipawn loss relative to the best candidate move. Always non-negative.
-fn cloud_delta(row: &CloudEngineRow, best_score: Option<f64>, turn: Color) -> Option<f64> {
-    let score = cloud_row_score(row)?;
-    let best = best_score?;
-    Some(if turn == Color::White {
-        (best - score).max(0.0)
-    } else {
-        (score - best).max(0.0)
-    })
-}
-
-/// Green → yellow → orange → red for increasing centipawn loss against the
-/// best move. The small floor keeps a non-best move from being rendered in the
-/// same green as the optimal move when the candidates are very close.
-fn move_delta_color(delta_cp: f64) -> Color32 {
-    const STOPS: [(f64, [u8; 3]); 5] = [
-        (0.0, [0x7E, 0xD3, 0x8A]),
-        (10.0, [0xB6, 0xD8, 0x7A]),
-        (30.0, [0xE8, 0xC4, 0x6A]),
-        (70.0, [0xE8, 0x99, 0x5A]),
-        (120.0, [0xE0, 0x6C, 0x6C]),
-    ];
-    let delta = if delta_cp > 0.0 {
-        delta_cp.max(5.0)
-    } else {
-        0.0
-    };
-    if delta >= STOPS[STOPS.len() - 1].0 {
-        let [r, g, b] = STOPS[STOPS.len() - 1].1;
-        return Color32::from_rgb(r, g, b);
-    }
-    for pair in STOPS.windows(2) {
-        let (low, low_rgb) = pair[0];
-        let (high, high_rgb) = pair[1];
-        if delta <= high {
-            let t = ((delta - low) / (high - low)).clamp(0.0, 1.0) as f32;
-            let mix =
-                |a: u8, b: u8| (f32::from(a) + (f32::from(b) - f32::from(a)) * t).round() as u8;
-            return Color32::from_rgb(
-                mix(low_rgb[0], high_rgb[0]),
-                mix(low_rgb[1], high_rgb[1]),
-                mix(low_rgb[2], high_rgb[2]),
-            );
-        }
-    }
-    let [r, g, b] = STOPS[STOPS.len() - 1].1;
-    Color32::from_rgb(r, g, b)
-}
-
-fn cloud_eval_hint(row: &CloudEngineRow, delta: Option<f64>) -> String {
-    match delta {
-        Some(delta) if delta <= f64::EPSILON => {
-            "Best move · White maximizes, Black minimizes".to_string()
-        }
-        Some(_) if row.lichess.and_then(|(_, mate)| mate).is_some() => {
-            "Mate line, but worse than the best candidate".to_string()
-        }
-        Some(delta) if delta >= 1_000.0 => {
-            "Far worse than the best move · White maximizes, Black minimizes".to_string()
-        }
-        Some(delta) => {
-            format!("{delta:.1} cp worse than the best move · White maximizes, Black minimizes")
-        }
-        None => "No evaluation available".to_string(),
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn cloud_row_ui(
-    ui: &mut Ui,
-    row: &CloudEngineRow,
-    pos: &Chess,
-    best_score: Option<f64>,
-    has_chessdb: bool,
-    has_lichess: bool,
-    has_stockfish: bool,
-    has_leela: bool,
-    hover_preview: &mut Option<HoverPreview>,
-    clicked_line: &mut Option<Vec<String>>,
-) {
-    let delta = cloud_delta(row, best_score, pos.turn());
-    let eval_color = delta
-        .map(move_delta_color)
-        .unwrap_or_else(|| Color32::from_gray(150));
-    let eval_hint = cloud_eval_hint(row, delta);
-
-    ui.horizontal(|ui| {
-        if has_chessdb {
-            left_sized_label(
-                ui,
-                64.0,
-                20.0,
-                RichText::new(
-                    row.chessdb
-                        .map(format_cp)
-                        .unwrap_or_else(|| "—".to_string()),
-                )
-                .monospace()
-                .small()
-                .color(if row.chessdb.is_some() {
-                    eval_color
-                } else {
-                    Color32::from_gray(150)
-                }),
-            )
-            .on_hover_text(eval_hint.as_str());
-        }
-
-        if has_lichess {
-            left_sized_label(
-                ui,
-                90.0,
-                20.0,
-                RichText::new(
-                    row.lichess
-                        .map(|(cp, mate)| pv_score(cp, mate))
-                        .unwrap_or_else(|| "—".to_string()),
-                )
-                .monospace()
-                .small()
-                .color(if row.lichess.is_some() {
-                    eval_color
-                } else {
-                    Color32::from_gray(150)
-                }),
-            )
-            .on_hover_text(if let Some(d) = row.lichess_depth {
-                format!("{eval_hint} · Lichess depth {d}")
-            } else {
-                eval_hint.clone()
-            });
-        }
-
-        if has_stockfish {
-            let sf_text = row
-                .stockfish
-                .map(|(cp, mate)| pv_score(cp, mate))
-                .unwrap_or_else(|| "—".to_string());
-            let sf_tooltip = row
-                .stockfish_name
-                .as_deref()
-                .unwrap_or("Stockfish evaluation, White POV");
-            left_sized_label(
-                ui,
-                80.0,
-                20.0,
-                RichText::new(sf_text)
-                    .monospace()
-                    .small()
-                    .color(if row.stockfish.is_some() {
-                        eval_color
-                    } else {
-                        Color32::from_gray(150)
-                    }),
-            )
-            .on_hover_text(sf_tooltip);
-        }
-
-        if has_leela {
-            let leela_text = row
-                .leela
-                .map(|(cp, mate)| pv_score(cp, mate))
-                .unwrap_or_else(|| "—".to_string());
-            let engine_label = row.leela_name.as_deref().unwrap_or("Leela Chess Zero");
-            let leela_tooltip = if let Some((Some(cp), _)) = row.leela {
-                let sf_equiv = crate::analysis_cache::leela_to_stockfish_cp(cp);
-                format!(
-                    "{engine_label}: {} (~{} SF equivalent), White POV",
-                    format_cp(cp),
-                    format_cp(sf_equiv)
-                )
-            } else {
-                format!("{engine_label} evaluation, White POV")
-            };
-            left_sized_label(
-                ui,
-                80.0,
-                20.0,
-                RichText::new(leela_text)
-                    .monospace()
-                    .small()
-                    .color(if row.leela.is_some() {
-                        eval_color
-                    } else {
-                        Color32::from_gray(150)
-                    }),
-            )
-            .on_hover_text(leela_tooltip);
-        }
-
-        // Render variation lines: stacked 2-line layout if alt_variation exists, else single line
-        let line_width = (ui.available_width() - ui.spacing().item_spacing.x).max(80.0);
-        let height = if row.alt_variation.is_some() {
-            38.0
-        } else {
-            20.0
-        };
-        ui.allocate_ui_with_layout(
-            vec2(line_width, height),
-            Layout::top_down(Align::Min),
-            |ui| {
-                // Line 1: Primary (deeper) variation
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 2.0;
-                    if let Some(src) = &row.variation_source {
-                        ui.label(RichText::new(format!("[{src}]")).size(9.0).weak());
-                    }
-                    if row.variation.is_empty() {
-                        let response = ui
-                            .selectable_label(
-                                false,
-                                RichText::new(&row.san).small().color(eval_color),
-                            )
-                            .on_hover_text("Hover to preview · click to play");
-                        if response.hovered() {
-                            *hover_preview = preview_after_uci(pos, &row.uci);
-                        }
-                        if response.clicked() {
-                            *clicked_line = Some(vec![row.uci.clone()]);
-                        }
-                    } else {
-                        let steps = pv_steps(pos, &row.variation, row.variation.len());
-                        pv_steps_ui_compact(
-                            ui,
-                            &steps,
-                            &row.variation,
-                            hover_preview,
-                            clicked_line,
-                            Some(eval_color),
-                        );
-                    }
-                });
-
-                // Line 2: Alt variation (if present)
-                if let Some(alt_pv) = &row.alt_variation {
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 2.0;
-                        if let Some(src) = &row.alt_variation_source {
-                            ui.label(RichText::new(format!("[{src}]")).size(9.0).weak());
-                        }
-                        let steps = pv_steps(pos, alt_pv, alt_pv.len());
-                        pv_steps_ui_compact(
-                            ui,
-                            &steps,
-                            alt_pv,
-                            hover_preview,
-                            clicked_line,
-                            Some(Color32::from_gray(160)),
-                        );
-                    });
-                }
-            },
-        );
-    });
-    ui.add_space(2.0);
-}
-
-/// Compact chip for the folded chessdb-only moves. The Lichess column and its
-/// dash are intentionally omitted here; the foldout states once that these
-/// moves have no Lichess evaluation.
-fn cloud_compact_row_ui(
-    ui: &mut Ui,
-    row: &CloudEngineRow,
-    pos: &Chess,
-    best_score: Option<f64>,
-    hover_preview: &mut Option<HoverPreview>,
-    clicked_line: &mut Option<Vec<String>>,
-) {
-    let delta = cloud_delta(row, best_score, pos.turn());
-    let color = delta
-        .map(move_delta_color)
-        .unwrap_or_else(|| Color32::from_gray(150));
-    let steps = pv_steps(pos, &row.variation, 1);
-    let line = steps
-        .first()
-        .map(|step| {
-            let prefix = pv_move_prefix(step, None).unwrap_or_default();
-            format!("{prefix} {}", step.san)
-        })
-        .unwrap_or_else(|| row.san.clone());
-    let eval = row
-        .chessdb
-        .map(format_cp)
-        .unwrap_or_else(|| "—".to_string());
-    let label = format!("{eval} {line}");
-    let response = ui
-        .selectable_label(false, RichText::new(label).monospace().small().color(color))
-        .on_hover_text(cloud_eval_hint(row, delta));
-    if response.hovered() {
-        *hover_preview = steps
-            .first()
-            .map(|step| step.preview.clone())
-            .or_else(|| preview_after_uci(pos, &row.uci));
-    }
-    if response.clicked() {
-        *clicked_line = Some(if row.variation.is_empty() {
-            vec![row.uci.clone()]
-        } else {
-            row.variation.clone()
-        });
-    }
-}
-
-fn pv_score(cp: Option<i32>, mate: Option<i32>) -> String {
-    if let Some(mate) = mate {
-        return format!("M{mate}");
-    }
-    cp.map(format_cp).unwrap_or_else(|| "—".to_string())
-}
-
-fn open_library(path: &std::path::Path) -> anyhow::Result<Arc<dyn GameLibrary>> {
-    let extension = path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    if extension == "si4" || extension == "si3" {
-        ScidLibrary::open(path).map(|library| Arc::new(library) as Arc<dyn GameLibrary>)
-    } else if extension == "cbv" {
-        CbhLibrary::open_cbv(path).map(|library| Arc::new(library) as Arc<dyn GameLibrary>)
-    } else if extension == "cbh" {
-        CbhLibrary::open(path).map(|library| Arc::new(library) as Arc<dyn GameLibrary>)
-    } else if matches!(extension.as_str(), "2cbh" | "2cbg" | "2cba" | "2lid") {
-        TwoCbhLibrary::open(path).map(|library| Arc::new(library) as Arc<dyn GameLibrary>)
-    } else {
-        PgnLibrary::build(path.to_path_buf())
-            .map(|library| Arc::new(library) as Arc<dyn GameLibrary>)
-    }
-}
-
-fn index_summary(index: &PositionIndex) -> String {
-    format!(
-        "{} · {} positions · {:.1}s · {} index",
-        games_label(index.game_count()),
-        index.position_count(),
-        index.build_time().as_secs_f64(),
-        bytes_label(index.file_len())
-    )
-}
-
-fn bytes_label(bytes: u64) -> String {
-    if bytes >= 1024 * 1024 {
-        format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
-    } else {
-        format!("{:.0} KiB", bytes as f64 / 1024.0)
-    }
-}
-
-fn date_range(first: u32, last: u32) -> String {
-    let first = first / 10_000;
-    let last = last / 10_000;
-    match (first, last) {
-        (0, 0) => "—".to_string(),
-        (0, last) => format!("{last}"),
-        (first, 0) => format!("{first}"),
-        (first, last) if first == last => format!("{first}"),
-        (first, last) => format!("{first}–{last}"),
-    }
-}
-
-fn color_name(color: Color) -> &'static str {
-    match color {
-        Color::White => "White",
-        Color::Black => "Black",
-    }
-}
-
-/// Result from the prepared player's perspective.
-fn outcome_label(result: &str, color: Color) -> &'static str {
-    match (result, color) {
-        ("1-0", Color::White) | ("0-1", Color::Black) => "won",
-        ("0-1", Color::White) | ("1-0", Color::Black) => "lost",
-        ("1/2-1/2", _) => "drew",
-        _ => "unfinished",
-    }
-}
-
-fn prep_matches(app: &App, player_key: &str) -> bool {
-    app.prep
-        .as_ref()
-        .is_some_and(|prep| prep.player_key == player_key)
-}
-
-fn pgn_date(date: u32) -> String {
-    format!(
-        "{:04}.{:02}.{:02}",
-        date / 10_000,
-        (date / 100) % 100,
-        date % 100
-    )
-}
-
-fn short_date(date: u32) -> String {
-    if date == 0 {
-        "—".to_string()
-    } else {
-        format!("{:04}.{:02}", date / 10_000, (date / 100) % 100)
-    }
-}
-
-fn trend_label(trend: Option<f64>) -> (String, Color32) {
-    match trend {
-        Some(delta) if delta > 1.0 => (
-            format!("↑ +{delta:.0}pp"),
-            Color32::from_rgb(0x8F, 0xC9, 0x97),
-        ),
-        Some(delta) if delta < -1.0 => (
-            format!("↓ {delta:.0}pp"),
-            Color32::from_rgb(0xD9, 0x94, 0x94),
-        ),
-        _ => ("→ 0pp".to_string(), Color32::from_gray(150)),
-    }
-}
-
-/// Horizontal probability bar used by the player-prediction table. The filled
-/// width is the posterior mean; the gold segment marks the 90% interval.
-fn probability_bar(ui: &mut Ui, probability: f64, low: f64, high: f64) {
-    let (rect, response) = ui.allocate_exact_size(vec2(84.0, 16.0), Sense::hover());
-    let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, 3.0, Color32::from_gray(45));
-    let filled = rect.width() * probability.clamp(0.0, 1.0) as f32;
-    if filled > 0.0 {
-        painter.rect_filled(
-            egui::Rect::from_min_size(rect.min, vec2(filled, rect.height())),
-            3.0,
-            Color32::from_rgb(0x4F, 0x8A, 0x5B),
-        );
-    }
-    let y = rect.center().y + 5.0;
-    let low_x = rect.left() + rect.width() * low.clamp(0.0, 1.0) as f32;
-    let high_x = rect.left() + rect.width() * high.clamp(0.0, 1.0) as f32;
-    painter.line_segment([pos2(low_x, y), pos2(high_x, y)], Stroke::new(2.0, GOLD));
-    painter.text(
-        rect.center(),
-        Align2::CENTER_CENTER,
-        format!("{:.0}%", probability * 100.0),
-        FontId::proportional(10.0),
-        Color32::WHITE,
-    );
-    response.on_hover_text(format!(
-        "Posterior mean {:.1}% · approximate 90% credible interval {:.1}–{:.1}%",
-        probability * 100.0,
-        low * 100.0,
-        high * 100.0
-    ));
-}
-
-/// Win/draw/loss bar from the player's perspective.
-fn record_bar(ui: &mut Ui, wins: u32, draws: u32, losses: u32) {
-    let width = ui.available_width().max(80.0);
-    let (rect, response) = ui.allocate_exact_size(vec2(width, 10.0), Sense::hover());
-    let painter = ui.painter_at(rect);
-    let total = (wins + draws + losses).max(1) as f32;
-    let mut x = rect.left();
-    for (count, color) in [
-        (wins, Color32::from_rgb(0x6F, 0xAE, 0x7A)),
-        (draws, Color32::from_rgb(0x87, 0x8C, 0x91)),
-        (losses, Color32::from_rgb(0xB5, 0x6B, 0x6B)),
-    ] {
-        let segment = rect.width() * count as f32 / total;
-        if segment > 0.0 {
-            painter.rect_filled(
-                egui::Rect::from_min_size(egui::pos2(x, rect.top()), vec2(segment, rect.height())),
-                0.0,
-                color,
-            );
-            x += segment;
-        }
-    }
-    painter.rect_stroke(
-        rect,
-        0.0,
-        Stroke::new(1.0, Color32::from_gray(70)),
-        StrokeKind::Inside,
-    );
-    response.on_hover_text(format!("Wins {wins} · draws {draws} · losses {losses}"));
-}
-
-fn wdl_bar(ui: &mut Ui, stats: &PositionStats) {
-    let width = ui.available_width().max(80.0);
-    let (rect, response) = ui.allocate_exact_size(vec2(width, 10.0), Sense::hover());
-    let painter = ui.painter_at(rect);
-    let total = stats.games.max(1) as f32;
-    let mut x = rect.left();
-    let segments = [
-        (stats.white, Color32::from_rgb(0xCB, 0xDD, 0xC4)),
-        (stats.draw, Color32::from_rgb(0x87, 0x8C, 0x91)),
-        (stats.black, Color32::from_rgb(0x2A, 0x2D, 0x30)),
-    ];
-    for (count, color) in segments {
-        let segment = rect.width() * count as f32 / total;
-        if segment > 0.0 {
-            painter.rect_filled(
-                egui::Rect::from_min_size(egui::pos2(x, rect.top()), vec2(segment, rect.height())),
-                0.0,
-                color,
-            );
-            x += segment;
-        }
-    }
-    painter.rect_stroke(
-        rect,
-        0.0,
-        egui::Stroke::new(1.0, Color32::from_gray(70)),
-        egui::StrokeKind::Inside,
-    );
-    response.on_hover_text(format!(
-        "White {} · draw {} · Black {}",
-        stats.white, stats.draw, stats.black
-    ));
-}
-
-/// Normal opening-tree summary and table for one position. Kept free of
-/// scrolling so preparation mode can place it inside its own scroll area.
-fn opening_tree_table(
-    ui: &mut Ui,
-    index: Option<&PositionIndex>,
-    key: u64,
-    pos: &Chess,
-    empty_message: &str,
-    trends: crate::recent::TrendConfig,
-    hover_preview: &mut Option<HoverPreview>,
-) -> Option<Move> {
-    let Some(index) = index else {
-        ui.label(RichText::new(empty_message).weak());
-        return None;
-    };
-    let stats = index.stats(key);
-    let moves = index.moves(key);
-    let trend_by_move: HashMap<u32, crate::recent::MoveTrend> =
-        crate::recent::position_trends(&moves, trends)
-            .into_iter()
-            .map(|trend| (trend.mv, trend))
-            .collect();
-
-    if let Some(stats) = stats {
-        ui.horizontal(|ui| {
-            ui.label(RichText::new(games_label(stats.games as usize)).strong());
-            ui.label(
-                RichText::new(format!(
-                    "W {} · D {} · B {}",
-                    stats.white, stats.draw, stats.black
-                ))
-                .weak(),
-            );
-        });
-        wdl_bar(ui, &stats);
-        let mut summary = Vec::new();
-        if let Some(elo) = stats.elo_avg() {
-            summary.push(format!("avg Elo {elo:.0}"));
-        }
-        let dates = date_range(stats.first_date, stats.last_date);
-        if dates != "—" {
-            summary.push(dates);
-        }
-        if !summary.is_empty() {
-            ui.label(RichText::new(summary.join(" · ")).weak().small());
-        }
-    } else {
-        ui.label(RichText::new(empty_message).weak());
-    }
-
-    if moves.is_empty() {
-        return None;
-    }
-
-    let mut rows: Vec<(String, Move, position::MoveStat)> = moves
-        .into_iter()
-        .filter_map(|stat| {
-            let mv = stat.to_move(pos)?;
-            let san = stat.san(pos)?;
-            Some((san, mv, stat))
-        })
-        .collect();
-    rows.sort_by(|a, b| b.2.games.cmp(&a.2.games).then(a.0.cmp(&b.0)));
-
-    let mut clicked = None;
-    ui.add_space(4.0);
-    egui::Grid::new("opening-tree-grid")
-        .num_columns(7)
-        .striped(true)
-        .spacing([10.0, 4.0])
-        .show(ui, |ui| {
-            ui.label(RichText::new("Move").strong());
-            ui.label(RichText::new("Games").strong());
-            ui.label(RichText::new("Score").strong());
-            ui.label(RichText::new("W/D/B").strong());
-            ui.label(RichText::new("Elo").strong());
-            ui.label(RichText::new("Years").strong());
-            ui.label(RichText::new("Trend").strong());
-            ui.end_row();
-
-            for (san, mv, stat) in rows {
-                let response = ui
-                    .selectable_label(false, RichText::new(&san).monospace())
-                    .on_hover_text("Hover to preview · click to play");
-                if response.hovered() {
-                    *hover_preview = preview_after_move(pos, mv);
-                }
-                if response.clicked() {
-                    clicked = Some(mv);
-                }
-                ui.label(stat.games.to_string());
-                ui.label(format!("{:.0}%", stat.score_white() * 100.0));
-                ui.label(format!("{}/{}/{}", stat.white, stat.draw, stat.black));
-                ui.label(
-                    stat.elo_avg()
-                        .map(|elo| format!("{elo:.0}"))
-                        .unwrap_or_else(|| "—".to_string()),
-                );
-                ui.label(date_range(stat.first_date, stat.last_date));
-                match trend_by_move
-                    .get(&stat.mv)
-                    .and_then(crate::recent::MoveTrend::compact_label)
-                {
-                    Some(label) => {
-                        let trend = trend_by_move.get(&stat.mv).expect("trend map entry");
-                        ui.label(RichText::new(label).small())
-                            .on_hover_text(trend.tooltip(trends));
-                    }
-                    None => {
-                        ui.label(RichText::new("—").weak()).on_hover_text(
-                            "Not enough dated games in both windows for a trend badge.",
-                        );
-                    }
-                }
-                ui.end_row();
-            }
-        });
-    clicked
-}
-
-/// Native executable picker for an arbitrary UCI engine.
-fn open_engine_dialog() -> Option<std::path::PathBuf> {
-    use std::process::Command;
-
-    let dialogs: [(&str, &[&str]); 2] = [
-        (
-            "zenity",
-            &[
-                "--file-selection",
-                "--title=Select UCI engine",
-                "--file-filter=All files | *",
-            ],
-        ),
-        ("kdialog", &["--getopenfilename", ".", "*|All files"]),
-    ];
-
-    for (program, args) in dialogs {
-        match Command::new(program).args(args).output() {
-            Ok(out) if out.status.success() => {
-                let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                return (!path.is_empty()).then(|| std::path::PathBuf::from(path));
-            }
-            Ok(_) => return None,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(_) => return None,
-        }
-    }
-
-    None
-}
-
-/// Native file dialog. Prefers zenity/kdialog (both common on Linux desktops)
-/// and returns `None` when no dialog is available or the user cancels.
-/// The first priority name is the user's own name. It is labelled **You** in
-/// the player list.
-fn top_priority_player_key(names: &[String]) -> Option<String> {
-    names.first().and_then(|name| players::player_key(name))
-}
-
-/// Find the side belonging to the user. Names are checked in priority order, so
-/// the first matching alias wins even if both players are in the list.
-fn my_player_color(names: &[String], game: &Game) -> Option<Color> {
-    let white = players::player_key(game.white());
-    let black = players::player_key(game.black());
-    for name in names {
-        let Some(key) = players::player_key(name) else {
-            continue;
-        };
-        if white.as_deref() == Some(key.as_str()) {
-            return Some(Color::White);
-        }
-        if black.as_deref() == Some(key.as_str()) {
-            return Some(Color::Black);
-        }
-    }
-    None
-}
-
-/// The first alias is the name written into preparation PGN tags. With no
-/// configured alias, keep the historical placeholder.
-fn prep_you_name(names: &[String]) -> String {
-    names
-        .first()
-        .map(|name| natural_player_name(name))
-        .unwrap_or_else(|| "You".to_string())
-}
-
-fn home_path(relative: &str) -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .map(|home| home.join(relative))
-}
-
-/// The reference database used when no explicit choice has been saved.
-/// `BRETT_REFERENCE` wins, then a conventional Mega Database location.
-fn default_reference_path() -> Option<PathBuf> {
-    let env = std::env::var_os("BRETT_REFERENCE")
-        .map(PathBuf::from)
-        .filter(|path| !path.as_os_str().is_empty());
-    env.into_iter()
-        .chain(home_path("Downloads/Mega Database 2025.cbv"))
-        .find(|path| path.exists())
-}
-
-/// The correspondence database used automatically in the Engine tab.
-/// `BRETT_CORRESPONDENCE` wins, then the snapshot bundled in a source
-/// checkout, then the conventional Brett Resources location. The file remains
-/// read-only; only a position-index cache is built.
-fn default_correspondence_path() -> Option<PathBuf> {
-    let env = std::env::var_os("BRETT_CORRESPONDENCE")
-        .map(PathBuf::from)
-        .filter(|path| !path.as_os_str().is_empty());
-    let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("databases/iccf");
-    let executable = std::env::current_exe()
-        .ok()
-        .and_then(|path| path.parent().map(Path::to_path_buf));
-    let candidates = [
-        Some(PathBuf::from("databases/iccf/Correspondence_2350.si4")),
-        Some(manifest.join("Correspondence_2350.si4")),
-        executable.map(|dir| dir.join("databases/iccf/Correspondence_2350.si4")),
-        home_path("Downloads/Brett Resources/Correspondence Database/Correspondence_2350.si4"),
-        home_path("Downloads/CBH/Pimped Correspondence Database.cbh"),
-    ];
-    env.into_iter()
-        .chain(candidates.into_iter().flatten())
-        .find(|path| path.exists())
-}
-
-fn open_dialog(initial_dir: Option<&Path>) -> Option<std::path::PathBuf> {
-    use std::process::Command;
-
-    let mut zenity = vec![
-        "--file-selection".to_string(),
-        "--title=Open chess database".to_string(),
-        "--file-filter=Chess databases | *.pgn *.PGN *.si4 *.si3 *.cbh *.CBH *.2cbh *.2cbg *.2cba *.2lid".to_string(),
-        "--file-filter=PGN files | *.pgn *.PGN".to_string(),
-        "--file-filter=SCID databases | *.si4 *.si3".to_string(),
-        "--file-filter=ChessBase databases | *.cbh *.CBH *.2cbh *.2cbg *.2cba *.2lid".to_string(),
-        "--file-filter=All files | *".to_string(),
-    ];
-    if let Some(dir) = initial_dir.filter(|path| path.is_dir()) {
-        zenity.push(format!("--filename={}", dir.display()));
-    }
-    match Command::new("zenity").args(&zenity).output() {
-        Ok(out) if out.status.success() => {
-            let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            return (!path.is_empty()).then(|| std::path::PathBuf::from(path));
-        }
-        // The dialog ran but the user cancelled it.
-        Ok(_) => return None,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(_) => return None,
-    }
-
-    let start = initial_dir
-        .filter(|path| path.is_dir())
-        .map(|path| path.display().to_string())
-        .unwrap_or_else(|| ".".to_string());
-    let kdialog = [
-        "--getopenfilename",
-        start.as_str(),
-        "*.pgn *.PGN *.si4 *.si3 *.cbh *.CBH *.2cbh *.2cbg *.2cba *.2lid|Chess databases",
-    ];
-    match Command::new("kdialog").args(kdialog).output() {
-        Ok(out) if out.status.success() => {
-            let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            (!path.is_empty()).then(|| std::path::PathBuf::from(path))
-        }
-        _ => None,
-    }
-}
-
-fn open_file_dialog(
-    title: &str,
-    initial_dir: Option<&Path>,
-    filter_name: &str,
-    filter_glob: &str,
-) -> Option<std::path::PathBuf> {
-    use std::process::Command;
-
-    let mut zenity = vec![
-        "--file-selection".to_string(),
-        format!("--title={title}"),
-        format!("--file-filter={filter_name} | {filter_glob}"),
-        "--file-filter=All files | *".to_string(),
-    ];
-    if let Some(dir) = initial_dir.filter(|path| path.is_dir()) {
-        zenity.push(format!("--filename={}", dir.display()));
-    }
-    match Command::new("zenity").args(&zenity).output() {
-        Ok(out) if out.status.success() => {
-            let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            return (!path.is_empty()).then(|| std::path::PathBuf::from(path));
-        }
-        Ok(_) => return None,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(_) => return None,
-    }
-
-    let start = initial_dir
-        .filter(|path| path.is_dir())
-        .map(|path| path.display().to_string())
-        .unwrap_or_else(|| ".".to_string());
-    let filter = format!("{filter_glob}|{filter_name}");
-    let kdialog = ["--getopenfilename", start.as_str(), filter.as_str()];
-    match Command::new("kdialog").args(kdialog).output() {
-        Ok(out) if out.status.success() => {
-            let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            (!path.is_empty()).then(|| std::path::PathBuf::from(path))
-        }
-        _ => None,
-    }
-}
-
-/// Native Save As dialog for one database format. SCID and classic CBH
-/// overwrite confirmation is handled in-app because their companion files
-/// must be replaced together.
-fn save_format_dialog(
-    format: DatabaseFormat,
-    default_path: &std::path::Path,
-) -> Option<std::path::PathBuf> {
-    save_database_dialog(
-        default_path,
-        &format!("Save database as {}", format.short_label()),
-        format.filter_name(),
-        &format!("*.{}", format.extension()),
-        format == DatabaseFormat::Pgn,
-    )
-}
-
-/// Native Save As dialog for a Typst print export.
-fn save_print_dialog(default_path: &std::path::Path) -> Option<std::path::PathBuf> {
-    save_database_dialog(
-        default_path,
-        "Export current game as Typst",
-        "Typst source",
-        "*.typ",
-        false,
-    )
-}
-
-/// Default print export path for the given directory and game.
-/// If `directory` is absent or not a directory, falls back to `documents_path()`.
-fn default_print_path(directory: Option<&Path>, game: Option<&Game>) -> PathBuf {
-    let dir = directory
-        .filter(|path| path.is_dir())
-        .map(Path::to_path_buf)
-        .unwrap_or_else(documents_path);
-    dir.join(default_print_filename(game))
-}
-
-/// Default export filename for a game, formatted as `White - Black.typ` with
-/// path separators and invalid characters sanitized. Falls back to `game.typ`
-/// when both player names are absent or placeholders.
-fn default_print_filename(game: Option<&Game>) -> String {
-    let Some(game) = game else {
-        return "game.typ".to_string();
-    };
-    format!("{}.typ", default_print_stem(game.white(), game.black()))
-}
-
-/// Generates a sanitized filename stem for `White - Black`.
-fn default_print_stem(white: &str, black: &str) -> String {
-    let white = clean_player_name(white);
-    let black = clean_player_name(black);
-    let stem = match (white, black) {
-        (Some(w), Some(b)) => format!("{w} - {b}"),
-        (Some(w), None) => w,
-        (None, Some(b)) => b,
-        (None, None) => "game".to_string(),
-    };
-    sanitize_print_stem(&stem)
-}
-
-fn clean_player_name(name: &str) -> Option<String> {
-    let trimmed = name.trim();
-    if pgn_tag_is_empty(trimmed) || trimmed == "-" || trimmed == "*" {
-        return None;
-    }
-    let sanitized = sanitize_name_segment(trimmed);
-    let cleaned = sanitized.trim_matches(|c: char| c == '-' || c == '_' || c.is_whitespace());
-    if cleaned.is_empty() || cleaned == "?" {
-        None
-    } else {
-        Some(cleaned.to_string())
-    }
-}
-
-fn sanitize_name_segment(part: &str) -> String {
-    let mut clean = String::with_capacity(part.len());
-    for ch in part.chars() {
-        match ch {
-            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => {
-                clean.push('-');
-            }
-            c if c.is_control() => {}
-            c => clean.push(c),
-        }
-    }
-    clean
-}
-
-fn sanitize_print_stem(stem: &str) -> String {
-    let mut result = String::with_capacity(stem.len());
-    let mut last_was_dash = false;
-    let mut last_was_space = false;
-    for ch in stem.chars() {
-        if ch == '-' {
-            if !last_was_dash {
-                result.push('-');
-                last_was_dash = true;
-            }
-            last_was_space = false;
-        } else if ch.is_whitespace() {
-            if !last_was_space {
-                result.push(' ');
-                last_was_space = true;
-            }
-        } else {
-            result.push(ch);
-            last_was_dash = false;
-            last_was_space = false;
-        }
-    }
-    let trimmed = result.trim().trim_matches(|c| c == '-' || c == '.').trim();
-    if trimmed.is_empty() {
-        return "game".to_string();
-    }
-    if is_windows_reserved_stem(trimmed) {
-        format!("{trimmed}-game")
-    } else {
-        trimmed.to_string()
-    }
-}
-
-fn is_windows_reserved_stem(stem: &str) -> bool {
-    let upper = stem.to_ascii_uppercase();
-    matches!(
-        upper.as_str(),
-        "CON"
-            | "PRN"
-            | "AUX"
-            | "NUL"
-            | "COM1"
-            | "COM2"
-            | "COM3"
-            | "COM4"
-            | "COM5"
-            | "COM6"
-            | "COM7"
-            | "COM8"
-            | "COM9"
-            | "LPT1"
-            | "LPT2"
-            | "LPT3"
-            | "LPT4"
-            | "LPT5"
-            | "LPT6"
-            | "LPT7"
-            | "LPT8"
-            | "LPT9"
-    )
-}
-
-/// User's Documents folder, falling back to the home directory when it does
-/// not exist. Print exports default here so a compiled PDF is easy to find.
-fn documents_path() -> PathBuf {
-    home_path("Documents")
-        .filter(|path| path.is_dir())
-        .or_else(|| home_path(""))
-        .unwrap_or_else(|| PathBuf::from("."))
-}
-
-/// Fallback folder for the first database save, before any open or save has
-/// established a remembered directory.
-fn default_database_dir() -> PathBuf {
-    home_path("")
-        .filter(|path| path.is_dir())
-        .unwrap_or_else(|| PathBuf::from("."))
-}
-
-fn print_owner() -> String {
-    std::env::var("USER")
-        .or_else(|_| std::env::var("LOGNAME"))
-        .ok()
-        .map(|owner| owner.trim().to_string())
-        .filter(|owner| !owner.is_empty())
-        .unwrap_or_else(|| "Brett".to_string())
-}
-
-fn print_date() -> String {
-    let today = players::today();
-    format!(
-        "{:04}-{:02}-{:02}",
-        today / 10_000,
-        (today / 100) % 100,
-        today % 100
-    )
-}
-
-fn toggle_diagram(diagrams: &mut BTreeSet<usize>, node: usize) {
-    if !diagrams.remove(&node) {
-        diagrams.insert(node);
-    }
-}
-
-fn save_database_dialog(
-    default_path: &std::path::Path,
-    title: &str,
-    filter_name: &str,
-    filter_glob: &str,
-    confirm_overwrite: bool,
-) -> Option<std::path::PathBuf> {
-    use std::process::Command;
-
-    let mut zenity = vec![
-        "--file-selection".to_string(),
-        "--save".to_string(),
-        format!("--title={title}"),
-        format!("--filename={}", default_path.display()),
-        format!("--file-filter={filter_name} | {filter_glob}"),
-        "--file-filter=All files | *".to_string(),
-    ];
-    if confirm_overwrite {
-        zenity.insert(2, "--confirm-overwrite".to_string());
-    }
-    match Command::new("zenity").args(&zenity).output() {
-        Ok(out) if out.status.success() => {
-            let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            return (!path.is_empty()).then(|| std::path::PathBuf::from(path));
-        }
-        Ok(_) => return None,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(_) => return None,
-    }
-
-    let default = default_path.display().to_string();
-    let filter = format!("{filter_glob}|{filter_name}");
-    let kdialog = ["--getsavefilename", default.as_str(), filter.as_str()];
-    match Command::new("kdialog").args(kdialog).output() {
-        Ok(out) if out.status.success() => {
-            let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            (!path.is_empty()).then(|| std::path::PathBuf::from(path))
-        }
-        _ => None,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn cloud_test_row(
-        chessdb: Option<i32>,
-        lichess: Option<(Option<i32>, Option<i32>)>,
-    ) -> CloudEngineRow {
-        CloudEngineRow {
-            uci: "e2e4".to_string(),
-            san: "e4".to_string(),
-            chessdb,
-            lichess,
-            variation: vec!["e2e4".to_string()],
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn player_title_normalizes_without_rewriting_the_raw_tag() {
-        let pgn = b"[Event \"Titles\"]\n[White \"A\"]\n[WhiteTitle \"Women's Grandmaster\"]\n[Black \"B\"]\n[BlackTitle \"2500\"]\n[Result \"*\"]\n\n*\n";
-        let mut games = domain::parse_pgn(&pgn[..]).unwrap();
-        let game = games.remove(0);
-        assert_eq!(player_title(&game, Color::White), Some("WGM"));
-        assert_eq!(
-            game.header("WhiteTitle"),
-            Some("Women's Grandmaster"),
-            "display decoding must not rewrite the stored tag"
-        );
-        assert_eq!(player_title(&game, Color::Black), None);
-    }
-
-    #[test]
-    fn player_fide_id_reads_numeric_tags_without_rewriting_them() {
-        let pgn = b"[Event \"FIDE\"]\n[White \"A\"]\n[WhiteFideId \" 1503014 \"]\n[Black \"B\"]\n[BlackFideId \"not-an-id\"]\n[Result \"*\"]\n\n*\n";
-        let mut games = domain::parse_pgn(&pgn[..]).unwrap();
-        let game = games.remove(0);
-        assert_eq!(player_fide_id(&game, Color::White), Some("1503014"));
-        assert_eq!(
-            game.header("WhiteFideId"),
-            Some(" 1503014 "),
-            "display decoding must not rewrite the stored tag"
-        );
-        assert_eq!(player_fide_id(&game, Color::Black), None);
-    }
-
-    #[test]
-    fn row_title_is_a_compact_prefix_before_the_name() {
-        let name_format = TextFormat {
-            font_id: FontId::proportional(14.0),
-            color: Color32::WHITE,
-            ..Default::default()
-        };
-        let title_format = TextFormat {
-            font_id: FontId::proportional(10.5),
-            color: GOLD,
-            ..Default::default()
-        };
-        let fide_format = TextFormat {
-            font_id: FontId::proportional(10.5),
-            color: Color32::from_gray(150),
-            ..Default::default()
-        };
-
-        let mut job = LayoutJob::default();
-        append_player_name(
-            &mut job,
-            "Kasparov, Garry",
-            Some("GM"),
-            None,
-            None,
-            &title_format,
-            &name_format,
-            &fide_format,
-        );
-        assert_eq!(job.text, "GM Kasparov, Garry");
-        assert_eq!(job.sections[0].format.color, GOLD);
-        assert_eq!(job.sections[0].format.font_id.size, 10.5);
-
-        let mut plain = LayoutJob::default();
-        append_player_name(
-            &mut plain,
-            "Kasparov, Garry",
-            None,
-            None,
-            None,
-            &title_format,
-            &name_format,
-            &fide_format,
-        );
-        assert_eq!(plain.text, "Kasparov, Garry");
-        assert_eq!(plain.sections.len(), 1);
-    }
-
-    #[test]
-    fn row_fide_id_is_a_muted_suffix_after_the_name() {
-        let name_format = TextFormat {
-            font_id: FontId::proportional(14.0),
-            color: Color32::WHITE,
-            ..Default::default()
-        };
-        let title_format = TextFormat {
-            font_id: FontId::proportional(10.5),
-            color: GOLD,
-            ..Default::default()
-        };
-        let fide_format = TextFormat {
-            font_id: FontId::proportional(10.5),
-            color: Color32::from_gray(150),
-            ..Default::default()
-        };
-
-        let mut job = LayoutJob::default();
-        append_player_name(
-            &mut job,
-            "Carlsen, Magnus",
-            Some("GM"),
-            None,
-            Some("1503014"),
-            &title_format,
-            &name_format,
-            &fide_format,
-        );
-        assert_eq!(job.text, "GM Carlsen, Magnus · 1503014");
-        let suffix = job.sections.last().unwrap();
-        assert_eq!(suffix.format.color, Color32::from_gray(150));
-        assert_eq!(suffix.format.font_id.size, 10.5);
-    }
-
-    #[test]
-    fn player_country_reads_tags_without_rewriting_them() {
-        let pgn = b"[Event \"Country\"]\n[White \"A\"]\n[WhiteCountry \" NOR \"]\n[Black \"B\"]\n[BlackFed \"USA\"]\n[Result \"*\"]\n\n*\n";
-        let mut games = domain::parse_pgn(&pgn[..]).unwrap();
-        let game = games.remove(0);
-        let white_country = player_country(&game, Color::White).unwrap();
-        assert_eq!(white_country.code, "NOR");
-        assert_eq!(white_country.flag, "🇳🇴");
-        assert_eq!(white_country.badge, "🇳🇴 NOR");
-        assert_eq!(
-            game.header("WhiteCountry"),
-            Some(" NOR "),
-            "display decoding must not rewrite the stored tag"
-        );
-
-        let black_country = player_country(&game, Color::Black).unwrap();
-        assert_eq!(black_country.code, "USA");
-        assert_eq!(black_country.flag, "🇺🇸");
-        assert_eq!(black_country.badge, "🇺🇸 USA");
-        assert_eq!(
-            game.header("BlackFed"),
-            Some("USA"),
-            "display decoding must not rewrite the stored tag"
-        );
-    }
-
-    #[test]
-    fn row_country_and_fide_id_are_muted_suffixes_after_the_name() {
-        let name_format = TextFormat {
-            font_id: FontId::proportional(14.0),
-            color: Color32::WHITE,
-            ..Default::default()
-        };
-        let title_format = TextFormat {
-            font_id: FontId::proportional(10.5),
-            color: GOLD,
-            ..Default::default()
-        };
-        let fide_format = TextFormat {
-            font_id: FontId::proportional(10.5),
-            color: Color32::from_gray(150),
-            ..Default::default()
-        };
-
-        // Both country and FIDE ID
-        let mut both = LayoutJob::default();
-        append_player_name(
-            &mut both,
-            "Carlsen, Magnus",
-            Some("GM"),
-            Some("🇳🇴 NOR"),
-            Some("1503014"),
-            &title_format,
-            &name_format,
-            &fide_format,
-        );
-        assert_eq!(both.text, "GM Carlsen, Magnus · 🇳🇴 NOR · 1503014");
-
-        // Only country
-        let mut only_country = LayoutJob::default();
-        append_player_name(
-            &mut only_country,
-            "Nakamura, Hikaru",
-            Some("GM"),
-            Some("🇺🇸 USA"),
-            None,
-            &title_format,
-            &name_format,
-            &fide_format,
-        );
-        assert_eq!(only_country.text, "GM Nakamura, Hikaru · 🇺🇸 USA");
-    }
-
-    fn test_app() -> App {
-        let mut games = domain::parse_pgn(include_bytes!("../fixtures/opera.pgn")).unwrap();
-        let ctx = egui::Context::default();
-        App {
-            library: None,
-            session: crate::session::GameList::empty(),
-            current: Some(games.remove(0)),
-            edited: std::collections::HashMap::new(),
-            dirty: false,
-            views: Vec::new(),
-            views_open: false,
-            pending_game_drop: None,
-            pending_merge: None,
-            pending_open_choice: None,
-            current_slot: None,
-            node: 0,
-            orientation: Color::White,
-            show_clocks: true,
-            selected: None,
-            targets: Vec::new(),
-            drag_from: None,
-            status: String::new(),
-            open_rx: None,
-            open_job: None,
-            index: None,
-            index_rx: None,
-            index_job: None,
-            index_status: String::new(),
-            confirm_large_index: false,
-            last_database_dir: None,
-            last_print_dir: None,
-            database_save_path: None,
-            session_dirty: false,
-            close_confirm_open: false,
-            pending_window_close: false,
-            save_database_dialog_open: false,
-            save_database_as: false,
-            save_database_format: DatabaseFormat::Pgn,
-            save_database_path: String::new(),
-            save_database_close_after: false,
-            save_database_error: String::new(),
-            tree_path: String::new(),
-            tree_index: None,
-            tree_index_rx: None,
-            tree_index_job: None,
-            tree_library: None,
-            tree_status: String::new(),
-            book_path: String::new(),
-            book: None,
-            book_rx: None,
-            book_job: None,
-            book_status: String::new(),
-            left_tab: LeftTab::Games,
-            right_tab: RightTab::Moves,
-            multi_view: false,
-            visible_tabs: [true, false, false, false],
-            players: PlayerDirectory::default(),
-            players_rx: None,
-            players_job: None,
-            players_status: String::new(),
-            player_filter: String::new(),
-            selected_player: None,
-            wiki_enabled: true,
-            wiki_cache: crate::wiki::Cache::default(),
-            wiki_rx: None,
-            wiki_job: None,
-            wiki_for: None,
-            wiki_state: WikiState::Idle,
-            wiki_expanded: false,
-            player_book: None,
-            player_book_rx: None,
-            player_book_job: None,
-            player_book_status: String::new(),
-            prep: None,
-            prep_recent_limit: 10,
-            prep_player_names: Vec::new(),
-            recent_preview: None,
-            reference_path: String::new(),
-            reference_enabled: false,
-            reference_band: 200,
-            reference_offset: 0,
-            reference: None,
-            reference_rx: None,
-            reference_job: None,
-            reference_status: String::new(),
-            correspondence_enabled: true,
-            correspondence_path: String::new(),
-            correspondence: None,
-            correspondence_rx: None,
-            correspondence_job: None,
-            correspondence_status: String::new(),
-            annotation_editor: None,
-            annotation_focus: false,
-            tags_expanded: false,
-            show_empty_pgn_tags: false,
-            board_tag_visible: false,
-            forced_tag_visibility: HashSet::new(),
-            branch_choice: None,
-            branch_recency: std::collections::HashMap::new(),
-            branch_clock: 0,
-            hover_moves: false,
-            photos: None,
-            photo_textures: std::collections::HashMap::new(),
-            photo_order: VecDeque::new(),
-            show_player_photos: true,
-            photo_size: PhotoSize::Small,
-            champion_lineage: ChampionLineage::Fide,
-            photo_viewer: None,
-            show_nav_buttons: false,
-            show_pgn_tags: true,
-            show_annotations: true,
-            date_picker: None,
-            date_picker_anchor: None,
-            rating_priority: RatingPriority::Elo,
-            show_all_ratings: false,
-            hover_preview: None,
-            online_open: false,
-            online_source: OnlineSource::Lichess,
-            online_username: String::new(),
-            online_max: 500,
-            online_status: String::new(),
-            online_rx: None,
-            online_game_rx: None,
-            online_game_job: None,
-            online_reference_open: false,
-            online_ref_source: OnlineSource::Lichess,
-            online_ref_username: String::new(),
-            online_ref_games: Vec::new(),
-            online_ref_status: String::new(),
-            online_ref_rx: None,
-            online_ref_job: None,
-            online_ref_at_position: false,
-            prep_online_games: Vec::new(),
-            prep_online_status: String::new(),
-            prep_online_rx: None,
-            prep_online_job: None,
-            cloud: None,
-            cloud_cache: BTreeMap::new(),
-            cloud_rx: None,
-            cloud_job: None,
-            explorer_rx: None,
-            explorer_job: None,
-            cloud_pending: None,
-            cloud_status: String::new(),
-            cached_analyses: Vec::new(),
-            lichess_token: None,
-            explorer_source: cloud::ExplorerSource::Masters,
-            engine: None,
-            engine_view: EngineView::Both,
-            engine_bar: true,
-            bar_cloud_cache: BTreeMap::new(),
-            bar_cloud_rx: None,
-            bar_cloud_job: None,
-            bar_cloud_pending: None,
-            engine_status: "Engine not started.".to_string(),
-            engine_name: String::new(),
-            engine_ready: false,
-            engine_auto: true,
-            engine_multipv: 3,
-            engine_depth: 18,
-            engine_time_ms: 1_500,
-            engine_limit_mode: EngineLimitMode::Infinite,
-            engine_cache_saved_notice: None,
-            cached_analyses_pos: None,
-            engine_request: 0,
-            engine_fen: None,
-            engine_infos: BTreeMap::new(),
-            engine_bestmove: None,
-            engine_searching: false,
-            engine_path: "/usr/bin/stockfish".to_string(),
-            engine_threads: 1,
-            engine_hash_mb: 16,
-            cache_engine_analysis: true,
-            heuristic_supersede: true,
-            analysis_cache: None,
-            analysis_debouncer: crate::analysis_cache::AnalysisDebouncer::new(),
-            review_engine: None,
-            review: None,
-            review_open: false,
-            engine_settings_open: false,
-            review_status: "No game review yet.".to_string(),
-            review_depth: 14,
-            review_time_ms: 500,
-            review_use_time: true,
-            review_skip_book: true,
-            review_book_min_games: 3,
-            review_book_max_plies: 30,
-            review_book_rx: None,
-            review_cache: Vec::new(),
-            trend_window: crate::recent::TrendWindow::default(),
-            trend_baseline: crate::recent::TrendBaseline::default(),
-            trend_min_games: 10,
-            filter: String::new(),
-            pending_pgn_export: None,
-            pending_scid_export: None,
-            pending_cbh_export: None,
-            pending_two_cbh_export: None,
-            print_diagrams: BTreeSet::new(),
-            print_export_open: false,
-            print_export_path: String::new(),
-            print_export_include_final: true,
-            print_export_compile_pdf: false,
-            print_export_status: String::new(),
-            setup_open: false,
-            setup_state: crate::setup::PositionSetupState::default(),
-            classify_openings_open: false,
-            classify_overwrite: false,
-            classify_status: String::new(),
-            show_about: false,
-            show_cache_info: false,
-            show_settings: false,
-            settings_rating_priority: RatingPriority::Elo,
-            settings_show_all_ratings: false,
-            settings_photo_size: PhotoSize::Small,
-            settings_champion_lineage: ChampionLineage::Fide,
-            settings_show_clocks: true,
-            settings_show_annotations: true,
-            settings_show_pgn_tags: true,
-            settings_show_nav_buttons: false,
-            settings_show_player_photos: true,
-            settings_show_empty_pgn_tags: false,
-            settings_online_reference: false,
-            settings_engine_bar: true,
-            settings_my_player_names: String::new(),
-            settings_correspondence_enabled: true,
-            settings_correspondence_path: String::new(),
-            settings_review_skip_book: true,
-            settings_review_book_min_games: 3,
-            settings_review_book_max_plies: 30,
-            settings_trend_window: crate::recent::TrendWindow::default(),
-            settings_trend_baseline: crate::recent::TrendBaseline::default(),
-            settings_trend_min_games: 10,
-            settings_token: String::new(),
-            settings_token_visible: false,
-            settings_token_from_env: false,
-            settings_wiki_enabled: true,
-            settings_status: String::new(),
-            textures: PieceTextures::load(&ctx),
-            ctx,
-        }
-    }
-
-    fn wiki_player(name: &str) -> PlayerSummary {
-        PlayerSummary {
-            name: name.to_string(),
-            key: players::player_key(name).unwrap(),
-            title: None,
-            fide_id: None,
-            country: None,
-            white: players::PlayerRecord::default(),
-            black: players::PlayerRecord::default(),
-            elo_sum: 0,
-            elo_count: 0,
-            elo_max: 0,
-            opponent_elo_sum: 0,
-            opponent_elo_count: 0,
-            first_year: 0,
-            last_year: 0,
-            game_indices: Vec::new(),
-        }
-    }
-
-    fn wiki_summary(title: &str) -> crate::wiki::Summary {
-        crate::wiki::Summary {
-            title: title.to_string(),
-            description: "Norwegian chess grandmaster".to_string(),
-            extract: format!("{title} is a Norwegian chess grandmaster."),
-            url: format!("https://en.wikipedia.org/wiki/{}", title.replace(' ', "_")),
-        }
-    }
-
-    #[test]
-    fn wikipedia_summary_loads_from_the_cache_when_a_profile_opens() {
-        let mut app = test_app();
-        let player = wiki_player("Carlsen, Magnus");
-        app.wiki_cache.insert(
-            &player.name,
-            &crate::wiki::Lookup::Summary(wiki_summary("Magnus Carlsen")),
-        );
-        assert!(app.wiki_rx.is_none());
-        app.open_wiki_for(&player);
-        assert!(
-            app.wiki_rx.is_none(),
-            "a cache hit must not start a request"
-        );
-        assert_eq!(app.wiki_for.as_deref(), Some(player.key.as_str()));
-        let WikiState::Ready(crate::wiki::Lookup::Summary(summary)) = &app.wiki_state else {
-            panic!("expected the cached summary");
-        };
-        assert_eq!(summary.title, "Magnus Carlsen");
-    }
-
-    #[test]
-    fn wikipedia_summary_is_not_fetched_when_the_setting_is_off() {
-        let mut app = test_app();
-        app.wiki_enabled = false;
-        app.wiki_for = Some("stale".to_string());
-        app.wiki_state = WikiState::Failed("stale".to_string());
-        let player = wiki_player("Magnus Carlsen");
-        app.open_wiki_for(&player);
-        assert!(app.wiki_for.is_none());
-        assert!(matches!(app.wiki_state, WikiState::Idle));
-        assert!(app.wiki_rx.is_none());
-    }
-
-    #[test]
-    fn wikipedia_ambiguous_and_failed_results_are_handled() {
-        let mut app = test_app();
-        let player = wiki_player("Magnus Carlsen");
-        app.wiki_for = Some(player.key.clone());
-        app.wiki_state = WikiState::Loading;
-
-        let ambiguous = crate::wiki::Lookup::Ambiguous {
-            search_url: crate::wiki::search_url(&player.name),
-        };
-        app.apply_wiki_result(player.key.clone(), Ok(ambiguous.clone()));
-        let WikiState::Ready(crate::wiki::Lookup::Ambiguous { search_url }) = &app.wiki_state
-        else {
-            panic!("expected a search link");
-        };
-        assert!(search_url.contains("Magnus%20Carlsen"));
-        assert_eq!(app.wiki_cache.get(&player.name), Some(ambiguous));
-
-        app.apply_wiki_result(player.key.clone(), Err("offline".to_string()));
-        let WikiState::Failed(err) = &app.wiki_state else {
-            panic!("expected a failure");
-        };
-        assert!(err.contains("offline"));
-    }
-
-    #[test]
-    fn wikipedia_state_follows_the_selected_profile() {
-        let mut app = test_app();
-        let first = wiki_player("Magnus Carlsen");
-        let second = wiki_player("Judit Polgar");
-        app.wiki_cache.insert(
-            &first.name,
-            &crate::wiki::Lookup::Summary(wiki_summary("Magnus Carlsen")),
-        );
-        app.wiki_cache.insert(
-            &second.name,
-            &crate::wiki::Lookup::Summary(wiki_summary("Judit Polgár")),
-        );
-        app.open_wiki_for(&first);
-        assert_eq!(app.wiki_for.as_deref(), Some(first.key.as_str()));
-        app.open_wiki_for(&second);
-        assert_eq!(app.wiki_for.as_deref(), Some(second.key.as_str()));
-        let WikiState::Ready(crate::wiki::Lookup::Summary(summary)) = &app.wiki_state else {
-            panic!("expected the second player's summary");
-        };
-        assert_eq!(summary.title, "Judit Polgár");
-    }
-
-    #[test]
-    fn detects_export_targets_under_a_root() {
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!("brett-ro-{stamp}"));
-        std::fs::create_dir_all(root.join("sub")).unwrap();
-        let target = root.join("sub").join("export.pgn");
-        assert!(path_is_under(&target, &root));
-        assert!(!path_is_under(
-            &std::env::temp_dir().join(format!("outside-{stamp}.pgn")),
-            &root
-        ));
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn exports_session_games_in_order() {
-        let mut app = test_app();
-        let game = app.current.clone().unwrap();
-        let mut first = game.clone();
-        first.set_header("White", "First".to_string());
-        let mut second = game;
-        second.set_header("White", "Second".to_string());
-        app.session.insert_game(first, None);
-        app.session.insert_game(second, None);
-
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "brett-pgn-export-{}-{stamp}.pgn",
-            std::process::id()
-        ));
-        let written = app.try_write_pgn_export(&path).unwrap();
-        assert_eq!(written, 2);
-
-        let games = domain::parse_pgn_file(&path).unwrap();
-        assert_eq!(games.len(), 2);
-        assert_eq!(games[0].white(), "First");
-        assert_eq!(games[1].white(), "Second");
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn exports_session_games_as_scid_triple() {
-        let mut app = test_app();
-        let game = app.current.clone().unwrap();
-        let mut first = game.clone();
-        first.set_header("White", "First".to_string());
-        let mut second = game;
-        second.set_header("White", "Second".to_string());
-        app.session.insert_game(first, None);
-        app.session.insert_game(second, None);
-
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "brett-scid-export-{}-{stamp}.si4",
-            std::process::id()
-        ));
-        let report = app.try_write_scid_export(&path).unwrap();
-        assert_eq!(report.games, 2);
-        assert!(path.exists());
-        assert!(path.with_extension("sn4").exists());
-        assert!(path.with_extension("sg4").exists());
-
-        let library = ScidLibrary::open(&path).unwrap();
-        assert_eq!(library.len(), 2);
-        assert_eq!(library.load(0).unwrap().white(), "First");
-        assert_eq!(library.load(1).unwrap().white(), "Second");
-
-        for path in scid_triple(&path) {
-            let _ = std::fs::remove_file(path);
-        }
-    }
-
-    #[test]
-    fn exports_session_games_as_cbh_database() {
-        let mut app = test_app();
-        let game = app.current.clone().unwrap();
-        let mut first = game.clone();
-        first.set_header("White", "First".to_string());
-        let mut second = game;
-        second.set_header("White", "Second".to_string());
-        app.session.insert_game(first, None);
-        app.session.insert_game(second, None);
-
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "brett-cbh-export-{}-{stamp}.cbh",
-            std::process::id()
-        ));
-        let report = app.try_write_cbh_export(&path).unwrap();
-        assert_eq!(report.games, 2);
-        for companion in crate::cbh::core_companion_files(&path) {
-            assert!(companion.exists(), "missing {}", companion.display());
-        }
-
-        let library = CbhLibrary::open(&path).unwrap();
-        assert_eq!(library.len(), 2);
-        assert_eq!(library.load(0).unwrap().white(), "First");
-        assert_eq!(library.load(1).unwrap().white(), "Second");
-
-        for companion in crate::cbh::existing_companion_files(&path) {
-            let _ = std::fs::remove_file(companion);
-        }
-    }
-
-    #[test]
-    fn exports_session_games_as_two_cbh_database() {
-        let mut app = test_app();
-        let first = domain::parse_pgn(b"[White \"First\"]\n[Black \"Black\"]\n\n1. e4 e5 *\n")
-            .unwrap()
-            .remove(0);
-        let second = domain::parse_pgn(b"[White \"Second\"]\n[Black \"Black\"]\n\n1. d4 d5 *\n")
-            .unwrap()
-            .remove(0);
-        app.session.insert_game(first, None);
-        app.session.insert_game(second, None);
-
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "brett-2cbh-export-{}-{stamp}.2cbh",
-            std::process::id()
-        ));
-
-        let report = app.try_write_two_cbh_export(&path, false).unwrap();
-        assert_eq!(report.games, 2);
-        for companion in crate::twocbh::core_companion_files(&path) {
-            assert!(companion.exists(), "missing {}", companion.display());
-        }
-
-        let library = crate::twocbh::TwoCbhLibrary::open(&path).unwrap();
-        assert_eq!(library.len(), 2);
-        assert_eq!(library.load(0).unwrap().white(), "First");
-        assert_eq!(library.load(1).unwrap().white(), "Second");
-
-        for companion in crate::twocbh::existing_companion_files(&path) {
-            let _ = std::fs::remove_file(companion);
-        }
-    }
-
-    #[test]
-    fn two_cbh_save_waits_for_annotation_confirmation() {
-        let mut app = test_app();
-        // The Opera fixture has comments and a NAG.
-        let game = app.current.clone().unwrap();
-        app.session.insert_game(game, None);
-
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "brett-2cbh-confirm-{}-{stamp}.2cbh",
-            std::process::id()
-        ));
-
-        app.start_two_cbh_save(Some(path.clone()), false);
-
-        let pending = app.pending_two_cbh_export.as_ref().unwrap();
-        assert!(pending.annotations);
-        assert_eq!(pending.games, 1);
-        assert!(!path.exists());
-
-        // Confirming the dialog passes the annotation-loss flag through.
-        app.pending_two_cbh_export = None;
-        app.write_two_cbh_export(&path, true, false);
-        let library = crate::twocbh::TwoCbhLibrary::open(&path).unwrap();
-        assert_eq!(library.len(), 1);
-        assert_eq!(library.load(0).unwrap().white(), "Paul Morphy");
-
-        for companion in crate::twocbh::existing_companion_files(&path) {
-            let _ = std::fs::remove_file(companion);
-        }
-    }
-
-    #[test]
-    fn two_cbh_save_normalizes_core_extensions_but_rejects_other_extensions() {
-        let mut app = test_app();
-        let game = domain::parse_pgn(b"[White \"A\"]\n[Black \"B\"]\n\n1. e4 *\n")
-            .unwrap()
-            .remove(0);
-        app.session.insert_game(game, None);
-
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir =
-            std::env::temp_dir().join(format!("brett-2cbh-target-{}-{stamp}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-
-        app.start_two_cbh_save(Some(dir.join("named.2cbg")), false);
-        assert!(dir.join("named.2cbh").exists());
-        assert!(app.status.starts_with("Saved "), "{}", app.status);
-
-        app.start_two_cbh_save(Some(dir.join("bare")), false);
-        assert!(dir.join("bare.2cbh").exists());
-
-        app.start_two_cbh_save(Some(dir.join("wrong.txt")), false);
-        assert!(!dir.join("wrong.txt").exists());
-        assert!(
-            app.status.starts_with("2CBH save failed:"),
-            "{}",
-            app.status
-        );
-
-        for companion in crate::twocbh::existing_companion_files(&dir.join("named.2cbh")) {
-            let _ = std::fs::remove_file(companion);
-        }
-        for companion in crate::twocbh::existing_companion_files(&dir.join("bare.2cbh")) {
-            let _ = std::fs::remove_file(companion);
-        }
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn two_cbh_export_lists_companion_files() {
-        let base = PathBuf::from("/tmp/example.2cbh");
-        assert_eq!(
-            crate::twocbh::core_companion_files(&base),
-            [
-                PathBuf::from("/tmp/example.2cbh"),
-                PathBuf::from("/tmp/example.2cbg"),
-                PathBuf::from("/tmp/example.2cba"),
-                PathBuf::from("/tmp/example.2lid"),
-            ]
-        );
-    }
-
-    #[test]
-    fn two_cbh_export_protects_the_open_source() {
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("brett-2cbh-source-{stamp}"));
-        std::fs::create_dir_all(&dir).unwrap();
-        let source = dir.join("source.2cbh");
-        crate::twocbh::write_database(&source, Vec::<anyhow::Result<Game>>::new()).unwrap();
-
-        let mut app = test_app();
-        app.library = Some(std::sync::Arc::new(
-            crate::twocbh::TwoCbhLibrary::open(&source).unwrap(),
-        ));
-        assert!(app.two_cbh_export_would_overwrite_source(&source));
-        assert!(app.two_cbh_export_would_overwrite_source(&source.with_extension("2cbg")));
-        for extension in crate::twocbh::ALL_EXTENSIONS {
-            assert!(
-                app.two_cbh_export_would_overwrite_source(&source.with_extension(extension)),
-                "source .{extension} is not protected"
-            );
-        }
-        assert!(!app.two_cbh_export_would_overwrite_source(&dir.join("copy.2cbh")));
-
-        for companion in crate::twocbh::existing_companion_files(&source) {
-            let _ = std::fs::remove_file(companion);
-        }
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn two_cbh_export_protects_only_the_actual_pgn_source() {
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("brett-2cbh-pgn-source-{stamp}"));
-        std::fs::create_dir_all(&dir).unwrap();
-        let source = dir.join("games.pgn");
-        std::fs::write(&source, b"[Event \"Test\"]\n\n1. e4 e5 *\n").unwrap();
-
-        let mut app = test_app();
-        app.library = Some(std::sync::Arc::new(PgnLibrary::build(&source).unwrap()));
-        // Converting a PGN library to 2CBH on the default target is allowed.
-        assert!(
-            !app.two_cbh_export_would_overwrite_source(&dir.join("games.2cbh")),
-            "PGN source must not protect the 2CBH default target"
-        );
-        // The exact source path is still protected.
-        assert!(app.two_cbh_export_would_overwrite_source(&source));
-
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn classifies_session_openings_preserving_or_overwriting_existing_tags() {
-        let mut app = test_app();
-        let untagged = domain::parse_pgn(b"1. e4 e5 2. Nf3 Nc6 3. Bb5 *\n")
-            .unwrap()
-            .remove(0);
-        let tagged =
-            domain::parse_pgn(b"[ECO \"A00\"]\n[Opening \"Custom\"]\n\n1. d4 d5 2. c4 *\n")
-                .unwrap()
-                .remove(0);
-        let id1 = app.session.insert_game(untagged, None);
-        let id2 = app.session.insert_game(tagged, None);
-
-        let summary = app.classify_session_openings(false);
-        assert_eq!(summary.total, 2);
-        assert_eq!(summary.updated, 1);
-        assert_eq!(summary.preserved, 1);
-        assert_eq!(app.session.slot(id1).unwrap().header("ECO"), Some("C60"));
-        assert_eq!(
-            app.session.slot(id1).unwrap().header("Opening"),
-            Some("Ruy Lopez")
-        );
-        assert_eq!(app.session.slot(id2).unwrap().header("ECO"), Some("A00"));
-        assert_eq!(
-            app.session.slot(id2).unwrap().header("Opening"),
-            Some("Custom")
-        );
-
-        let summary = app.classify_session_openings(true);
-        assert_eq!(summary.total, 2);
-        assert_eq!(summary.updated, 2);
-        assert_eq!(app.session.slot(id2).unwrap().header("ECO"), Some("D06"));
-        assert_eq!(
-            app.session.slot(id2).unwrap().header("Opening"),
-            Some("Queen's Gambit")
-        );
-    }
-
-    #[test]
-    fn cbh_export_lists_companion_files_and_protects_source() {
-        let base = PathBuf::from("/tmp/example.cbh");
-        assert_eq!(
-            crate::cbh::core_companion_files(&base),
-            [
-                PathBuf::from("/tmp/example.cbh"),
-                PathBuf::from("/tmp/example.cbg"),
-                PathBuf::from("/tmp/example.cba"),
-                PathBuf::from("/tmp/example.cbp"),
-                PathBuf::from("/tmp/example.cbt"),
-                PathBuf::from("/tmp/example.cbc"),
-                PathBuf::from("/tmp/example.cbs"),
-            ]
-        );
-    }
-
-    #[test]
-    fn scid_export_normalizes_and_lists_the_triple() {
-        let base = PathBuf::from("/tmp/example.si4");
-        assert_eq!(
-            scid_triple(&base),
-            [
-                PathBuf::from("/tmp/example.si4"),
-                PathBuf::from("/tmp/example.sn4"),
-                PathBuf::from("/tmp/example.sg4"),
-            ]
-        );
-        assert!(same_file_path(&base, &base));
-        assert!(!same_file_path(&base, &PathBuf::from("/tmp/other.si4")));
-    }
-
-    #[test]
-    fn compact_metadata_tags_group_event_site_and_round_board() {
-        for tag in ["Event", "Site", "Date", "Round", "Result"] {
-            assert!(is_compact_pgn_tag(tag));
-        }
-        assert!(!is_compact_pgn_tag("White"));
-        let (round, board) = round_and_board("3.4");
-        assert_eq!(round, "3");
-        assert_eq!(board.as_deref(), Some("4"));
-        assert_eq!(combine_round("3", "4"), "3.4");
-        assert_eq!(combine_round("3", ""), "3");
-    }
-
-    #[test]
-    fn my_player_names_orient_by_priority() {
-        let names = vec![
-            "Carlsen, Magnus".to_string(),
-            "Nakamura, Hikaru".to_string(),
-        ];
-        assert_eq!(
-            top_priority_player_key(&names).as_deref(),
-            Some("carlsen magnus"),
-            "only the first priority name is labelled You"
-        );
-        assert!(top_priority_player_key(&[]).is_none());
-
-        let game = |white: &str, black: &str| Game {
-            headers: vec![
-                ("White".to_string(), white.to_string()),
-                ("Black".to_string(), black.to_string()),
-            ],
-            ..Game::default()
-        };
-        assert_eq!(
-            my_player_color(&names, &game("Magnus Carlsen", "Ding Liren")),
-            Some(Color::White)
-        );
-        assert_eq!(
-            my_player_color(&names, &game("Ding Liren", "Hikaru Nakamura")),
-            Some(Color::Black)
-        );
-        assert_eq!(
-            my_player_color(&names, &game("Hikaru Nakamura", "Magnus Carlsen")),
-            Some(Color::Black),
-            "the first alias in the list wins when both players match"
-        );
-        assert_eq!(
-            my_player_color(&names, &game("Ding Liren", "Fabiano Caruana")),
-            None
-        );
-        assert_eq!(prep_you_name(&names), "Magnus Carlsen");
-        assert_eq!(prep_you_name(&[]), "You");
-    }
-
-    #[test]
-    fn app_analysis_cache_lifecycle() {
-        let mut app = test_app();
-        assert!(app.cache_engine_analysis);
-        assert!(app.heuristic_supersede);
-
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let db_path = std::env::temp_dir().join(format!("brett-test-app-cache-{nonce}.db"));
-        let handle = crate::analysis_cache::AnalysisCacheHandle::spawn(Some(db_path.clone()), true);
-        app.analysis_cache = Some(handle);
-
-        // When navigating to starting position, cached_analyses is initially empty
-        app.update_cached_analyses();
-        assert!(app.cached_analyses.is_empty());
-
-        // Store an analysis into the handle
-        let pos = Chess::default();
-        let hash = pos.position_hash();
-        let entry = crate::analysis_cache::CachedAnalysis {
-            pos_hash: hash,
-            fen: "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1".to_string(),
-            engine_family: crate::analysis_cache::EngineFamily::Stockfish,
-            engine_name: "Stockfish 17".to_string(),
-            multipv: 1,
-            depth: 28,
-            seldepth: Some(34),
-            score_cp: Some(30),
-            score_mate: None,
-            nodes: Some(5_000_000),
-            time_ms: Some(1000),
-            nps: Some(5_000_000),
-            pv: vec!["e2e4".to_string(), "e7e5".to_string()],
-            quality_score: 5000.0,
-            analyzed_at: 1700000000,
-        };
-        app.analysis_cache.as_ref().unwrap().store(entry);
-
-        // Give worker thread a moment to write
-        std::thread::sleep(std::time::Duration::from_millis(60));
-
-        // When update_cached_analyses is called, it loads the cached record
-        app.cached_analyses.clear();
-        app.cached_analyses_pos = None;
-        app.update_cached_analyses();
-        assert_eq!(app.cached_analyses.len(), 1);
-        assert_eq!(app.cached_analyses[0].engine_name, "Stockfish 17");
-        assert_eq!(app.cached_analyses[0].depth, 28);
-
-        let _ = std::fs::remove_file(&db_path);
-    }
-
-    #[test]
-    fn app_apply_imported_settings() {
-        let mut app = test_app();
-        let bundle = crate::settings::SettingsBundle {
-            engine: crate::settings::EnginePrefs {
-                path: Some(PathBuf::from("/usr/bin/stockfish")),
-                threads: 4,
-                hash_mb: 1024,
-                cache_engine_analysis: false,
-                heuristic_supersede: false,
-            },
-            references: crate::settings::CloudPrefs {
-                lichess_token: Some("imported_token_xyz".to_string()),
-                lichess_username: Some("grandmaster_brett".to_string()),
-                chesscom_username: None,
-                explorer_source: crate::cloud::ExplorerSource::Masters,
-                wikipedia_summaries: false,
-            },
-            preparation: crate::settings::PreparationPrefs {
-                reference_enabled: true,
-                rating_band: 250,
-                rating_offset: -50,
-                prep_player_names: vec!["Kasparov, Garry".to_string()],
-                ..Default::default()
-            },
-            display: crate::settings::DisplayPrefs::default(),
-        };
-
-        app.apply_imported_settings(&bundle);
-
-        assert_eq!(app.engine_threads, 4);
-        assert_eq!(app.engine_hash_mb, 1024);
-        assert!(!app.cache_engine_analysis);
-        assert!(!app.heuristic_supersede);
-        assert_eq!(app.lichess_token, Some("imported_token_xyz".to_string()));
-        assert!(!app.wiki_enabled);
-        assert_eq!(app.prep_player_names, vec!["Kasparov, Garry".to_string()]);
-        assert_eq!(app.reference_band, 250);
-        assert_eq!(app.reference_offset, -50);
-        assert_eq!(app.status, "Settings successfully imported.");
-    }
-
-    #[test]
-    fn app_cache_info_dialog_toggle() {
-        let mut app = test_app();
-        assert!(!app.show_cache_info);
-        app.show_cache_info = true;
-        assert!(app.show_cache_info);
-        app.show_cache_info = false;
-        assert!(!app.show_cache_info);
-    }
-
-    #[test]
-    fn annotation_toggles_replace_conflicting_symbols() {
-        let mut app = test_app();
-        let node = 1; // 1. e4
-        app.set_nag(node, Some(5));
-        assert_eq!(app.current.as_ref().unwrap().nodes[node].nags, vec![5]);
-
-        app.set_nag(node, Some(13));
-        assert_eq!(app.current.as_ref().unwrap().nodes[node].nags, vec![5, 13]);
-
-        app.set_nag(node, Some(14));
-        assert_eq!(app.current.as_ref().unwrap().nodes[node].nags, vec![5, 14]);
-
-        app.set_nag(node, Some(5));
-        assert_eq!(app.current.as_ref().unwrap().nodes[node].nags, vec![14]);
-
-        app.set_nag(node, None);
-        assert!(app.current.as_ref().unwrap().nodes[node].nags.is_empty());
-    }
-
-    #[test]
-    fn annotation_editor_closes_when_navigating_elsewhere() {
-        let mut app = test_app();
-        app.annotation_editor = Some(1);
-        app.goto(1);
-        assert_eq!(app.annotation_editor, Some(1));
-        app.goto(2);
-        assert_eq!(app.annotation_editor, None);
-    }
-
-    #[test]
-    fn clicking_the_selected_piece_again_clears_the_hints() {
-        let mut app = test_app();
-        app.click_square(Square::E2);
-        assert_eq!(app.selected, Some(Square::E2));
-        assert!(app.targets.contains(&Square::E4));
-
-        app.click_square(Square::E2);
-        assert_eq!(app.selected, None);
-        assert!(app.targets.is_empty());
-    }
-
-    #[test]
-    fn drag_start_selects_the_piece_and_drop_plays_the_move() {
-        let mut app = test_app();
-        app.handle_board_event(BoardEvent::DragStart(Square::E2));
-        assert_eq!(app.selected, Some(Square::E2));
-        assert_eq!(app.drag_from, Some(Square::E2));
-        assert!(app.targets.contains(&Square::E4));
-
-        app.handle_board_event(BoardEvent::Drop {
-            from: Square::E2,
-            to: Square::E4,
-        });
-        assert_eq!(app.drag_from, None);
-        assert_eq!(app.selected, None);
-        assert_eq!(
-            app.current.as_ref().unwrap().nodes[app.node].san(),
-            Some("e4")
-        );
-    }
-
-    #[test]
-    fn cloud_primary_split_folds_only_trailing_chessdb_rows() {
-        let row = |san: &str, lichess: bool| CloudEngineRow {
-            uci: "e2e4".to_string(),
-            san: san.to_string(),
-            chessdb: Some(20),
-            lichess: lichess.then_some((Some(20), None)),
-            variation: vec!["e2e4".to_string()],
-            ..Default::default()
-        };
-        let rows = vec![
-            row("e4", true),
-            row("d4", false),
-            row("Nf3", true),
-            row("c4", false),
-            row("b3", false),
-        ];
-        assert_eq!(cloud_primary_split(&rows), 3);
-        assert!(rows[3..].iter().all(|row| row.lichess.is_none()));
-
-        let all_chessdb = vec![row("e4", false), row("d4", false)];
-        assert_eq!(cloud_primary_split(&all_chessdb), 0);
-    }
-
-    #[test]
-    fn multi_source_engine_rows_merging_and_stacking() {
-        use crate::analysis_cache::{CachedAnalysis, EngineFamily};
-
-        let pos = Chess::default();
-        let chessdb = cloud::ChessDb {
-            moves: vec![cloud::ChessDbMove {
-                uci: "e2e4".to_string(),
-                score: 25,
-                rank: 2,
-                note: String::new(),
-                winrate: 52.0,
-            }],
-        };
-        let cloud_eval = cloud::CloudEval {
-            depth: 35,
-            knodes: 100_000,
-            pvs: vec![cloud::CloudPv {
-                moves: "e2e4 c7c5 g1f3 d7d6".to_string(),
-                cp: Some(22),
-                mate: None,
-            }],
-        };
-        let snapshot = cloud::Snapshot {
-            fen: "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1".to_string(),
-            chessdb: Ok(chessdb),
-            explorer: Err("disabled".to_string()),
-            cloud_eval: Ok(cloud_eval),
-            explorer_source: cloud::ExplorerSource::Masters,
-        };
-
-        let local_sf = CachedAnalysis {
-            pos_hash: 1,
-            fen: "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1".to_string(),
-            engine_family: EngineFamily::Stockfish,
-            engine_name: "Stockfish 17".to_string(),
-            multipv: 1,
-            depth: 38,
-            seldepth: Some(42),
-            score_cp: Some(30),
-            score_mate: None,
-            nodes: Some(10_000_000),
-            time_ms: Some(2000),
-            nps: Some(5_000_000),
-            pv: vec![
-                "e2e4".to_string(),
-                "e7e5".to_string(),
-                "g1f3".to_string(),
-                "b8c6".to_string(),
-            ],
-            quality_score: 5000.0,
-            analyzed_at: 1700000000,
-        };
-
-        let rows = merge_multi_source_engine_rows(Some(&snapshot), &[local_sf], &pos);
-        assert!(!rows.is_empty());
-        let e4_row = rows.iter().find(|r| r.san == "e4").unwrap();
-
-        assert_eq!(e4_row.chessdb, Some(25));
-        assert_eq!(e4_row.lichess, Some((Some(22), None)));
-        assert_eq!(e4_row.stockfish, Some((Some(30), None)));
-        assert_eq!(e4_row.stockfish_depth, Some(38));
-
-        assert_eq!(e4_row.variation, vec!["e2e4", "e7e5", "g1f3", "b8c6"]);
-        assert!(
-            e4_row
-                .variation_source
-                .as_deref()
-                .unwrap()
-                .contains("Stockfish")
-        );
-
-        assert!(e4_row.alt_variation.is_some());
-        assert_eq!(
-            e4_row.alt_variation.as_ref().unwrap(),
-            &vec!["e2e4", "c7c5", "g1f3", "d7d6"]
-        );
-    }
-
-    #[test]
-    fn pv_steps_convert_uci_and_track_each_prefix() {
-        let pv = vec!["e2e4".to_string(), "e7e5".to_string(), "g1f3".to_string()];
-        let steps = pv_steps(&Chess::default(), &pv, 10);
-        assert_eq!(steps.len(), 3);
-        assert_eq!(steps[0].san, "e4");
-        assert_eq!(steps[1].san, "e5");
-        assert_eq!(steps[2].san, domain::figurine_san("Nf3"));
-        assert_eq!(steps[0].preview.last_move, Some((Square::E2, Square::E4)));
-        assert_eq!(steps[2].preview.last_move, Some((Square::G1, Square::F3)));
-        assert_eq!(steps[2].preview.pos.turn(), Color::Black);
-        assert_eq!(pv_line_text(&steps), "1. e4 e5 2. ♘f3");
-        assert!(preview_after_uci(&Chess::default(), "e2e5").is_none());
-
-        let after_e4 = preview_after_uci(&Chess::default(), "e2e4").unwrap().pos;
-        let black_pv = vec!["e7e5".to_string(), "g1f3".to_string()];
-        let steps = pv_steps(&after_e4, &black_pv, 10);
-        assert_eq!(pv_line_text(&steps), "1... e5 2. ♘f3");
-    }
-
-    #[test]
-    fn cloud_engine_rows_sort_by_average_and_keep_every_lichess_pv() {
-        let chessdb = cloud::ChessDb {
-            moves: vec![
-                cloud::ChessDbMove {
-                    uci: "e2e4".to_string(),
-                    score: 20,
-                    rank: 2,
-                    note: String::new(),
-                    winrate: 52.0,
-                },
-                cloud::ChessDbMove {
-                    uci: "d2d4".to_string(),
-                    score: 10,
-                    rank: 1,
-                    note: String::new(),
-                    winrate: 51.0,
-                },
-                cloud::ChessDbMove {
-                    uci: "g1f3".to_string(),
-                    score: 5,
-                    rank: 0,
-                    note: String::new(),
-                    winrate: 50.0,
-                },
-                cloud::ChessDbMove {
-                    uci: "b2b3".to_string(),
-                    score: 1,
-                    rank: 0,
-                    note: String::new(),
-                    winrate: 49.0,
-                },
-                cloud::ChessDbMove {
-                    uci: "h2h3".to_string(),
-                    score: 100,
-                    rank: 0,
-                    note: String::new(),
-                    winrate: 60.0,
-                },
-            ],
-        };
-        let cloud_eval = cloud::CloudEval {
-            depth: 75,
-            knodes: 1,
-            pvs: vec![
-                cloud::CloudPv {
-                    moves: "e2e4 e7e5 g1f3 b8c6".to_string(),
-                    cp: Some(20),
-                    mate: None,
-                },
-                cloud::CloudPv {
-                    moves: "e2e4 c7c5 g1f3 d7d6".to_string(),
-                    cp: Some(18),
-                    mate: None,
-                },
-                cloud::CloudPv {
-                    moves: "d2d4 d7d5 c2c4 e7e6".to_string(),
-                    cp: Some(15),
-                    mate: None,
-                },
-                cloud::CloudPv {
-                    moves: "g1f3 g8f6 c2c4 e7e6".to_string(),
-                    cp: Some(12),
-                    mate: None,
-                },
-                cloud::CloudPv {
-                    moves: "c2c4 c7c5 g1f3 g8f6".to_string(),
-                    cp: Some(8),
-                    mate: None,
-                },
-            ],
-        };
-        let snapshot = cloud::Snapshot {
-            fen: "start".to_string(),
-            explorer_source: cloud::ExplorerSource::Masters,
-            chessdb: Ok(chessdb),
-            explorer: Err("not used".to_string()),
-            cloud_eval: Ok(cloud_eval),
-        };
-        let rows = cloud_engine_rows(&snapshot, &Chess::default());
-        assert_eq!(rows.iter().filter(|row| row.lichess.is_some()).count(), 5);
-        assert_eq!(
-            rows.len(),
-            7,
-            "five Lichess rows plus two chessdb-only rows"
-        );
-        assert_eq!(
-            rows[0].uci, "h2h3",
-            "the highest average row sorts first for White"
-        );
-        assert!(rows[0].lichess.is_none());
-        let scores: Vec<f64> = rows.iter().filter_map(cloud_row_score).collect();
-        assert!(
-            scores.windows(2).all(|pair| pair[0] >= pair[1]),
-            "White rows descend by average score"
-        );
-        assert_eq!(rows[6].uci, "b2b3");
-        assert!(rows[6].lichess.is_none());
-        assert_eq!(
-            rows[6].variation,
-            vec!["b2b3".to_string()],
-            "chessdb-only rows render a one-ply line"
-        );
-        assert!(
-            rows.iter().all(|row| !row.variation.is_empty()),
-            "every row has a clickable line, including chessdb-only moves"
-        );
-        let e4_rows: Vec<_> = rows.iter().filter(|row| row.uci == "e2e4").collect();
-        assert_eq!(e4_rows.len(), 2);
-        assert_ne!(e4_rows[0].variation[1], e4_rows[1].variation[1]);
-        assert!(
-            rows.iter()
-                .any(|row| row.uci == "c2c4" && row.chessdb.is_none())
-        );
-
-        let after_e4 = preview_after_uci(&Chess::default(), "e2e4").unwrap().pos;
-        let black_snapshot = cloud::Snapshot {
-            fen: "after e4".to_string(),
-            explorer_source: cloud::ExplorerSource::Masters,
-            chessdb: Ok(cloud::ChessDb {
-                moves: vec![cloud::ChessDbMove {
-                    uci: "e7e5".to_string(),
-                    score: -30,
-                    rank: 2,
-                    note: String::new(),
-                    winrate: 48.0,
-                }],
-            }),
-            explorer: Err("not used".to_string()),
-            cloud_eval: Err("not used".to_string()),
-        };
-        let rows = cloud_engine_rows(&black_snapshot, &after_e4);
-        assert_eq!(rows[0].chessdb, Some(30), "chessdb scores use White's POV");
-    }
-
-    #[test]
-    fn cloud_engine_rows_match_castling_across_uci_encodings() {
-        let pos = Fen::from_ascii(b"r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1")
-            .unwrap()
-            .into_position(CastlingMode::Standard)
-            .unwrap();
-        let snapshot = cloud::Snapshot {
-            fen: fen_string(&pos),
-            explorer_source: cloud::ExplorerSource::Masters,
-            chessdb: Ok(cloud::ChessDb {
-                moves: vec![cloud::ChessDbMove {
-                    // chessdb may spell queenside castling as king-to-rook.
-                    uci: "e1a1".to_string(),
-                    score: 30,
-                    rank: 2,
-                    note: String::new(),
-                    winrate: 50.0,
-                }],
-            }),
-            explorer: Err("not used".to_string()),
-            cloud_eval: Ok(cloud::CloudEval {
-                depth: 50,
-                knodes: 1,
-                pvs: vec![cloud::CloudPv {
-                    // Lichess spells the same move as king-to-castle.
-                    moves: "e1c1 e8g8".to_string(),
-                    cp: Some(20),
-                    mate: None,
-                }],
-            }),
-        };
-        let rows = cloud_engine_rows(&snapshot, &pos);
-        assert_eq!(rows.len(), 1, "both castling encodings are the same move");
-        assert_eq!(rows[0].san, "O-O-O");
-        assert_eq!(rows[0].chessdb, Some(30));
-        assert_eq!(rows[0].lichess, Some((Some(20), None)));
-        assert_eq!(
-            rows[0].variation,
-            vec!["e1c1".to_string(), "e8g8".to_string()]
-        );
-    }
-
-    #[test]
-    fn cloud_scores_average_sources_and_handle_mates() {
-        let both = cloud_test_row(Some(200), Some((Some(100), None)));
-        assert_eq!(cloud_average_cp(&both), Some(150.0));
-        assert_eq!(cloud_row_score(&both), Some(150.0));
-
-        let negative = cloud_test_row(Some(-100), Some((Some(-300), None)));
-        assert_eq!(cloud_average_cp(&negative), Some(-200.0));
-        assert_eq!(cloud_row_score(&negative), Some(-200.0));
-
-        let chessdb_only = cloud_test_row(Some(50), None);
-        assert_eq!(cloud_average_cp(&chessdb_only), Some(50.0));
-        assert_eq!(cloud_row_score(&chessdb_only), Some(50.0));
-
-        let lichess_only = cloud_test_row(None, Some((Some(-50), None)));
-        assert_eq!(cloud_average_cp(&lichess_only), Some(-50.0));
-        assert_eq!(cloud_row_score(&lichess_only), Some(-50.0));
-
-        let odd = cloud_test_row(Some(0), Some((Some(19), None)));
-        assert_eq!(
-            cloud_average_cp(&odd),
-            Some(9.5),
-            "odd cp differences keep their fractional average"
-        );
-
-        let mate = cloud_test_row(Some(100), Some((None, Some(2))));
-        assert_eq!(cloud_row_score(&mate), Some(99_998.0));
-        let black_mate = cloud_test_row(Some(100), Some((None, Some(-2))));
-        assert_eq!(cloud_row_score(&black_mate), Some(-99_998.0));
-
-        let missing = cloud_test_row(None, None);
-        assert_eq!(cloud_average_cp(&missing), None);
-        assert_eq!(cloud_row_score(&missing), None);
-    }
-
-    #[test]
-    fn cloud_rows_sort_best_first_for_the_side_to_move() {
-        let mut rows = vec![
-            cloud_test_row(Some(10), Some((Some(20), None))),
-            cloud_test_row(Some(100), None),
-            cloud_test_row(Some(0), Some((Some(0), None))),
-            cloud_test_row(None, None),
-        ];
-
-        cloud_sort_rows(&mut rows, Color::White);
-        assert_eq!(
-            rows.iter().map(|row| row.chessdb).collect::<Vec<_>>(),
-            vec![Some(100), Some(10), Some(0), None],
-            "White sorts from the highest score down; missing evals last"
-        );
-
-        cloud_sort_rows(&mut rows, Color::Black);
-        assert_eq!(
-            rows.iter().map(|row| row.chessdb).collect::<Vec<_>>(),
-            vec![Some(0), Some(10), Some(100), None],
-            "Black sorts from the lowest score up; missing evals last"
-        );
-    }
-
-    #[test]
-    fn cloud_delta_colors_follow_the_side_to_move() {
-        let white_rows = vec![
-            cloud_test_row(Some(100), Some((Some(100), None))),
-            cloud_test_row(Some(40), Some((Some(40), None))),
-            cloud_test_row(Some(-100), Some((Some(-100), None))),
-        ];
-        let best = cloud_best_score(&white_rows, Color::White);
-        assert_eq!(best, Some(100.0));
-        assert_eq!(cloud_delta(&white_rows[0], best, Color::White), Some(0.0));
-        assert_eq!(cloud_delta(&white_rows[1], best, Color::White), Some(60.0));
-        assert_eq!(cloud_delta(&white_rows[2], best, Color::White), Some(200.0));
-        assert_eq!(
-            cloud_delta(&white_rows[0], best, Color::White).map(move_delta_color),
-            Some(Color32::from_rgb(0x7E, 0xD3, 0x8A))
-        );
-        assert_eq!(
-            cloud_delta(&white_rows[2], best, Color::White).map(move_delta_color),
-            Some(Color32::from_rgb(0xE0, 0x6C, 0x6C))
-        );
-
-        let black_rows = vec![
-            cloud_test_row(Some(-100), Some((Some(-100), None))),
-            cloud_test_row(Some(-40), Some((Some(-40), None))),
-            cloud_test_row(Some(100), Some((Some(100), None))),
-        ];
-        let best = cloud_best_score(&black_rows, Color::Black);
-        assert_eq!(best, Some(-100.0));
-        assert_eq!(cloud_delta(&black_rows[0], best, Color::Black), Some(0.0));
-        assert_eq!(cloud_delta(&black_rows[1], best, Color::Black), Some(60.0));
-        assert_eq!(cloud_delta(&black_rows[2], best, Color::Black), Some(200.0));
-        assert_eq!(
-            cloud_delta(&black_rows[0], best, Color::Black).map(move_delta_color),
-            Some(Color32::from_rgb(0x7E, 0xD3, 0x8A)),
-            "the lowest score is green for Black"
-        );
-        assert_eq!(
-            cloud_delta(&black_rows[2], best, Color::Black).map(move_delta_color),
-            Some(Color32::from_rgb(0xE0, 0x6C, 0x6C)),
-            "the highest score is red for Black"
-        );
-
-        assert_eq!(move_delta_color(30.0), Color32::from_rgb(0xE8, 0xC4, 0x6A));
-        assert_eq!(move_delta_color(120.0), Color32::from_rgb(0xE0, 0x6C, 0x6C));
-        assert_eq!(move_delta_color(500.0), Color32::from_rgb(0xE0, 0x6C, 0x6C));
-        assert_ne!(
-            move_delta_color(1.0),
-            move_delta_color(0.0),
-            "a non-best move is never rendered in the optimal-move green"
-        );
-    }
-
-    #[test]
-    fn cloud_mate_scores_are_included_in_the_baseline() {
-        let white_mate = cloud_test_row(Some(0), Some((None, Some(3))));
-        let quiet = cloud_test_row(Some(500), None);
-        let best = cloud_best_score(&[white_mate.clone(), quiet.clone()], Color::White);
-        assert_eq!(best, Some(99_997.0));
-        assert_eq!(cloud_delta(&white_mate, best, Color::White), Some(0.0));
-        assert!(
-            cloud_delta(&quiet, best, Color::White).unwrap() > 90_000.0,
-            "a non-mate move is far worse when a forced mate is available"
-        );
-
-        let black_mate = cloud_test_row(Some(0), Some((None, Some(-2))));
-        let white_mate = cloud_test_row(Some(0), Some((None, Some(2))));
-        let best = cloud_best_score(&[black_mate.clone(), white_mate.clone()], Color::Black);
-        assert_eq!(best, Some(-99_998.0));
-        assert_eq!(cloud_delta(&black_mate, best, Color::Black), Some(0.0));
-        assert!(
-            cloud_delta(&white_mate, best, Color::Black).unwrap() > 90_000.0,
-            "a mate for White is the worst row when Black has a mate"
-        );
-    }
-
-    #[test]
-    fn branch_choice_keeps_mainline_first_then_recent_variations() {
-        let mut app = test_app();
-        app.play_uci("d2d4");
-        app.goto(0);
-        app.play_uci("c2c4");
-        app.goto(0);
-        app.next_move();
-
-        let choice = app.branch_choice.as_ref().expect("branch popup");
-        assert_eq!(choice.selected, 0, "mainline is selected by default");
-        let sans: Vec<String> = choice
-            .options
-            .iter()
-            .map(|&node| {
-                app.current.as_ref().unwrap().nodes[node]
-                    .san()
-                    .unwrap()
-                    .to_string()
-            })
-            .collect();
-        assert_eq!(sans, vec!["e4", "c4", "d4"]);
-    }
-
-    #[test]
-    fn empty_pgn_placeholders_are_treated_as_absent() {
-        assert!(pgn_tag_is_empty(""));
-        assert!(pgn_tag_is_empty(" ? "));
-        assert!(pgn_tag_is_empty("????.??.??"));
-        assert!(!pgn_tag_is_empty("*"));
-        assert!(!pgn_tag_is_empty("3.4"));
-    }
-
-    #[test]
-    fn reference_prior_is_used_only_when_enabled() {
-        let dir = std::env::temp_dir().join(format!(
-            "brett-reference-prior-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let pgn_path = dir.join("reference.pgn");
-        let index_path = dir.join("reference.brettpos");
-        std::fs::write(&pgn_path, include_bytes!("../fixtures/opera.pgn")).unwrap();
-        PositionIndex::build_to(&pgn_path, &index_path, BuildOptions::default(), |_| {}).unwrap();
-        let index = PositionIndex::open(&index_path).unwrap();
-        let mut app = test_app();
-        app.reference_path = pgn_path.display().to_string();
-        app.reference = Some(ReferenceIndex {
-            index,
-            job: ReferenceJob {
-                path: pgn_path.clone(),
-                target: 2_500,
-                band: 200,
-                offset: 0,
-            },
-        });
-        let key = position::position_key(&Chess::default());
-
-        app.reference_enabled = false;
-        let (moves, source) = app.prior_for_position(key);
-        assert!(moves.is_empty());
-        assert_eq!(source, players::PriorSource::CurrentDatabase);
-
-        app.reference_enabled = true;
-        let (moves, source) = app.prior_for_position(key);
-        assert!(!moves.is_empty());
-        assert_eq!(source, players::PriorSource::Reference);
-
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn prep_line_lists_opponent_moves_with_likelihoods() {
-        let pgn = b"[Event \"Prep\"]\n[White \"You\"]\n[Black \"Opponent\"]\n[Date \"2024.01.01\"]\n[Result \"*\"]\n\n1. e4 e5 2. Nf3 Nc6 *\n";
-        let mut games = domain::parse_pgn(&pgn[..]).unwrap();
-        let game = games.remove(0);
-        let book = players::PlayerBook::from_games(
-            "opponent",
-            "Opponent",
-            std::slice::from_ref(&game),
-            players::PredictionConfig::default(),
-            players::today(),
-        );
-
-        let mut app = test_app();
-        app.node = game.nodes.len() - 1;
-        app.current = Some(game);
-        app.player_book = Some(book);
-        app.prep = Some(PrepSession {
-            player_key: "opponent".to_string(),
-            player_name: "Opponent".to_string(),
-            player_title: None,
-            player_fide_id: None,
-            our_color: Color::White,
-            previous_game: None,
-            previous_orientation: Color::White,
-        });
-
-        let prep = app.prep.clone().unwrap();
-        let rows = app.prep_line_rows(&prep);
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].label, "1... e5");
-        assert_eq!(
-            rows[1].label,
-            format!("2... {}", domain::figurine_san("Nc6"))
-        );
-        assert_eq!(rows[0].date, 2024_0101);
-        assert!(rows.iter().all(|row| row.likelihood.is_some()));
-        assert!(
-            rows.iter()
-                .all(|row| row.likelihood_low.is_some() && row.likelihood_high.is_some())
-        );
-        assert!(rows.iter().all(|row| row.tree_score.is_none()));
-    }
-
-    #[test]
-    fn recent_preview_is_read_only_and_restores_preparation() {
-        let pgn = b"[Event \"Preview\"]\n[White \"Preview White\"]\n[Black \"Preview Black\"]\n[Date \"2025.05.05\"]\n[Result \"*\"]\n\n1. d4 d5 *\n";
-        let mut path = std::env::temp_dir();
-        path.push(format!(
-            "brett-preview-{}-{}.pgn",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::write(&path, pgn).unwrap();
-        let library = PgnLibrary::build(&path).unwrap();
-
-        let mut app = test_app();
-        let prep_game = app.current.clone().unwrap();
-        app.library = Some(Arc::new(library) as Arc<dyn GameLibrary>);
-        app.node = 2;
-        app.right_tab = RightTab::Tree;
-        app.prep = Some(PrepSession {
-            player_key: "opponent".to_string(),
-            player_name: "Opponent".to_string(),
-            player_title: None,
-            player_fide_id: None,
-            our_color: Color::White,
-            previous_game: None,
-            previous_orientation: Color::White,
-        });
-
-        app.open_recent_preview(0);
-        assert!(app.prep.is_some());
-        assert!(app.recent_preview.is_some());
-        assert_eq!(app.current.as_ref().unwrap().event(), "Preview");
-        assert_eq!(app.node, 0);
-        assert_eq!(app.right_tab, RightTab::Moves);
-
-        let before = app.current.as_ref().unwrap().mainline_len();
-        app.handle_board_event(BoardEvent::Drop {
-            from: Square::E2,
-            to: Square::E4,
-        });
-        assert_eq!(app.node, 0);
-        assert_eq!(app.current.as_ref().unwrap().mainline_len(), before);
-        app.play_uci("d2d4");
-        assert_eq!(app.node, 0);
-        assert_eq!(app.current.as_ref().unwrap().mainline_len(), before);
-
-        app.close_recent_preview();
-        assert!(app.prep.is_some());
-        assert!(app.recent_preview.is_none());
-        assert_eq!(app.current.as_ref().unwrap().event(), prep_game.event());
-        assert_eq!(app.node, 2);
-        assert_eq!(app.right_tab, RightTab::Tree);
-
-        std::fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn crown_hit_rect_tracks_the_crown_glyph() {
-        let ctx = egui::Context::default();
-        let mut crowned = None;
-        let mut plain = None;
-        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
-            let crowned_galley = ui.painter().layout_no_wrap(
-                "Magnus Carlsen 👑".to_owned(),
-                FontId::proportional(14.0),
-                Color32::WHITE,
-            );
-            crowned = crown_rect(&crowned_galley, pos2(10.0, 20.0));
-            let plain_galley = ui.painter().layout_no_wrap(
-                "Magnus Carlsen".to_owned(),
-                FontId::proportional(14.0),
-                Color32::WHITE,
-            );
-            plain = crown_rect(&plain_galley, pos2(10.0, 20.0));
-        });
-        output.textures_delta.clear();
-
-        let rect = crowned.expect("the crown glyph should have a hit rect");
-        assert!(rect.width() > 0.0);
-        assert!(rect.height() > 0.0);
-        assert!(rect.min.x >= 10.0);
-        assert!(rect.min.y >= 0.0);
-        assert!(rect.max.x <= 220.0);
-        assert!(rect.max.y <= 100.0);
-        assert!(plain.is_none(), "a label without a crown must not match");
-    }
-
-    #[test]
-    fn map_search_url_encodes_the_site_value() {
-        assert_eq!(
-            map_search_url("  Café de la Paix  "),
-            "https://www.openstreetmap.org/search?query=Caf%C3%A9%20de%20la%20Paix"
-        );
-        assert_eq!(
-            map_search_url("St. Louis & Co."),
-            "https://www.openstreetmap.org/search?query=St.%20Louis%20%26%20Co."
-        );
-        assert_eq!(
-            map_search_url(""),
-            "https://www.openstreetmap.org/search?query="
-        );
-    }
-
-    fn completed_review(
-        app: &App,
-        game: &Game,
-        book_plies: usize,
-    ) -> (review::ReviewKey, ReviewState) {
-        let config = ReviewConfig {
-            limit: SearchLimit::Depth(8),
-        };
-        let key = review::ReviewKey::new(
-            game,
-            config,
-            book_plies,
-            app.engine_path(),
-            app.engine_options(),
-        );
-        let mut state = ReviewState::new(game, config, book_plies);
-        state.key = Some(key.clone());
-        state.mark_complete_for_test();
-        (key, state)
-    }
-
-    #[test]
-    fn review_cache_restores_a_completed_review_without_an_engine() {
-        let mut app = test_app();
-        let game = app.current.clone().unwrap();
-        let (key, state) = completed_review(&app, &game, 0);
-        app.store_review(key.clone(), state);
-        assert_eq!(app.review_cache.len(), 1);
-
-        app.begin_review(
-            &game,
-            ReviewConfig {
-                limit: SearchLimit::Depth(8),
-            },
-            0,
-        );
-
-        let restored = app.review.as_ref().expect("cached review restored");
-        assert!(restored.complete());
-        assert_eq!(restored.key.as_ref(), Some(&key));
-        assert!(app.review_status.starts_with("Review restored from cache"));
-        assert!(app.review_open);
-        assert!(
-            app.review_engine.is_none(),
-            "a cache hit must not spawn an engine"
-        );
-    }
-
-    #[test]
-    fn review_cache_stores_only_completed_reviews() {
-        let mut app = test_app();
-        let game = app.current.clone().unwrap();
-        let config = ReviewConfig {
-            limit: SearchLimit::Depth(8),
-        };
-        let key = review::ReviewKey::new(&game, config, 0, app.engine_path(), app.engine_options());
-        let mut state = ReviewState::new(&game, config, 0);
-        state.key = Some(key.clone());
-        app.store_review(key, state);
-        assert!(app.review_cache.is_empty());
-    }
-
-    #[test]
-    fn review_cache_evicts_the_oldest_entry_at_the_limit() {
-        let mut app = test_app();
-        let game = app.current.clone().unwrap();
-        let config = ReviewConfig {
-            limit: SearchLimit::Depth(8),
-        };
-        let mut keys = Vec::new();
-        for index in 0..=REVIEW_CACHE_LIMIT {
-            let key = review::ReviewKey::new(
-                &game,
-                config,
-                0,
-                format!("/usr/bin/stockfish-{index}"),
-                app.engine_options(),
-            );
-            let mut state = ReviewState::new(&game, config, 0);
-            state.key = Some(key.clone());
-            state.mark_complete_for_test();
-            app.store_review(key.clone(), state);
-            keys.push(key);
-        }
-
-        assert_eq!(app.review_cache.len(), REVIEW_CACHE_LIMIT);
-        assert!(
-            app.cached_review(&keys[0]).is_none(),
-            "the oldest entry is evicted first"
-        );
-        assert!(app.cached_review(&keys[REVIEW_CACHE_LIMIT]).is_some());
-    }
-
-    #[test]
-    fn review_cache_hits_refresh_lru_order() {
-        let mut app = test_app();
-        let game = app.current.clone().unwrap();
-        let config = ReviewConfig {
-            limit: SearchLimit::Depth(8),
-        };
-        let mut keys = Vec::new();
-        for index in 0..REVIEW_CACHE_LIMIT {
-            let key = review::ReviewKey::new(
-                &game,
-                config,
-                0,
-                format!("/usr/bin/stockfish-{index}"),
-                app.engine_options(),
-            );
-            let mut state = ReviewState::new(&game, config, 0);
-            state.key = Some(key.clone());
-            state.mark_complete_for_test();
-            app.store_review(key.clone(), state);
-            keys.push(key);
-        }
-        assert!(app.cached_review(&keys[0]).is_some());
-
-        let extra = review::ReviewKey::new(
-            &game,
-            config,
-            0,
-            "/usr/bin/stockfish-extra",
-            app.engine_options(),
-        );
-        let mut state = ReviewState::new(&game, config, 0);
-        state.key = Some(extra.clone());
-        state.mark_complete_for_test();
-        app.store_review(extra, state);
-
-        assert_eq!(app.review_cache.len(), REVIEW_CACHE_LIMIT);
-        assert!(
-            app.cached_review(&keys[0]).is_some(),
-            "a cache hit refreshed the entry"
-        );
-        assert!(
-            app.cached_review(&keys[1]).is_none(),
-            "the second-oldest entry is evicted"
-        );
-    }
-
-    #[test]
-    fn restart_invalidates_the_matching_cached_review() {
-        let mut app = test_app();
-        let game = app.current.clone().unwrap();
-        let (key, state) = completed_review(&app, &game, 0);
-        app.store_review(key, state.clone());
-        app.review = Some(state);
-        assert_eq!(app.review_cache.len(), 1);
-
-        app.invalidate_current_review_cache();
-        assert!(app.review_cache.is_empty());
-    }
-
-    #[test]
-    fn default_print_filename_formats_white_minus_black_and_sanitizes() {
-        assert_eq!(
-            default_print_stem("Carlsen, Magnus", "Nakamura, Hikaru"),
-            "Carlsen, Magnus - Nakamura, Hikaru"
-        );
-        assert_eq!(
-            default_print_stem("Kasparov, Garry", "?"),
-            "Kasparov, Garry"
-        );
-        assert_eq!(
-            default_print_stem("?", "Karpov, Anatoly"),
-            "Karpov, Anatoly"
-        );
-        assert_eq!(default_print_stem("?", "?"), "game");
-        assert_eq!(default_print_stem("  ", ""), "game");
-        assert_eq!(default_print_stem("-", "*"), "game");
-
-        // Sanitization of filesystem characters
-        assert_eq!(
-            default_print_stem("Doe / Smith", "Player: 1"),
-            "Doe - Smith - Player- 1"
-        );
-        assert_eq!(
-            default_print_stem(r#"White\Black"#, r#"Foo*Bar?Baz<Qux>Pipe|Quote""#),
-            "White-Black - Foo-Bar-Baz-Qux-Pipe-Quote"
-        );
-
-        // Windows reserved device names
-        assert_eq!(default_print_stem("CON", "?"), "CON-game");
-        assert_eq!(default_print_stem("aux", "  "), "aux-game");
-
-        // Full filename with extension
-        assert_eq!(default_print_filename(None), "game.typ");
-
-        let mut game = Game::default();
-        game.headers
-            .push(("White".to_string(), "Carlsen, Magnus".to_string()));
-        game.headers
-            .push(("Black".to_string(), "Nakamura, Hikaru".to_string()));
-        assert_eq!(
-            default_print_filename(Some(&game)),
-            "Carlsen, Magnus - Nakamura, Hikaru.typ"
-        );
-    }
-
-    #[test]
-    fn default_print_path_uses_documents_on_first_use_and_remembers_last_folder() {
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("."));
-        let docs = home.join("Documents");
-
-        let mut game = Game::default();
-        game.headers
-            .push(("White".to_string(), "Paul Morphy".to_string()));
-        game.headers
-            .push(("Black".to_string(), "Converse".to_string()));
-
-        // First use without a remembered directory falls back to Documents
-        assert_eq!(
-            default_print_path(None, Some(&game)),
-            docs.join("Paul Morphy - Converse.typ")
-        );
-
-        // Non-existent directory falls back to Documents
-        let missing = PathBuf::from("/nonexistent/directory/for/testing");
-        assert_eq!(
-            default_print_path(Some(&missing), Some(&game)),
-            docs.join("Paul Morphy - Converse.typ")
-        );
-
-        // Valid remembered directory is used
-        let temp_dir = std::env::temp_dir();
-        assert_eq!(
-            default_print_path(Some(&temp_dir), Some(&game)),
-            temp_dir.join("Paul Morphy - Converse.typ")
-        );
-
-        // Verify BrettApp remembered print dir behavior
-        let mut app = test_app();
-        assert_eq!(app.last_print_dir, None);
-        assert_eq!(
-            app.default_print_export_path(),
-            docs.join("Paul Morphy - Duke Karl and Count Isouard.typ")
-        );
-
-        // Set remembered print dir
-        app.last_print_dir = Some(temp_dir.clone());
-        assert_eq!(
-            app.default_print_export_path(),
-            temp_dir.join("Paul Morphy - Duke Karl and Count Isouard.typ")
-        );
-    }
-
-    #[test]
-    fn database_format_makes_2cbh_writable() {
-        assert_eq!(
-            DatabaseFormat::from_path(Path::new("games.2cbh")),
-            DatabaseFormat::TwoCbh
-        );
-        assert!(DatabaseFormat::TwoCbh.is_writable());
-        assert_eq!(DatabaseFormat::WRITABLE.len(), 4);
-        assert!(DatabaseFormat::WRITABLE.contains(&DatabaseFormat::TwoCbh));
-    }
-
-    #[test]
-    fn database_save_default_path_avoids_overwriting_the_open_source() {
-        let dir = Path::new("/tmp/brett-databases");
-        assert_eq!(
-            database_save_default_path(
-                "Mega Database 2026",
-                Some(Path::new("/db/Mega.2cbh")),
-                dir,
-                DatabaseFormat::Pgn
-            ),
-            dir.join("Mega Database 2026.pgn")
-        );
-        assert_eq!(
-            database_save_default_path(
-                "Mega Database 2026",
-                Some(Path::new("/db/Mega.cbh")),
-                dir,
-                DatabaseFormat::Cbh
-            ),
-            dir.join("Mega Database 2026-saved.cbh")
-        );
-        assert_eq!(
-            database_save_default_path("Brett Database", None, dir, DatabaseFormat::Pgn),
-            dir.join("Brett Database.pgn")
-        );
-    }
-
-    #[test]
-    fn saving_snapshots_the_current_game_edit() {
-        let mut app = test_app();
-        let id = app.session.insert_game(app.current.clone().unwrap(), None);
-        app.current_slot = Some(id);
-        app.current
-            .as_mut()
-            .unwrap()
-            .set_header("Event", "Saved event".to_string());
-        app.dirty = true;
-
-        app.persist_current_edit();
-
-        assert_eq!(
-            app.edited.get(&id).unwrap().header("Event"),
-            Some("Saved event")
-        );
-        assert!(app.dirty, "the edit is not saved until the file is written");
-    }
-
-    #[test]
-    fn save_as_reuses_the_current_writable_target() {
-        let mut app = test_app();
-        app.last_database_dir = Some(PathBuf::from("/tmp/brett-databases"));
-        app.database_save_path = Some(PathBuf::from("/tmp/brett-databases/My Database.pgn"));
-
-        assert_eq!(
-            app.default_database_save_path(DatabaseFormat::Pgn),
-            PathBuf::from("/tmp/brett-databases/My Database.pgn")
-        );
-        assert_eq!(
-            app.default_database_save_path(DatabaseFormat::Scid),
-            PathBuf::from("/tmp/brett-databases/My Database.si4")
-        );
-    }
-
-    #[test]
-    fn unsaved_changes_include_game_edits_and_session_changes() {
-        let mut app = test_app();
-        assert!(!app.has_unsaved_changes());
-        app.dirty = true;
-        assert!(app.has_unsaved_changes());
-        app.dirty = false;
-        app.session_dirty = true;
-        assert!(app.has_unsaved_changes());
-    }
-
-    fn close_request_input() -> egui::RawInput {
-        let mut input = egui::RawInput::default();
-        let mut viewport = egui::ViewportInfo::default();
-        viewport.events.push(egui::ViewportEvent::Close);
-        input.viewports.insert(egui::ViewportId::ROOT, viewport);
-        input
-    }
-
-    #[test]
-    fn close_request_is_cancelled_when_the_database_is_modified() {
-        let ctx = egui::Context::default();
-        let mut app = test_app();
-        app.dirty = true;
-
-        let mut output = ctx.run_ui(close_request_input(), |ui| {
-            app.handle_close_request(ui.ctx());
-        });
-        output.textures_delta.clear();
-
-        assert!(app.close_confirm_open);
-        assert!(
-            output.viewport_output[&egui::ViewportId::ROOT]
-                .commands
-                .contains(&egui::ViewportCommand::CancelClose)
-        );
-    }
-
-    #[test]
-    fn close_request_without_edits_does_not_prompt() {
-        let ctx = egui::Context::default();
-        let mut app = test_app();
-
-        let mut output = ctx.run_ui(close_request_input(), |ui| {
-            app.handle_close_request(ui.ctx());
-        });
-        output.textures_delta.clear();
-
-        assert!(!app.close_confirm_open);
-        assert!(app.pending_window_close);
-        assert!(
-            !output.viewport_output[&egui::ViewportId::ROOT]
-                .commands
-                .contains(&egui::ViewportCommand::CancelClose)
-        );
-    }
-
-    #[test]
-    fn toggling_a_diagram_adds_then_removes_the_node() {
-        let mut diagrams = BTreeSet::new();
-        toggle_diagram(&mut diagrams, 4);
-        assert!(diagrams.contains(&4));
-        toggle_diagram(&mut diagrams, 4);
-        assert!(!diagrams.contains(&4));
-    }
-
-    #[test]
-    fn exporting_the_current_game_writes_typst_and_diagram_assets() {
-        let mut app = test_app();
-        let dir = std::env::temp_dir().join(format!(
-            "brett-print-export-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("opera.typ");
-        app.print_export_path = path.display().to_string();
-        let node = app.current.as_ref().unwrap().mainline()[2];
-        app.print_diagrams.insert(node);
-        app.print_export_include_final = true;
-
-        app.export_current_game_as_typst();
-
-        assert!(path.exists());
-        assert!(
-            app.print_export_status.starts_with("Wrote "),
-            "{}",
-            app.print_export_status
-        );
-        assert_eq!(app.print_export_path, path.display().to_string());
-        assert_eq!(app.last_print_dir, Some(dir.clone()));
-        let diagrams = dir.join("opera_diagrams");
-        assert!(diagrams.join("diagram-01.svg").exists());
-        assert!(diagrams.join("diagram-02.svg").exists());
-
-        let source = std::fs::read_to_string(&path).unwrap();
-        assert!(source.contains("opera_diagrams/diagram-01.svg"));
-        assert!(source.contains("opera_diagrams/diagram-02.svg"));
-        assert!(!source.contains("(Diagram)"));
-
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn setup_dialog_creates_and_loads_new_game_from_position() {
-        let mut app = test_app();
-        assert!(!app.setup_open);
-
-        // Open setup dialog
-        app.open_setup_dialog();
-        assert!(app.setup_open);
-
-        // Modify setup
-        app.setup_state.clear_board();
-        app.setup_state.setup.board.set_piece_at(
-            Square::E1,
-            crate::chess::Piece::new(crate::chess::Color::White, crate::chess::Role::King),
-        );
-        app.setup_state.setup.board.set_piece_at(
-            Square::E8,
-            crate::chess::Piece::new(crate::chess::Color::Black, crate::chess::Role::King),
-        );
-        app.setup_state.sync_fen();
-        assert!(app.setup_state.validation_error.is_none());
-
-        let game = app.setup_state.to_game("2026.11.02").unwrap();
-        let id = app.session.insert_game(game, None);
-        app.select_slot(id);
-
-        assert!(app.current.is_some());
-        let current = app.current.as_ref().unwrap();
-        assert_eq!(current.header("SetUp"), Some("1"));
-        assert_eq!(current.header("FEN"), Some("4k3/8/8/8/8/8/8/4K3 w - - 0 1"));
-    }
-
-    #[test]
-    fn player_strip_renders_name_rating_and_move_counter() {
-        let ctx = egui::Context::default();
-        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
-            let badge = PlayerBadge {
-                name: "Carlsen, Magnus".to_string(),
-                title: Some("GM".to_string()),
-                country: Some("🇳🇴 NOR"),
-                fide_id: Some("1503014".to_string()),
-                rating: Some("2882".to_string()),
-                team: None,
-                clock: None,
-                color: Color::White,
-            };
-            let action = player_strip(
-                ui,
-                400.0,
-                &badge,
-                false,
-                None,
-                PhotoSize::Small,
-                None,
-                Some("move 14 / 35"),
-            );
-            assert!(!action.photo_clicked);
-            assert!(!action.name_clicked);
-        });
-        output.textures_delta.clear();
-    }
-
-    #[test]
-    fn view_preferences_round_trip_and_defaults() {
-        let mut app = test_app();
-        assert!(app.show_pgn_tags);
-        assert!(app.show_annotations);
-        app.show_annotations = false;
-        app.show_pgn_tags = false;
-        app.save_display_prefs();
-        let loaded = DisplayPrefs::load();
-        assert!(!loaded.show_annotations);
-        assert!(!loaded.show_pgn_tags);
-    }
-}
+      
+... [truncated for diff preview]
