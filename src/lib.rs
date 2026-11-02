@@ -29,6 +29,7 @@ pub mod review_book;
 pub mod scid;
 pub mod session;
 pub mod settings;
+pub mod setup;
 pub mod titles;
 pub mod twocbh;
 pub mod ui;

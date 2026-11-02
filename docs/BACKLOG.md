@@ -33,8 +33,9 @@ clock and evaluation-bar toggles live in Settings. The 2026-10-31 pass also
 replaced the separate PGN/SCID/CBH save entries with **Save database** and
 **Save database as…**, remembers the last database folder, and asks before
 closing a modified database. Item 25's Typst target is implemented, including
-the `White - Black` default filename and remembered export folder. Items 26
-and 27 add board setup and country-flag display to the backlog.
+the `White - Black` default filename and remembered export folder. Item 26
+(Set up position) is implemented with board setup, real-time FEN editing, and
+legality validation. Item 27 adds country-flag display to the backlog.
 
 **Decision log (2026-10-28):**
 
@@ -1029,7 +1030,7 @@ other.
 
 ## 26. Set up position
 
-**Status:** backlog only. No implementation is scheduled yet.
+**Status:** implemented 2026-11-02 in `src/setup.rs` and wired into the Board and File menus.
 
 **Goal:** let the user start a game from an arbitrary legal position without
 hand-editing a PGN `FEN` tag, the way a board-setup dialog works in ChessBase.

@@ -2,7 +2,7 @@
 //! bitboards. All types are thin value wrappers with option-free accessors.
 
 use std::fmt;
-use std::ops::{BitOr, BitOrAssign};
+use std::ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign, Not};
 use std::str::FromStr;
 
 /// Error returned when a string cannot be parsed as a [`Square`].
@@ -619,6 +619,28 @@ impl BitOr for Bitboard {
 impl BitOrAssign for Bitboard {
     fn bitor_assign(&mut self, rhs: Bitboard) {
         self.0 |= rhs.0;
+    }
+}
+
+impl BitAnd for Bitboard {
+    type Output = Bitboard;
+
+    fn bitand(self, rhs: Bitboard) -> Bitboard {
+        Bitboard(self.0 & rhs.0)
+    }
+}
+
+impl BitAndAssign for Bitboard {
+    fn bitand_assign(&mut self, rhs: Bitboard) {
+        self.0 &= rhs.0;
+    }
+}
+
+impl Not for Bitboard {
+    type Output = Bitboard;
+
+    fn not(self) -> Bitboard {
+        Bitboard(!self.0)
     }
 }
 

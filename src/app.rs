@@ -821,6 +821,8 @@ pub struct App {
     print_export_include_final: bool,
     print_export_compile_pdf: bool,
     print_export_status: String,
+    setup_open: bool,
+    setup_state: crate::setup::PositionSetupState,
     classify_openings_open: bool,
     classify_overwrite: bool,
     classify_status: String,
@@ -1120,6 +1122,8 @@ impl App {
             print_export_include_final: true,
             print_export_compile_pdf: false,
             print_export_status: String::new(),
+            setup_open: false,
+            setup_state: crate::setup::PositionSetupState::default(),
             classify_openings_open: false,
             classify_overwrite: false,
             classify_status: String::new(),
@@ -2961,6 +2965,40 @@ impl App {
         }
         if !cancel {
             self.print_export_open = open;
+        }
+    }
+
+    fn open_setup_dialog(&mut self) {
+        if let Some(game) = self.current.as_ref() {
+            let node = self.node.min(game.nodes.len().saturating_sub(1));
+            let pos = &game.nodes[node].pos;
+            self.setup_state = crate::setup::PositionSetupState::from_chess(pos);
+        } else {
+            self.setup_state = crate::setup::PositionSetupState::default();
+        }
+        self.setup_open = true;
+    }
+
+    fn setup_dialog(&mut self, ctx: &egui::Context) {
+        if !self.setup_open {
+            return;
+        }
+        let date_str = print_date();
+        let action = crate::setup::draw_setup_dialog(
+            ctx,
+            &mut self.setup_open,
+            &mut self.setup_state,
+            &self.textures,
+            &date_str,
+        );
+        match action {
+            crate::setup::SetupAction::StartGame(game) => {
+                let id = self.session.insert_game(game, None);
+                self.session_dirty = true;
+                self.select_slot(id);
+                self.status = "Started new game from setup position.".to_string();
+            }
+            crate::setup::SetupAction::Cancel | crate::setup::SetupAction::None => {}
         }
     }
 
@@ -6123,6 +6161,10 @@ impl App {
                         }
                         ui.close();
                     }
+                    if ui.button("New game from position…").clicked() {
+                        self.open_setup_dialog();
+                        ui.close();
+                    }
                     if ui
                         .add_enabled(
                             !self.session.is_empty(),
@@ -6213,6 +6255,10 @@ impl App {
                     }
                     if ui.button("Start position (Home)").clicked() {
                         self.goto(0);
+                        ui.close();
+                    }
+                    if ui.button("Set up position…").clicked() {
+                        self.open_setup_dialog();
                         ui.close();
                     }
                 });
@@ -11425,6 +11471,7 @@ impl eframe::App for App {
         self.cbh_export_dialog(&ctx);
         self.two_cbh_export_dialog(&ctx);
         self.print_export_dialog(&ctx);
+        self.setup_dialog(&ctx);
         self.classify_openings_dialog(&ctx);
         self.index_confirmation_dialog(&ctx);
         self.branch_choice_dialog(&ctx);
@@ -15881,6 +15928,8 @@ mod tests {
             print_export_include_final: true,
             print_export_compile_pdf: false,
             print_export_status: String::new(),
+            setup_open: false,
+            setup_state: crate::setup::PositionSetupState::default(),
             classify_openings_open: false,
             classify_overwrite: false,
             classify_status: String::new(),
@@ -17508,5 +17557,37 @@ mod tests {
         assert!(!source.contains("(Diagram)"));
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn setup_dialog_creates_and_loads_new_game_from_position() {
+        let mut app = test_app();
+        assert!(!app.setup_open);
+
+        // Open setup dialog
+        app.open_setup_dialog();
+        assert!(app.setup_open);
+
+        // Modify setup
+        app.setup_state.clear_board();
+        app.setup_state.setup.board.set_piece_at(
+            Square::E1,
+            crate::chess::Piece::new(crate::chess::Color::White, crate::chess::Role::King),
+        );
+        app.setup_state.setup.board.set_piece_at(
+            Square::E8,
+            crate::chess::Piece::new(crate::chess::Color::Black, crate::chess::Role::King),
+        );
+        app.setup_state.sync_fen();
+        assert!(app.setup_state.validation_error.is_none());
+
+        let game = app.setup_state.to_game("2026.11.02").unwrap();
+        let id = app.session.insert_game(game, None);
+        app.select_slot(id);
+
+        assert!(app.current.is_some());
+        let current = app.current.as_ref().unwrap();
+        assert_eq!(current.header("SetUp"), Some("1"));
+        assert_eq!(current.header("FEN"), Some("4k3/8/8/8/8/8/8/4K3 w - - 0 1"));
     }
 }

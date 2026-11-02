@@ -3,10 +3,10 @@ use egui::{Color32, Pos2, Rect, Sense, Stroke, StrokeKind, Ui, Vec2, pos2};
 
 use crate::ui::pieces::PieceTextures;
 
-const LIGHT: Color32 = Color32::from_rgb(0xEB, 0xEC, 0xD0);
-const DARK: Color32 = Color32::from_rgb(0x77, 0x96, 0x56);
+pub(crate) const LIGHT: Color32 = Color32::from_rgb(0xEB, 0xEC, 0xD0);
+pub(crate) const DARK: Color32 = Color32::from_rgb(0x77, 0x96, 0x56);
 const LAST_MOVE: Color32 = Color32::from_rgba_premultiplied(0x58, 0x54, 0x15, 0x70);
-const SELECTED: Color32 = Color32::from_rgba_premultiplied(0x12, 0x51, 0x24, 0x90);
+pub(crate) const SELECTED: Color32 = Color32::from_rgba_premultiplied(0x12, 0x51, 0x24, 0x90);
 const TARGET: Color32 = Color32::from_rgba_premultiplied(0x06, 0x13, 0x06, 0x66);
 const DROP_TARGET: Color32 = Color32::from_rgba_premultiplied(0xE6, 0xF0, 0xDA, 0x38);
 
@@ -209,7 +209,7 @@ fn is_movable(pos: &Chess, sq: Square) -> bool {
         .is_some_and(|piece| piece.color == pos.turn())
 }
 
-fn square_at_pos(rect: Rect, cell: f32, p: Pos2, orientation: Color) -> Option<Square> {
+pub(crate) fn square_at_pos(rect: Rect, cell: f32, p: Pos2, orientation: Color) -> Option<Square> {
     let col = ((p.x - rect.left()) / cell).floor();
     let row = ((p.y - rect.top()) / cell).floor();
     if (0.0..8.0).contains(&col) && (0.0..8.0).contains(&row) {
@@ -219,7 +219,7 @@ fn square_at_pos(rect: Rect, cell: f32, p: Pos2, orientation: Color) -> Option<S
     }
 }
 
-fn is_dark(sq: Square) -> bool {
+pub(crate) fn is_dark(sq: Square) -> bool {
     (sq.file().to_u32() + sq.rank().to_u32()).is_multiple_of(2)
 }
 
@@ -227,7 +227,7 @@ fn contrast_text(dark_square: bool) -> Color32 {
     if dark_square { LIGHT } else { DARK }
 }
 
-fn coords(sq: Square, orientation: Color) -> (i32, i32) {
+pub(crate) fn coords(sq: Square, orientation: Color) -> (i32, i32) {
     let file = sq.file().to_u32() as i32;
     let rank = sq.rank().to_u32() as i32;
     match orientation {
@@ -236,7 +236,7 @@ fn coords(sq: Square, orientation: Color) -> (i32, i32) {
     }
 }
 
-fn square_at(col: i32, row: i32, orientation: Color) -> Square {
+pub(crate) fn square_at(col: i32, row: i32, orientation: Color) -> Square {
     let (file, rank) = match orientation {
         Color::White => (col, 7 - row),
         Color::Black => (7 - col, row),
