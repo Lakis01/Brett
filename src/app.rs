@@ -2725,16 +2725,17 @@ impl App {
             return false;
         };
         let source = library.path();
-        let mut protected = vec![source.to_path_buf()];
-        for extension in crate::twocbh::ALL_EXTENSIONS {
-            protected.push(source.with_extension(extension));
+        if same_file_path(path, source) {
+            return true;
+        }
+        if DatabaseFormat::from_path(source) != DatabaseFormat::TwoCbh {
+            return false;
         }
         for extension in crate::twocbh::ALL_EXTENSIONS {
-            let target = path.with_extension(extension);
-            if protected
-                .iter()
-                .any(|source_file| same_file_path(&target, source_file))
-            {
+            if same_file_path(
+                &path.with_extension(extension),
+                &source.with_extension(extension),
+            ) {
                 return true;
             }
         }
@@ -16155,6 +16156,30 @@ mod tests {
         for companion in crate::twocbh::existing_companion_files(&source) {
             let _ = std::fs::remove_file(companion);
         }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn two_cbh_export_protects_only_the_actual_pgn_source() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("brett-2cbh-pgn-source-{stamp}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("games.pgn");
+        std::fs::write(&source, b"[Event \"Test\"]\n\n1. e4 e5 *\n").unwrap();
+
+        let mut app = test_app();
+        app.library = Some(std::sync::Arc::new(PgnLibrary::build(&source).unwrap()));
+        // Converting a PGN library to 2CBH on the default target is allowed.
+        assert!(
+            !app.two_cbh_export_would_overwrite_source(&dir.join("games.2cbh")),
+            "PGN source must not protect the 2CBH default target"
+        );
+        // The exact source path is still protected.
+        assert!(app.two_cbh_export_would_overwrite_source(&source));
+
         let _ = std::fs::remove_dir_all(dir);
     }
 

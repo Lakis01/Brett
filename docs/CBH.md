@@ -239,9 +239,10 @@ An export produces the four core files:
 
 The writer streams to temporary files beside the target, replaces the existing
 companion set atomically with rollback, and removes stale derived `.2lcd` and
-`.2lgd` indexes so ChessBase rebuilds them. It preserves moves, variations,
-headers, names, custom starts, Chess960, castling, promotions, en passant,
-null moves, and the deleted flag. Comments, NAGs, clocks, and evaluations are
+`.2lgd` indexes so ChessBase rebuilds them. The writer emits only 2CBH
+generation `0x26`. It preserves moves, variations, headers, names, standard
+chess and Chess960 starts, castling, promotions, en passant, null moves, and
+the deleted flag. Comments, NAGs, clocks, and evaluations are
 not written, so the library refuses annotation loss unless
 `TwoCbhWriteOptions { allow_annotation_loss: true }` is passed.
 
@@ -258,7 +259,7 @@ ChessBase checklist.
 
 ### Limits
 
-- Only 2CBH generation `0x26` is accepted. The older `0x22` generation is not
+- Only 2CBH generation `0x26` is read and written. The older `0x22` generation is not
   verified.
 - `.2cba` annotation items are not decoded; comments and NAGs are not
   fabricated. The annotation offset is recorded so the framing can be added

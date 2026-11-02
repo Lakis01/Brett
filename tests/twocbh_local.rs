@@ -81,6 +81,12 @@ fn writer_round_trips_update01_sample() {
             .any(|game| game.nodes.iter().any(|node| node.children.len() > 1)),
         "sample has no branching variation to order-check"
     );
+    assert!(
+        games
+            .iter()
+            .any(|game| tree_ordered(game, 0) != tree(game, 0)),
+        "sample has no game whose stored sibling order differs from sorted order"
+    );
 
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

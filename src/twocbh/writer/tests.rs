@@ -176,6 +176,9 @@ fn variation_markers_follow_the_replaced_move_and_round_trip() {
 
 #[test]
 fn special_moves_round_trip() {
+    const BLACK_EN_PASSANT: &str = "1. e4 e5 2. Nf3 Nc6 3. Bc4 Bc5 4. c3 Nf6 5. b4 Bb6 6. a4 a6 7. O-O O-O \
+         8. Bb2 d6 9. h3 Be6 10. Bxe6 fxe6 11. Qe2 Qe7 12. Na3 Rad8 13. Rad1 d5 \
+         14. Bc1 dxe4 15. d4 exd3 *";
     for pgn in [
         // En passant, then a capture promotion.
         "1. e4 a6 2. e5 d5 3. exd6 Nf6 4. dxc7 Nbd7 5. cxd8=Q *",
@@ -183,9 +186,19 @@ fn special_moves_round_trip() {
         "1. a4 b5 2. axb5 a6 3. bxa6 Nc6 4. a7 Rb8 5. a8=Q *",
         "1. e4 e5 2. Nf3 Nc6 3. Bc4 Bc5 4. O-O *",
         "1. d4 d5 2. Nc3 Nc6 3. Bf4 Bf5 4. Qd2 Qd7 5. O-O-O *",
+        // Black queenside castling.
+        "1. d4 d5 2. Nc3 Nc6 3. Bf4 Bf5 4. Qd2 Qd7 5. O-O-O O-O-O *",
+        // Black en passant (...exd3 after 15. d4).
+        BLACK_EN_PASSANT,
         "1. e4 e5 2. -- *",
     ] {
         let game = parse_one(pgn);
+        assert!(game.errors.is_empty(), "{pgn}: {:?}", game.errors);
+        if pgn == BLACK_EN_PASSANT {
+            let line = uci_line(&game);
+            assert_eq!(line.len(), 30, "{pgn}");
+            assert_eq!(line.last().map(String::as_str), Some("e4d3"), "{pgn}");
+        }
         let encoded = encode_game_moves(&game).unwrap();
         let decoded = decode(&encoded, None);
         assert!(decoded.errors.is_empty(), "{pgn}: {:?}", decoded.errors);

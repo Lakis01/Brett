@@ -294,8 +294,8 @@ filters. Both work behind `GameLibrary`, so the Games, Players, Tree, and
 position-index paths need no format-specific UI. `.2cba` annotations remain
 deferred. Format details and validation results are in [CBH.md](CBH.md).
 
-**Goal:** read the older multi-file ChessBase CBH format and the current 2CBH
-container. They are separate formats with separate readers.
+**Goal:** read and write the older multi-file ChessBase CBH format and the current 2CBH
+container. They are separate formats with separate readers and writers.
 
 A local sample classic multi-file database was used during development (under
 the git-ignored `fixtures/local/` tree; never redistributed). It is a classic
@@ -421,11 +421,11 @@ keeps the window open.
   through both `CbhLibrary` and `cbvault_format::cbh`.
 - **2CBH writer (separate, container-first, done):** native `.2cbh`, `.2cbg`,
   `.2cba`, and `.2lid` export from **File → Save database as… → 2CBH**
-  (`src/twocbh/writer.rs`) preserves moves, variations, headers, names, custom
-  starts, Chess960, castling, promotions, en passant, null moves, and the
-  deleted flag, atomically replaces the companion set, and removes stale
-  `.2lcd`/`.2lgd` indexes. Comments, NAGs, clocks, and evaluations are
-  deferred. Round-trips through `TwoCbhLibrary`; manual ChessBase validation
+  (`src/twocbh/writer.rs`) preserves moves, variations, headers, names,
+  standard chess and Chess960 starts, castling, promotions, en passant, null
+  moves, and the deleted flag, atomically replaces the companion set, and
+  removes stale `.2lcd`/`.2lgd` indexes. Comments, NAGs, clocks, and evaluations
+  are deferred. Round-trips through `TwoCbhLibrary`; manual ChessBase validation
   uses `examples/twocbh_sample.rs`. Do not fold 2CBH into the classic CBH
   writer; the containers and validation fixtures are different.
 - **SCID writer (done):** native SCID4 export from **File → Save database as…
