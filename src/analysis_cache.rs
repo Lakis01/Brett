@@ -34,6 +34,174 @@ impl EngineFamily {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct ParsedEngineVersion {
+    pub family: EngineFamily,
+    pub major: Option<u32>,
+    pub minor: Option<u32>,
+    pub dev_date: Option<u32>, // YYYYMMDD
+    pub baseline_elo: f64,
+}
+
+pub fn parse_engine_identity(name: &str) -> ParsedEngineVersion {
+    let lower = name.trim().to_ascii_lowercase();
+    let family = if lower.contains("stockfish") {
+        EngineFamily::Stockfish
+    } else if lower.contains("leela") || lower.contains("lc0") {
+        EngineFamily::Leela
+    } else {
+        EngineFamily::Generic
+    };
+
+    let mut major = None;
+    let mut minor = None;
+    let mut dev_date = None;
+
+    if family == EngineFamily::Stockfish {
+        // Look for dev date, e.g. dev-20241018
+        if let Some(pos) = lower.find("dev-") {
+            let digits: String = lower[pos + 4..]
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
+            if digits.len() == 8 {
+                if let Ok(d) = digits.parse::<u32>() {
+                    dev_date = Some(d);
+                }
+            }
+        }
+
+        // Look for major and minor version numbers
+        let tokens: Vec<&str> = name.split_whitespace().collect();
+        for token in tokens {
+            let parts: Vec<&str> = token.split('.').collect();
+            if let Some(first) = parts.first()
+                && let Ok(maj) = first.parse::<u32>()
+                && (10..=30).contains(&maj)
+            {
+                major = Some(maj);
+                if parts.len() > 1
+                    && let Ok(min) = parts[1].parse::<u32>()
+                {
+                    minor = Some(min);
+                }
+                break;
+            }
+        }
+    }
+
+    let baseline_elo = match family {
+        EngineFamily::Stockfish => {
+            if let Some(date) = dev_date {
+                // Approximate scaling: Stockfish 17 was released Sept 2024 (~20240901)
+                let day_offset = (date as i64 - 20240901).max(0) as f64;
+                (3830.0 + day_offset * 0.25).min(4100.0)
+            } else {
+                match (major, minor) {
+                    (Some(17), _) => 3830.0,
+                    (Some(16), Some(1)) => 3790.0,
+                    (Some(16), _) => 3760.0,
+                    (Some(15), Some(1)) => 3720.0,
+                    (Some(15), _) => 3690.0,
+                    (Some(14), Some(1)) => 3650.0,
+                    (Some(14), _) => 3620.0,
+                    (Some(13), _) => 3570.0,
+                    (Some(12), _) => 3520.0,
+                    (Some(11), _) => 3450.0,
+                    (Some(m), _) if m > 17 => 3830.0 + (m - 17) as f64 * 40.0,
+                    _ => 3400.0,
+                }
+            }
+        }
+        EngineFamily::Leela => 3650.0,
+        EngineFamily::Generic => 3400.0,
+    };
+
+    ParsedEngineVersion {
+        family,
+        major,
+        minor,
+        dev_date,
+        baseline_elo,
+    }
+}
+
+pub fn compute_search_strength(depth: u32) -> f64 {
+    if depth == 0 {
+        return 0.0;
+    }
+    let mut strength = 0.0;
+    let p1 = depth.min(18);
+    strength += p1 as f64 * 50.0;
+    if depth > 18 {
+        let p2 = (depth - 18).min(12);
+        strength += p2 as f64 * 35.0;
+    }
+    if depth > 30 {
+        let p3 = depth - 30;
+        strength += p3 as f64 * 20.0;
+    }
+    strength
+}
+
+pub fn compute_quality_rating(
+    _family: EngineFamily,
+    baseline_elo: f64,
+    depth: u32,
+    seldepth: Option<u32>,
+    nodes: Option<u64>,
+    score_mate: Option<i32>,
+) -> f64 {
+    let mut q = baseline_elo + compute_search_strength(depth);
+    if let Some(sel) = seldepth {
+        if sel > depth {
+            q += (sel - depth) as f64 * 0.5;
+        }
+    }
+    if let Some(n) = nodes {
+        if n > 100_000 {
+            q += (n as f64 / 100_000.0).log10() * 3.0;
+        }
+    }
+    if let Some(mate) = score_mate {
+        q += 20_000.0 - mate.unsigned_abs() as f64 * 10.0;
+    }
+    q
+}
+
+pub fn should_supersede(
+    incoming: &CachedAnalysis,
+    existing: &CachedAnalysis,
+    heuristic_supersede: bool,
+) -> bool {
+    if incoming.engine_family != existing.engine_family {
+        return false;
+    }
+    if incoming.engine_name == existing.engine_name {
+        return incoming.depth >= existing.depth;
+    }
+    if !heuristic_supersede {
+        return false;
+    }
+    // With heuristic superseding active, require incoming quality to exceed existing plus a 15 Elo margin
+    incoming.quality_score > existing.quality_score + 15.0
+}
+
+/// Translate Leela centipawns to Stockfish-equivalent centipawns.
+///
+/// Leela's UCI evaluation scale is compressed relative to Stockfish NNUE:
+/// +50 cp in Leela corresponds to ~+78 cp in Stockfish, and +100 cp corresponds
+/// to ~+165 cp (reflecting decisive winning chances).
+pub fn leela_to_stockfish_cp(cp: i32) -> i32 {
+    if cp == 0 {
+        return 0;
+    }
+    let sign = cp.signum();
+    let abs = cp.abs() as f64;
+    let scaled = abs * 1.45 + (abs / 100.0).powi(2) * 20.0;
+    sign * scaled.round() as i32
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct CachedAnalysis {
     pub pos_hash: u64,
     pub fen: String,
@@ -192,17 +360,29 @@ impl AnalysisDb {
 
         match existing {
             Ok((existing_name, existing_depth, existing_quality)) => {
-                let identical_engine = existing_name == analysis.engine_name;
-                if identical_engine {
-                    if analysis.depth < existing_depth {
-                        return Ok(false); // Do not downgrade depth
-                    }
-                } else if supersede_older {
-                    // Supersede if incoming quality is higher
-                    if analysis.quality_score < existing_quality {
-                        return Ok(false);
-                    }
-                    // Delete the older different build for this family/multipv slot
+                let existing_mock = CachedAnalysis {
+                    pos_hash: analysis.pos_hash,
+                    fen: analysis.fen.clone(),
+                    engine_family: analysis.engine_family,
+                    engine_name: existing_name.clone(),
+                    multipv: analysis.multipv,
+                    depth: existing_depth,
+                    seldepth: None,
+                    score_cp: None,
+                    score_mate: None,
+                    nodes: None,
+                    time_ms: None,
+                    nps: None,
+                    pv: Vec::new(),
+                    quality_score: existing_quality,
+                    analyzed_at: 0,
+                };
+
+                if !should_supersede(analysis, &existing_mock, supersede_older) {
+                    return Ok(false);
+                }
+
+                if existing_name != analysis.engine_name {
                     self.conn.execute(
                         "DELETE FROM position_analysis WHERE pos_hash = ?1 AND engine_family = ?2 AND multipv = ?3 AND engine_name = ?4",
                         params![hash_i64, family_str, analysis.multipv, existing_name],
@@ -355,5 +535,83 @@ mod tests {
         assert_eq!(retrieved[1].multipv, 2);
 
         let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn parse_engine_identities() {
+        let sf17 = parse_engine_identity("Stockfish 17");
+        assert_eq!(sf17.family, EngineFamily::Stockfish);
+        assert_eq!(sf17.major, Some(17));
+        assert_eq!(sf17.baseline_elo, 3830.0);
+
+        let sf16_1 = parse_engine_identity("Stockfish 16.1");
+        assert_eq!(sf16_1.family, EngineFamily::Stockfish);
+        assert_eq!(sf16_1.major, Some(16));
+        assert_eq!(sf16_1.minor, Some(1));
+        assert_eq!(sf16_1.baseline_elo, 3790.0);
+
+        let sf_dev = parse_engine_identity("Stockfish dev-20241018");
+        assert_eq!(sf_dev.family, EngineFamily::Stockfish);
+        assert_eq!(sf_dev.dev_date, Some(20241018));
+        assert!(sf_dev.baseline_elo >= 3830.0);
+
+        let leela = parse_engine_identity("Lc0 v0.31.2");
+        assert_eq!(leela.family, EngineFamily::Leela);
+
+        let generic = parse_engine_identity("Komodo 14");
+        assert_eq!(generic.family, EngineFamily::Generic);
+    }
+
+    #[test]
+    fn piecewise_search_strength() {
+        assert_eq!(compute_search_strength(0), 0.0);
+        assert_eq!(compute_search_strength(10), 10.0 * 50.0);
+        assert_eq!(compute_search_strength(18), 18.0 * 50.0);
+        assert_eq!(compute_search_strength(20), 18.0 * 50.0 + 2.0 * 35.0);
+        assert_eq!(compute_search_strength(30), 18.0 * 50.0 + 12.0 * 35.0);
+        assert_eq!(compute_search_strength(35), 18.0 * 50.0 + 12.0 * 35.0 + 5.0 * 20.0);
+    }
+
+    #[test]
+    fn quality_comparison_and_superseding() {
+        let mut sf16_deep = sample_analysis(1, EngineFamily::Stockfish, "Stockfish 16", 1, 26, 20, &["e2e4"]);
+        sf16_deep.quality_score = compute_quality_rating(EngineFamily::Stockfish, 3760.0, 26, Some(30), Some(5_000_000), None);
+
+        let mut sf17_shallow = sample_analysis(1, EngineFamily::Stockfish, "Stockfish 17", 1, 20, 20, &["e2e4"]);
+        sf17_shallow.quality_score = compute_quality_rating(EngineFamily::Stockfish, 3830.0, 20, Some(24), Some(1_000_000), None);
+
+        // SF16 at depth 26 beats SF17 at depth 20:
+        assert!(!should_supersede(&sf17_shallow, &sf16_deep, true));
+
+        // But SF17 at depth 25 beats SF16 at depth 26:
+        let mut sf17_deep = sample_analysis(1, EngineFamily::Stockfish, "Stockfish 17", 1, 25, 20, &["e2e4"]);
+        sf17_deep.quality_score = compute_quality_rating(EngineFamily::Stockfish, 3830.0, 25, Some(29), Some(3_000_000), None);
+        assert!(should_supersede(&sf17_deep, &sf16_deep, true));
+
+        // When heuristic superseding is disabled, different engine names do NOT supersede:
+        assert!(!should_supersede(&sf17_deep, &sf16_deep, false));
+
+        // But identical engine name DOES supersede when depth >= existing depth:
+        let sf16_shallower = sample_analysis(1, EngineFamily::Stockfish, "Stockfish 16", 1, 24, 20, &["e2e4"]);
+        assert!(should_supersede(&sf16_deep, &sf16_shallower, false));
+
+        // Proven mate bonus dominates:
+        let mate_analysis = CachedAnalysis {
+            score_mate: Some(5),
+            quality_score: compute_quality_rating(EngineFamily::Stockfish, 3600.0, 15, Some(15), Some(100_000), Some(5)),
+            ..sf16_shallower
+        };
+        assert!(should_supersede(&mate_analysis, &sf17_deep, true));
+    }
+
+    #[test]
+    fn leela_centipawn_translation() {
+        assert_eq!(leela_to_stockfish_cp(0), 0);
+        let cp50 = leela_to_stockfish_cp(50);
+        assert!(cp50 >= 70 && cp50 <= 90, "cp50: {cp50}");
+        let cp100 = leela_to_stockfish_cp(100);
+        assert!(cp100 >= 150 && cp100 <= 180, "cp100: {cp100}");
+        let cp_neg100 = leela_to_stockfish_cp(-100);
+        assert_eq!(cp_neg100, -cp100);
     }
 }
