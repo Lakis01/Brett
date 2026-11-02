@@ -15,11 +15,15 @@ kept, edited, or compiled later.
 4. Pick the `.typ` path and, if wanted, enable **Compile a PDF with Typst**.
 5. Select **Export**.
 
-The default path is `$HOME/Documents/<library-stem>-print.typ`. If the
-Documents folder does not exist, Brett uses `$HOME`; with no database open it
-uses `brett-print.typ`. A compiled PDF is written beside the `.typ` source, so
-it lands in Documents as well. Diagram markers are cleared when another game is
-selected, so they always belong to the game currently on screen.
+The default path is `<export-folder>/<White - Black>.typ` (for example
+`Documents/Carlsen, Magnus - Nakamura, Hikaru.typ`), avoiding naming conflicts
+when exporting several games from one database. If player names are missing or
+placeholders (`?`), Brett falls back to `game.typ`. Brett remembers the last
+folder chosen for a print export across sessions, falling back to
+`$HOME/Documents` (or `$HOME`) on first use. A compiled PDF is written beside the
+`.typ` source, keeping their filenames aligned. Diagram markers are cleared
+when another game is selected, so they always belong to the game currently on
+screen.
 
 ## Output layout
 

@@ -429,6 +429,9 @@ pub struct DisplayPrefs {
     /// Folder of the last database opened or saved, used as the initial
     /// location for database pickers.
     pub last_database_dir: Option<PathBuf>,
+    /// Folder of the last game exported for printing, used as the initial
+    /// location for print exports.
+    pub last_print_dir: Option<PathBuf>,
     /// Maximum number of recent preparation games shown for a position.
     pub prep_recent_limit: usize,
     /// Show PGN fields that are absent or empty. Hidden by default so a game
@@ -479,6 +482,7 @@ impl Default for DisplayPrefs {
             opening_tree_path: String::new(),
             opening_book_path: String::new(),
             last_database_dir: None,
+            last_print_dir: None,
             prep_recent_limit: 10,
             show_empty_pgn_tags: false,
             hover_moves: false,
@@ -549,6 +553,12 @@ impl DisplayPrefs {
             .to_string();
         let last_database_dir = value
             .get("last_database_dir")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from);
+        let last_print_dir = value
+            .get("last_print_dir")
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|path| !path.is_empty())
@@ -633,6 +643,7 @@ impl DisplayPrefs {
             opening_tree_path,
             opening_book_path,
             last_database_dir,
+            last_print_dir,
             prep_recent_limit,
             show_empty_pgn_tags,
             hover_moves,
@@ -661,6 +672,7 @@ impl DisplayPrefs {
             "opening_tree_path": self.opening_tree_path,
             "opening_book_path": self.opening_book_path,
             "last_database_dir": self.last_database_dir.as_ref().map(|path| path.display().to_string()),
+            "last_print_dir": self.last_print_dir.as_ref().map(|path| path.display().to_string()),
             "prep_recent_limit": self.prep_recent_limit,
             "show_empty_pgn_tags": self.show_empty_pgn_tags,
             "hover_moves": self.hover_moves,
@@ -983,6 +995,7 @@ mod tests {
             opening_tree_path: "/tmp/masters.pgn".to_string(),
             opening_book_path: "/tmp/perfect.abk".to_string(),
             last_database_dir: Some(PathBuf::from("/tmp/databases")),
+            last_print_dir: Some(PathBuf::from("/tmp/prints")),
             prep_recent_limit: 25,
             show_empty_pgn_tags: true,
             hover_moves: true,
@@ -1052,6 +1065,21 @@ mod tests {
             None
         );
         assert_eq!(DisplayPrefs::default().last_database_dir, None);
+    }
+
+    #[test]
+    fn display_prefs_remember_the_last_print_directory() {
+        let parsed = DisplayPrefs::from_json(r#"{"last_print_dir":"/home/tester/Documents"}"#);
+        assert_eq!(
+            parsed.last_print_dir.as_deref(),
+            Some(std::path::Path::new("/home/tester/Documents"))
+        );
+        assert!(parsed.to_json().contains("last_print_dir"));
+        assert_eq!(
+            DisplayPrefs::from_json(r#"{"last_print_dir":"  "}"#).last_print_dir,
+            None
+        );
+        assert_eq!(DisplayPrefs::default().last_print_dir, None);
     }
 
     #[test]

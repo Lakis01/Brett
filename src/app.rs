@@ -613,6 +613,9 @@ pub struct App {
     /// Folder of the last database opened or saved. Database pickers start
     /// here so the user usually lands in the right directory.
     last_database_dir: Option<PathBuf>,
+    /// Folder of the last print export. Print exports start here so
+    /// repeated exports from the same session stay together.
+    last_print_dir: Option<PathBuf>,
     /// Last writable database path chosen in this session. Save database
     /// writes here without asking again.
     database_save_path: Option<PathBuf>,
@@ -936,6 +939,7 @@ impl App {
             index_status: "No position index yet.".to_string(),
             confirm_large_index: false,
             last_database_dir: display_prefs.last_database_dir.clone(),
+            last_print_dir: display_prefs.last_print_dir.clone(),
             database_save_path: None,
             session_dirty: false,
             close_confirm_open: false,
@@ -2798,12 +2802,7 @@ impl App {
     }
 
     fn default_print_export_path(&self) -> PathBuf {
-        let stem = self
-            .library
-            .as_ref()
-            .and_then(|library| library.path().file_stem())
-            .map(|stem| stem.to_string_lossy());
-        default_print_path(stem.as_deref())
+        default_print_path(self.last_print_dir.as_deref(), self.current.as_ref())
     }
 
     fn print_source_label(&self) -> String {
@@ -2854,6 +2853,7 @@ impl App {
                 return;
             }
         };
+        self.remember_print_dir(&path);
         self.print_export_path = path.display().to_string();
         let mut status = format!(
             "Wrote {} and {} diagram(s).",
@@ -2949,6 +2949,7 @@ impl App {
                 default
             };
             if let Some(path) = save_print_dialog(&default) {
+                self.remember_print_dir(&path);
                 self.print_export_path = path.display().to_string();
             }
         }
@@ -3558,6 +3559,24 @@ impl App {
         }
     }
 
+    fn remember_print_dir(&mut self, path: &Path) {
+        let Some(parent) = path.parent() else {
+            return;
+        };
+        let parent = if parent.as_os_str().is_empty() {
+            std::env::current_dir().ok()
+        } else {
+            Some(parent.to_path_buf())
+        };
+        let Some(parent) = parent else {
+            return;
+        };
+        if self.last_print_dir.as_ref() != Some(&parent) {
+            self.last_print_dir = Some(parent);
+            self.save_display_prefs();
+        }
+    }
+
     fn save_display_prefs(&mut self) {
         let prefs = DisplayPrefs {
             rating_priority: self.rating_priority,
@@ -3567,6 +3586,7 @@ impl App {
             opening_tree_path: self.tree_path.clone(),
             opening_book_path: self.book_path.clone(),
             last_database_dir: self.last_database_dir.clone(),
+            last_print_dir: self.last_print_dir.clone(),
             prep_recent_limit: self.prep_recent_limit.clamp(1, 50),
             show_empty_pgn_tags: self.show_empty_pgn_tags,
             hover_moves: self.hover_moves,
@@ -15335,13 +15355,127 @@ fn save_print_dialog(default_path: &std::path::Path) -> Option<std::path::PathBu
     )
 }
 
-fn default_print_path(stem: Option<&str>) -> PathBuf {
-    let directory = documents_path();
-    let stem = stem
-        .map(str::trim)
-        .filter(|stem| !stem.is_empty())
-        .unwrap_or("brett");
-    directory.join(format!("{stem}-print.typ"))
+/// Default print export path for the given directory and game.
+/// If `directory` is absent or not a directory, falls back to `documents_path()`.
+fn default_print_path(directory: Option<&Path>, game: Option<&Game>) -> PathBuf {
+    let dir = directory
+        .filter(|path| path.is_dir())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(documents_path);
+    dir.join(default_print_filename(game))
+}
+
+/// Default export filename for a game, formatted as `White - Black.typ` with
+/// path separators and invalid characters sanitized. Falls back to `game.typ`
+/// when both player names are absent or placeholders.
+fn default_print_filename(game: Option<&Game>) -> String {
+    let Some(game) = game else {
+        return "game.typ".to_string();
+    };
+    format!("{}.typ", default_print_stem(game.white(), game.black()))
+}
+
+/// Generates a sanitized filename stem for `White - Black`.
+fn default_print_stem(white: &str, black: &str) -> String {
+    let white = clean_player_name(white);
+    let black = clean_player_name(black);
+    let stem = match (white, black) {
+        (Some(w), Some(b)) => format!("{w} - {b}"),
+        (Some(w), None) => w,
+        (None, Some(b)) => b,
+        (None, None) => "game".to_string(),
+    };
+    sanitize_print_stem(&stem)
+}
+
+fn clean_player_name(name: &str) -> Option<String> {
+    let trimmed = name.trim();
+    if pgn_tag_is_empty(trimmed) || trimmed == "-" || trimmed == "*" {
+        return None;
+    }
+    let sanitized = sanitize_name_segment(trimmed);
+    let cleaned = sanitized.trim_matches(|c: char| c == '-' || c == '_' || c.is_whitespace());
+    if cleaned.is_empty() || cleaned == "?" {
+        None
+    } else {
+        Some(cleaned.to_string())
+    }
+}
+
+fn sanitize_name_segment(part: &str) -> String {
+    let mut clean = String::with_capacity(part.len());
+    for ch in part.chars() {
+        match ch {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => {
+                clean.push('-');
+            }
+            c if c.is_control() => {}
+            c => clean.push(c),
+        }
+    }
+    clean
+}
+
+fn sanitize_print_stem(stem: &str) -> String {
+    let mut result = String::with_capacity(stem.len());
+    let mut last_was_dash = false;
+    let mut last_was_space = false;
+    for ch in stem.chars() {
+        if ch == '-' {
+            if !last_was_dash {
+                result.push('-');
+                last_was_dash = true;
+            }
+            last_was_space = false;
+        } else if ch.is_whitespace() {
+            if !last_was_space {
+                result.push(' ');
+                last_was_space = true;
+            }
+        } else {
+            result.push(ch);
+            last_was_dash = false;
+            last_was_space = false;
+        }
+    }
+    let trimmed = result.trim().trim_matches(|c| c == '-' || c == '.').trim();
+    if trimmed.is_empty() {
+        return "game".to_string();
+    }
+    if is_windows_reserved_stem(trimmed) {
+        format!("{trimmed}-game")
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn is_windows_reserved_stem(stem: &str) -> bool {
+    let upper = stem.to_ascii_uppercase();
+    matches!(
+        upper.as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+    )
 }
 
 /// User's Documents folder, falling back to the home directory when it does
@@ -15583,6 +15717,7 @@ mod tests {
             index_status: String::new(),
             confirm_large_index: false,
             last_database_dir: None,
+            last_print_dir: None,
             database_save_path: None,
             session_dirty: false,
             close_confirm_open: false,
@@ -17101,21 +17236,97 @@ mod tests {
     }
 
     #[test]
-    fn default_print_path_uses_documents_and_the_library_stem() {
+    fn default_print_filename_formats_white_minus_black_and_sanitizes() {
+        assert_eq!(
+            default_print_stem("Carlsen, Magnus", "Nakamura, Hikaru"),
+            "Carlsen, Magnus - Nakamura, Hikaru"
+        );
+        assert_eq!(
+            default_print_stem("Kasparov, Garry", "?"),
+            "Kasparov, Garry"
+        );
+        assert_eq!(
+            default_print_stem("?", "Karpov, Anatoly"),
+            "Karpov, Anatoly"
+        );
+        assert_eq!(default_print_stem("?", "?"), "game");
+        assert_eq!(default_print_stem("  ", ""), "game");
+        assert_eq!(default_print_stem("-", "*"), "game");
+
+        // Sanitization of filesystem characters
+        assert_eq!(
+            default_print_stem("Doe / Smith", "Player: 1"),
+            "Doe - Smith - Player- 1"
+        );
+        assert_eq!(
+            default_print_stem(r#"White\Black"#, r#"Foo*Bar?Baz<Qux>Pipe|Quote""#),
+            "White-Black - Foo-Bar-Baz-Qux-Pipe-Quote"
+        );
+
+        // Windows reserved device names
+        assert_eq!(default_print_stem("CON", "?"), "CON-game");
+        assert_eq!(default_print_stem("aux", "  "), "aux-game");
+
+        // Full filename with extension
+        assert_eq!(default_print_filename(None), "game.typ");
+
+        let mut game = Game::default();
+        game.headers
+            .push(("White".to_string(), "Carlsen, Magnus".to_string()));
+        game.headers
+            .push(("Black".to_string(), "Nakamura, Hikaru".to_string()));
+        assert_eq!(
+            default_print_filename(Some(&game)),
+            "Carlsen, Magnus - Nakamura, Hikaru.typ"
+        );
+    }
+
+    #[test]
+    fn default_print_path_uses_documents_on_first_use_and_remembers_last_folder() {
         let home = std::env::var_os("HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("."));
+        let docs = home.join("Documents");
+
+        let mut game = Game::default();
+        game.headers
+            .push(("White".to_string(), "Paul Morphy".to_string()));
+        game.headers
+            .push(("Black".to_string(), "Converse".to_string()));
+
+        // First use without a remembered directory falls back to Documents
         assert_eq!(
-            default_print_path(Some("Mega Database 2026")),
-            home.join("Documents/Mega Database 2026-print.typ")
+            default_print_path(None, Some(&game)),
+            docs.join("Paul Morphy - Converse.typ")
         );
+
+        // Non-existent directory falls back to Documents
+        let missing = PathBuf::from("/nonexistent/directory/for/testing");
         assert_eq!(
-            default_print_path(Some("   ")),
-            home.join("Documents/brett-print.typ")
+            default_print_path(Some(&missing), Some(&game)),
+            docs.join("Paul Morphy - Converse.typ")
         );
+
+        // Valid remembered directory is used
+        let temp_dir = std::env::temp_dir();
         assert_eq!(
-            default_print_path(None),
-            home.join("Documents/brett-print.typ")
+            default_print_path(Some(&temp_dir), Some(&game)),
+            temp_dir.join("Paul Morphy - Converse.typ")
+        );
+
+        // Verify BrettApp remembered print dir behavior
+        let mut app = test_app();
+        assert_eq!(app.last_print_dir, None);
+        assert_eq!(
+            app.default_print_export_path(),
+            docs.join("Paul Morphy - Duke Karl and Count Isouard.typ")
+        );
+
+        // Set remembered print dir
+        app.last_print_dir = Some(temp_dir.clone());
+        assert_eq!(
+            app.default_print_export_path(),
+            temp_dir.join("Paul Morphy - Duke Karl and Count Isouard.typ")
         );
     }
 
@@ -17286,6 +17497,7 @@ mod tests {
             app.print_export_status
         );
         assert_eq!(app.print_export_path, path.display().to_string());
+        assert_eq!(app.last_print_dir, Some(dir.clone()));
         let diagrams = dir.join("opera_diagrams");
         assert!(diagrams.join("diagram-01.svg").exists());
         assert!(diagrams.join("diagram-02.svg").exists());

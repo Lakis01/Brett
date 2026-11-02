@@ -32,8 +32,8 @@ database, and the Tree-tab path rows are read-only labels with **Choose…**,
 clock and evaluation-bar toggles live in Settings. The 2026-10-31 pass also
 replaced the separate PGN/SCID/CBH save entries with **Save database** and
 **Save database as…**, remembers the last database folder, and asks before
-closing a modified database. Item 25's Typst target is implemented, with the
-`White - Black` default filename and remembered export folder queued. Items 26
+closing a modified database. Item 25's Typst target is implemented, including
+the `White - Black` default filename and remembered export folder. Items 26
 and 27 add board setup and country-flag display to the backlog.
 
 **Decision log (2026-10-28):**
@@ -1014,14 +1014,14 @@ other.
   only when the user asks for a PDF, and report a missing compiler clearly.
 - Add tests for source escaping (player names, comments, URLs, Unicode),
   variation nesting, custom starts, Chess960, and deterministic output.
-- **Default print filename (queued 2026-11-02):** default the export filename
+- **Default print filename (implemented 2026-11-02):** default the export filename
   to `White - Black` (for example `Carlsen, Magnus - Nakamura, Hikaru.typ`),
   not the database stem, so exporting several games from one database does not
   keep colliding on the same name. Sanitize path separators and characters that
   are invalid on Windows, macOS, or Linux; fall back to a neutral stem when both
   player names are absent. Keep the `.typ` source and compiled PDF names
   aligned.
-- **Remember the print location (queued 2026-11-02):** default the print export
+- **Remember the print location (implemented 2026-11-02):** default the print export
   folder to the last folder the user chose for a print export, falling back to
   `Documents` on first use. Persist it with the other display/save preferences;
   do not silently reset it when the open database changes. Cover first-use and
