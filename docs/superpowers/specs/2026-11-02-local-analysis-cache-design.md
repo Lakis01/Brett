@@ -149,18 +149,17 @@ $$Q(A) = R(V) + \text{SearchStrength}(d) + B_{\text{seldepth}} + B_{\text{nodes}
    - No Lichess cloud eval exists for this position (e.g. deeper in the game tree, off-book lines, or custom variants), OR
    - Local search is deep ($d_{\text{local}} \ge 22$) and $d_{\text{local}} \ge d_{\text{lichess}} - 4$, OR
    - Local search has a hard minimum depth floor ($d_{\text{local}} \ge 18$), is within 50 cp of the best move, and uncovered a candidate move not present in Lichess's top PVs.
-3. **Table Sorting & Centipawn Averaging:**
-   - Local scores (converted to White POV) factor into candidate move centipawn averaging.
-   - If local analysis introduces a candidate move absent from remote sources, it creates an active candidate row with its local variation line.
+3. **Table Sorting, Eval Bar & Centipawn Translation:**
+   - **Option B (Multi-Column Layout):** When both Stockfish and Leela Chess Zero evaluations are available, both render side-by-side:
+     `chessdb eval` | `Lichess eval` | `Stockfish eval` | `Leela eval` | `lines`
+     (missing sources dynamically hide their column).
+   - **Eval Bar Hierarchy:** When both Stockfish and Leela are present, Stockfish defines the eval bar. If only Leela is available, Leela defines the eval bar.
+   - **Leela Score Translation:** Leela centipawns are calibrated/scaled to Stockfish-equivalent centipawns for the eval bar and centipawn delta calculation via `leela_to_stockfish_cp(cp)`. The raw Leela score displays in the column with tooltip translation.
 4. **UI Layout:**
-   - Columns adjust dynamically:
-     - `chessdb eval` (visible if ChessDB has scores)
-     - `Lichess eval (dXX)` (visible if Lichess has cloud eval)
-     - `Local eval (dYY)` (visible if local cache has qualified eval)
    - Variation lines:
-     - If both Lichess and Local PVs are available for a candidate move:
-       - Line 1 (Top): Deeper variation (tagged with source & depth, e.g. `[Local d38]`).
-       - Line 2 (Bottom): Secondary variation (e.g. `[Lichess d32]`).
+     - If multiple sources (Lichess, Stockfish, Leela) provide variations for a candidate move:
+       - Line 1 (Top): Deeper variation (tagged with source & depth, e.g. `[SF d38]` or `[Lichess d45]`).
+       - Line 2 (Bottom): Secondary variation (e.g. `[Lc0 42k]` or `[Lichess d32]`).
      - If only one source has a variation: collapses into a single line.
      - Move interaction (hover preview and click to play line) works identically across both lines.
 
