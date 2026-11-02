@@ -118,7 +118,7 @@ jobs:
           EOF
           chmod +x "${APPDIR}/AppRun"
 
-          wget -q https://github.com/AppImage/AppImageKit/releases/download/13/appimagetool-x86_64.AppImage -O appimagetool
+          wget -q https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage -O appimagetool
           chmod +x appimagetool
           ./appimagetool --appimage-extract-and-run "${APPDIR}" "brett-v${VERSION}-x86_64.AppImage" || true
 
