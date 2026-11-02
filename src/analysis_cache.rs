@@ -525,22 +525,24 @@ pub enum CacheCommand {
 #[derive(Clone)]
 pub struct AnalysisCacheHandle {
     sender: Sender<CacheCommand>,
+    path: PathBuf,
 }
 
 impl AnalysisCacheHandle {
     pub fn spawn(db_path: Option<PathBuf>, heuristic_supersede: bool) -> Self {
         let (sender, receiver) = mpsc::channel();
         let path = db_path.unwrap_or_else(AnalysisDb::default_path);
+        let worker_path = path.clone();
 
         thread::Builder::new()
             .name("brett-analysis-cache".to_string())
             .spawn(move || {
-                let mut db = match AnalysisDb::open_at(&path) {
+                let mut db = match AnalysisDb::open_at(&worker_path) {
                     Ok(db) => db,
                     Err(err) => {
                         eprintln!(
                             "Failed to open analysis database at {}: {err}",
-                            path.display()
+                            worker_path.display()
                         );
                         return;
                     }
@@ -563,7 +565,27 @@ impl AnalysisCacheHandle {
             })
             .expect("failed to spawn analysis cache worker thread");
 
-        Self { sender }
+        Self { sender, path }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn query_position(&self, pos_hash: u64) -> Vec<CachedAnalysis> {
+        AnalysisDb::open_at(&self.path)
+            .and_then(|db| db.get_position(pos_hash))
+            .unwrap_or_default()
+    }
+
+    pub fn count_positions(&self) -> usize {
+        AnalysisDb::open_at(&self.path)
+            .and_then(|db| db.count_positions())
+            .unwrap_or(0)
+    }
+
+    pub fn clear(&self) -> Result<()> {
+        AnalysisDb::open_at(&self.path).and_then(|mut db| db.clear())
     }
 
     pub fn store(&self, analysis: CachedAnalysis) {

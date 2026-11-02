@@ -19,6 +19,10 @@ pub struct EnginePrefs {
     pub path: Option<PathBuf>,
     pub threads: u32,
     pub hash_mb: u32,
+    /// Whether locally analyzed positions are stored in the local SQLite cache.
+    pub cache_engine_analysis: bool,
+    /// Whether fine-grained Stockfish quality comparison is used to supersede entries.
+    pub heuristic_supersede: bool,
 }
 
 impl Default for EnginePrefs {
@@ -27,6 +31,8 @@ impl Default for EnginePrefs {
             path: None,
             threads: 1,
             hash_mb: 16,
+            cache_engine_analysis: true,
+            heuristic_supersede: true,
         }
     }
 }
@@ -65,10 +71,20 @@ impl EnginePrefs {
             .and_then(Value::as_u64)
             .unwrap_or(16)
             .clamp(1, 32_768) as u32;
+        let cache_engine_analysis = value
+            .get("cache_engine_analysis")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        let heuristic_supersede = value
+            .get("heuristic_supersede")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
         Self {
             path,
             threads,
             hash_mb,
+            cache_engine_analysis,
+            heuristic_supersede,
         }
     }
 
@@ -77,6 +93,8 @@ impl EnginePrefs {
             "engine_path": self.path.as_ref().map(|path| path.display().to_string()),
             "threads": self.threads,
             "hash_mb": self.hash_mb,
+            "cache_engine_analysis": self.cache_engine_analysis,
+            "heuristic_supersede": self.heuristic_supersede,
         }))
         .unwrap_or_default()
     }
@@ -922,8 +940,30 @@ mod tests {
             path: Some(PathBuf::from("/opt/engines/stockfish")),
             threads: 6,
             hash_mb: 1024,
+            cache_engine_analysis: true,
+            heuristic_supersede: true,
         };
         assert_eq!(EnginePrefs::from_json(&prefs.to_json()), prefs);
+    }
+
+    #[test]
+    fn engine_cache_prefs() {
+        let default_prefs = EnginePrefs::default();
+        assert!(default_prefs.cache_engine_analysis);
+        assert!(default_prefs.heuristic_supersede);
+
+        let custom = EnginePrefs {
+            path: None,
+            threads: 4,
+            hash_mb: 256,
+            cache_engine_analysis: false,
+            heuristic_supersede: false,
+        };
+        let json = custom.to_json();
+        let loaded = EnginePrefs::from_json(&json);
+        assert_eq!(loaded, custom);
+        assert!(!loaded.cache_engine_analysis);
+        assert!(!loaded.heuristic_supersede);
     }
 
     #[test]
@@ -1181,6 +1221,8 @@ mod tests {
             path: Some(PathBuf::from("/opt/engines/stockfish")),
             threads: 4,
             hash_mb: 256,
+            cache_engine_analysis: true,
+            heuristic_supersede: true,
         };
         assert_eq!(EnginePrefs::load_from(&path), EnginePrefs::default());
         prefs.save_to(&path).unwrap();

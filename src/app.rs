@@ -809,6 +809,10 @@ pub struct App {
     engine_path: String,
     engine_threads: u32,
     engine_hash_mb: u32,
+    cache_engine_analysis: bool,
+    heuristic_supersede: bool,
+    analysis_cache: Option<crate::analysis_cache::AnalysisCacheHandle>,
+    analysis_debouncer: crate::analysis_cache::AnalysisDebouncer,
     review_engine: Option<EngineHandle>,
     review: Option<ReviewState>,
     review_open: bool,
@@ -1121,6 +1125,13 @@ impl App {
             engine_path: engine_prefs.resolved_path().display().to_string(),
             engine_threads: engine_prefs.threads,
             engine_hash_mb: engine_prefs.hash_mb,
+            cache_engine_analysis: engine_prefs.cache_engine_analysis,
+            heuristic_supersede: engine_prefs.heuristic_supersede,
+            analysis_cache: Some(crate::analysis_cache::AnalysisCacheHandle::spawn(
+                None,
+                engine_prefs.heuristic_supersede,
+            )),
+            analysis_debouncer: crate::analysis_cache::AnalysisDebouncer::new(),
             review_engine: None,
             review: None,
             review_open: false,
@@ -4141,6 +4152,30 @@ impl App {
         Some(Fen::from_position(&node.pos, EnPassantMode::Legal).to_string())
     }
 
+    fn current_position(&self) -> Option<Chess> {
+        let game = self.current.as_ref()?;
+        let node = game.nodes.get(self.node)?;
+        Some(node.pos.clone())
+    }
+
+    fn update_cached_analyses(&mut self) {
+        let Some(pos) = self.current_position() else {
+            self.cached_analyses.clear();
+            return;
+        };
+        let hash = pos.position_hash();
+        if self
+            .cached_analyses
+            .first()
+            .is_some_and(|a| a.pos_hash == hash)
+        {
+            return;
+        }
+        if let Some(cache) = &self.analysis_cache {
+            self.cached_analyses = cache.query_position(hash);
+        }
+    }
+
     fn engine_limit(&self) -> SearchLimit {
         if self.engine_use_time {
             SearchLimit::MoveTime(Duration::from_millis(self.engine_time_ms))
@@ -4172,6 +4207,11 @@ impl App {
     }
 
     fn reset_engine_events(&mut self) {
+        if let Some(batch) = self.analysis_debouncer.flush()
+            && let Some(cache) = &self.analysis_cache
+        {
+            cache.store_batch(batch);
+        }
         self.engine_request = 0;
         self.engine_fen = None;
         self.engine_infos.clear();
@@ -4243,7 +4283,13 @@ impl App {
             path: Some(self.engine_path()),
             threads: self.engine_options().threads,
             hash_mb: self.engine_options().hash_mb,
+            cache_engine_analysis: self.cache_engine_analysis,
+            heuristic_supersede: self.heuristic_supersede,
         };
+        self.analysis_cache = Some(crate::analysis_cache::AnalysisCacheHandle::spawn(
+            None,
+            self.heuristic_supersede,
+        ));
         if let Err(err) = prefs.save() {
             self.status = format!("Could not save engine settings: {err:#}");
         } else if let Some(path) = crate::settings::config_path() {
@@ -4372,7 +4418,43 @@ impl App {
                 }
                 EngineEvent::Info { request, info } => {
                     if request == self.engine_request {
-                        self.engine_infos.insert(info.multipv, info);
+                        self.engine_infos.insert(info.multipv, info.clone());
+                        if self.cache_engine_analysis
+                            && let Some(pos) = self.current_position()
+                        {
+                            let pos_hash = pos.position_hash();
+                            let family =
+                                crate::analysis_cache::parse_engine_identity(&self.engine_name)
+                                    .family;
+                            let (score_cp, score_mate) = match info.score {
+                                Some(Score::Cp(cp)) => (Some(cp), None),
+                                Some(Score::Mate(m)) => (None, Some(m)),
+                                None => (None, None),
+                            };
+                            let cached = crate::analysis_cache::CachedAnalysis {
+                                pos_hash,
+                                fen: self.engine_fen.clone().unwrap_or_default(),
+                                engine_family: family,
+                                engine_name: self.engine_name.clone(),
+                                multipv: info.multipv,
+                                depth: info.depth,
+                                seldepth: info.seldepth,
+                                score_cp,
+                                score_mate,
+                                nodes: info.nodes,
+                                time_ms: info.time_ms,
+                                nps: info.nps,
+                                pv: info.pv.clone(),
+                                quality_score: 0.0,
+                                analyzed_at: 0,
+                            };
+                            if let Some(batch) =
+                                self.analysis_debouncer.push(cached, Instant::now())
+                                && let Some(cache) = &self.analysis_cache
+                            {
+                                cache.store_batch(batch);
+                            }
+                        }
                     }
                 }
                 EngineEvent::BestMove { request, best, .. } => {
@@ -4380,6 +4462,12 @@ impl App {
                         self.engine_searching = false;
                         self.engine_bestmove = Some(best);
                         self.engine_status = "Analysis complete.".to_string();
+                        if self.cache_engine_analysis
+                            && let Some(batch) = self.analysis_debouncer.flush()
+                            && let Some(cache) = &self.analysis_cache
+                        {
+                            cache.store_batch(batch);
+                        }
                     }
                 }
                 EngineEvent::Error(err) => {
@@ -5533,6 +5621,7 @@ impl App {
     /// delayed briefly so holding an arrow key does not fire a request for
     /// every intermediate position.
     fn maybe_request_cloud(&mut self) {
+        self.update_cached_analyses();
         let wants_tab = |tab: RightTab| match tab {
             RightTab::References | RightTab::Tree => true,
             RightTab::Engine => self.engine_view != EngineView::Local,
@@ -5645,6 +5734,7 @@ impl App {
     }
 
     fn maybe_request_bar_cloud(&mut self) {
+        self.update_cached_analyses();
         if !self.engine_bar {
             return;
         }
@@ -8017,6 +8107,43 @@ impl App {
                                 .weak(),
                             );
                         }
+                        ui.separator();
+                        ui.horizontal_wrapped(|ui| {
+                            if ui
+                                .checkbox(&mut self.cache_engine_analysis, "Cache engine analysis")
+                                .on_hover_text("Persist locally analyzed positions to SQLite cache")
+                                .changed()
+                            {
+                                apply_engine = true;
+                            }
+                            if ui
+                                .checkbox(&mut self.heuristic_supersede, "Smart Stockfish replacement")
+                                .on_hover_text(
+                                    "Use fine-grained formula to supersede earlier/weaker analysis (disable to keep all)",
+                                )
+                                .changed()
+                            {
+                                apply_engine = true;
+                            }
+                        });
+                        if let Some(cache) = &self.analysis_cache {
+                            let count = cache.count_positions();
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new(format!("Cached positions: {count}"))
+                                        .small()
+                                        .weak(),
+                                );
+                                if ui
+                                    .button("Clear cache")
+                                    .on_hover_text("Delete all cached engine evaluations")
+                                    .clicked()
+                                {
+                                    let _ = cache.clear();
+                                    self.cached_analyses.clear();
+                                }
+                            });
+                        }
                         if self.engine_settings_pending() {
                             ui.label(
                                 RichText::new("Settings changed — Apply & restart to use them.")
@@ -8152,6 +8279,11 @@ impl App {
         if stop {
             if let Some(engine) = &self.engine {
                 engine.stop();
+            }
+            if let Some(batch) = self.analysis_debouncer.flush()
+                && let Some(cache) = &self.analysis_cache
+            {
+                cache.store_batch(batch);
             }
             self.engine_searching = false;
             self.engine_status = "Stopped.".to_string();
@@ -16727,6 +16859,10 @@ mod tests {
             engine_path: "/usr/bin/stockfish".to_string(),
             engine_threads: 1,
             engine_hash_mb: 16,
+            cache_engine_analysis: true,
+            heuristic_supersede: true,
+            analysis_cache: None,
+            analysis_debouncer: crate::analysis_cache::AnalysisDebouncer::new(),
             review_engine: None,
             review: None,
             review_open: false,
@@ -17322,6 +17458,59 @@ mod tests {
         );
         assert_eq!(prep_you_name(&names), "Magnus Carlsen");
         assert_eq!(prep_you_name(&[]), "You");
+    }
+
+    #[test]
+    fn app_analysis_cache_lifecycle() {
+        let mut app = test_app();
+        assert!(app.cache_engine_analysis);
+        assert!(app.heuristic_supersede);
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let db_path = std::env::temp_dir().join(format!("brett-test-app-cache-{nonce}.db"));
+        let handle = crate::analysis_cache::AnalysisCacheHandle::spawn(Some(db_path.clone()), true);
+        app.analysis_cache = Some(handle);
+
+        // When navigating to starting position, cached_analyses is initially empty
+        app.update_cached_analyses();
+        assert!(app.cached_analyses.is_empty());
+
+        // Store an analysis into the handle
+        let pos = Chess::default();
+        let hash = pos.position_hash();
+        let entry = crate::analysis_cache::CachedAnalysis {
+            pos_hash: hash,
+            fen: "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1".to_string(),
+            engine_family: crate::analysis_cache::EngineFamily::Stockfish,
+            engine_name: "Stockfish 17".to_string(),
+            multipv: 1,
+            depth: 28,
+            seldepth: Some(34),
+            score_cp: Some(30),
+            score_mate: None,
+            nodes: Some(5_000_000),
+            time_ms: Some(1000),
+            nps: Some(5_000_000),
+            pv: vec!["e2e4".to_string(), "e7e5".to_string()],
+            quality_score: 5000.0,
+            analyzed_at: 1700000000,
+        };
+        app.analysis_cache.as_ref().unwrap().store(entry);
+
+        // Give worker thread a moment to write
+        std::thread::sleep(std::time::Duration::from_millis(60));
+
+        // When update_cached_analyses is called, it loads the cached record
+        app.cached_analyses.clear();
+        app.update_cached_analyses();
+        assert_eq!(app.cached_analyses.len(), 1);
+        assert_eq!(app.cached_analyses[0].engine_name, "Stockfish 17");
+        assert_eq!(app.cached_analyses[0].depth, 28);
+
+        let _ = std::fs::remove_file(&db_path);
     }
 
     #[test]
