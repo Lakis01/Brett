@@ -576,13 +576,23 @@ struct PendingOpenChoice {
     path: PathBuf,
 }
 
-#[derive(Clone)]
-struct CloudEngineRow {
+#[derive(Clone, Default)]
+pub(crate) struct CloudEngineRow {
     uci: String,
     san: String,
     chessdb: Option<i32>,
     lichess: Option<(Option<i32>, Option<i32>)>,
+    lichess_depth: Option<u32>,
+    stockfish: Option<(Option<i32>, Option<i32>)>,
+    stockfish_depth: Option<u32>,
+    stockfish_name: Option<String>,
+    leela: Option<(Option<i32>, Option<i32>)>,
+    leela_depth: Option<u32>,
+    leela_name: Option<String>,
     variation: Vec<String>,
+    variation_source: Option<String>,
+    alt_variation: Option<Vec<String>>,
+    alt_variation_source: Option<String>,
 }
 
 pub struct App {
@@ -778,6 +788,7 @@ pub struct App {
     explorer_job: Option<(String, cloud::ExplorerSource)>,
     cloud_pending: Option<(String, Instant)>,
     cloud_status: String,
+    cached_analyses: Vec<crate::analysis_cache::CachedAnalysis>,
     lichess_token: Option<String>,
     explorer_source: cloud::ExplorerSource,
     engine: Option<EngineHandle>,
@@ -1089,6 +1100,7 @@ impl App {
             explorer_job: None,
             cloud_pending: None,
             cloud_status: "Open a game and select References.".to_string(),
+            cached_analyses: Vec::new(),
             lichess_token: cloud_prefs.lichess_token,
             explorer_source: cloud_prefs.explorer_source,
             engine: None,
@@ -5700,6 +5712,35 @@ impl App {
         {
             info.score
                 .map(|score| BoardEval::from_local(score, rev_turn, info.depth))
+        } else if !self.cached_analyses.is_empty() {
+            let sf = self.cached_analyses.iter().find(|a| {
+                a.engine_family == crate::analysis_cache::EngineFamily::Stockfish && a.multipv == 1
+            });
+            let lc0 = self.cached_analyses.iter().find(|a| {
+                a.engine_family == crate::analysis_cache::EngineFamily::Leela && a.multipv == 1
+            });
+            if let Some(sf) = sf {
+                let score = if let Some(mate) = sf.score_mate {
+                    Score::Mate(mate)
+                } else if let Some(cp) = sf.score_cp {
+                    Score::Cp(cp)
+                } else {
+                    Score::Cp(0)
+                };
+                Some(BoardEval::from_local(score, turn, sf.depth))
+            } else if let Some(lc0) = lc0 {
+                let score = if let Some(mate) = lc0.score_mate {
+                    Score::Mate(mate)
+                } else if let Some(cp) = lc0.score_cp {
+                    let translated = crate::analysis_cache::leela_to_stockfish_cp(cp);
+                    Score::Cp(translated)
+                } else {
+                    Score::Cp(0)
+                };
+                Some(BoardEval::from_local(score, turn, lc0.depth))
+            } else {
+                None
+            }
         } else {
             None
         };
@@ -8195,8 +8236,13 @@ impl App {
             if engine_view == EngineView::Both {
                 ui.add_space(8.0);
             }
-            let (cloud_line, cloud_preview) =
-                cloud_engine_section(ui, self.cloud.as_ref(), Some(&pos), &self.cloud_status);
+            let (cloud_line, cloud_preview) = cloud_engine_section(
+                ui,
+                self.cloud.as_ref(),
+                &self.cached_analyses,
+                Some(&pos),
+                &self.cloud_status,
+            );
             if cloud_line.is_some() {
                 clicked_line = cloud_line;
             }
@@ -14728,20 +14774,18 @@ fn correspondence_section(
     (clicked, hover_preview)
 }
 
-/// Merge chessdb.cn moves with every Lichess cloud-eval PV. One Lichess PV is
-/// attached to each matching first move; additional PVs that share a first
-/// move get their own rows so all five variations remain visible. Rows are
-/// sorted by their average White-POV score, best first for the side to move.
-fn cloud_engine_rows(snapshot: &cloud::Snapshot, pos: &Chess) -> Vec<CloudEngineRow> {
+/// Merge remote cloud evaluations (chessdb.cn, Lichess cloud eval) with
+/// local cached evaluations (Stockfish, Leela, Generic).
+pub(crate) fn merge_multi_source_engine_rows(
+    snapshot: Option<&cloud::Snapshot>,
+    local: &[crate::analysis_cache::CachedAnalysis],
+    pos: &Chess,
+) -> Vec<CloudEngineRow> {
     let chessdb = snapshot
-        .chessdb
-        .as_ref()
-        .ok()
+        .and_then(|s| s.chessdb.as_ref().ok())
         .map(|data| data.moves.as_slice())
         .unwrap_or_default();
-    // Match on SAN rather than the raw UCI string. Sources may encode castling
-    // as either king-to-castle (e1c1) or king-to-rook (e1a1); both are legal
-    // UCI spellings of O-O-O and must collapse into one row.
+
     let chessdb_score = |san: &str| {
         chessdb
             .iter()
@@ -14749,58 +14793,252 @@ fn cloud_engine_rows(snapshot: &cloud::Snapshot, pos: &Chess) -> Vec<CloudEngine
             .map(|mv| mv.white_score(pos.turn()))
     };
 
-    let mut rows: Vec<CloudEngineRow> = Vec::new();
-    if let Ok(eval) = &snapshot.cloud_eval {
+    let cloud_eval = snapshot.and_then(|s| s.cloud_eval.as_ref().ok());
+    let lichess_depth = cloud_eval.map(|e| e.depth);
+
+    // Filter local analyses that qualify by the quality gate
+    let qualified_local: Vec<&crate::analysis_cache::CachedAnalysis> = local
+        .iter()
+        .filter(|analysis| {
+            if let Some(ld) = lichess_depth {
+                analysis.depth >= 22 && analysis.depth >= ld.saturating_sub(4)
+                    || analysis.depth >= 18
+            } else {
+                analysis.depth >= 12
+            }
+        })
+        .collect();
+
+    struct CandidateSource {
+        uci: String,
+        san: String,
+        chessdb: Option<i32>,
+        lichess: Option<(Option<i32>, Option<i32>)>,
+        lichess_depth: Option<u32>,
+        lichess_pv: Option<Vec<String>>,
+        stockfish: Option<(Option<i32>, Option<i32>)>,
+        stockfish_depth: Option<u32>,
+        stockfish_name: Option<String>,
+        stockfish_pv: Option<Vec<String>>,
+        leela: Option<(Option<i32>, Option<i32>)>,
+        leela_depth: Option<u32>,
+        leela_name: Option<String>,
+        leela_pv: Option<Vec<String>>,
+    }
+
+    let mut candidates: Vec<CandidateSource> = Vec::new();
+
+    // 1. Process Lichess PVs
+    if let Some(eval) = cloud_eval {
         for pv in &eval.pvs {
-            let variation: Vec<String> = pv.moves.split_whitespace().map(str::to_string).collect();
-            let Some(first) = variation.first() else {
-                continue;
-            };
+            let moves: Vec<String> = pv.moves.split_whitespace().map(str::to_string).collect();
+            let Some(first) = moves.first() else { continue };
             let san = cloud::uci_san(pos, first).unwrap_or_else(|| first.clone());
-            rows.push(CloudEngineRow {
+            let entry = if let Some(existing) = candidates
+                .iter_mut()
+                .find(|c| c.san == san && c.lichess.is_none())
+            {
+                existing
+            } else {
+                candidates.push(CandidateSource {
+                    uci: first.clone(),
+                    san: san.clone(),
+                    chessdb: chessdb_score(&san),
+                    lichess: None,
+                    lichess_depth: None,
+                    lichess_pv: None,
+                    stockfish: None,
+                    stockfish_depth: None,
+                    stockfish_name: None,
+                    stockfish_pv: None,
+                    leela: None,
+                    leela_depth: None,
+                    leela_name: None,
+                    leela_pv: None,
+                });
+                candidates.last_mut().unwrap()
+            };
+            if entry.lichess.is_none() {
+                entry.lichess = Some((pv.cp, pv.mate));
+                entry.lichess_depth = Some(eval.depth);
+                entry.lichess_pv = Some(moves);
+            }
+        }
+    }
+
+    // 2. Process Qualified Local Analysis
+    for analysis in qualified_local {
+        let Some(first) = analysis.pv.first() else {
+            continue;
+        };
+        let san = cloud::uci_san(pos, first).unwrap_or_else(|| first.clone());
+        let entry = if let Some(existing) = candidates.iter_mut().find(|c| c.san == san) {
+            existing
+        } else {
+            candidates.push(CandidateSource {
                 uci: first.clone(),
+                san: san.clone(),
                 chessdb: chessdb_score(&san),
-                san,
-                lichess: Some((pv.cp, pv.mate)),
-                variation,
+                lichess: None,
+                lichess_depth: None,
+                lichess_pv: None,
+                stockfish: None,
+                stockfish_depth: None,
+                stockfish_name: None,
+                stockfish_pv: None,
+                leela: None,
+                leela_depth: None,
+                leela_name: None,
+                leela_pv: None,
+            });
+            candidates.last_mut().unwrap()
+        };
+
+        let sign = if pos.turn() == Color::White { 1 } else { -1 };
+        let score_cp_white = analysis.score_cp.map(|cp| cp * sign);
+        let score_mate_white = analysis.score_mate.map(|mate| mate * sign);
+
+        match analysis.engine_family {
+            crate::analysis_cache::EngineFamily::Stockfish => {
+                if entry.stockfish.is_none() || analysis.depth > entry.stockfish_depth.unwrap_or(0)
+                {
+                    entry.stockfish = Some((score_cp_white, score_mate_white));
+                    entry.stockfish_depth = Some(analysis.depth);
+                    entry.stockfish_name = Some(analysis.engine_name.clone());
+                    entry.stockfish_pv = Some(analysis.pv.clone());
+                }
+            }
+            crate::analysis_cache::EngineFamily::Leela => {
+                if entry.leela.is_none() || analysis.depth > entry.leela_depth.unwrap_or(0) {
+                    entry.leela = Some((score_cp_white, score_mate_white));
+                    entry.leela_depth = Some(analysis.depth);
+                    entry.leela_name = Some(analysis.engine_name.clone());
+                    entry.leela_pv = Some(analysis.pv.clone());
+                }
+            }
+            crate::analysis_cache::EngineFamily::Generic => {
+                if entry.stockfish.is_none() || analysis.depth > entry.stockfish_depth.unwrap_or(0)
+                {
+                    entry.stockfish = Some((score_cp_white, score_mate_white));
+                    entry.stockfish_depth = Some(analysis.depth);
+                    entry.stockfish_name = Some(analysis.engine_name.clone());
+                    entry.stockfish_pv = Some(analysis.pv.clone());
+                }
+            }
+        }
+    }
+
+    // 3. Process remaining ChessDB candidate moves
+    for mv in chessdb {
+        let san = cloud::uci_san(pos, &mv.uci).unwrap_or_else(|| mv.uci.clone());
+        if !candidates.iter().any(|c| c.san == san) {
+            candidates.push(CandidateSource {
+                uci: mv.uci.clone(),
+                san: san.clone(),
+                chessdb: Some(mv.white_score(pos.turn())),
+                lichess: None,
+                lichess_depth: None,
+                lichess_pv: Some(vec![mv.uci.clone()]),
+                stockfish: None,
+                stockfish_depth: None,
+                stockfish_name: None,
+                stockfish_pv: None,
+                leela: None,
+                leela_depth: None,
+                leela_name: None,
+                leela_pv: None,
             });
         }
     }
 
-    for mv in chessdb {
-        let san = cloud::uci_san(pos, &mv.uci).unwrap_or_else(|| mv.uci.clone());
-        if rows.iter().any(|row| row.san == san) {
-            continue;
+    // 4. Construct final CloudEngineRow instances with stacked variations
+    let mut rows: Vec<CloudEngineRow> = Vec::new();
+    for c in candidates {
+        let mut variations: Vec<(u32, String, Vec<String>)> = Vec::new();
+        if let Some(pv) = c.stockfish_pv {
+            let d = c.stockfish_depth.unwrap_or(0);
+            let name = c.stockfish_name.as_deref().unwrap_or("Stockfish");
+            variations.push((d, format!("{name} d{d}"), pv));
         }
+        if let Some(pv) = c.lichess_pv {
+            let d = c.lichess_depth.unwrap_or(0);
+            variations.push((d, format!("Lichess d{d}"), pv));
+        }
+        if let Some(pv) = c.leela_pv {
+            let d = c.leela_depth.unwrap_or(0);
+            let name = c.leela_name.as_deref().unwrap_or("Leela");
+            variations.push((d, format!("{name} {d}k"), pv));
+        }
+
+        variations.sort_by_key(|a| std::cmp::Reverse(a.0));
+
+        let (variation, variation_source, alt_variation, alt_variation_source) =
+            match variations.len() {
+                0 => (vec![c.uci.clone()], None, None, None),
+                1 => {
+                    let v = variations.remove(0);
+                    (v.2, Some(v.1), None, None)
+                }
+                _ => {
+                    let primary = variations.remove(0);
+                    let secondary = variations.remove(0);
+                    (
+                        primary.2,
+                        Some(primary.1),
+                        Some(secondary.2),
+                        Some(secondary.1),
+                    )
+                }
+            };
+
         rows.push(CloudEngineRow {
-            uci: mv.uci.clone(),
-            san,
-            chessdb: Some(mv.white_score(pos.turn())),
-            lichess: None,
-            // No Lichess PV exists, so the line is deliberately truncated to
-            // the one ply we can evaluate.
-            variation: vec![mv.uci.clone()],
+            uci: c.uci,
+            san: c.san,
+            chessdb: c.chessdb,
+            lichess: c.lichess,
+            lichess_depth: c.lichess_depth,
+            stockfish: c.stockfish,
+            stockfish_depth: c.stockfish_depth,
+            stockfish_name: c.stockfish_name,
+            leela: c.leela,
+            leela_depth: c.leela_depth,
+            leela_name: c.leela_name,
+            variation,
+            variation_source,
+            alt_variation,
+            alt_variation_source,
         });
     }
+
     cloud_sort_rows(&mut rows, pos.turn());
     rows
 }
 
-/// Number of leading rows that still have a Lichess line. Any chessdb-only
-/// rows after the last Lichess row are trailing and can be folded into one
+#[cfg(test)]
+fn cloud_engine_rows(snapshot: &cloud::Snapshot, pos: &Chess) -> Vec<CloudEngineRow> {
+    merge_multi_source_engine_rows(Some(snapshot), &[], pos)
+}
+
+/// Number of leading rows that still have an engine line. Any chessdb-only
+/// rows after the last engine variation are trailing and can be folded into one
 /// compact line.
 fn cloud_primary_split(rows: &[CloudEngineRow]) -> usize {
     rows.iter()
-        .rposition(|row| row.lichess.is_some())
+        .rposition(|row| {
+            row.lichess.is_some()
+                || row.stockfish.is_some()
+                || row.leela.is_some()
+                || row.variation.len() > 1
+        })
         .map_or(0, |index| index + 1)
 }
 
-/// Cloud Engine: chessdb.cn and every available Lichess cloud-eval variation
-/// in one compact table. The Lichess line itself is made of clickable moves,
-/// so clicking a prefix plays up to that point.
+/// Cloud Engine: chessdb.cn, Lichess cloud-eval, and local cached analysis
+/// in one compact table.
 fn cloud_engine_section(
     ui: &mut Ui,
     snapshot: Option<&cloud::Snapshot>,
+    local_cached: &[crate::analysis_cache::CachedAnalysis],
     position: Option<&Chess>,
     status: &str,
 ) -> (Option<Vec<String>>, Option<HoverPreview>) {
@@ -14816,7 +15054,7 @@ fn cloud_engine_section(
             ui.horizontal_wrapped(|ui| {
                 ui.heading("Cloud Engine");
                 ui.label(
-                    RichText::new("chessdb.cn · Lichess cloud eval")
+                    RichText::new("chessdb.cn · Lichess cloud eval · Local cache")
                         .small()
                         .weak(),
                 );
@@ -14829,78 +15067,118 @@ fn cloud_engine_section(
                 }
             });
 
-            let Some(snapshot) = snapshot else {
-                ui.label(RichText::new(status).weak().italics());
-                return;
-            };
             let Some(pos) = position else {
                 ui.label(RichText::new("Open a game to query cloud evaluations.").weak());
                 return;
             };
 
-            let rows = cloud_engine_rows(snapshot, pos);
+            let rows = merge_multi_source_engine_rows(snapshot, local_cached, pos);
             let best_score = cloud_best_score(&rows, pos.turn());
 
             if rows.is_empty() {
                 ui.label(
-                    RichText::new("No cloud moves for this position yet.")
-                        .weak()
-                        .italics(),
+                    RichText::new(if snapshot.is_none() && local_cached.is_empty() {
+                        status
+                    } else {
+                        "No engine moves for this position yet."
+                    })
+                    .weak()
+                    .italics(),
                 );
             } else {
+                let has_chessdb = rows.iter().any(|r| r.chessdb.is_some());
+                let has_lichess = rows.iter().any(|r| r.lichess.is_some());
+                let has_stockfish = rows.iter().any(|r| r.stockfish.is_some());
+                let has_leela = rows.iter().any(|r| r.leela.is_some());
+
                 let lichess_heading = snapshot
-                    .cloud_eval
-                    .as_ref()
-                    .map(|eval| format!("Lichess eval (d{})", eval.depth))
-                    .unwrap_or_else(|_| "Lichess eval".to_string());
+                    .and_then(|s| s.cloud_eval.as_ref().ok())
+                    .map(|eval| format!("Lichess (d{})", eval.depth))
+                    .unwrap_or_else(|| "Lichess".to_string());
+
+                let sf_max_depth = rows.iter().filter_map(|r| r.stockfish_depth).max();
+                let sf_heading = sf_max_depth
+                    .map(|d| format!("SF (d{d})"))
+                    .unwrap_or_else(|| "Stockfish".to_string());
+
+                let leela_max_depth = rows.iter().filter_map(|r| r.leela_depth).max();
+                let leela_heading = leela_max_depth
+                    .map(|d| format!("Lc0 ({d}k)"))
+                    .unwrap_or_else(|| "Lc0".to_string());
+
                 ui.horizontal(|ui| {
-                    left_sized_label(
-                        ui,
-                        64.0,
-                        18.0,
-                        RichText::new("chessdb eval").strong().small(),
-                    )
-                    .on_hover_text("chessdb.cn evaluation, White POV");
-                    left_sized_label(
-                        ui,
-                        100.0,
-                        18.0,
-                        RichText::new(lichess_heading).strong().small(),
-                    )
-                    .on_hover_text("Lichess cloud evaluation at this depth, White POV");
-                    ui.label(RichText::new("line").strong().small())
+                    if has_chessdb {
+                        left_sized_label(
+                            ui,
+                            64.0,
+                            18.0,
+                            RichText::new("chessdb").strong().small(),
+                        )
+                        .on_hover_text("chessdb.cn evaluation, White POV");
+                    }
+                    if has_lichess {
+                        left_sized_label(
+                            ui,
+                            90.0,
+                            18.0,
+                            RichText::new(lichess_heading).strong().small(),
+                        )
+                        .on_hover_text("Lichess cloud evaluation at this depth, White POV");
+                    }
+                    if has_stockfish {
+                        left_sized_label(
+                            ui,
+                            80.0,
+                            18.0,
+                            RichText::new(sf_heading).strong().small(),
+                        )
+                        .on_hover_text("Stockfish local cached evaluation, White POV");
+                    }
+                    if has_leela {
+                        left_sized_label(
+                            ui,
+                            80.0,
+                            18.0,
+                            RichText::new(leela_heading).strong().small(),
+                        )
+                        .on_hover_text("Leela Chess Zero cached evaluation, White POV");
+                    }
+                    ui.label(RichText::new("lines (deeper on top)").strong().small())
                         .on_hover_text(
-                            "Sorted by average eval, best for the side to move first · Hover a move to preview · click to play up to it",
+                            "Sorted by composite score, best for side to move · Hover move to preview · click to play",
                         );
                 });
                 ui.separator();
-                // Keep the table compact: the best eight rows stay open and
-                // the rest are available under "More moves". Chessdb-only
-                // rows that trail the last Lichess variation have no line to
-                // show, so fold them into one compact line instead of giving
-                // each one a full table row.
+
                 const PRIMARY_ROWS: usize = 8;
                 let primary_count = rows.len().min(PRIMARY_ROWS);
                 let primary = &rows[..primary_count];
                 let split = cloud_primary_split(primary);
                 let (primary_lines, trailing) = primary.split_at(split);
+
                 for row in primary_lines {
                     cloud_row_ui(
                         ui,
                         row,
                         pos,
                         best_score,
+                        has_chessdb,
+                        has_lichess,
+                        has_stockfish,
+                        has_leela,
                         &mut hover_preview,
                         &mut clicked_line,
                     );
                 }
+
                 let trailing_chessdb: Vec<&CloudEngineRow> = trailing
                     .iter()
-                    .filter(|row| row.lichess.is_none())
+                    .filter(|row| row.lichess.is_none() && row.stockfish.is_none() && row.leela.is_none())
                     .collect();
+
                 if trailing_chessdb.len() >= 2 {
                     ui.label(
-                        RichText::new("chessdb-only moves · no Lichess line")
+                        RichText::new("chessdb-only moves · no engine line")
                             .small()
                             .weak(),
                     );
@@ -14925,11 +15203,16 @@ fn cloud_engine_section(
                             row,
                             pos,
                             best_score,
+                            has_chessdb,
+                            has_lichess,
+                            has_stockfish,
+                            has_leela,
                             &mut hover_preview,
                             &mut clicked_line,
                         );
                     }
                 }
+
                 if primary_count < rows.len() {
                     let extra = &rows[primary_count..];
                     egui::CollapsingHeader::new(
@@ -14939,37 +15222,16 @@ fn cloud_engine_section(
                     )
                     .default_open(false)
                     .show(ui, |ui| {
-                        let (chessdb_only, with_lichess): (Vec<_>, Vec<_>) =
-                            extra.iter().partition(|row| row.lichess.is_none());
-                        if !chessdb_only.is_empty() {
-                            ui.label(
-                                RichText::new(
-                                    "chessdb-only moves · no Lichess evaluation",
-                                )
-                                .small()
-                                .weak(),
-                            );
-                            ui.add_space(2.0);
-                            ui.horizontal_wrapped(|ui| {
-                                ui.spacing_mut().item_spacing = vec2(8.0, 3.0);
-                                for row in chessdb_only {
-                                    cloud_compact_row_ui(
-                                        ui,
-                                        row,
-                                        pos,
-                                        best_score,
-                                        &mut hover_preview,
-                                        &mut clicked_line,
-                                    );
-                                }
-                            });
-                        }
-                        for row in with_lichess {
+                        for row in extra {
                             cloud_row_ui(
                                 ui,
                                 row,
                                 pos,
                                 best_score,
+                                has_chessdb,
+                                has_lichess,
+                                has_stockfish,
+                                has_leela,
                                 &mut hover_preview,
                                 &mut clicked_line,
                             );
@@ -14978,24 +15240,25 @@ fn cloud_engine_section(
                 }
             }
 
-            if let Err(err) = &snapshot.chessdb {
-                ui.label(RichText::new(format!("chessdb.cn: {err}")).small().weak());
-            }
-            if let Err(err) = &snapshot.cloud_eval {
-                ui.label(
-                    RichText::new(format!("Lichess cloud eval: {err}"))
-                        .small()
-                        .weak(),
-                );
+            if let Some(s) = snapshot {
+                if let Err(err) = &s.chessdb {
+                    ui.label(RichText::new(format!("chessdb.cn: {err}")).small().weak());
+                }
+                if let Err(err) = &s.cloud_eval {
+                    ui.label(
+                        RichText::new(format!("Lichess cloud eval: {err}"))
+                            .small()
+                            .weak(),
+                    );
+                }
             }
         });
 
     (clicked_line, hover_preview)
 }
 
-/// Average the available White-POV centipawn scores from chessdb.cn and the
-/// Lichess cloud evaluation. A fractional average avoids losing a centipawn
-/// when the two sources differ by an odd number.
+/// Average the available White-POV centipawn scores from chessdb.cn, Lichess,
+/// and local cached evaluations (Stockfish, Leela).
 fn cloud_average_cp(row: &CloudEngineRow) -> Option<f64> {
     let mut total = 0.0;
     let mut count = 0;
@@ -15007,13 +15270,27 @@ fn cloud_average_cp(row: &CloudEngineRow) -> Option<f64> {
         total += f64::from(cp);
         count += 1;
     }
+    if let Some(cp) = row.stockfish.and_then(|(cp, _)| cp) {
+        total += f64::from(cp);
+        count += 1;
+    }
+    if let Some(cp) = row.leela.and_then(|(cp, _)| cp) {
+        let translated = crate::analysis_cache::leela_to_stockfish_cp(cp);
+        total += f64::from(translated);
+        count += 1;
+    }
     (count > 0).then(|| total / f64::from(count))
 }
 
-/// A comparable White-POV score for a cloud row. A Lichess mate dominates any
+/// A comparable White-POV score for a row. A mate dominates any
 /// centipawn score; otherwise use the average of the available cp sources.
 fn cloud_row_score(row: &CloudEngineRow) -> Option<f64> {
-    if let Some(mate) = row.lichess.and_then(|(_, mate)| mate) {
+    if let Some(mate) = row
+        .stockfish
+        .and_then(|(_, mate)| mate)
+        .or_else(|| row.lichess.and_then(|(_, mate)| mate))
+        .or_else(|| row.leela.and_then(|(_, mate)| mate))
+    {
         return Some(if mate > 0 {
             100_000.0 - f64::from(mate)
         } else {
@@ -15127,11 +15404,16 @@ fn cloud_eval_hint(row: &CloudEngineRow, delta: Option<f64>) -> String {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cloud_row_ui(
     ui: &mut Ui,
     row: &CloudEngineRow,
     pos: &Chess,
     best_score: Option<f64>,
+    has_chessdb: bool,
+    has_lichess: bool,
+    has_stockfish: bool,
+    has_leela: bool,
     hover_preview: &mut Option<HoverPreview>,
     clicked_line: &mut Option<Vec<String>>,
 ) {
@@ -15142,71 +15424,169 @@ fn cloud_row_ui(
     let eval_hint = cloud_eval_hint(row, delta);
 
     ui.horizontal(|ui| {
-        left_sized_label(
-            ui,
-            64.0,
-            20.0,
-            RichText::new(
-                row.chessdb
-                    .map(format_cp)
-                    .unwrap_or_else(|| "—".to_string()),
-            )
-            .monospace()
-            .small()
-            .color(if row.chessdb.is_some() {
-                eval_color
-            } else {
-                Color32::from_gray(150)
-            }),
-        )
-        .on_hover_text(eval_hint.as_str());
-        left_sized_label(
-            ui,
-            100.0,
-            20.0,
-            RichText::new(
-                row.lichess
-                    .map(|(cp, mate)| pv_score(cp, mate))
-                    .unwrap_or_else(|| "—".to_string()),
-            )
-            .monospace()
-            .small()
-            .color(if row.lichess.is_some() {
-                eval_color
-            } else {
-                Color32::from_gray(150)
-            }),
-        )
-        .on_hover_text(eval_hint.as_str());
-
-        // Absorb the candidate move into the line: the first SAN already
-        // carries the move number, and chessdb-only rows have a one-ply line.
-        let line_width = (ui.available_width() - ui.spacing().item_spacing.x).max(80.0);
-        ui.allocate_ui_with_layout(
-            vec2(line_width, 20.0),
-            Layout::left_to_right(Align::Center),
-            |ui| {
-                ui.spacing_mut().item_spacing.x = 2.0;
-                if row.variation.is_empty() {
-                    let response = ui
-                        .selectable_label(false, RichText::new(&row.san).small().color(eval_color))
-                        .on_hover_text("Hover to preview · click to play");
-                    if response.hovered() {
-                        *hover_preview = preview_after_uci(pos, &row.uci);
-                    }
-                    if response.clicked() {
-                        *clicked_line = Some(vec![row.uci.clone()]);
-                    }
+        if has_chessdb {
+            left_sized_label(
+                ui,
+                64.0,
+                20.0,
+                RichText::new(
+                    row.chessdb
+                        .map(format_cp)
+                        .unwrap_or_else(|| "—".to_string()),
+                )
+                .monospace()
+                .small()
+                .color(if row.chessdb.is_some() {
+                    eval_color
                 } else {
-                    let steps = pv_steps(pos, &row.variation, row.variation.len());
-                    pv_steps_ui_compact(
-                        ui,
-                        &steps,
-                        &row.variation,
-                        hover_preview,
-                        clicked_line,
-                        Some(eval_color),
-                    );
+                    Color32::from_gray(150)
+                }),
+            )
+            .on_hover_text(eval_hint.as_str());
+        }
+
+        if has_lichess {
+            left_sized_label(
+                ui,
+                90.0,
+                20.0,
+                RichText::new(
+                    row.lichess
+                        .map(|(cp, mate)| pv_score(cp, mate))
+                        .unwrap_or_else(|| "—".to_string()),
+                )
+                .monospace()
+                .small()
+                .color(if row.lichess.is_some() {
+                    eval_color
+                } else {
+                    Color32::from_gray(150)
+                }),
+            )
+            .on_hover_text(if let Some(d) = row.lichess_depth {
+                format!("{eval_hint} · Lichess depth {d}")
+            } else {
+                eval_hint.clone()
+            });
+        }
+
+        if has_stockfish {
+            let sf_text = row
+                .stockfish
+                .map(|(cp, mate)| pv_score(cp, mate))
+                .unwrap_or_else(|| "—".to_string());
+            let sf_tooltip = row
+                .stockfish_name
+                .as_deref()
+                .unwrap_or("Stockfish evaluation, White POV");
+            left_sized_label(
+                ui,
+                80.0,
+                20.0,
+                RichText::new(sf_text)
+                    .monospace()
+                    .small()
+                    .color(if row.stockfish.is_some() {
+                        eval_color
+                    } else {
+                        Color32::from_gray(150)
+                    }),
+            )
+            .on_hover_text(sf_tooltip);
+        }
+
+        if has_leela {
+            let leela_text = row
+                .leela
+                .map(|(cp, mate)| pv_score(cp, mate))
+                .unwrap_or_else(|| "—".to_string());
+            let engine_label = row.leela_name.as_deref().unwrap_or("Leela Chess Zero");
+            let leela_tooltip = if let Some((Some(cp), _)) = row.leela {
+                let sf_equiv = crate::analysis_cache::leela_to_stockfish_cp(cp);
+                format!(
+                    "{engine_label}: {} (~{} SF equivalent), White POV",
+                    format_cp(cp),
+                    format_cp(sf_equiv)
+                )
+            } else {
+                format!("{engine_label} evaluation, White POV")
+            };
+            left_sized_label(
+                ui,
+                80.0,
+                20.0,
+                RichText::new(leela_text)
+                    .monospace()
+                    .small()
+                    .color(if row.leela.is_some() {
+                        eval_color
+                    } else {
+                        Color32::from_gray(150)
+                    }),
+            )
+            .on_hover_text(leela_tooltip);
+        }
+
+        // Render variation lines: stacked 2-line layout if alt_variation exists, else single line
+        let line_width = (ui.available_width() - ui.spacing().item_spacing.x).max(80.0);
+        let height = if row.alt_variation.is_some() {
+            38.0
+        } else {
+            20.0
+        };
+        ui.allocate_ui_with_layout(
+            vec2(line_width, height),
+            Layout::top_down(Align::Min),
+            |ui| {
+                // Line 1: Primary (deeper) variation
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 2.0;
+                    if let Some(src) = &row.variation_source {
+                        ui.label(RichText::new(format!("[{src}]")).size(9.0).weak());
+                    }
+                    if row.variation.is_empty() {
+                        let response = ui
+                            .selectable_label(
+                                false,
+                                RichText::new(&row.san).small().color(eval_color),
+                            )
+                            .on_hover_text("Hover to preview · click to play");
+                        if response.hovered() {
+                            *hover_preview = preview_after_uci(pos, &row.uci);
+                        }
+                        if response.clicked() {
+                            *clicked_line = Some(vec![row.uci.clone()]);
+                        }
+                    } else {
+                        let steps = pv_steps(pos, &row.variation, row.variation.len());
+                        pv_steps_ui_compact(
+                            ui,
+                            &steps,
+                            &row.variation,
+                            hover_preview,
+                            clicked_line,
+                            Some(eval_color),
+                        );
+                    }
+                });
+
+                // Line 2: Alt variation (if present)
+                if let Some(alt_pv) = &row.alt_variation {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 2.0;
+                        if let Some(src) = &row.alt_variation_source {
+                            ui.label(RichText::new(format!("[{src}]")).size(9.0).weak());
+                        }
+                        let steps = pv_steps(pos, alt_pv, alt_pv.len());
+                        pv_steps_ui_compact(
+                            ui,
+                            &steps,
+                            alt_pv,
+                            hover_preview,
+                            clicked_line,
+                            Some(Color32::from_gray(160)),
+                        );
+                    });
                 }
             },
         );
@@ -15989,6 +16369,7 @@ mod tests {
             chessdb,
             lichess,
             variation: vec!["e2e4".to_string()],
+            ..Default::default()
         }
     }
 
@@ -16320,6 +16701,7 @@ mod tests {
             explorer_job: None,
             cloud_pending: None,
             cloud_status: String::new(),
+            cached_analyses: Vec::new(),
             lichess_token: None,
             explorer_source: cloud::ExplorerSource::Masters,
             engine: None,
@@ -17012,6 +17394,7 @@ mod tests {
             chessdb: Some(20),
             lichess: lichess.then_some((Some(20), None)),
             variation: vec!["e2e4".to_string()],
+            ..Default::default()
         };
         let rows = vec![
             row("e4", true),
@@ -17025,6 +17408,85 @@ mod tests {
 
         let all_chessdb = vec![row("e4", false), row("d4", false)];
         assert_eq!(cloud_primary_split(&all_chessdb), 0);
+    }
+
+    #[test]
+    fn multi_source_engine_rows_merging_and_stacking() {
+        use crate::analysis_cache::{CachedAnalysis, EngineFamily};
+
+        let pos = Chess::default();
+        let chessdb = cloud::ChessDb {
+            moves: vec![cloud::ChessDbMove {
+                uci: "e2e4".to_string(),
+                score: 25,
+                rank: 2,
+                note: String::new(),
+                winrate: 52.0,
+            }],
+        };
+        let cloud_eval = cloud::CloudEval {
+            depth: 35,
+            knodes: 100_000,
+            pvs: vec![cloud::CloudPv {
+                moves: "e2e4 c7c5 g1f3 d7d6".to_string(),
+                cp: Some(22),
+                mate: None,
+            }],
+        };
+        let snapshot = cloud::Snapshot {
+            fen: "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1".to_string(),
+            chessdb: Ok(chessdb),
+            explorer: Err("disabled".to_string()),
+            cloud_eval: Ok(cloud_eval),
+            explorer_source: cloud::ExplorerSource::Masters,
+        };
+
+        let local_sf = CachedAnalysis {
+            pos_hash: 1,
+            fen: "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1".to_string(),
+            engine_family: EngineFamily::Stockfish,
+            engine_name: "Stockfish 17".to_string(),
+            multipv: 1,
+            depth: 38,
+            seldepth: Some(42),
+            score_cp: Some(30),
+            score_mate: None,
+            nodes: Some(10_000_000),
+            time_ms: Some(2000),
+            nps: Some(5_000_000),
+            pv: vec![
+                "e2e4".to_string(),
+                "e7e5".to_string(),
+                "g1f3".to_string(),
+                "b8c6".to_string(),
+            ],
+            quality_score: 5000.0,
+            analyzed_at: 1700000000,
+        };
+
+        let rows = merge_multi_source_engine_rows(Some(&snapshot), &[local_sf], &pos);
+        assert!(!rows.is_empty());
+        let e4_row = rows.iter().find(|r| r.san == "e4").unwrap();
+
+        assert_eq!(e4_row.chessdb, Some(25));
+        assert_eq!(e4_row.lichess, Some((Some(22), None)));
+        assert_eq!(e4_row.stockfish, Some((Some(30), None)));
+        assert_eq!(e4_row.stockfish_depth, Some(38));
+
+        assert_eq!(e4_row.variation, vec!["e2e4", "e7e5", "g1f3", "b8c6"]);
+        assert!(
+            e4_row
+                .variation_source
+                .as_deref()
+                .unwrap()
+                .contains("Stockfish")
+        );
+
+        assert!(e4_row.alt_variation.is_some());
+        assert_eq!(
+            e4_row.alt_variation.as_ref().unwrap(),
+            &vec!["e2e4", "c7c5", "g1f3", "d7d6"]
+        );
     }
 
     #[test]

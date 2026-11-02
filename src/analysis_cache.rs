@@ -4,13 +4,13 @@
 //! in SQLite with WAL mode. Supports coexistence of engine families (Stockfish,
 //! Leela, Generic) and fine-grained replacement heuristics.
 
+use anyhow::{Context, Result};
+use rusqlite::{Connection, params};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
-use anyhow::{Context, Result};
-use rusqlite::{Connection, params};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum EngineFamily {
@@ -19,20 +19,24 @@ pub enum EngineFamily {
     Generic,
 }
 
+impl std::str::FromStr for EngineFamily {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s.trim().to_ascii_lowercase().as_str() {
+            "stockfish" => Self::Stockfish,
+            "leela" | "lc0" => Self::Leela,
+            _ => Self::Generic,
+        })
+    }
+}
+
 impl EngineFamily {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Stockfish => "stockfish",
             Self::Leela => "leela",
             Self::Generic => "generic",
-        }
-    }
-
-    pub fn from_str(s: &str) -> Self {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "stockfish" => Self::Stockfish,
-            "leela" | "lc0" => Self::Leela,
-            _ => Self::Generic,
         }
     }
 }
@@ -67,10 +71,10 @@ pub fn parse_engine_identity(name: &str) -> ParsedEngineVersion {
                 .chars()
                 .take_while(|c| c.is_ascii_digit())
                 .collect();
-            if digits.len() == 8 {
-                if let Ok(d) = digits.parse::<u32>() {
-                    dev_date = Some(d);
-                }
+            if digits.len() == 8
+                && let Ok(d) = digits.parse::<u32>()
+            {
+                dev_date = Some(d);
             }
         }
 
@@ -156,15 +160,15 @@ pub fn compute_quality_rating(
     score_mate: Option<i32>,
 ) -> f64 {
     let mut q = baseline_elo + compute_search_strength(depth);
-    if let Some(sel) = seldepth {
-        if sel > depth {
-            q += (sel - depth) as f64 * 0.5;
-        }
+    if let Some(sel) = seldepth
+        && sel > depth
+    {
+        q += (sel - depth) as f64 * 0.5;
     }
-    if let Some(n) = nodes {
-        if n > 100_000 {
-            q += (n as f64 / 100_000.0).log10() * 3.0;
-        }
+    if let Some(n) = nodes
+        && n > 100_000
+    {
+        q += (n as f64 / 100_000.0).log10() * 3.0;
     }
     if let Some(mate) = score_mate {
         q += 20_000.0 - mate.unsigned_abs() as f64 * 10.0;
@@ -311,15 +315,12 @@ impl AnalysisDb {
             let quality_score: f64 = row.get(13)?;
             let analyzed_at: i64 = row.get(14)?;
 
-            let pv = pv_str
-                .split_whitespace()
-                .map(str::to_string)
-                .collect();
+            let pv = pv_str.split_whitespace().map(str::to_string).collect();
 
             Ok(CachedAnalysis {
                 pos_hash: pos_hash_val as u64,
                 fen,
-                engine_family: EngineFamily::from_str(&family_str),
+                engine_family: family_str.parse().unwrap_or(EngineFamily::Generic),
                 engine_name,
                 multipv,
                 depth,
@@ -352,15 +353,13 @@ impl AnalysisDb {
              WHERE pos_hash = ?1 AND engine_family = ?2 AND multipv = ?3",
         )?;
 
-        let existing = check_stmt.query_row(
-            params![hash_i64, family_str, analysis.multipv],
-            |row| {
+        let existing =
+            check_stmt.query_row(params![hash_i64, family_str, analysis.multipv], |row| {
                 let name: String = row.get(0)?;
                 let depth: u32 = row.get(1)?;
                 let quality: f64 = row.get(2)?;
                 Ok((name, depth, quality))
-            },
-        );
+            });
 
         match existing {
             Ok((existing_name, existing_depth, existing_quality)) => {
@@ -468,16 +467,16 @@ impl AnalysisDebouncer {
 
     pub fn push(&mut self, analysis: CachedAnalysis, now: Instant) -> Option<Vec<CachedAnalysis>> {
         let mut previous_flushed = None;
-        if let Some(current) = self.current_pos_hash {
-            if current != analysis.pos_hash {
-                // Position changed: return previous buffered analyses
-                if !self.buffered.is_empty() {
-                    previous_flushed = Some(self.buffered.values().cloned().collect());
-                }
-                self.buffered.clear();
-                self.last_flush = now;
-                self.last_persisted_depth = 0;
+        if let Some(current) = self.current_pos_hash
+            && current != analysis.pos_hash
+        {
+            // Position changed: return previous buffered analyses
+            if !self.buffered.is_empty() {
+                previous_flushed = Some(self.buffered.values().cloned().collect());
             }
+            self.buffered.clear();
+            self.last_flush = now;
+            self.last_persisted_depth = 0;
         }
         self.current_pos_hash = Some(analysis.pos_hash);
         let depth = analysis.depth;
@@ -539,7 +538,10 @@ impl AnalysisCacheHandle {
                 let mut db = match AnalysisDb::open_at(&path) {
                     Ok(db) => db,
                     Err(err) => {
-                        eprintln!("Failed to open analysis database at {}: {err}", path.display());
+                        eprintln!(
+                            "Failed to open analysis database at {}: {err}",
+                            path.display()
+                        );
                         return;
                     }
                 };
@@ -588,7 +590,10 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("brett-test-{name}-{}-{nonce}.db", std::process::id()));
+        let path = std::env::temp_dir().join(format!(
+            "brett-test-{name}-{}-{nonce}.db",
+            std::process::id()
+        ));
         let _ = std::fs::remove_file(&path);
         path
     }
@@ -628,7 +633,15 @@ mod tests {
 
         assert_eq!(db.count_positions().unwrap(), 0);
 
-        let entry = sample_analysis(0x12345678_abcdef01, EngineFamily::Stockfish, "Stockfish 17", 1, 25, 32, &["e2e4", "e7e5"]);
+        let entry = sample_analysis(
+            0x12345678_abcdef01,
+            EngineFamily::Stockfish,
+            "Stockfish 17",
+            1,
+            25,
+            32,
+            &["e2e4", "e7e5"],
+        );
         let stored = db.store(&entry, true).unwrap();
         assert!(stored);
 
@@ -647,16 +660,44 @@ mod tests {
         let db_path = test_db_path("coexist");
         let mut db = AnalysisDb::open_at(&db_path).unwrap();
 
-        let sf_entry = sample_analysis(0xdeadbeef_cafebabe, EngineFamily::Stockfish, "Stockfish 17", 1, 35, 28, &["d2d4", "d7d5"]);
-        let leela_entry = sample_analysis(0xdeadbeef_cafebabe, EngineFamily::Leela, "Lc0 v0.31.2", 1, 20, 15, &["c2c4", "e7e6"]);
+        let sf_entry = sample_analysis(
+            0xdeadbeef_cafebabe,
+            EngineFamily::Stockfish,
+            "Stockfish 17",
+            1,
+            35,
+            28,
+            &["d2d4", "d7d5"],
+        );
+        let leela_entry = sample_analysis(
+            0xdeadbeef_cafebabe,
+            EngineFamily::Leela,
+            "Lc0 v0.31.2",
+            1,
+            20,
+            15,
+            &["c2c4", "e7e6"],
+        );
 
         db.store(&sf_entry, true).unwrap();
         db.store(&leela_entry, true).unwrap();
 
         let retrieved = db.get_position(0xdeadbeef_cafebabe).unwrap();
-        assert_eq!(retrieved.len(), 2, "both Stockfish and Leela must coexist for the position");
-        assert!(retrieved.iter().any(|r| r.engine_family == EngineFamily::Stockfish));
-        assert!(retrieved.iter().any(|r| r.engine_family == EngineFamily::Leela));
+        assert_eq!(
+            retrieved.len(),
+            2,
+            "both Stockfish and Leela must coexist for the position"
+        );
+        assert!(
+            retrieved
+                .iter()
+                .any(|r| r.engine_family == EngineFamily::Stockfish)
+        );
+        assert!(
+            retrieved
+                .iter()
+                .any(|r| r.engine_family == EngineFamily::Leela)
+        );
 
         let _ = std::fs::remove_file(&db_path);
     }
@@ -666,8 +707,24 @@ mod tests {
         let db_path = test_db_path("multipv");
         let mut db = AnalysisDb::open_at(&db_path).unwrap();
 
-        let pv1 = sample_analysis(0x11112222_33334444, EngineFamily::Stockfish, "Stockfish 17", 1, 22, 40, &["e2e4"]);
-        let pv2 = sample_analysis(0x11112222_33334444, EngineFamily::Stockfish, "Stockfish 17", 2, 22, 25, &["d2d4"]);
+        let pv1 = sample_analysis(
+            0x11112222_33334444,
+            EngineFamily::Stockfish,
+            "Stockfish 17",
+            1,
+            22,
+            40,
+            &["e2e4"],
+        );
+        let pv2 = sample_analysis(
+            0x11112222_33334444,
+            EngineFamily::Stockfish,
+            "Stockfish 17",
+            2,
+            22,
+            25,
+            &["d2d4"],
+        );
 
         db.store(&pv1, true).unwrap();
         db.store(&pv2, true).unwrap();
@@ -712,36 +769,99 @@ mod tests {
         assert_eq!(compute_search_strength(18), 18.0 * 50.0);
         assert_eq!(compute_search_strength(20), 18.0 * 50.0 + 2.0 * 35.0);
         assert_eq!(compute_search_strength(30), 18.0 * 50.0 + 12.0 * 35.0);
-        assert_eq!(compute_search_strength(35), 18.0 * 50.0 + 12.0 * 35.0 + 5.0 * 20.0);
+        assert_eq!(
+            compute_search_strength(35),
+            18.0 * 50.0 + 12.0 * 35.0 + 5.0 * 20.0
+        );
     }
 
     #[test]
     fn quality_comparison_and_superseding() {
-        let mut sf16_deep = sample_analysis(1, EngineFamily::Stockfish, "Stockfish 16", 1, 26, 20, &["e2e4"]);
-        sf16_deep.quality_score = compute_quality_rating(EngineFamily::Stockfish, 3760.0, 26, Some(30), Some(5_000_000), None);
+        let mut sf16_deep = sample_analysis(
+            1,
+            EngineFamily::Stockfish,
+            "Stockfish 16",
+            1,
+            26,
+            20,
+            &["e2e4"],
+        );
+        sf16_deep.quality_score = compute_quality_rating(
+            EngineFamily::Stockfish,
+            3760.0,
+            26,
+            Some(30),
+            Some(5_000_000),
+            None,
+        );
 
-        let mut sf17_shallow = sample_analysis(1, EngineFamily::Stockfish, "Stockfish 17", 1, 20, 20, &["e2e4"]);
-        sf17_shallow.quality_score = compute_quality_rating(EngineFamily::Stockfish, 3830.0, 20, Some(24), Some(1_000_000), None);
+        let mut sf17_shallow = sample_analysis(
+            1,
+            EngineFamily::Stockfish,
+            "Stockfish 17",
+            1,
+            20,
+            20,
+            &["e2e4"],
+        );
+        sf17_shallow.quality_score = compute_quality_rating(
+            EngineFamily::Stockfish,
+            3830.0,
+            20,
+            Some(24),
+            Some(1_000_000),
+            None,
+        );
 
         // SF16 at depth 26 beats SF17 at depth 20:
         assert!(!should_supersede(&sf17_shallow, &sf16_deep, true));
 
         // But SF17 at depth 25 beats SF16 at depth 26:
-        let mut sf17_deep = sample_analysis(1, EngineFamily::Stockfish, "Stockfish 17", 1, 25, 20, &["e2e4"]);
-        sf17_deep.quality_score = compute_quality_rating(EngineFamily::Stockfish, 3830.0, 25, Some(29), Some(3_000_000), None);
+        let mut sf17_deep = sample_analysis(
+            1,
+            EngineFamily::Stockfish,
+            "Stockfish 17",
+            1,
+            25,
+            20,
+            &["e2e4"],
+        );
+        sf17_deep.quality_score = compute_quality_rating(
+            EngineFamily::Stockfish,
+            3830.0,
+            25,
+            Some(29),
+            Some(3_000_000),
+            None,
+        );
         assert!(should_supersede(&sf17_deep, &sf16_deep, true));
 
         // When heuristic superseding is disabled, different engine names do NOT supersede:
         assert!(!should_supersede(&sf17_deep, &sf16_deep, false));
 
         // But identical engine name DOES supersede when depth >= existing depth:
-        let sf16_shallower = sample_analysis(1, EngineFamily::Stockfish, "Stockfish 16", 1, 24, 20, &["e2e4"]);
+        let sf16_shallower = sample_analysis(
+            1,
+            EngineFamily::Stockfish,
+            "Stockfish 16",
+            1,
+            24,
+            20,
+            &["e2e4"],
+        );
         assert!(should_supersede(&sf16_deep, &sf16_shallower, false));
 
         // Proven mate bonus dominates:
         let mate_analysis = CachedAnalysis {
             score_mate: Some(5),
-            quality_score: compute_quality_rating(EngineFamily::Stockfish, 3600.0, 15, Some(15), Some(100_000), Some(5)),
+            quality_score: compute_quality_rating(
+                EngineFamily::Stockfish,
+                3600.0,
+                15,
+                Some(15),
+                Some(100_000),
+                Some(5),
+            ),
             ..sf16_shallower
         };
         assert!(should_supersede(&mate_analysis, &sf17_deep, true));
@@ -751,9 +871,9 @@ mod tests {
     fn leela_centipawn_translation() {
         assert_eq!(leela_to_stockfish_cp(0), 0);
         let cp50 = leela_to_stockfish_cp(50);
-        assert!(cp50 >= 70 && cp50 <= 90, "cp50: {cp50}");
+        assert!((70..=90).contains(&cp50), "cp50: {cp50}");
         let cp100 = leela_to_stockfish_cp(100);
-        assert!(cp100 >= 150 && cp100 <= 180, "cp100: {cp100}");
+        assert!((150..=180).contains(&cp100), "cp100: {cp100}");
         let cp_neg100 = leela_to_stockfish_cp(-100);
         assert_eq!(cp_neg100, -cp100);
     }
@@ -766,14 +886,38 @@ mod tests {
         let t0 = Instant::now();
 
         // 1. Rapid shallow plies (< 20) within 10s should buffer without flushing
-        let a1 = sample_analysis(100, EngineFamily::Stockfish, "Stockfish 17", 1, 10, 20, &["e2e4"]);
+        let a1 = sample_analysis(
+            100,
+            EngineFamily::Stockfish,
+            "Stockfish 17",
+            1,
+            10,
+            20,
+            &["e2e4"],
+        );
         assert!(debouncer.push(a1, t0).is_none());
 
-        let a2 = sample_analysis(100, EngineFamily::Stockfish, "Stockfish 17", 1, 12, 22, &["e2e4"]);
+        let a2 = sample_analysis(
+            100,
+            EngineFamily::Stockfish,
+            "Stockfish 17",
+            1,
+            12,
+            22,
+            &["e2e4"],
+        );
         assert!(debouncer.push(a2, t0 + Duration::from_secs(2)).is_none());
 
         // At 10s mark, shallow search flushes
-        let a3 = sample_analysis(100, EngineFamily::Stockfish, "Stockfish 17", 1, 15, 25, &["e2e4"]);
+        let a3 = sample_analysis(
+            100,
+            EngineFamily::Stockfish,
+            "Stockfish 17",
+            1,
+            15,
+            25,
+            &["e2e4"],
+        );
         let flushed = debouncer.push(a3, t0 + Duration::from_secs(10));
         assert!(flushed.is_some());
         let batch = flushed.unwrap();
@@ -781,21 +925,49 @@ mod tests {
         assert_eq!(batch[0].depth, 15);
 
         // 2. Deep plies (>= 20) flush immediately on depth increment
-        let a4 = sample_analysis(100, EngineFamily::Stockfish, "Stockfish 17", 1, 20, 28, &["e2e4"]);
+        let a4 = sample_analysis(
+            100,
+            EngineFamily::Stockfish,
+            "Stockfish 17",
+            1,
+            20,
+            28,
+            &["e2e4"],
+        );
         let flushed20 = debouncer.push(a4, t0 + Duration::from_secs(11));
         assert!(flushed20.is_some(), "depth 20 should flush immediately");
 
-        let a5 = sample_analysis(100, EngineFamily::Stockfish, "Stockfish 17", 1, 21, 30, &["e2e4"]);
+        let a5 = sample_analysis(
+            100,
+            EngineFamily::Stockfish,
+            "Stockfish 17",
+            1,
+            21,
+            30,
+            &["e2e4"],
+        );
         let flushed21 = debouncer.push(a5, t0 + Duration::from_secs(12));
         assert!(flushed21.is_some(), "depth 21 should flush immediately");
 
         // 3. Search stop / BestMove flush
-        let a6_buffered = sample_analysis(100, EngineFamily::Stockfish, "Stockfish 17", 2, 21, 10, &["d2d4"]);
+        let a6_buffered = sample_analysis(
+            100,
+            EngineFamily::Stockfish,
+            "Stockfish 17",
+            2,
+            21,
+            10,
+            &["d2d4"],
+        );
         // same depth so not flushed immediately:
         debouncer.push(a6_buffered, t0 + Duration::from_secs(13));
         let end_flush = debouncer.flush();
         assert!(end_flush.is_some());
         let final_batch = end_flush.unwrap();
-        assert_eq!(final_batch.len(), 2, "both multipv 1 and 2 should be returned on flush");
+        assert_eq!(
+            final_batch.len(),
+            2,
+            "both multipv 1 and 2 should be returned on flush"
+        );
     }
 }

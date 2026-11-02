@@ -3,8 +3,8 @@
 //! The library crate exists so the domain model and UI can be tested without
 //! starting a window. The binary is a thin wrapper around [`app::App`].
 
-pub mod app;
 pub mod analysis_cache;
+pub mod app;
 pub mod book;
 pub mod cbh;
 pub mod cbv;
