@@ -1,0 +1,27 @@
+# Maintainer: Lakis01 <contact@brett.chess>
+pkgname=brett-bin
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Chess Preparation and Database Suite (pre-compiled binary release)"
+arch=('x86_64')
+url="https://github.com/Lakis01/Brett"
+license=('MIT')
+depends=('hicolor-icon-theme' 'fontconfig' 'wayland' 'libxkbcommon' 'libx11')
+optdepends=(
+    'stockfish: Default local UCI analysis engine'
+    'lc0: Leela Chess Zero UCI engine'
+    'firefox: Default web browser for external lookups'
+)
+provides=('brett')
+conflicts=('brett')
+source=("${url}/releases/download/v${pkgver}/brett-v${pkgver}-x86_64-unknown-linux-gnu.tar.gz")
+sha256sums=('SKIP')
+
+package() {
+    cd "brett-v${pkgver}-x86_64-unknown-linux-gnu"
+    install -Dm755 brett "${pkgdir}/usr/bin/brett"
+    install -Dm644 brett.desktop "${pkgdir}/usr/share/applications/brett.desktop"
+    install -Dm644 brett.png "${pkgdir}/usr/share/icons/hicolor/128x128/apps/brett.png"
+    install -Dm644 LICENSE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+    install -Dm644 README.md "${pkgdir}/usr/share/doc/${pkgname}/README.md"
+}

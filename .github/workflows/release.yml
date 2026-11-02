@@ -122,6 +122,15 @@ jobs:
           chmod +x appimagetool
           ./appimagetool --appimage-extract-and-run "${APPDIR}" "brett-v${VERSION}-x86_64.AppImage" || true
 
+      - name: Generate AUR PKGBUILD
+        run: |
+          VERSION="${{ steps.version.outputs.VERSION }}"
+          TARBALL="brett-v${VERSION}-${{ matrix.target }}.tar.gz"
+          SHA256=$(sha256sum "${TARBALL}" | awk '{print $1}')
+          sed -e "s/pkgver=0.1.0/pkgver=${VERSION}/" \
+              -e "s/sha256sums=('SKIP')/sha256sums=('${SHA256}')/" \
+              packaging/aur/brett-bin/PKGBUILD > "PKGBUILD"
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -130,6 +139,7 @@ jobs:
             *.tar.gz
             *.deb
             *.AppImage
+            PKGBUILD
 
   build-windows:
     name: Build Windows (${{ matrix.target }})
