@@ -1071,3 +1071,47 @@ inventing one from a name.
 
 **Depends on:** `src/domain.rs`, `src/players.rs`, `src/fide.rs`, and the shared
 player-name rendering helpers.
+
+## 28. Persistent Local Analysis Cache & Multi-Source Cloud Engine
+
+**Status:** implemented 2026-11-02 in `src/analysis_cache.rs`, `src/settings.rs`, and `src/app.rs`.
+
+**Goal:** build an embedded, persistent cache of locally analyzed positions in
+SQLite (WAL mode), debounced write throttling, fine-grained Stockfish quality
+heuristics, separate Leela Chess Zero coexistence, and multi-source integration
+with ChessDB.cn and Lichess Cloud Eval in a stacked candidate variation table.
+
+- Embedded SQLite database at `$XDG_CACHE_HOME/brett/analysis.db` with multi-PV support.
+- 10-second write debouncing during rapid early search plies ($d < 20$); immediate
+  per-ply commits during deep search ($d \ge 20$) or on search completion.
+- Engine family separation: Leela Chess Zero evaluations are partitioned and never
+  overwritten by Stockfish.
+- Piecewise depth scaling and calibrated version baseline Elo replacement heuristic
+  with a 15-Elo stability hysteresis; opt-out toggle in Settings.
+- Centipawn translation for Leela via `leela_to_stockfish_cp`.
+- Stacked 2-line layout displaying deeper variation on top with source tags.
+- Easy migration support: one-click export/import of analysis database and
+  unified JSON settings bundle.
+
+**Depends on:** `src/engine/`, `src/cloud.rs`, `src/eval.rs`, and `src/settings.rs`.
+
+## 29. Leela Chess Zero (`lc0`) GPU acceleration & cross-vendor backend verification
+
+**Status:** queued.
+
+**Goal:** ensure Leela Chess Zero (`lc0`) runs optimally across GPU backends,
+specifically supporting non-NVIDIA GPUs (Intel Iris Xe, AMD Radeon, Apple Silicon)
+via Vulkan and OpenCL backends alongside NVIDIA CUDA, as well as CPU fallbacks
+(eigen, onednn).
+
+- Detect and support `lc0` configuration options via UCI: `WeightsFile`, `Backend`
+  (`vulkan`, `opencl`, `onednn`, `eigen`, `cuda`), `Threads`, `MinibatchSize`.
+- Verify engine initialization and search output across different backends,
+  handling cases where CUDA is unavailable or the default package requires
+  Vulkan/OpenCL drivers.
+- Verify evaluation score and nodes-per-second (NPS) reporting across Lc0 backends
+  and calibrate Leela centipawn translation under various network architectures.
+- Provide clear diagnostics and troubleshooting guidance in the Engine drawer
+  when GPU backend initialization fails, offering graceful fallback to CPU backends.
+
+**Depends on:** `src/engine/`, `src/analysis_cache.rs`, and `src/app.rs`.
