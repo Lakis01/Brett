@@ -4,7 +4,11 @@
 //! in SQLite with WAL mode. Supports coexistence of engine families (Stockfish,
 //! Leela, Generic) and fine-grained replacement heuristics.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Sender};
+use std::thread;
+use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use rusqlite::{Connection, params};
 
@@ -436,6 +440,145 @@ impl AnalysisDb {
     }
 }
 
+pub struct AnalysisDebouncer {
+    last_flush: Instant,
+    last_persisted_depth: u32,
+    buffered: BTreeMap<usize, CachedAnalysis>,
+    current_pos_hash: Option<u64>,
+}
+
+impl Default for AnalysisDebouncer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AnalysisDebouncer {
+    pub const FAST_DEPTH_THRESHOLD: u32 = 20;
+    pub const THROTTLE_DURATION: Duration = Duration::from_secs(10);
+
+    pub fn new() -> Self {
+        Self {
+            last_flush: Instant::now(),
+            last_persisted_depth: 0,
+            buffered: BTreeMap::new(),
+            current_pos_hash: None,
+        }
+    }
+
+    pub fn push(&mut self, analysis: CachedAnalysis, now: Instant) -> Option<Vec<CachedAnalysis>> {
+        let mut previous_flushed = None;
+        if let Some(current) = self.current_pos_hash {
+            if current != analysis.pos_hash {
+                // Position changed: return previous buffered analyses
+                if !self.buffered.is_empty() {
+                    previous_flushed = Some(self.buffered.values().cloned().collect());
+                }
+                self.buffered.clear();
+                self.last_flush = now;
+                self.last_persisted_depth = 0;
+            }
+        }
+        self.current_pos_hash = Some(analysis.pos_hash);
+        let depth = analysis.depth;
+        self.buffered.insert(analysis.multipv, analysis);
+
+        if previous_flushed.is_some() {
+            return previous_flushed;
+        }
+
+        if depth < Self::FAST_DEPTH_THRESHOLD {
+            if now.duration_since(self.last_flush) >= Self::THROTTLE_DURATION {
+                self.last_flush = now;
+                self.last_persisted_depth = depth;
+                Some(self.buffered.values().cloned().collect())
+            } else {
+                None
+            }
+        } else {
+            // Deep plies (>= 20) flush immediately on depth increment
+            if depth > self.last_persisted_depth {
+                self.last_flush = now;
+                self.last_persisted_depth = depth;
+                Some(self.buffered.values().cloned().collect())
+            } else {
+                None
+            }
+        }
+    }
+
+    pub fn flush(&mut self) -> Option<Vec<CachedAnalysis>> {
+        if self.buffered.is_empty() {
+            None
+        } else {
+            Some(self.buffered.values().cloned().collect())
+        }
+    }
+}
+
+pub enum CacheCommand {
+    Store(CachedAnalysis),
+    StoreBatch(Vec<CachedAnalysis>),
+    Flush,
+    Close,
+}
+
+#[derive(Clone)]
+pub struct AnalysisCacheHandle {
+    sender: Sender<CacheCommand>,
+}
+
+impl AnalysisCacheHandle {
+    pub fn spawn(db_path: Option<PathBuf>, heuristic_supersede: bool) -> Self {
+        let (sender, receiver) = mpsc::channel();
+        let path = db_path.unwrap_or_else(AnalysisDb::default_path);
+
+        thread::Builder::new()
+            .name("brett-analysis-cache".to_string())
+            .spawn(move || {
+                let mut db = match AnalysisDb::open_at(&path) {
+                    Ok(db) => db,
+                    Err(err) => {
+                        eprintln!("Failed to open analysis database at {}: {err}", path.display());
+                        return;
+                    }
+                };
+
+                while let Ok(cmd) = receiver.recv() {
+                    match cmd {
+                        CacheCommand::Store(analysis) => {
+                            let _ = db.store(&analysis, heuristic_supersede);
+                        }
+                        CacheCommand::StoreBatch(analyses) => {
+                            for analysis in analyses {
+                                let _ = db.store(&analysis, heuristic_supersede);
+                            }
+                        }
+                        CacheCommand::Flush => {}
+                        CacheCommand::Close => break,
+                    }
+                }
+            })
+            .expect("failed to spawn analysis cache worker thread");
+
+        Self { sender }
+    }
+
+    pub fn store(&self, analysis: CachedAnalysis) {
+        let _ = self.sender.send(CacheCommand::Store(analysis));
+    }
+
+    pub fn store_batch(&self, analyses: Vec<CachedAnalysis>) {
+        if !analyses.is_empty() {
+            let _ = self.sender.send(CacheCommand::StoreBatch(analyses));
+        }
+    }
+
+    pub fn flush(&self) {
+        let _ = self.sender.send(CacheCommand::Flush);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -613,5 +756,46 @@ mod tests {
         assert!(cp100 >= 150 && cp100 <= 180, "cp100: {cp100}");
         let cp_neg100 = leela_to_stockfish_cp(-100);
         assert_eq!(cp_neg100, -cp100);
+    }
+
+    #[test]
+    fn test_debouncer_throttling_and_deep_plies() {
+        use std::time::{Duration, Instant};
+
+        let mut debouncer = AnalysisDebouncer::new();
+        let t0 = Instant::now();
+
+        // 1. Rapid shallow plies (< 20) within 10s should buffer without flushing
+        let a1 = sample_analysis(100, EngineFamily::Stockfish, "Stockfish 17", 1, 10, 20, &["e2e4"]);
+        assert!(debouncer.push(a1, t0).is_none());
+
+        let a2 = sample_analysis(100, EngineFamily::Stockfish, "Stockfish 17", 1, 12, 22, &["e2e4"]);
+        assert!(debouncer.push(a2, t0 + Duration::from_secs(2)).is_none());
+
+        // At 10s mark, shallow search flushes
+        let a3 = sample_analysis(100, EngineFamily::Stockfish, "Stockfish 17", 1, 15, 25, &["e2e4"]);
+        let flushed = debouncer.push(a3, t0 + Duration::from_secs(10));
+        assert!(flushed.is_some());
+        let batch = flushed.unwrap();
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].depth, 15);
+
+        // 2. Deep plies (>= 20) flush immediately on depth increment
+        let a4 = sample_analysis(100, EngineFamily::Stockfish, "Stockfish 17", 1, 20, 28, &["e2e4"]);
+        let flushed20 = debouncer.push(a4, t0 + Duration::from_secs(11));
+        assert!(flushed20.is_some(), "depth 20 should flush immediately");
+
+        let a5 = sample_analysis(100, EngineFamily::Stockfish, "Stockfish 17", 1, 21, 30, &["e2e4"]);
+        let flushed21 = debouncer.push(a5, t0 + Duration::from_secs(12));
+        assert!(flushed21.is_some(), "depth 21 should flush immediately");
+
+        // 3. Search stop / BestMove flush
+        let a6_buffered = sample_analysis(100, EngineFamily::Stockfish, "Stockfish 17", 2, 21, 10, &["d2d4"]);
+        // same depth so not flushed immediately:
+        debouncer.push(a6_buffered, t0 + Duration::from_secs(13));
+        let end_flush = debouncer.flush();
+        assert!(end_flush.is_some());
+        let final_batch = end_flush.unwrap();
+        assert_eq!(final_batch.len(), 2, "both multipv 1 and 2 should be returned on flush");
     }
 }
