@@ -437,6 +437,76 @@ impl AnalysisDb {
         self.conn.execute("DELETE FROM position_analysis", [])?;
         Ok(())
     }
+
+    /// Export a clean, self-contained, compacted snapshot of the database
+    /// to the target path using SQLite's VACUUM INTO.
+    pub fn export_to(&self, target_path: &Path) -> Result<()> {
+        if target_path.exists() {
+            let _ = std::fs::remove_file(target_path);
+        }
+        if let Some(parent) = target_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let target_str = target_path.to_string_lossy();
+        self.conn.execute("VACUUM INTO ?1", params![target_str])?;
+        Ok(())
+    }
+
+    /// Import positions from another SQLite analysis database file,
+    /// merging all non-conflicting entries or superseding where quality is higher.
+    pub fn import_from(&mut self, source_path: &Path, heuristic_supersede: bool) -> Result<usize> {
+        let source_db = AnalysisDb::open_at(source_path)?;
+        let mut count = 0;
+        let mut stmt = source_db.conn.prepare(
+            "SELECT pos_hash, fen, engine_family, engine_name, multipv, depth, seldepth,
+                    score_cp, score_mate, nodes, time_ms, nps, pv, quality_score, analyzed_at
+             FROM position_analysis",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let pos_hash_val: i64 = row.get(0)?;
+            let fen: String = row.get(1)?;
+            let family_str: String = row.get(2)?;
+            let engine_name: String = row.get(3)?;
+            let multipv: usize = row.get(4)?;
+            let depth: u32 = row.get(5)?;
+            let seldepth: Option<u32> = row.get(6)?;
+            let score_cp: Option<i32> = row.get(7)?;
+            let score_mate: Option<i32> = row.get(8)?;
+            let nodes: Option<i64> = row.get(9)?;
+            let time_ms: Option<i64> = row.get(10)?;
+            let nps: Option<i64> = row.get(11)?;
+            let pv_str: String = row.get(12)?;
+            let quality_score: f64 = row.get(13)?;
+            let analyzed_at: i64 = row.get(14)?;
+            let pv = pv_str.split_whitespace().map(str::to_string).collect();
+
+            Ok(CachedAnalysis {
+                pos_hash: pos_hash_val as u64,
+                fen,
+                engine_family: family_str.parse().unwrap_or(EngineFamily::Generic),
+                engine_name,
+                multipv,
+                depth,
+                seldepth,
+                score_cp,
+                score_mate,
+                nodes: nodes.map(|n| n as u64),
+                time_ms: time_ms.map(|t| t as u64),
+                nps: nps.map(|n| n as u64),
+                pv,
+                quality_score,
+                analyzed_at: analyzed_at as u64,
+            })
+        })?;
+
+        for row in rows {
+            let analysis = row?;
+            if self.store(&analysis, heuristic_supersede)? {
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
 }
 
 pub struct AnalysisDebouncer {
@@ -518,6 +588,7 @@ impl AnalysisDebouncer {
 pub enum CacheCommand {
     Store(CachedAnalysis),
     StoreBatch(Vec<CachedAnalysis>),
+    SetHeuristicSupersede(bool),
     Flush,
     Close,
 }
@@ -548,15 +619,19 @@ impl AnalysisCacheHandle {
                     }
                 };
 
+                let mut supersede_mode = heuristic_supersede;
                 while let Ok(cmd) = receiver.recv() {
                     match cmd {
                         CacheCommand::Store(analysis) => {
-                            let _ = db.store(&analysis, heuristic_supersede);
+                            let _ = db.store(&analysis, supersede_mode);
                         }
                         CacheCommand::StoreBatch(analyses) => {
                             for analysis in analyses {
-                                let _ = db.store(&analysis, heuristic_supersede);
+                                let _ = db.store(&analysis, supersede_mode);
                             }
+                        }
+                        CacheCommand::SetHeuristicSupersede(enabled) => {
+                            supersede_mode = enabled;
                         }
                         CacheCommand::Flush => {}
                         CacheCommand::Close => break,
@@ -588,6 +663,16 @@ impl AnalysisCacheHandle {
         AnalysisDb::open_at(&self.path).and_then(|mut db| db.clear())
     }
 
+    pub fn export_to(&self, target_path: &Path) -> Result<()> {
+        let db = AnalysisDb::open_at(&self.path)?;
+        db.export_to(target_path)
+    }
+
+    pub fn import_from(&self, source_path: &Path, heuristic_supersede: bool) -> Result<usize> {
+        let mut db = AnalysisDb::open_at(&self.path)?;
+        db.import_from(source_path, heuristic_supersede)
+    }
+
     pub fn store(&self, analysis: CachedAnalysis) {
         let _ = self.sender.send(CacheCommand::Store(analysis));
     }
@@ -596,6 +681,12 @@ impl AnalysisCacheHandle {
         if !analyses.is_empty() {
             let _ = self.sender.send(CacheCommand::StoreBatch(analyses));
         }
+    }
+
+    pub fn set_heuristic_supersede(&self, enabled: bool) {
+        let _ = self
+            .sender
+            .send(CacheCommand::SetHeuristicSupersede(enabled));
     }
 
     pub fn flush(&self) {
@@ -991,5 +1082,58 @@ mod tests {
             2,
             "both multipv 1 and 2 should be returned on flush"
         );
+    }
+
+    #[test]
+    fn export_and_import_migration() {
+        let db1_path = test_db_path("migration-source");
+        let export_path = test_db_path("migration-export");
+        let db2_path = test_db_path("migration-target");
+
+        let mut db1 = AnalysisDb::open_at(&db1_path).unwrap();
+        let entry1 = sample_analysis(
+            1,
+            EngineFamily::Stockfish,
+            "Stockfish 17",
+            1,
+            30,
+            25,
+            &["e2e4", "e7e5"],
+        );
+        let entry2 = sample_analysis(
+            2,
+            EngineFamily::Leela,
+            "Lc0 v0.31.2",
+            1,
+            20,
+            15,
+            &["d2d4", "d7d5"],
+        );
+        db1.store(&entry1, true).unwrap();
+        db1.store(&entry2, true).unwrap();
+
+        // Export via VACUUM INTO
+        db1.export_to(&export_path).unwrap();
+        assert!(export_path.exists());
+
+        // Import into db2
+        let mut db2 = AnalysisDb::open_at(&db2_path).unwrap();
+        assert_eq!(db2.count_positions().unwrap(), 0);
+
+        let imported_count = db2.import_from(&export_path, true).unwrap();
+        assert_eq!(imported_count, 2);
+        assert_eq!(db2.count_positions().unwrap(), 2);
+
+        let p1 = db2.get_position(1).unwrap();
+        assert_eq!(p1.len(), 1);
+        assert_eq!(p1[0].engine_name, "Stockfish 17");
+
+        let p2 = db2.get_position(2).unwrap();
+        assert_eq!(p2.len(), 1);
+        assert_eq!(p2[0].engine_name, "Lc0 v0.31.2");
+
+        let _ = std::fs::remove_file(&db1_path);
+        let _ = std::fs::remove_file(&export_path);
+        let _ = std::fs::remove_file(&db2_path);
     }
 }

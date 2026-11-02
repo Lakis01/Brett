@@ -833,6 +833,15 @@ impl CloudPrefs {
         prefs
     }
 
+    pub fn save(&self) -> Result<()> {
+        let path = cloud_path().context("no XDG config or HOME directory is available")?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+        }
+        fs::write(&path, self.to_json()).with_context(|| format!("writing {}", path.display()))?;
+        Ok(())
+    }
+
     /// Persist only the explorer choice, leaving the token from the config
     /// file untouched. In particular, an environment token is not copied to
     /// disk just because the corpus was changed.
@@ -927,6 +936,88 @@ fn config_dir() -> Option<PathBuf> {
                 .map(|home| home.join(".config"))
         })?;
     Some(base.join("brett"))
+}
+
+/// Unified bundle containing all configuration files for seamless migration
+/// across machines and operating systems.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SettingsBundle {
+    pub engine: EnginePrefs,
+    pub references: CloudPrefs,
+    pub preparation: PreparationPrefs,
+    pub display: DisplayPrefs,
+}
+
+impl SettingsBundle {
+    pub fn current() -> Self {
+        Self {
+            engine: EnginePrefs::load(),
+            references: CloudPrefs::load(),
+            preparation: PreparationPrefs::load(),
+            display: DisplayPrefs::load(),
+        }
+    }
+
+    pub fn to_json(&self) -> String {
+        serde_json::to_string_pretty(&json!({
+            "version": 1,
+            "engine": serde_json::from_str::<Value>(&self.engine.to_json()).unwrap_or(Value::Null),
+            "references": serde_json::from_str::<Value>(&self.references.to_json()).unwrap_or(Value::Null),
+            "preparation": serde_json::from_str::<Value>(&self.preparation.to_json()).unwrap_or(Value::Null),
+            "display": serde_json::from_str::<Value>(&self.display.to_json()).unwrap_or(Value::Null),
+        }))
+        .unwrap_or_default()
+    }
+
+    pub fn from_json(text: &str) -> Result<Self> {
+        let value: Value = serde_json::from_str(text).context("parsing settings bundle JSON")?;
+        let engine_str = value
+            .get("engine")
+            .map(|v| v.to_string())
+            .unwrap_or_default();
+        let ref_str = value
+            .get("references")
+            .map(|v| v.to_string())
+            .unwrap_or_default();
+        let prep_str = value
+            .get("preparation")
+            .map(|v| v.to_string())
+            .unwrap_or_default();
+        let disp_str = value
+            .get("display")
+            .map(|v| v.to_string())
+            .unwrap_or_default();
+
+        Ok(Self {
+            engine: EnginePrefs::from_json(&engine_str),
+            references: CloudPrefs::from_json(&ref_str),
+            preparation: PreparationPrefs::from_json(&prep_str),
+            display: DisplayPrefs::from_json(&disp_str),
+        })
+    }
+
+    pub fn save_all(&self) -> Result<()> {
+        self.engine.save()?;
+        self.references.save()?;
+        self.preparation.save()?;
+        self.display.save()?;
+        Ok(())
+    }
+
+    pub fn export_to_file(&self, target_path: &std::path::Path) -> Result<()> {
+        if let Some(parent) = target_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(target_path, self.to_json())?;
+        Ok(())
+    }
+
+    pub fn import_from_file(source_path: &std::path::Path) -> Result<Self> {
+        let text = fs::read_to_string(source_path)?;
+        let bundle = Self::from_json(&text)?;
+        bundle.save_all()?;
+        Ok(bundle)
+    }
 }
 
 #[cfg(test)]
@@ -1228,5 +1319,39 @@ mod tests {
         prefs.save_to(&path).unwrap();
         assert_eq!(EnginePrefs::load_from(&path), prefs);
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn settings_bundle_round_trip() {
+        let bundle = SettingsBundle {
+            engine: EnginePrefs {
+                path: Some(PathBuf::from("/usr/bin/stockfish")),
+                threads: 8,
+                hash_mb: 512,
+                cache_engine_analysis: true,
+                heuristic_supersede: false,
+            },
+            references: CloudPrefs {
+                lichess_token: Some("token123".to_string()),
+                lichess_username: Some("grandmaster".to_string()),
+                chesscom_username: None,
+                explorer_source: crate::cloud::ExplorerSource::Lichess,
+                wikipedia_summaries: true,
+            },
+            preparation: PreparationPrefs::default(),
+            display: DisplayPrefs::default(),
+        };
+
+        let json = bundle.to_json();
+        let loaded = SettingsBundle::from_json(&json).unwrap();
+        assert_eq!(loaded.engine, bundle.engine);
+        assert_eq!(
+            loaded.references.lichess_token,
+            Some("token123".to_string())
+        );
+        assert_eq!(
+            loaded.references.lichess_username,
+            Some("grandmaster".to_string())
+        );
     }
 }

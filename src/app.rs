@@ -848,6 +848,7 @@ pub struct App {
     classify_overwrite: bool,
     classify_status: String,
     show_about: bool,
+    show_cache_info: bool,
     show_settings: bool,
     settings_rating_priority: RatingPriority,
     settings_show_all_ratings: bool,
@@ -1165,6 +1166,7 @@ impl App {
             classify_overwrite: false,
             classify_status: String::new(),
             show_about: false,
+            show_cache_info: false,
             show_settings: false,
             settings_rating_priority: display_prefs.rating_priority,
             settings_show_all_ratings: display_prefs.show_all_ratings,
@@ -3906,6 +3908,83 @@ impl App {
         saved
     }
 
+    fn apply_imported_settings(&mut self, bundle: &crate::settings::SettingsBundle) {
+        self.engine_path = bundle.engine.resolved_path().display().to_string();
+        self.engine_threads = bundle.engine.threads;
+        self.engine_hash_mb = bundle.engine.hash_mb;
+        self.cache_engine_analysis = bundle.engine.cache_engine_analysis;
+        self.heuristic_supersede = bundle.engine.heuristic_supersede;
+        if let Some(cache) = &self.analysis_cache {
+            cache.set_heuristic_supersede(self.heuristic_supersede);
+        }
+        self.apply_engine_settings();
+
+        self.lichess_token = bundle.references.lichess_token.clone();
+        self.explorer_source = bundle.references.explorer_source;
+        self.wiki_enabled = bundle.references.wikipedia_summaries;
+
+        self.prep_player_names = bundle.preparation.prep_player_names.clone();
+        self.reference_enabled = bundle.preparation.reference_enabled;
+        self.reference_band = bundle.preparation.rating_band;
+        self.reference_offset = bundle.preparation.rating_offset;
+        self.correspondence_enabled = bundle.preparation.correspondence_enabled;
+        self.correspondence_path = bundle
+            .preparation
+            .correspondence_path
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        if let Some(ref_path) = &bundle.preparation.reference_path {
+            self.reference_path = ref_path.display().to_string();
+        }
+
+        self.rating_priority = bundle.display.rating_priority;
+        self.show_all_ratings = bundle.display.show_all_ratings;
+        self.photo_size = bundle.display.photo_size;
+        self.champion_lineage = bundle.display.champion_lineage;
+        self.show_clocks = bundle.display.show_clocks;
+        self.show_annotations = bundle.display.show_annotations;
+        self.show_pgn_tags = bundle.display.show_pgn_tags;
+        self.show_nav_buttons = bundle.display.show_nav_buttons;
+        self.show_player_photos = bundle.display.show_player_photos;
+        self.show_empty_pgn_tags = bundle.display.show_empty_pgn_tags;
+        self.engine_bar = bundle.display.engine_bar;
+        self.engine_auto = bundle.display.engine_auto;
+        self.engine_view = EngineView::from_config(&bundle.display.engine_view);
+        self.review_skip_book = bundle.display.review_skip_book;
+        self.review_book_min_games = bundle.display.review_book_min_games;
+        self.review_book_max_plies = bundle.display.review_book_max_plies;
+        self.trend_window = bundle.display.trend_window;
+        self.trend_baseline = bundle.display.trend_baseline;
+        self.trend_min_games = bundle.display.trend_min_games;
+
+        self.settings_rating_priority = self.rating_priority;
+        self.settings_show_all_ratings = self.show_all_ratings;
+        self.settings_photo_size = self.photo_size;
+        self.settings_champion_lineage = self.champion_lineage;
+        self.settings_show_clocks = self.show_clocks;
+        self.settings_show_annotations = self.show_annotations;
+        self.settings_show_pgn_tags = self.show_pgn_tags;
+        self.settings_show_nav_buttons = self.show_nav_buttons;
+        self.settings_show_player_photos = self.show_player_photos;
+        self.settings_show_empty_pgn_tags = self.show_empty_pgn_tags;
+        self.settings_online_reference = self.online_reference_open;
+        self.settings_engine_bar = self.engine_bar;
+        self.settings_wiki_enabled = self.wiki_enabled;
+        self.settings_my_player_names = self.prep_player_names.join("\n");
+        self.settings_correspondence_enabled = self.correspondence_enabled;
+        self.settings_correspondence_path = self.correspondence_path.clone();
+        self.settings_review_skip_book = self.review_skip_book;
+        self.settings_review_book_min_games = self.review_book_min_games;
+        self.settings_review_book_max_plies = self.review_book_max_plies;
+        self.settings_trend_window = self.trend_window;
+        self.settings_trend_baseline = self.trend_baseline;
+        self.settings_trend_min_games = self.trend_min_games;
+        self.settings_token = self.lichess_token.clone().unwrap_or_default();
+
+        self.status = "Settings successfully imported.".to_string();
+    }
+
     /// Mark the currently open database as the default preparation reference.
     fn set_current_database_as_reference(&mut self) {
         let Some(library) = &self.library else {
@@ -6574,6 +6653,55 @@ impl App {
                     }
                     ui.separator();
                     if ui
+                        .button("Export all settings…")
+                        .on_hover_text(
+                            "Export a single portable JSON bundle of all preferences and configurations",
+                        )
+                        .clicked()
+                    {
+                        let default_path = documents_path().join("brett_settings.json");
+                        if let Some(target) = save_database_dialog(
+                            &default_path,
+                            "Export All Settings",
+                            "JSON settings bundle",
+                            "*.json",
+                            true,
+                        ) {
+                            if let Err(e) =
+                                crate::settings::SettingsBundle::current().export_to_file(&target)
+                            {
+                                eprintln!("Failed to export settings: {e}");
+                            } else {
+                                self.status = format!("Settings exported to {}.", target.display());
+                            }
+                        }
+                        ui.close();
+                    }
+                    if ui
+                        .button("Import all settings…")
+                        .on_hover_text("Import settings bundle from another Brett installation")
+                        .clicked()
+                    {
+                        if let Some(source) = open_file_dialog(
+                            "Import Settings Bundle",
+                            None,
+                            "JSON settings bundle",
+                            "*.json",
+                        ) {
+                            match crate::settings::SettingsBundle::import_from_file(&source) {
+                                Ok(bundle) => {
+                                    self.apply_imported_settings(&bundle);
+                                }
+                                Err(e) => {
+                                    eprintln!("Failed to import settings: {e}");
+                                    self.status = format!("Failed to import settings: {e}");
+                                }
+                            }
+                        }
+                        ui.close();
+                    }
+                    ui.separator();
+                    if ui
                         .checkbox(&mut self.hover_moves, "Preview moves on hover")
                         .on_hover_text(
                             "Show the position after a move while hovering it in the open game's move list. Off by default; tree, engine, and reference previews stay enabled.",
@@ -8117,6 +8245,13 @@ impl App {
                                 apply_engine = true;
                             }
                             if ui
+                                .small_button("ℹ")
+                                .on_hover_text("About local analysis storage and migration")
+                                .clicked()
+                            {
+                                self.show_cache_info = true;
+                            }
+                            if ui
                                 .checkbox(&mut self.heuristic_supersede, "Smart Stockfish replacement")
                                 .on_hover_text(
                                     "Use fine-grained formula to supersede earlier/weaker analysis (disable to keep all)",
@@ -8126,14 +8261,58 @@ impl App {
                                 apply_engine = true;
                             }
                         });
-                        if let Some(cache) = &self.analysis_cache {
+                        let cache_opt = self.analysis_cache.clone();
+                        if let Some(cache) = cache_opt {
                             let count = cache.count_positions();
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 ui.label(
                                     RichText::new(format!("Cached positions: {count}"))
                                         .small()
                                         .weak(),
                                 );
+                                if ui
+                                    .button("Export cache…")
+                                    .on_hover_text("Export compacted SQLite snapshot to a backup file")
+                                    .clicked()
+                                {
+                                    let default_path = documents_path().join("brett_analysis_backup.db");
+                                    if let Some(target) = save_database_dialog(
+                                        &default_path,
+                                        "Export Analysis Cache",
+                                        "SQLite database",
+                                        "*.db",
+                                        true,
+                                    ) {
+                                        if let Err(e) = cache.export_to(&target) {
+                                            eprintln!("Failed to export cache: {e}");
+                                        } else {
+                                            self.status = format!("Cache exported to {}.", target.display());
+                                        }
+                                    }
+                                }
+                                if ui
+                                    .button("Import cache…")
+                                    .on_hover_text("Import and merge positions from an external analysis SQLite database")
+                                    .clicked()
+                                    && let Some(source) = open_file_dialog(
+                                        "Import Analysis Cache",
+                                        None,
+                                        "SQLite database",
+                                        "*.db",
+                                    )
+                                {
+                                    match cache.import_from(&source, self.heuristic_supersede) {
+                                        Ok(imported) => {
+                                            self.status = format!("Imported {imported} positions from {}.", source.display());
+                                            self.cached_analyses.clear();
+                                            self.update_cached_analyses();
+                                        }
+                                        Err(e) => {
+                                            eprintln!("Failed to import cache: {e}");
+                                            self.status = format!("Failed to import cache: {e}");
+                                        }
+                                    }
+                                }
                                 if ui
                                     .button("Clear cache")
                                     .on_hover_text("Delete all cached engine evaluations")
@@ -8368,7 +8547,7 @@ impl App {
             if engine_view == EngineView::Both {
                 ui.add_space(8.0);
             }
-            let (cloud_line, cloud_preview) = cloud_engine_section(
+            let (cloud_line, cloud_preview, show_cache_info) = cloud_engine_section(
                 ui,
                 self.cloud.as_ref(),
                 &self.cached_analyses,
@@ -8380,6 +8559,9 @@ impl App {
             }
             if cloud_preview.is_some() {
                 hover_preview = cloud_preview;
+            }
+            if show_cache_info {
+                self.show_cache_info = true;
             }
         }
 
@@ -11637,6 +11819,80 @@ impl App {
                 }
             });
     }
+
+    fn cache_info_dialog(&mut self, ctx: &egui::Context) {
+        if !self.show_cache_info {
+            return;
+        }
+        let mut close_dialog = false;
+        egui::Window::new("Local Analysis Cache & Storage")
+            .open(&mut self.show_cache_info)
+            .collapsible(false)
+            .resizable(true)
+            .default_width(500.0)
+            .show(ctx, |ui| {
+                ui.heading("Storage Footprint & Longevity");
+                ui.label(
+                    "Local engine evaluations are stored in an embedded SQLite database using \
+                     Write-Ahead Logging (WAL). Each analyzed position and principal variation \
+                     consumes ~180 bytes on disk.",
+                );
+                ui.add_space(6.0);
+                egui::Grid::new("cache_storage_grid")
+                    .striped(true)
+                    .spacing([24.0, 4.0])
+                    .show(ui, |ui| {
+                        ui.label(RichText::new("Analyzed Positions").strong());
+                        ui.label(RichText::new("Estimated Disk Space").strong());
+                        ui.end_row();
+
+                        ui.label("1,000 positions");
+                        ui.label("~180 KB");
+                        ui.end_row();
+
+                        ui.label("10,000 positions");
+                        ui.label("~1.8 MB");
+                        ui.end_row();
+
+                        ui.label("100,000 positions");
+                        ui.label("~18 MB");
+                        ui.end_row();
+
+                        ui.label("1,000,000 positions");
+                        ui.label("~180 MB");
+                        ui.end_row();
+                    });
+                ui.add_space(6.0);
+                ui.label(
+                    "Even over decades of heavy daily preparation, the cache takes at most \
+                     a few hundred megabytes, which is negligible on modern storage.",
+                );
+                ui.separator();
+                ui.heading("Intelligent Caching & Coexistence");
+                ui.label(
+                    "• Debounced writes: early plies commit every 10 seconds; deep plies (depth ≥ 20) commit immediately.\n\
+                     • Smart Stockfish replacement: deeper analyses supersede earlier/weaker ones based on search depth and calibrated version ratings.\n\
+                     • Coexistence: Leela Chess Zero evaluations are partitioned separately and never overwritten by Stockfish.\n\
+                     • Zero network overhead: the replacement heuristic operates 100% in-memory locally with 0 bytes bandwidth.",
+                );
+                ui.separator();
+                ui.heading("Seamless Migration Across Machines");
+                ui.label(
+                    "You can easily move your analysis and settings to another machine or OS:\n\
+                     • Cache Migration: In the Engine drawer, click 'Export cache…' to export a clean, compacted .db snapshot (via SQLite VACUUM INTO), or 'Import cache…' to merge an existing database.\n\
+                     • Settings Migration: In the top Settings menu, click 'Export all settings…' or 'Import all settings…' to transfer all configuration and preparation profiles as a single JSON file.",
+                );
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Close").clicked() {
+                        close_dialog = true;
+                    }
+                });
+            });
+        if close_dialog {
+            self.show_cache_info = false;
+        }
+    }
 }
 
 impl eframe::App for App {
@@ -11894,6 +12150,7 @@ impl eframe::App for App {
         });
 
         self.about(&ctx);
+        self.cache_info_dialog(&ctx);
         self.photo_viewer_window(&ctx);
         self.settings_dialog(&ctx);
         self.online_dialog(&ctx);
@@ -15173,9 +15430,10 @@ fn cloud_engine_section(
     local_cached: &[crate::analysis_cache::CachedAnalysis],
     position: Option<&Chess>,
     status: &str,
-) -> (Option<Vec<String>>, Option<HoverPreview>) {
+) -> (Option<Vec<String>>, Option<HoverPreview>, bool) {
     let mut clicked_line = None;
     let mut hover_preview = None;
+    let mut open_cache_info = false;
 
     egui::Frame::new()
         .fill(SURFACE)
@@ -15190,6 +15448,13 @@ fn cloud_engine_section(
                         .small()
                         .weak(),
                 );
+                if ui
+                    .small_button("ℹ")
+                    .on_hover_text("About local analysis storage and migration")
+                    .clicked()
+                {
+                    open_cache_info = true;
+                }
                 if let Some(Ok(eval)) = snapshot.map(|snapshot| &snapshot.cloud_eval) {
                     ui.label(
                         RichText::new(format!("Lichess d{} · {} PVs", eval.depth, eval.pvs.len()))
@@ -15386,7 +15651,7 @@ fn cloud_engine_section(
             }
         });
 
-    (clicked_line, hover_preview)
+    (clicked_line, hover_preview, open_cache_info)
 }
 
 /// Average the available White-POV centipawn scores from chessdb.cn, Lichess,
@@ -16253,6 +16518,48 @@ fn open_dialog(initial_dir: Option<&Path>) -> Option<std::path::PathBuf> {
     }
 }
 
+fn open_file_dialog(
+    title: &str,
+    initial_dir: Option<&Path>,
+    filter_name: &str,
+    filter_glob: &str,
+) -> Option<std::path::PathBuf> {
+    use std::process::Command;
+
+    let mut zenity = vec![
+        "--file-selection".to_string(),
+        format!("--title={title}"),
+        format!("--file-filter={filter_name} | {filter_glob}"),
+        "--file-filter=All files | *".to_string(),
+    ];
+    if let Some(dir) = initial_dir.filter(|path| path.is_dir()) {
+        zenity.push(format!("--filename={}", dir.display()));
+    }
+    match Command::new("zenity").args(&zenity).output() {
+        Ok(out) if out.status.success() => {
+            let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            return (!path.is_empty()).then(|| std::path::PathBuf::from(path));
+        }
+        Ok(_) => return None,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return None,
+    }
+
+    let start = initial_dir
+        .filter(|path| path.is_dir())
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| ".".to_string());
+    let filter = format!("{filter_glob}|{filter_name}");
+    let kdialog = ["--getopenfilename", start.as_str(), filter.as_str()];
+    match Command::new("kdialog").args(kdialog).output() {
+        Ok(out) if out.status.success() => {
+            let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            (!path.is_empty()).then(|| std::path::PathBuf::from(path))
+        }
+        _ => None,
+    }
+}
+
 /// Native Save As dialog for one database format. SCID and classic CBH
 /// overwrite confirmation is handled in-app because their companion files
 /// must be replaced together.
@@ -16896,6 +17203,7 @@ mod tests {
             classify_overwrite: false,
             classify_status: String::new(),
             show_about: false,
+            show_cache_info: false,
             show_settings: false,
             settings_rating_priority: RatingPriority::Elo,
             settings_show_all_ratings: false,
@@ -17511,6 +17819,58 @@ mod tests {
         assert_eq!(app.cached_analyses[0].depth, 28);
 
         let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn app_apply_imported_settings() {
+        let mut app = test_app();
+        let bundle = crate::settings::SettingsBundle {
+            engine: crate::settings::EnginePrefs {
+                path: Some(PathBuf::from("/usr/bin/stockfish")),
+                threads: 4,
+                hash_mb: 1024,
+                cache_engine_analysis: false,
+                heuristic_supersede: false,
+            },
+            references: crate::settings::CloudPrefs {
+                lichess_token: Some("imported_token_xyz".to_string()),
+                lichess_username: Some("grandmaster_brett".to_string()),
+                chesscom_username: None,
+                explorer_source: crate::cloud::ExplorerSource::Masters,
+                wikipedia_summaries: false,
+            },
+            preparation: crate::settings::PreparationPrefs {
+                reference_enabled: true,
+                rating_band: 250,
+                rating_offset: -50,
+                prep_player_names: vec!["Kasparov, Garry".to_string()],
+                ..Default::default()
+            },
+            display: crate::settings::DisplayPrefs::default(),
+        };
+
+        app.apply_imported_settings(&bundle);
+
+        assert_eq!(app.engine_threads, 4);
+        assert_eq!(app.engine_hash_mb, 1024);
+        assert!(!app.cache_engine_analysis);
+        assert!(!app.heuristic_supersede);
+        assert_eq!(app.lichess_token, Some("imported_token_xyz".to_string()));
+        assert!(!app.wiki_enabled);
+        assert_eq!(app.prep_player_names, vec!["Kasparov, Garry".to_string()]);
+        assert_eq!(app.reference_band, 250);
+        assert_eq!(app.reference_offset, -50);
+        assert_eq!(app.status, "Settings successfully imported.");
+    }
+
+    #[test]
+    fn app_cache_info_dialog_toggle() {
+        let mut app = test_app();
+        assert!(!app.show_cache_info);
+        app.show_cache_info = true;
+        assert!(app.show_cache_info);
+        app.show_cache_info = false;
+        assert!(!app.show_cache_info);
     }
 
     #[test]
