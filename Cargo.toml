@@ -28,6 +28,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ureq = "2.12"
 webbrowser = "1.2"
+rusqlite = { version = "0.33", features = ["bundled"] }
 
 [profile.dev]
 opt-level = 1
