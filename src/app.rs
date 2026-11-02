@@ -234,6 +234,40 @@ impl EngineView {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum EngineLimitMode {
+    #[default]
+    Infinite,
+    Depth,
+    Time,
+}
+
+impl EngineLimitMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Infinite => "Infinite",
+            Self::Depth => "Depth",
+            Self::Time => "Time",
+        }
+    }
+
+    pub fn from_config(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "depth" => Self::Depth,
+            "time" => Self::Time,
+            _ => Self::Infinite,
+        }
+    }
+
+    pub fn config_value(self) -> &'static str {
+        match self {
+            Self::Infinite => "infinite",
+            Self::Depth => "depth",
+            Self::Time => "time",
+        }
+    }
+}
+
 enum PlayerBookMessage {
     Progress { done: usize, total: usize },
     Done(Result<PlayerBook, String>),
@@ -800,7 +834,9 @@ pub struct App {
     engine_multipv: usize,
     engine_depth: u32,
     engine_time_ms: u64,
-    engine_use_time: bool,
+    engine_limit_mode: EngineLimitMode,
+    engine_cache_saved_notice: Option<(u64, u32, Instant)>,
+    cached_analyses_pos: Option<u64>,
     engine_request: u64,
     engine_fen: Option<String>,
     engine_infos: BTreeMap<usize, EngineInfo>,
@@ -1115,9 +1151,11 @@ impl App {
             engine_ready: false,
             engine_auto: display_prefs.engine_auto,
             engine_multipv: 3,
-            engine_depth: 18,
-            engine_time_ms: 1_500,
-            engine_use_time: false,
+            engine_depth: display_prefs.engine_depth,
+            engine_time_ms: display_prefs.engine_time_ms,
+            engine_limit_mode: EngineLimitMode::from_config(&display_prefs.engine_limit_mode),
+            engine_cache_saved_notice: None,
+            cached_analyses_pos: None,
             engine_request: 0,
             engine_fen: None,
             engine_infos: BTreeMap::new(),
@@ -3687,6 +3725,9 @@ impl App {
             trend_window: self.trend_window,
             trend_baseline: self.trend_baseline,
             trend_min_games: self.trend_min_games.clamp(3, 200),
+            engine_limit_mode: self.engine_limit_mode.config_value().to_string(),
+            engine_depth: self.engine_depth,
+            engine_time_ms: self.engine_time_ms,
         };
         if let Err(err) = prefs.save() {
             self.status = format!("Could not save display settings: {err:#}");
@@ -3957,6 +3998,9 @@ impl App {
         self.trend_window = bundle.display.trend_window;
         self.trend_baseline = bundle.display.trend_baseline;
         self.trend_min_games = bundle.display.trend_min_games;
+        self.engine_limit_mode = EngineLimitMode::from_config(&bundle.display.engine_limit_mode);
+        self.engine_depth = bundle.display.engine_depth;
+        self.engine_time_ms = bundle.display.engine_time_ms;
 
         self.settings_rating_priority = self.rating_priority;
         self.settings_show_all_ratings = self.show_all_ratings;
@@ -4240,26 +4284,65 @@ impl App {
     fn update_cached_analyses(&mut self) {
         let Some(pos) = self.current_position() else {
             self.cached_analyses.clear();
+            self.cached_analyses_pos = None;
             return;
         };
         let hash = pos.position_hash();
-        if self
-            .cached_analyses
-            .first()
-            .is_some_and(|a| a.pos_hash == hash)
-        {
+        if self.cached_analyses_pos == Some(hash) {
             return;
         }
+        self.cached_analyses_pos = Some(hash);
         if let Some(cache) = &self.analysis_cache {
             self.cached_analyses = cache.query_position(hash);
         }
     }
 
+    fn record_cache_written(
+        &mut self,
+        pos_hash: u64,
+        batch: &[crate::analysis_cache::CachedAnalysis],
+    ) {
+        let max_depth = batch.iter().map(|item| item.depth).max().unwrap_or(0);
+        self.engine_cache_saved_notice = Some((pos_hash, max_depth, Instant::now()));
+
+        if self.current_position().map(|p| p.position_hash()) == Some(pos_hash) {
+            for incoming in batch {
+                if let Some(existing) = self.cached_analyses.iter_mut().find(|a| {
+                    a.pos_hash == incoming.pos_hash
+                        && a.engine_family == incoming.engine_family
+                        && a.multipv == incoming.multipv
+                }) {
+                    if incoming.depth >= existing.depth {
+                        *existing = incoming.clone();
+                    }
+                } else {
+                    self.cached_analyses.push(incoming.clone());
+                }
+            }
+            self.cached_analyses
+                .sort_by_key(|a| (a.engine_family, a.multipv));
+            self.cached_analyses_pos = Some(pos_hash);
+        }
+    }
+
+    fn flush_engine_cache(&mut self) {
+        if let Some(batch) = self.analysis_debouncer.flush()
+            && let Some(cache) = &self.analysis_cache
+            && let Some(first) = batch.first()
+        {
+            let pos_hash = first.pos_hash;
+            cache.store_batch(batch.clone());
+            self.record_cache_written(pos_hash, &batch);
+        }
+    }
+
     fn engine_limit(&self) -> SearchLimit {
-        if self.engine_use_time {
-            SearchLimit::MoveTime(Duration::from_millis(self.engine_time_ms))
-        } else {
-            SearchLimit::Depth(self.engine_depth)
+        match self.engine_limit_mode {
+            EngineLimitMode::Infinite => SearchLimit::Infinite,
+            EngineLimitMode::Depth => SearchLimit::Depth(self.engine_depth),
+            EngineLimitMode::Time => {
+                SearchLimit::MoveTime(Duration::from_millis(self.engine_time_ms))
+            }
         }
     }
 
@@ -4286,10 +4369,8 @@ impl App {
     }
 
     fn reset_engine_events(&mut self) {
-        if let Some(batch) = self.analysis_debouncer.flush()
-            && let Some(cache) = &self.analysis_cache
-        {
-            cache.store_batch(batch);
+        if self.cache_engine_analysis {
+            self.flush_engine_cache();
         }
         self.engine_request = 0;
         self.engine_fen = None;
@@ -4383,6 +4464,9 @@ impl App {
     }
 
     fn clear_engine_results(&mut self) {
+        if self.cache_engine_analysis {
+            self.flush_engine_cache();
+        }
         if let Some(engine) = &self.engine {
             engine.stop();
         }
@@ -4437,6 +4521,7 @@ impl App {
         self.engine_bestmove = None;
         self.engine_searching = true;
         self.engine_status = match limit {
+            SearchLimit::Infinite => "Searching (infinite)…".to_string(),
             SearchLimit::Depth(depth) => format!("Searching to depth {depth}…"),
             SearchLimit::MoveTime(time) => {
                 format!("Searching for {} ms…", time.as_millis())
@@ -4499,6 +4584,9 @@ impl App {
                     if request == self.engine_request {
                         self.engine_infos.insert(info.multipv, info.clone());
                         if self.cache_engine_analysis
+                            && !info.pv.is_empty()
+                            && info.score.is_some()
+                            && info.depth > 0
                             && let Some(pos) = self.current_position()
                         {
                             let pos_hash = pos.position_hash();
@@ -4510,6 +4598,20 @@ impl App {
                                 Some(Score::Mate(m)) => (None, Some(m)),
                                 None => (None, None),
                             };
+                            let identity =
+                                crate::analysis_cache::parse_engine_identity(&self.engine_name);
+                            let quality_score = crate::analysis_cache::compute_quality_rating(
+                                family,
+                                identity.baseline_elo,
+                                info.depth,
+                                info.seldepth,
+                                info.nodes,
+                                score_mate,
+                            );
+                            let analyzed_at = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs();
                             let cached = crate::analysis_cache::CachedAnalysis {
                                 pos_hash,
                                 fen: self.engine_fen.clone().unwrap_or_default(),
@@ -4524,14 +4626,15 @@ impl App {
                                 time_ms: info.time_ms,
                                 nps: info.nps,
                                 pv: info.pv.clone(),
-                                quality_score: 0.0,
-                                analyzed_at: 0,
+                                quality_score,
+                                analyzed_at,
                             };
                             if let Some(batch) =
                                 self.analysis_debouncer.push(cached, Instant::now())
                                 && let Some(cache) = &self.analysis_cache
                             {
-                                cache.store_batch(batch);
+                                cache.store_batch(batch.clone());
+                                self.record_cache_written(pos_hash, &batch);
                             }
                         }
                     }
@@ -4541,11 +4644,8 @@ impl App {
                         self.engine_searching = false;
                         self.engine_bestmove = Some(best);
                         self.engine_status = "Analysis complete.".to_string();
-                        if self.cache_engine_analysis
-                            && let Some(batch) = self.analysis_debouncer.flush()
-                            && let Some(cache) = &self.analysis_cache
-                        {
-                            cache.store_batch(batch);
+                        if self.cache_engine_analysis {
+                            self.flush_engine_cache();
                         }
                     }
                 }
@@ -8305,6 +8405,7 @@ impl App {
                                         Ok(imported) => {
                                             self.status = format!("Imported {imported} positions from {}.", source.display());
                                             self.cached_analyses.clear();
+                                            self.cached_analyses_pos = None;
                                             self.update_cached_analyses();
                                         }
                                         Err(e) => {
@@ -8320,6 +8421,7 @@ impl App {
                                 {
                                     let _ = cache.clear();
                                     self.cached_analyses.clear();
+                                    self.cached_analyses_pos = None;
                                 }
                             });
                         }
@@ -8360,47 +8462,63 @@ impl App {
                     });
 
                     ui.horizontal_wrapped(|ui| {
+                        let prev_mode = self.engine_limit_mode;
                         egui::ComboBox::from_id_salt("engine-limit")
-                            .selected_text(if self.engine_use_time {
-                                "Time"
-                            } else {
-                                "Depth"
-                            })
+                            .selected_text(self.engine_limit_mode.label())
                             .show_ui(ui, |ui| {
-                                if ui
-                                    .selectable_value(&mut self.engine_use_time, false, "Depth")
-                                    .changed()
-                                {
-                                    settings_changed = true;
-                                }
-                                if ui
-                                    .selectable_value(&mut self.engine_use_time, true, "Time")
-                                    .changed()
-                                {
-                                    settings_changed = true;
-                                }
+                                ui.selectable_value(
+                                    &mut self.engine_limit_mode,
+                                    EngineLimitMode::Infinite,
+                                    "Infinite",
+                                );
+                                ui.selectable_value(
+                                    &mut self.engine_limit_mode,
+                                    EngineLimitMode::Depth,
+                                    "Depth",
+                                );
+                                ui.selectable_value(
+                                    &mut self.engine_limit_mode,
+                                    EngineLimitMode::Time,
+                                    "Time",
+                                );
                             });
-                        if self.engine_use_time {
-                            if ui
-                                .add(
-                                    egui::DragValue::new(&mut self.engine_time_ms)
-                                        .range(100..=30_000)
-                                        .suffix(" ms")
-                                        .speed(50),
-                                )
-                                .changed()
-                            {
-                                settings_changed = true;
+                        if self.engine_limit_mode != prev_mode {
+                            self.save_display_prefs();
+                        }
+                        match self.engine_limit_mode {
+                            EngineLimitMode::Infinite => {
+                                ui.label(
+                                    RichText::new("Runs continuously until stopped")
+                                        .small()
+                                        .weak(),
+                                );
                             }
-                        } else if ui
-                            .add(
-                                egui::DragValue::new(&mut self.engine_depth)
-                                    .range(6..=40)
-                                    .speed(1),
-                            )
-                            .changed()
-                        {
-                            settings_changed = true;
+                            EngineLimitMode::Depth => {
+                                if ui
+                                    .add(
+                                        egui::DragValue::new(&mut self.engine_depth)
+                                            .range(1..=100)
+                                            .speed(1)
+                                            .prefix("d"),
+                                    )
+                                    .changed()
+                                {
+                                    self.save_display_prefs();
+                                }
+                            }
+                            EngineLimitMode::Time => {
+                                if ui
+                                    .add(
+                                        egui::DragValue::new(&mut self.engine_time_ms)
+                                            .range(100..=60_000)
+                                            .suffix(" ms")
+                                            .speed(100),
+                                    )
+                                    .changed()
+                                {
+                                    self.save_display_prefs();
+                                }
+                            }
                         }
                     });
 
@@ -8419,6 +8537,37 @@ impl App {
                         }
                         if self.engine.is_none() && ui.button("Start engine").clicked() {
                             start = true;
+                        }
+
+                        let curr_hash = self
+                            .current_position()
+                            .map(|p| p.position_hash())
+                            .unwrap_or(0);
+                        if let Some((notice_hash, depth, ts)) = self.engine_cache_saved_notice {
+                            if notice_hash == curr_hash && ts.elapsed() < Duration::from_secs(4) {
+                                ui.label(
+                                    RichText::new(format!("✓ Saved to cache (d{depth})"))
+                                        .color(Color32::from_rgb(74, 222, 128))
+                                        .strong()
+                                        .small(),
+                                );
+                            } else if let Some(max_cached) =
+                                self.cached_analyses.iter().map(|a| a.depth).max()
+                            {
+                                ui.label(
+                                    RichText::new(format!("💾 Stored in cache (d{max_cached})"))
+                                        .weak()
+                                        .small(),
+                                );
+                            }
+                        } else if let Some(max_cached) =
+                            self.cached_analyses.iter().map(|a| a.depth).max()
+                        {
+                            ui.label(
+                                RichText::new(format!("💾 Stored in cache (d{max_cached})"))
+                                    .weak()
+                                    .small(),
+                            );
                         }
                     });
                 } else {
@@ -8459,10 +8608,8 @@ impl App {
             if let Some(engine) = &self.engine {
                 engine.stop();
             }
-            if let Some(batch) = self.analysis_debouncer.flush()
-                && let Some(cache) = &self.analysis_cache
-            {
-                cache.store_batch(batch);
+            if self.cache_engine_analysis {
+                self.flush_engine_cache();
             }
             self.engine_searching = false;
             self.engine_status = "Stopped.".to_string();
@@ -13657,12 +13804,12 @@ fn map_search_url(site: &str) -> String {
     )
 }
 
-/// Open an external URL in the user's default browser, using egui's platform
-/// bridge and falling back to the `webbrowser` crate for Wayland/X11 desktop
-/// environments.
+/// Open an external URL in the user's default browser, using the `webbrowser`
+/// crate for desktop environments and falling back to egui's platform bridge.
 fn open_browser_url(ctx: &egui::Context, url: &str) {
-    ctx.open_url(egui::OpenUrl::new_tab(url));
-    let _ = webbrowser::open(url);
+    if webbrowser::open(url).is_err() {
+        ctx.open_url(egui::OpenUrl::new_tab(url));
+    }
 }
 
 /// Copy text to the clipboard, synchronizing with egui's context and
@@ -15183,19 +15330,11 @@ pub(crate) fn merge_multi_source_engine_rows(
     };
 
     let cloud_eval = snapshot.and_then(|s| s.cloud_eval.as_ref().ok());
-    let lichess_depth = cloud_eval.map(|e| e.depth);
 
-    // Filter local analyses that qualify by the quality gate
+    // Include local analyses that have valid moves and depth
     let qualified_local: Vec<&crate::analysis_cache::CachedAnalysis> = local
         .iter()
-        .filter(|analysis| {
-            if let Some(ld) = lichess_depth {
-                analysis.depth >= 22 && analysis.depth >= ld.saturating_sub(4)
-                    || analysis.depth >= 18
-            } else {
-                analysis.depth >= 12
-            }
-        })
+        .filter(|analysis| analysis.depth >= 1 && !analysis.pv.is_empty())
         .collect();
 
     struct CandidateSource {
@@ -17157,7 +17296,9 @@ mod tests {
             engine_multipv: 3,
             engine_depth: 18,
             engine_time_ms: 1_500,
-            engine_use_time: false,
+            engine_limit_mode: EngineLimitMode::Infinite,
+            engine_cache_saved_notice: None,
+            cached_analyses_pos: None,
             engine_request: 0,
             engine_fen: None,
             engine_infos: BTreeMap::new(),
@@ -17813,6 +17954,7 @@ mod tests {
 
         // When update_cached_analyses is called, it loads the cached record
         app.cached_analyses.clear();
+        app.cached_analyses_pos = None;
         app.update_cached_analyses();
         assert_eq!(app.cached_analyses.len(), 1);
         assert_eq!(app.cached_analyses[0].engine_name, "Stockfish 17");

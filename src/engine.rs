@@ -73,6 +73,7 @@ pub struct EngineInfo {
 /// Search termination condition.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SearchLimit {
+    Infinite,
     Depth(u32),
     MoveTime(Duration),
 }
@@ -80,6 +81,7 @@ pub enum SearchLimit {
 impl SearchLimit {
     fn uci(self) -> String {
         match self {
+            Self::Infinite => "infinite".to_string(),
             Self::Depth(depth) => format!("depth {}", depth.max(1)),
             Self::MoveTime(duration) => {
                 format!("movetime {}", duration.as_millis().max(1))
@@ -572,6 +574,7 @@ mod tests {
 
     #[test]
     fn search_limits_are_formatted() {
+        assert_eq!(SearchLimit::Infinite.uci(), "infinite");
         assert_eq!(SearchLimit::Depth(14).uci(), "depth 14");
         assert_eq!(
             SearchLimit::MoveTime(Duration::from_millis(250)).uci(),

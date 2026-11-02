@@ -12,7 +12,7 @@ use std::sync::mpsc::{self, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum EngineFamily {
     Stockfish,
     Leela,
@@ -347,6 +347,32 @@ impl AnalysisDb {
         let hash_i64 = analysis.pos_hash as i64;
         let family_str = analysis.engine_family.as_str();
 
+        let quality_score = if analysis.quality_score == 0.0 {
+            let identity = parse_engine_identity(&analysis.engine_name);
+            compute_quality_rating(
+                identity.family,
+                identity.baseline_elo,
+                analysis.depth,
+                analysis.seldepth,
+                analysis.nodes,
+                analysis.score_mate,
+            )
+        } else {
+            analysis.quality_score
+        };
+        let analyzed_at = if analysis.analyzed_at == 0 {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+        } else {
+            analysis.analyzed_at
+        };
+
+        let mut incoming = analysis.clone();
+        incoming.quality_score = quality_score;
+        incoming.analyzed_at = analyzed_at;
+
         // Check if an existing entry exists for (pos_hash, engine_family, multipv)
         let mut check_stmt = self.conn.prepare(
             "SELECT engine_name, depth, quality_score FROM position_analysis
@@ -381,7 +407,7 @@ impl AnalysisDb {
                     analyzed_at: 0,
                 };
 
-                if !should_supersede(analysis, &existing_mock, supersede_older) {
+                if !should_supersede(&incoming, &existing_mock, supersede_older) {
                     return Ok(false);
                 }
 
@@ -416,8 +442,8 @@ impl AnalysisDb {
                 analysis.time_ms.map(|t| t as i64),
                 analysis.nps.map(|n| n as i64),
                 pv_str,
-                analysis.quality_score,
-                analysis.analyzed_at as i64,
+                quality_score,
+                analyzed_at as i64,
             ],
         )?;
 

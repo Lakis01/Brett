@@ -490,6 +490,12 @@ pub struct DisplayPrefs {
     /// Minimum dated games required in both windows at a position before
     /// showing a trend badge (`3..=200`).
     pub trend_min_games: u32,
+    /// Engine search limit mode: `infinite` (default), `depth`, or `time`.
+    pub engine_limit_mode: String,
+    /// Target depth when limit mode is `depth`.
+    pub engine_depth: u32,
+    /// Target milliseconds when limit mode is `time`.
+    pub engine_time_ms: u64,
 }
 
 impl Default for DisplayPrefs {
@@ -520,6 +526,9 @@ impl Default for DisplayPrefs {
             trend_window: crate::recent::TrendWindow::default(),
             trend_baseline: crate::recent::TrendBaseline::default(),
             trend_min_games: 10,
+            engine_limit_mode: "infinite".to_string(),
+            engine_depth: 25,
+            engine_time_ms: 1_500,
         }
     }
 }
@@ -660,6 +669,22 @@ impl DisplayPrefs {
             .and_then(Value::as_u64)
             .unwrap_or(10)
             .clamp(3, 200) as u32;
+        let engine_limit_mode = value
+            .get("engine_limit_mode")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or("infinite")
+            .to_string();
+        let engine_depth = value
+            .get("engine_depth")
+            .and_then(Value::as_u64)
+            .unwrap_or(25)
+            .clamp(1, 100) as u32;
+        let engine_time_ms = value
+            .get("engine_time_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or(1_500)
+            .clamp(100, 60_000);
         Self {
             rating_priority,
             show_all_ratings,
@@ -686,6 +711,9 @@ impl DisplayPrefs {
             trend_window,
             trend_baseline,
             trend_min_games,
+            engine_limit_mode,
+            engine_depth,
+            engine_time_ms,
         }
     }
 
@@ -716,6 +744,9 @@ impl DisplayPrefs {
             "trend_window": self.trend_window.config_value(),
             "trend_baseline": self.trend_baseline.config_value(),
             "trend_min_games": self.trend_min_games,
+            "engine_limit_mode": self.engine_limit_mode,
+            "engine_depth": self.engine_depth,
+            "engine_time_ms": self.engine_time_ms,
         }))
         .unwrap_or_default()
     }
@@ -1153,6 +1184,9 @@ mod tests {
             trend_window: crate::recent::TrendWindow::SixMonths,
             trend_baseline: crate::recent::TrendBaseline::Prior24Months,
             trend_min_games: 15,
+            engine_limit_mode: "depth".to_string(),
+            engine_depth: 30,
+            engine_time_ms: 2_500,
         };
         assert_eq!(DisplayPrefs::from_json(&prefs.to_json()), prefs);
         assert_eq!(DisplayPrefs::from_json("not json"), DisplayPrefs::default());
