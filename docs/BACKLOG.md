@@ -32,7 +32,9 @@ database, and the Tree-tab path rows are read-only labels with **Choose…**,
 clock and evaluation-bar toggles live in Settings. The 2026-10-31 pass also
 replaced the separate PGN/SCID/CBH save entries with **Save database** and
 **Save database as…**, remembers the last database folder, and asks before
-closing a modified database.
+closing a modified database. Item 25's Typst target is implemented, with the
+`White - Black` default filename and remembered export folder queued. Items 26
+and 27 add board setup and country-flag display to the backlog.
 
 **Decision log (2026-10-28):**
 
@@ -1012,3 +1014,59 @@ other.
   only when the user asks for a PDF, and report a missing compiler clearly.
 - Add tests for source escaping (player names, comments, URLs, Unicode),
   variation nesting, custom starts, Chess960, and deterministic output.
+- **Default print filename (queued 2026-11-02):** default the export filename
+  to `White - Black` (for example `Carlsen, Magnus - Nakamura, Hikaru.typ`),
+  not the database stem, so exporting several games from one database does not
+  keep colliding on the same name. Sanitize path separators and characters that
+  are invalid on Windows, macOS, or Linux; fall back to a neutral stem when both
+  player names are absent. Keep the `.typ` source and compiled PDF names
+  aligned.
+- **Remember the print location (queued 2026-11-02):** default the print export
+  folder to the last folder the user chose for a print export, falling back to
+  `Documents` on first use. Persist it with the other display/save preferences;
+  do not silently reset it when the open database changes. Cover first-use and
+  remembered-path behavior with tests.
+
+## 26. Set up position
+
+**Status:** backlog only. No implementation is scheduled yet.
+
+**Goal:** let the user start a game from an arbitrary legal position without
+hand-editing a PGN `FEN` tag, the way a board-setup dialog works in ChessBase.
+
+- Add a board setup dialog opened from the Board menu or the new-game flow.
+- Place, remove, and move pieces by dragging or clicking; choose the side to
+  move, castling rights, and the en passant square.
+- Validate the resulting position and refuse illegal setups with a clear
+  message; support standard chess and Chess960.
+- Start a new game from the setup with the same position, preserving the setup
+  as the game's start position for display, printing, and export.
+- Keep the existing custom-FEN import/export behavior; do not rewrite the
+  stored FEN tag on save.
+- Cover the dialog and the FEN round-trip with tests, including empty squares,
+  multiple pieces of the same type, and both colors.
+
+**Depends on:** `src/chess/`, `src/domain.rs`, and the board UI in `src/app.rs`.
+
+## 27. Country flags in player views
+
+**Status:** backlog only. No implementation is scheduled yet.
+
+**Goal:** show a small country flag beside player names in the player profile
+and database views when a real country or federation is known, without
+inventing one from a name.
+
+- Decode real country/federation data from PGN `WhiteCountry`/`BlackCountry`
+  tags, SCID headers, and FIDE profile metadata when available.
+- Show the flag in the player profile header and in database-view game rows
+  beside the existing title and FIDE-ID suffixes; keep it secondary to the
+  name.
+- Use a small bundled, licence-compatible flag set, or a documented fallback
+  such as a country-code label, and render nothing when the country is absent
+  or unknown.
+- Preserve raw tags when editing/exporting; do not guess a country from the
+  player's name or language.
+- Add tests for code normalization, unknown codes, and the no-country case.
+
+**Depends on:** `src/domain.rs`, `src/players.rs`, `src/fide.rs`, and the shared
+player-name rendering helpers.
