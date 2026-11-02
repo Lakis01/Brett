@@ -1,0 +1,283 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Tag name to release (e.g. v0.1.0)'
+        required: true
+        default: 'v0.1.0'
+
+permissions:
+  contents: write
+
+jobs:
+  build-linux:
+    name: Build Linux (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev \
+            libwayland-dev \
+            libx11-dev \
+            libasound2-dev \
+            libfontconfig1-dev \
+            libssl-dev
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Extract version
+        id: version
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          if [ -z "$VERSION" ] || [ "$VERSION" = "$GITHUB_REF_NAME" ]; then
+            VERSION=${{ github.event.inputs.tag_name }}
+            VERSION=${VERSION#v}
+          fi
+          echo "VERSION=${VERSION}" >> $GITHUB_OUTPUT
+
+      - name: Package tarball
+        run: |
+          VERSION="${{ steps.version.outputs.VERSION }}"
+          ARCHIVE_DIR="brett-v${VERSION}-${{ matrix.target }}"
+          mkdir -p "${ARCHIVE_DIR}"
+          cp "target/${{ matrix.target }}/release/brett" "${ARCHIVE_DIR}/"
+          cp assets/brett.desktop "${ARCHIVE_DIR}/"
+          cp assets/brett.png "${ARCHIVE_DIR}/"
+          cp README.md LICENSE "${ARCHIVE_DIR}/"
+          tar -czf "${ARCHIVE_DIR}.tar.gz" "${ARCHIVE_DIR}"
+
+      - name: Build Debian package (.deb)
+        run: |
+          VERSION="${{ steps.version.outputs.VERSION }}"
+          DEB_DIR="deb-pkg"
+          mkdir -p "${DEB_DIR}/DEBIAN"
+          mkdir -p "${DEB_DIR}/usr/bin"
+          mkdir -p "${DEB_DIR}/usr/share/applications"
+          mkdir -p "${DEB_DIR}/usr/share/icons/hicolor/128x128/apps"
+          mkdir -p "${DEB_DIR}/usr/share/doc/brett"
+
+          cat <<EOF > "${DEB_DIR}/DEBIAN/control"
+          Package: brett
+          Version: ${VERSION}
+          Section: games
+          Priority: optional
+          Architecture: amd64
+          Maintainer: Lakis01 <contact@brett.chess>
+          Description: Brett Chess Preparation and Database Suite
+           Brett is a native chess preparation workspace and database suite
+           for opening study, game review, and position analysis.
+          EOF
+
+          cp "target/${{ matrix.target }}/release/brett" "${DEB_DIR}/usr/bin/"
+          chmod 755 "${DEB_DIR}/usr/bin/brett"
+          cp assets/brett.desktop "${DEB_DIR}/usr/share/applications/"
+          cp assets/brett.png "${DEB_DIR}/usr/share/icons/hicolor/128x128/apps/brett.png"
+          cp README.md LICENSE "${DEB_DIR}/usr/share/doc/brett/"
+
+          dpkg-deb --build "${DEB_DIR}" "brett_${VERSION}_amd64.deb"
+
+      - name: Build AppImage
+        run: |
+          VERSION="${{ steps.version.outputs.VERSION }}"
+          APPDIR="Brett.AppDir"
+          mkdir -p "${APPDIR}/usr/bin"
+          mkdir -p "${APPDIR}/usr/share/icons/hicolor/128x128/apps"
+
+          cp "target/${{ matrix.target }}/release/brett" "${APPDIR}/usr/bin/brett"
+          cp assets/brett.desktop "${APPDIR}/"
+          cp assets/brett.png "${APPDIR}/"
+          cp assets/brett.png "${APPDIR}/usr/share/icons/hicolor/128x128/apps/brett.png"
+
+          cat <<'EOF' > "${APPDIR}/AppRun"
+          #!/bin/sh
+          SELF=$(readlink -f "$0")
+          HERE=${SELF%/*}
+          export PATH="${HERE}/usr/bin:${PATH}"
+          exec "${HERE}/usr/bin/brett" "$@"
+          EOF
+          chmod +x "${APPDIR}/AppRun"
+
+          wget -q https://github.com/AppImage/AppImageKit/releases/download/13/appimagetool-x86_64.AppImage -O appimagetool
+          chmod +x appimagetool
+          ./appimagetool --appimage-extract-and-run "${APPDIR}" "brett-v${VERSION}-x86_64.AppImage" || true
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-artifacts
+          path: |
+            *.tar.gz
+            *.deb
+            *.AppImage
+
+  build-windows:
+    name: Build Windows (${{ matrix.target }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Extract version
+        id: version
+        shell: bash
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          if [ -z "$VERSION" ] || [ "$VERSION" = "$GITHUB_REF_NAME" ]; then
+            VERSION=${{ github.event.inputs.tag_name }}
+            VERSION=${VERSION#v}
+          fi
+          echo "VERSION=${VERSION}" >> $GITHUB_OUTPUT
+
+      - name: Package zip
+        shell: bash
+        run: |
+          VERSION="${{ steps.version.outputs.VERSION }}"
+          ZIP_DIR="brett-v${VERSION}-${{ matrix.target }}"
+          mkdir -p "${ZIP_DIR}"
+          cp "target/${{ matrix.target }}/release/brett.exe" "${ZIP_DIR}/"
+          cp README.md LICENSE "${ZIP_DIR}/"
+          7z a "${ZIP_DIR}.zip" "${ZIP_DIR}"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-artifacts
+          path: '*.zip'
+
+  build-macos:
+    name: Build macOS (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-13
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Extract version
+        id: version
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          if [ -z "$VERSION" ] || [ "$VERSION" = "$GITHUB_REF_NAME" ]; then
+            VERSION=${{ github.event.inputs.tag_name }}
+            VERSION=${VERSION#v}
+          fi
+          echo "VERSION=${VERSION}" >> $GITHUB_OUTPUT
+
+      - name: Create macOS .app and .dmg
+        run: |
+          VERSION="${{ steps.version.outputs.VERSION }}"
+          APP="Brett.app"
+          mkdir -p "${APP}/Contents/MacOS"
+          mkdir -p "${APP}/Contents/Resources"
+
+          cp "target/${{ matrix.target }}/release/brett" "${APP}/Contents/MacOS/brett"
+          chmod +x "${APP}/Contents/MacOS/brett"
+
+          cat <<EOF > "${APP}/Contents/Info.plist"
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>CFBundleExecutable</key>
+              <string>brett</string>
+              <key>CFBundleIdentifier</key>
+              <string>com.lakis01.brett</string>
+              <key>CFBundleName</key>
+              <string>Brett</string>
+              <key>CFBundlePackageType</key>
+              <string>APPL</string>
+              <key>CFBundleShortVersionString</key>
+              <string>${VERSION}</string>
+              <key>NSHighResolutionCapable</key>
+              <true/>
+          </dict>
+          </plist>
+          EOF
+
+          DMG_NAME="brett-v${VERSION}-${{ matrix.target }}.dmg"
+          hdiutil create -volname "Brett" -srcfolder "${APP}" -ov -format UDZO "${DMG_NAME}"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.target }}-artifacts
+          path: '*.dmg'
+
+  publish-release:
+    name: Publish Release
+    needs: [build-linux, build-windows, build-macos]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all built artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Determine tag
+        id: tag
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          if [ -z "$TAG" ] || [ "$TAG" = "main" ]; then
+            TAG="${{ github.event.inputs.tag_name }}"
+          fi
+          echo "TAG=${TAG}" >> $GITHUB_OUTPUT
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.TAG }}
+          name: Brett ${{ steps.tag.outputs.TAG }}
+          files: release-assets/*
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+

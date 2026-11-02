@@ -3,13 +3,15 @@ name = "brett"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.97"
-description = "Brett: native Linux chess preparation workspace for PGN/SCID databases"
+description = "Brett: Chess Preparation and Database Suite"
 license = "MIT"
 
 [dependencies]
 eframe = { version = "0.37", default-features = false, features = [
+    "clipboard",
     "default_fonts",
     "glow",
+    "links",
     "wayland",
     "x11",
 ] }
@@ -19,11 +21,13 @@ image = { version = "0.25", default-features = false, features = ["png", "webp"]
 memmap2 = "0.9"
 cbvault-format = "0.1.4"
 anyhow = "1"
+arboard = "3"
 deunicode = "1.6"
 serde_json = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ureq = "2.12"
+webbrowser = "1.2"
 
 [profile.dev]
 opt-level = 1

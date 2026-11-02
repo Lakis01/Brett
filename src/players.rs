@@ -20,6 +20,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::chess::{Color, UciMove};
 use anyhow::Result;
 
+use crate::country::{self, Country};
 use crate::domain::Game;
 use crate::fide;
 use crate::library::GameLibrary;
@@ -80,6 +81,9 @@ pub struct PlayerSummary {
     /// First real numeric `WhiteFideId`/`BlackFideId` seen in this player's
     /// games. The raw tag stays untouched; this is only a display aggregate.
     pub fide_id: Option<String>,
+    /// First recognized country or federation seen in this player's games.
+    /// The raw tag stays untouched; this is only a display aggregate.
+    pub country: Option<Country>,
     pub white: PlayerRecord,
     pub black: PlayerRecord,
     pub elo_sum: u64,
@@ -169,6 +173,7 @@ impl PlayerDirectory {
                     key: key.clone(),
                     title: None,
                     fide_id: None,
+                    country: None,
                     white: PlayerRecord::default(),
                     black: PlayerRecord::default(),
                     elo_sum: 0,
@@ -195,6 +200,7 @@ impl PlayerDirectory {
                     key: key.clone(),
                     title: None,
                     fide_id: None,
+                    country: None,
                     white: PlayerRecord::default(),
                     black: PlayerRecord::default(),
                     elo_sum: 0,
@@ -239,6 +245,33 @@ impl PlayerDirectory {
         self.players.iter().position(|player| player.key == key)
     }
 
+    /// Return the index of a player, adding an empty summary if not yet present.
+    pub fn ensure_player(&mut self, name: &str) -> usize {
+        let key = player_key(name).unwrap_or_else(|| name.trim().to_lowercase());
+        if let Some(index) = self.find_key(&key) {
+            return index;
+        }
+        let summary = PlayerSummary {
+            name: name.trim().to_string(),
+            key,
+            title: None,
+            fide_id: None,
+            country: None,
+            white: PlayerRecord::default(),
+            black: PlayerRecord::default(),
+            elo_sum: 0,
+            elo_count: 0,
+            elo_max: 0,
+            opponent_elo_sum: 0,
+            opponent_elo_count: 0,
+            first_year: 0,
+            last_year: 0,
+            game_indices: Vec::new(),
+        };
+        self.players.push(summary);
+        self.players.len() - 1
+    }
+
     pub fn filter(&self, query: &str) -> Vec<usize> {
         let needle = query.trim().to_lowercase();
         if needle.is_empty() {
@@ -260,10 +293,25 @@ fn add_game(
     index: usize,
     self_play_other: Option<Color>,
 ) {
-    let (own_elo_tag, opponent_elo_tag, own_title_tag, own_fide_tag) = match color {
-        Color::White => ("WhiteElo", "BlackElo", "WhiteTitle", "WhiteFideId"),
-        Color::Black => ("BlackElo", "WhiteElo", "BlackTitle", "BlackFideId"),
-    };
+    let (own_elo_tag, opponent_elo_tag, own_title_tag, own_fide_tag, own_country_tag, own_fed_tag) =
+        match color {
+            Color::White => (
+                "WhiteElo",
+                "BlackElo",
+                "WhiteTitle",
+                "WhiteFideId",
+                "WhiteCountry",
+                "WhiteFed",
+            ),
+            Color::Black => (
+                "BlackElo",
+                "WhiteElo",
+                "BlackTitle",
+                "BlackFideId",
+                "BlackCountry",
+                "BlackFed",
+            ),
+        };
     if let Some(title) = game.header(own_title_tag).and_then(titles::normalize)
         && summary
             .title
@@ -275,6 +323,14 @@ fn add_game(
         && let Some(id) = fide::from_tag(game.header(own_fide_tag))
     {
         summary.fide_id = Some(id.to_string());
+    }
+    if summary.country.is_none() {
+        let raw = game
+            .header(own_country_tag)
+            .or_else(|| game.header(own_fed_tag));
+        if let Some(country) = country::from_header(raw) {
+            summary.country = Some(country);
+        }
     }
     let own_elo = game.header(own_elo_tag).and_then(parse_elo);
     let opponent_elo = game.header(opponent_elo_tag).and_then(parse_elo);
@@ -1268,6 +1324,96 @@ mod tests {
             .get(directory.find_key("richard roe").unwrap())
             .unwrap();
         assert_eq!(richard.fide_id, None, "no id is inferred from a name");
+
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn directory_keeps_a_real_normalized_country() {
+        const COUNTRY_GAMES: &str = r#"[Event "Olympiad"]
+[Site "Budapest"]
+[Date "2024.09.11"]
+[White "Carlsen, Magnus"]
+[WhiteCountry "NOR"]
+[Black "Nakamura, Hikaru"]
+[BlackFed "USA"]
+[Result "1-0"]
+
+1. e4 e5 1-0
+
+[Event "Open"]
+[Site "Test"]
+[Date "2024.09.12"]
+[White "Carlsen, Magnus"]
+[WhiteCountry "DEU"]
+[Black "Doe, Jane"]
+[BlackCountry "XYZ"]
+[Result "1-0"]
+
+1. d4 d5 1-0
+
+[Event "Open"]
+[Site "Test"]
+[Date "2024.09.13"]
+[White "Smith, John"]
+[WhiteCountry "?"]
+[Black "Roe, Richard"]
+[Result "1/2-1/2"]
+
+1. c4 c5 1/2-1/2
+"#;
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "brett-country-{}-{}.pgn",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, COUNTRY_GAMES).unwrap();
+        let library = PgnLibrary::build(&path).unwrap();
+        let directory = PlayerDirectory::build(&library);
+
+        // First country tag seen is kept
+        let magnus = directory
+            .get(directory.find_key("carlsen magnus").unwrap())
+            .unwrap();
+        assert_eq!(magnus.country.map(|c| c.code), Some("NOR"));
+        assert_eq!(magnus.country.map(|c| c.flag), Some("🇳🇴"));
+
+        // BlackFed fallback
+        let hikaru = directory
+            .get(
+                directory
+                    .find_key(&player_key("Nakamura, Hikaru").unwrap())
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(hikaru.country.map(|c| c.code), Some("USA"));
+        assert_eq!(hikaru.country.map(|c| c.flag), Some("🇺🇸"));
+
+        // Unknown country code XYZ yields None
+        let jane = directory
+            .get(directory.find_key("doe jane").unwrap())
+            .unwrap();
+        assert_eq!(jane.country, None, "unknown country code is discarded");
+
+        // Placeholder ? yields None
+        let john = directory
+            .get(
+                directory
+                    .find_key(&player_key("Smith, John").unwrap())
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(john.country, None, "placeholder is discarded");
+
+        // Absent country tag yields None, never guessed
+        let richard = directory
+            .get(directory.find_key("richard roe").unwrap())
+            .unwrap();
+        assert_eq!(richard.country, None, "no country inferred from name");
 
         std::fs::remove_file(path).unwrap();
     }

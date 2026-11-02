@@ -1,0 +1,12 @@
+[Desktop Entry]
+Name=Brett
+GenericName=Chess Preparation Suite
+Comment=Chess Preparation and Database Suite
+Exec=brett %F
+Icon=brett
+Terminal=false
+Type=Application
+Categories=Game;BoardGame;
+MimeType=application/x-chess-pgn;application/x-chess-scid;application/x-chess-cbh;
+Keywords=chess;database;preparation;analysis;pgn;scid;cbh;
+

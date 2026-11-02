@@ -1051,7 +1051,7 @@ hand-editing a PGN `FEN` tag, the way a board-setup dialog works in ChessBase.
 
 ## 27. Country flags in player views
 
-**Status:** backlog only. No implementation is scheduled yet.
+**Status:** implemented 2026-11-02 in `src/country.rs`, `src/players.rs`, and `src/app.rs`.
 
 **Goal:** show a small country flag beside player names in the player profile
 and database views when a real country or federation is known, without

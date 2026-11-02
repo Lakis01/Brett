@@ -1,8 +1,7 @@
 # Brett
 
-A native Linux chess preparation workspace. It is a functional re-implementation
-of the parts of ChessBase that matter for opening preparation — not a clone of
-its UI, and not a Wine package.
+Brett is a Chess Preparation and Database Suite. It is built for fast opening
+preparation, game review, database management, and deep position analysis.
 
 ## Quick start (Linux)
 

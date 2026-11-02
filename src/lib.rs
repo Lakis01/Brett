@@ -10,6 +10,7 @@ pub mod cbv;
 pub mod champions;
 pub mod chess;
 pub mod cloud;
+pub mod country;
 pub mod domain;
 pub mod eco;
 pub mod engine;

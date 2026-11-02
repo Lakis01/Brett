@@ -451,6 +451,8 @@ pub struct DisplayPrefs {
     pub show_nav_buttons: bool,
     /// Show the editable PGN-tags card above the move list.
     pub show_pgn_tags: bool,
+    /// Show the move annotations and comment editor card below the move list.
+    pub show_annotations: bool,
     /// Show PGN clock times in the board strips when the game has clocks.
     pub show_clocks: bool,
     /// Show the vertical evaluation bar beside the board.
@@ -491,6 +493,7 @@ impl Default for DisplayPrefs {
             champion_lineage: ChampionLineage::default(),
             show_nav_buttons: false,
             show_pgn_tags: true,
+            show_annotations: true,
             show_clocks: true,
             engine_bar: true,
             review_skip_book: true,
@@ -598,6 +601,10 @@ impl DisplayPrefs {
             .get("show_pgn_tags")
             .and_then(Value::as_bool)
             .unwrap_or(true);
+        let show_annotations = value
+            .get("show_annotations")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
         let show_clocks = value
             .get("show_clocks")
             .and_then(Value::as_bool)
@@ -652,6 +659,7 @@ impl DisplayPrefs {
             champion_lineage,
             show_nav_buttons,
             show_pgn_tags,
+            show_annotations,
             show_clocks,
             engine_bar,
             review_skip_book,
@@ -681,6 +689,7 @@ impl DisplayPrefs {
             "champion_lineage": self.champion_lineage.config_value(),
             "show_nav_buttons": self.show_nav_buttons,
             "show_pgn_tags": self.show_pgn_tags,
+            "show_annotations": self.show_annotations,
             "show_clocks": self.show_clocks,
             "engine_bar": self.engine_bar,
             "review_skip_book": self.review_skip_book,
@@ -1004,6 +1013,7 @@ mod tests {
             champion_lineage: ChampionLineage::Classical,
             show_nav_buttons: true,
             show_pgn_tags: false,
+            show_annotations: false,
             show_clocks: false,
             engine_bar: false,
             review_skip_book: false,
@@ -1024,6 +1034,7 @@ mod tests {
         assert!(DisplayPrefs::default().show_player_photos);
         assert!(!DisplayPrefs::default().show_nav_buttons);
         assert!(DisplayPrefs::default().show_pgn_tags);
+        assert!(DisplayPrefs::default().show_annotations);
         assert!(DisplayPrefs::default().engine_bar);
         assert!(DisplayPrefs::default().review_skip_book);
         assert_eq!(DisplayPrefs::default().review_book_min_games, 3);

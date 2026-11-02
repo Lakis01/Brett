@@ -411,17 +411,126 @@ fn is_confident(summary: &Summary) -> bool {
     if !chess {
         return false;
     }
-    let described_person = ["player", "grandmaster", "master", "champion", "prodigy"]
+
+    // Non-person entities (tournaments, leagues, places, media, clubs).
+    let non_person = [
+        "championship",
+        "competition",
+        "tournament",
+        "organization",
+        "club",
+        "federation",
+        "association",
+        "league",
+        "stadium",
+        "event",
+        "memorial",
+        "award",
+        "museum",
+        "village",
+        "town",
+        "city",
+        "river",
+        "mountain",
+        "company",
+        "album",
+        "song",
+        "film",
+        "movie",
+        "disambiguation",
+        "surname",
+        "given name",
+    ];
+    if non_person.iter().any(|word| has_word(&description, word)) {
+        return false;
+    }
+
+    // Non-chess professions (footballer, actor, politician, etc.) that might
+    // mention chess in passing or share a name with a chess player.
+    let non_chess_professions = [
+        "football",
+        "footballer",
+        "soccer",
+        "basketball",
+        "baseball",
+        "cricket",
+        "cricketer",
+        "hockey",
+        "rugby",
+        "tennis",
+        "golf",
+        "golfer",
+        "boxer",
+        "boxing",
+        "swimmer",
+        "swimming",
+        "athletics",
+        "politician",
+        "actor",
+        "actress",
+        "singer",
+        "musician",
+        "band",
+        "physician",
+        "lawyer",
+        "judge",
+        "general",
+        "admiral",
+    ];
+    let has_non_chess_profession = non_chess_professions
         .iter()
         .any(|word| has_word(&description, word));
-    if described_person {
+    if has_non_chess_profession && !has_word(&description, "chess") {
+        return false;
+    }
+
+    // Direct chess description: description identifies a chess role.
+    let chess_description = (has_word(&description, "chess")
+        && [
+            "player",
+            "grandmaster",
+            "master",
+            "champion",
+            "prodigy",
+            "writer",
+            "author",
+            "theorist",
+            "composer",
+            "official",
+            "arbiter",
+            "instructor",
+            "coach",
+            "figure",
+        ]
+        .iter()
+        .any(|word| has_word(&description, word)))
+        || has_word(&description, "grandmaster");
+    if chess_description {
         return true;
     }
+
+    // If description is generic or brief, the lead extract must clearly
+    // establish the subject as a chess player/grandmaster.
+    if has_non_chess_profession {
+        return false;
+    }
+
     [
         "chess player",
         "chess grandmaster",
         "chess master",
         "chess prodigy",
+        "world chess champion",
+        "world chess championship",
+        "international master of chess",
+        "chess international master",
+        "fide master",
+        "grandmaster of chess",
+        "chess woman grandmaster",
+        "woman grandmaster",
+        "chess author",
+        "chess composer",
+        "chess problemist",
     ]
     .iter()
     .any(|phrase| extract.contains(phrase))
@@ -667,6 +776,26 @@ mod tests {
             "The World Chess Championship is a chess competition to determine the World Champion.",
         );
         assert!(!is_confident(&tournament));
+
+        let basketball_player = summary(
+            "John Smith",
+            "American basketball player",
+            "John Smith is an American basketball player who also enjoys playing chess.",
+        );
+        assert!(
+            !is_confident(&basketball_player),
+            "non-chess athlete with passing chess mention must not be accepted"
+        );
+
+        let musician = summary(
+            "Bo Diddley",
+            "American singer and musician",
+            "Recorded on Chess Records in Chicago.",
+        );
+        assert!(
+            !is_confident(&musician),
+            "musician with Chess Records mention must not be accepted"
+        );
 
         let player = summary(
             "Judit Polgár",

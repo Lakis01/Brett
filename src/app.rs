@@ -18,6 +18,7 @@ use crate::book::Book;
 use crate::cbh::CbhLibrary;
 use crate::champions;
 use crate::cloud;
+use crate::country::{self, Country};
 use crate::domain::{self, Clock, Game, Token};
 use crate::engine::{EngineEvent, EngineHandle, EngineInfo, EngineOptions, Score, SearchLimit};
 use crate::eval::{self, BoardEval};
@@ -98,6 +99,7 @@ fn read_only_roots() -> Vec<PathBuf> {
 struct PlayerBadge {
     name: String,
     title: Option<String>,
+    country: Option<&'static str>,
     fide_id: Option<String>,
     rating: Option<String>,
     team: Option<String>,
@@ -380,6 +382,8 @@ struct PrepRecentRow {
     black: String,
     white_title: Option<&'static str>,
     black_title: Option<&'static str>,
+    white_country: Option<&'static str>,
+    black_country: Option<&'static str>,
     white_fide_id: Option<String>,
     black_fide_id: Option<String>,
     subtitle: String,
@@ -665,6 +669,7 @@ pub struct App {
     wiki_job: Option<String>,
     wiki_for: Option<String>,
     wiki_state: WikiState,
+    wiki_expanded: bool,
     player_book: Option<PlayerBook>,
     player_book_rx: Option<mpsc::Receiver<PlayerBookMessage>>,
     player_book_job: Option<String>,
@@ -727,6 +732,7 @@ pub struct App {
     photo_viewer: Option<String>,
     show_nav_buttons: bool,
     show_pgn_tags: bool,
+    show_annotations: bool,
     engine_bar: bool,
     bar_cloud_cache: BTreeMap<String, Option<cloud::CloudEval>>,
     bar_cloud_rx: Option<mpsc::Receiver<BarCloudMessage>>,
@@ -833,6 +839,12 @@ pub struct App {
     settings_photo_size: PhotoSize,
     settings_champion_lineage: ChampionLineage,
     settings_show_clocks: bool,
+    settings_show_annotations: bool,
+    settings_show_pgn_tags: bool,
+    settings_show_nav_buttons: bool,
+    settings_show_player_photos: bool,
+    settings_show_empty_pgn_tags: bool,
+    settings_online_reference: bool,
     settings_engine_bar: bool,
     settings_my_player_names: String,
     settings_correspondence_enabled: bool,
@@ -987,6 +999,7 @@ impl App {
             wiki_job: None,
             wiki_for: None,
             wiki_state: WikiState::Idle,
+            wiki_expanded: false,
             player_book: None,
             player_book_rx: None,
             player_book_job: None,
@@ -1036,6 +1049,7 @@ impl App {
             photo_viewer: None,
             show_nav_buttons: display_prefs.show_nav_buttons,
             show_pgn_tags: display_prefs.show_pgn_tags,
+            show_annotations: display_prefs.show_annotations,
             engine_bar: display_prefs.engine_bar,
             bar_cloud_cache: BTreeMap::new(),
             bar_cloud_rx: None,
@@ -1134,6 +1148,12 @@ impl App {
             settings_photo_size: display_prefs.photo_size,
             settings_champion_lineage: display_prefs.champion_lineage,
             settings_show_clocks: display_prefs.show_clocks,
+            settings_show_annotations: display_prefs.show_annotations,
+            settings_show_pgn_tags: display_prefs.show_pgn_tags,
+            settings_show_nav_buttons: display_prefs.show_nav_buttons,
+            settings_show_player_photos: display_prefs.show_player_photos,
+            settings_show_empty_pgn_tags: display_prefs.show_empty_pgn_tags,
+            settings_online_reference: false,
             settings_engine_bar: display_prefs.engine_bar,
             settings_my_player_names: String::new(),
             settings_correspondence_enabled: preparation_prefs.correspondence_enabled,
@@ -3633,6 +3653,7 @@ impl App {
             champion_lineage: self.champion_lineage,
             show_nav_buttons: self.show_nav_buttons,
             show_pgn_tags: self.show_pgn_tags,
+            show_annotations: self.show_annotations,
             show_clocks: self.show_clocks,
             engine_bar: self.engine_bar,
             review_skip_book: self.review_skip_book,
@@ -3712,6 +3733,12 @@ impl App {
         self.settings_photo_size = self.photo_size;
         self.settings_champion_lineage = self.champion_lineage;
         self.settings_show_clocks = self.show_clocks;
+        self.settings_show_annotations = self.show_annotations;
+        self.settings_show_pgn_tags = self.show_pgn_tags;
+        self.settings_show_nav_buttons = self.show_nav_buttons;
+        self.settings_show_player_photos = self.show_player_photos;
+        self.settings_show_empty_pgn_tags = self.show_empty_pgn_tags;
+        self.settings_online_reference = self.online_reference_open;
         self.settings_engine_bar = self.engine_bar;
         self.settings_wiki_enabled = self.wiki_enabled;
         self.settings_my_player_names = self.prep_player_names.join("\n");
@@ -3771,6 +3798,12 @@ impl App {
         self.photo_size = self.settings_photo_size;
         self.champion_lineage = self.settings_champion_lineage;
         self.show_clocks = self.settings_show_clocks;
+        self.show_annotations = self.settings_show_annotations;
+        self.show_pgn_tags = self.settings_show_pgn_tags;
+        self.show_nav_buttons = self.settings_show_nav_buttons;
+        self.show_player_photos = self.settings_show_player_photos;
+        self.show_empty_pgn_tags = self.settings_show_empty_pgn_tags;
+        self.online_reference_open = self.settings_online_reference;
         self.engine_bar = self.settings_engine_bar;
         self.review_skip_book = self.settings_review_skip_book;
         self.review_book_min_games = self.settings_review_book_min_games.clamp(1, 100);
@@ -4729,8 +4762,15 @@ impl App {
         }
         self.left_tab = LeftTab::Players;
         self.selected_player = Some(index);
+        self.wiki_expanded = false;
         self.start_player_book(index);
         self.open_wiki_for(&player);
+    }
+
+    /// Open or create the profile for the named player in the Players tab.
+    fn open_player_profile(&mut self, name: &str) {
+        let index = self.players.ensure_player(name);
+        self.select_player(index);
     }
 
     /// Load the Wikipedia card for a profile. This is the only entry point
@@ -4850,13 +4890,40 @@ impl App {
                 });
             }
             WikiState::Ready(crate::wiki::Lookup::Summary(summary)) => {
-                ui.label(RichText::new(summary.excerpt(320)).small());
+                let extract = &summary.extract;
+                let is_long = extract.chars().count() > 320;
+                if is_long && !self.wiki_expanded {
+                    let excerpt = summary.excerpt(320);
+                    let trimmed = excerpt.trim_end_matches('…');
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new(trimmed).small());
+                        if ui
+                            .link(RichText::new("… Read more").small().color(GOLD))
+                            .on_hover_text("Expand the full article extract")
+                            .clicked()
+                        {
+                            self.wiki_expanded = true;
+                        }
+                    });
+                } else {
+                    ui.label(RichText::new(extract).small());
+                    if is_long
+                        && ui
+                            .link(RichText::new("Read less").small().weak())
+                            .on_hover_text("Collapse the article extract")
+                            .clicked()
+                    {
+                        self.wiki_expanded = false;
+                    }
+                }
                 ui.horizontal_wrapped(|ui| {
-                    ui.hyperlink_to(
-                        RichText::new(format!("Wikipedia · {} ↗", summary.title)).small(),
-                        &summary.url,
-                    )
-                    .on_hover_text("Open the full article in your browser");
+                    if ui
+                        .link(RichText::new(format!("Wikipedia · {} ↗", summary.title)).small())
+                        .on_hover_text("Open the full article in your browser")
+                        .clicked()
+                    {
+                        open_browser_url(ui.ctx(), &summary.url);
+                    }
                     ui.label(RichText::new("CC BY-SA 4.0").small().weak())
                         .on_hover_text(
                             "Summary text from Wikipedia, licensed CC BY-SA 4.0. Brett caches it locally and does not bundle Wikipedia content.",
@@ -4869,8 +4936,13 @@ impl App {
                         .small()
                         .weak(),
                 );
-                ui.hyperlink_to(RichText::new("Search Wikipedia ↗").small(), search_url)
-                    .on_hover_text("The name may refer to a different person");
+                if ui
+                    .link(RichText::new("Search Wikipedia ↗").small())
+                    .on_hover_text("The name may refer to a different person")
+                    .clicked()
+                {
+                    open_browser_url(ui.ctx(), search_url);
+                }
             }
             WikiState::Failed(err) => {
                 ui.label(
@@ -4883,7 +4955,13 @@ impl App {
                         retry = true;
                     }
                     let search = crate::wiki::search_url(&player.name);
-                    ui.hyperlink_to(RichText::new("Search Wikipedia ↗").small(), search);
+                    if ui
+                        .link(RichText::new("Search Wikipedia ↗").small())
+                        .on_hover_text("Search Wikipedia for this name in your browser")
+                        .clicked()
+                    {
+                        open_browser_url(ui.ctx(), &search);
+                    }
                 });
             }
         }
@@ -6253,6 +6331,14 @@ impl App {
                         self.orientation = self.orientation.other();
                         ui.close();
                     }
+                    if ui.button("Copy FEN").clicked() {
+                        if let Some(game) = self.current.as_ref() {
+                            let fen = fen_string(&game.nodes[self.node].pos);
+                            copy_to_clipboard(ui.ctx(), &fen);
+                            self.status = "FEN copied to clipboard.".to_string();
+                        }
+                        ui.close();
+                    }
                     if ui.button("Start position (Home)").clicked() {
                         self.goto(0);
                         ui.close();
@@ -6260,6 +6346,87 @@ impl App {
                     if ui.button("Set up position…").clicked() {
                         self.open_setup_dialog();
                         ui.close();
+                    }
+                });
+
+                ui.menu_button("View", |ui| {
+                    if ui
+                        .checkbox(&mut self.show_pgn_tags, "Show PGN tags")
+                        .on_hover_text("Show the editable PGN-tags card above the move list.")
+                        .changed()
+                    {
+                        self.save_display_prefs();
+                    }
+                    if ui
+                        .checkbox(&mut self.show_annotations, "Show annotations")
+                        .on_hover_text(
+                            "Show the move annotations and comment editor below the move list.",
+                        )
+                        .changed()
+                    {
+                        self.save_display_prefs();
+                    }
+                    if ui
+                        .checkbox(&mut self.online_reference_open, "Show online reference")
+                        .on_hover_text(
+                            "Show the Lichess opening explorer and cloud evaluation side panel.",
+                        )
+                        .changed()
+                    {
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(
+                            self.photos.is_some(),
+                            egui::Checkbox::new(
+                                &mut self.show_player_photos,
+                                "Show player photos",
+                            ),
+                        )
+                        .on_hover_text("Show portraits in board strips when a photo pack is present.")
+                        .changed()
+                    {
+                        self.save_display_prefs();
+                    }
+                    if ui
+                        .checkbox(&mut self.show_clocks, "Show clocks")
+                        .on_hover_text("Show clock times in board strips when the game has clocks.")
+                        .changed()
+                    {
+                        self.save_display_prefs();
+                    }
+                    if ui
+                        .checkbox(&mut self.engine_bar, "Show evaluation bar")
+                        .on_hover_text("Show the vertical evaluation bar beside the board.")
+                        .changed()
+                    {
+                        self.save_display_prefs();
+                    }
+                    if ui
+                        .checkbox(&mut self.show_nav_buttons, "Show navigation buttons")
+                        .on_hover_text(
+                            "Show Start, Previous, Next, and End buttons below the board.",
+                        )
+                        .changed()
+                    {
+                        self.save_display_prefs();
+                    }
+                    if ui
+                        .checkbox(&mut self.show_empty_pgn_tags, "Show empty PGN tags")
+                        .on_hover_text("Show PGN fields that are absent or empty.")
+                        .changed()
+                    {
+                        self.save_display_prefs();
+                    }
+                    ui.separator();
+                    if ui
+                        .checkbox(&mut self.hover_moves, "Preview moves on hover")
+                        .on_hover_text(
+                            "Preview the board position when hovering moves in the notation list.",
+                        )
+                        .changed()
+                    {
+                        self.save_display_prefs();
                     }
                 });
 
@@ -6581,6 +6748,10 @@ impl App {
                                     (
                                         "vs ",
                                         RowName::new(opponent, player_title(game, opponent_color))
+                                            .with_country(
+                                                player_country(game, opponent_color)
+                                                    .map(|c| c.badge),
+                                            )
                                             .with_fide_id(player_fide_id(game, opponent_color)),
                                         None,
                                         format!(" · as {color}"),
@@ -6598,11 +6769,17 @@ impl App {
                                             game.white(),
                                             player_title(game, Color::White),
                                         )
+                                        .with_country(
+                                            player_country(game, Color::White).map(|c| c.badge),
+                                        )
                                         .with_fide_id(player_fide_id(game, Color::White)),
                                         Some(
                                             RowName::new(
                                                 game.black(),
                                                 player_title(game, Color::Black),
+                                            )
+                                            .with_country(
+                                                player_country(game, Color::Black).map(|c| c.badge),
                                             )
                                             .with_fide_id(player_fide_id(game, Color::Black)),
                                         ),
@@ -6682,6 +6859,14 @@ impl App {
                     let black_title = title_from_tag(slot.header("BlackTitle"));
                     let white_fide_id = player_fide_id_from_header(slot.header("WhiteFideId"));
                     let black_fide_id = player_fide_id_from_header(slot.header("BlackFideId"));
+                    let white_country = player_country_from_header(
+                        slot.header("WhiteCountry")
+                            .or_else(|| slot.header("WhiteFed")),
+                    );
+                    let black_country = player_country_from_header(
+                        slot.header("BlackCountry")
+                            .or_else(|| slot.header("BlackFed")),
+                    );
                     let subtitle = format!("{} · {}", slot.event(), slot.date());
                     let selected = self.current_slot == Some(id) && self.prep.is_none();
                     let width = ui.available_width();
@@ -6690,9 +6875,11 @@ impl App {
                         selected,
                         "",
                         RowName::new(slot.white(), white_title)
+                            .with_country(white_country.map(|c| c.badge))
                             .with_fide_id(white_fide_id.as_deref()),
                         Some(
                             RowName::new(slot.black(), black_title)
+                                .with_country(black_country.map(|c| c.badge))
                                 .with_fide_id(black_fide_id.as_deref()),
                         ),
                         "",
@@ -6861,11 +7048,18 @@ impl App {
                     .on_hover_text("Title from the database or imported PGN");
             }
             ui.heading(&player.name);
+            if let Some(country) = player.country {
+                ui.label(RichText::new(country.badge).small().weak())
+                    .on_hover_text(format!("{} ({})", country.name, country.code));
+            }
             if let Some(id) = player.fide_id.as_deref()
                 && let Some(url) = fide::profile_url(id)
+                && ui
+                    .link(RichText::new(format!("FIDE {id} ↗")).small().weak())
+                    .on_hover_text("Open this player's FIDE rating profile in your browser")
+                    .clicked()
             {
-                ui.hyperlink_to(RichText::new(format!("FIDE {id} ↗")).small().weak(), url)
-                    .on_hover_text("Open this player's FIDE rating profile in your browser");
+                open_browser_url(ui.ctx(), &url);
             }
             if let Some(champion) = champion {
                 ui.label(RichText::new("👑").size(20.0).color(GOLD))
@@ -7106,6 +7300,19 @@ impl App {
                                 Color::White => "WhiteFideId",
                                 Color::Black => "BlackFideId",
                             }));
+                        let opponent_country = player_country_from_header(
+                            entry
+                                .header(match opponent_color {
+                                    Color::White => "WhiteCountry",
+                                    Color::Black => "BlackCountry",
+                                })
+                                .or_else(|| {
+                                    entry.header(match opponent_color {
+                                        Color::White => "WhiteFed",
+                                        Color::Black => "BlackFed",
+                                    })
+                                }),
+                        );
                         let suffix = format!(" · as {color}");
                         let subtitle =
                             format!("{} · {} · {}", entry.result(), entry.event(), entry.date());
@@ -7120,6 +7327,7 @@ impl App {
                             selected,
                             "vs ",
                             RowName::new(opponent, opponent_title)
+                                .with_country(opponent_country.map(|c| c.badge))
                                 .with_fide_id(opponent_fide_id.as_deref()),
                             None,
                             &suffix,
@@ -7204,6 +7412,7 @@ impl App {
                     let name = player.name.clone();
                     let key = player.key.clone();
                     let player_title = player.title.map(titles::PlayerTitle::short);
+                    let player_country = player.country.map(|c| c.badge);
                     let player_fide_id = player.fide_id.clone();
                     let is_you = you_key.as_deref() == Some(key.as_str());
                     let title = if is_you {
@@ -7235,6 +7444,7 @@ impl App {
                         selected,
                         &title,
                         player_title,
+                        player_country,
                         player_fide_id.as_deref(),
                         &subtitle,
                         width,
@@ -8375,19 +8585,28 @@ impl App {
         ui.add_space(6.0);
         let mut show_empty = self.show_empty_pgn_tags;
         if self.show_pgn_tags {
-            game_tags_card(
-                ui,
-                &game,
-                &mut tag_update,
-                &mut tag_delete,
-                &mut tag_add,
-                &mut tag_add_value,
-                &mut self.tags_expanded,
-                &mut show_empty,
-                &mut self.board_tag_visible,
-                &self.forced_tag_visibility,
-                &mut date_clicked,
-            );
+            let tags_ui = ui.scope(|ui| {
+                game_tags_card(
+                    ui,
+                    &game,
+                    &mut tag_update,
+                    &mut tag_delete,
+                    &mut tag_add,
+                    &mut tag_add_value,
+                    &mut self.tags_expanded,
+                    &mut show_empty,
+                    &mut self.board_tag_visible,
+                    &self.forced_tag_visibility,
+                    &mut date_clicked,
+                );
+            });
+            tags_ui.response.context_menu(|ui| {
+                if ui.button("Hide PGN tags").clicked() {
+                    self.show_pgn_tags = false;
+                    self.save_display_prefs();
+                    ui.close();
+                }
+            });
             if show_empty != self.show_empty_pgn_tags {
                 self.show_empty_pgn_tags = show_empty;
                 self.save_display_prefs();
@@ -8473,107 +8692,116 @@ impl App {
             toggle_diagram(&mut self.print_diagrams, node);
         }
 
-        ui.add_space(8.0);
-
-        let edit_node = editor
-            .unwrap_or(node)
-            .min(game.nodes.len().saturating_sub(1));
         let editing = editor.is_some();
-        let selected_san = game.nodes[edit_node]
-            .mv
-            .as_ref()
-            .map(|ply| domain::figurine_san(&ply.san))
-            .unwrap_or_else(|| "Start position".to_string());
-        let selected_nags = game.nodes[edit_node].nags.clone();
-        let symbols = nag_symbols(&selected_nags);
-        let mut comment = game.nodes[edit_node].comment.clone();
+        if self.show_annotations || editing {
+            ui.add_space(8.0);
 
-        egui::Frame::new()
-            .fill(SURFACE)
-            .corner_radius(12.0)
-            .stroke(Stroke::new(
-                if editing { 1.5 } else { 1.0 },
-                if editing { GOLD } else { BORDER },
-            ))
-            .inner_margin(12.0)
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Annotations").size(15.0).strong());
-                    accent_chip(ui, &selected_san);
-                    if !symbols.is_empty() {
-                        ui.label(RichText::new(symbols).strong().color(GOLD));
-                    }
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if editing && ui.small_button("Done").clicked() {
-                            close_editor = true;
+            let edit_node = editor
+                .unwrap_or(node)
+                .min(game.nodes.len().saturating_sub(1));
+            let selected_san = game.nodes[edit_node]
+                .mv
+                .as_ref()
+                .map(|ply| domain::figurine_san(&ply.san))
+                .unwrap_or_else(|| "Start position".to_string());
+            let selected_nags = game.nodes[edit_node].nags.clone();
+            let symbols = nag_symbols(&selected_nags);
+            let mut comment = game.nodes[edit_node].comment.clone();
+
+            let ann_response = egui::Frame::new()
+                .fill(SURFACE)
+                .corner_radius(12.0)
+                .stroke(Stroke::new(
+                    if editing { 1.5 } else { 1.0 },
+                    if editing { GOLD } else { BORDER },
+                ))
+                .inner_margin(12.0)
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Annotations").size(15.0).strong());
+                        accent_chip(ui, &selected_san);
+                        if !symbols.is_empty() {
+                            ui.label(RichText::new(symbols).strong().color(GOLD));
                         }
-                        if ui
-                            .add_enabled(
-                                !selected_nags.is_empty(),
-                                egui::Button::new("Clear").small(),
-                            )
-                            .on_hover_text("Remove all symbols from this move")
-                            .clicked()
-                        {
-                            nag_action = Some((edit_node, None));
-                        }
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if editing && ui.small_button("Done").clicked() {
+                                close_editor = true;
+                            }
+                            if ui
+                                .add_enabled(
+                                    !selected_nags.is_empty(),
+                                    egui::Button::new("Clear").small(),
+                                )
+                                .on_hover_text("Remove all symbols from this move")
+                                .clicked()
+                            {
+                                nag_action = Some((edit_node, None));
+                            }
+                        });
                     });
-                });
-                ui.label(
-                    RichText::new(if editing {
-                        "Editing · click a symbol to toggle it"
-                    } else {
-                        "Click a move, then choose its symbols"
-                    })
-                    .small()
-                    .weak(),
-                );
-                ui.add_space(5.0);
-
-                if edit_node > 0 {
-                    if let Some(nag) = nag_palette(ui, &selected_nags, false) {
-                        nag_action = Some((edit_node, Some(nag)));
-                    }
-                } else {
                     ui.label(
-                        RichText::new("Annotations belong to moves; select a move first.")
-                            .small()
-                            .weak()
-                            .italics(),
+                        RichText::new(if editing {
+                            "Editing · click a symbol to toggle it"
+                        } else {
+                            "Click a move, then choose its symbols"
+                        })
+                        .small()
+                        .weak(),
                     );
-                }
+                    ui.add_space(5.0);
 
-                ui.add_space(7.0);
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Comment").small().strong());
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.label(RichText::new("saved automatically").small().weak());
-                    });
-                });
-                egui::Frame::new()
-                    .fill(Color32::from_rgb(0x1A, 0x1C, 0x1F))
-                    .corner_radius(6.0)
-                    .inner_margin(egui::Margin::symmetric(8, 5))
-                    .show(ui, |ui| {
-                        let width = ui.available_width();
-                        let response = ui.add_sized(
-                            [width, 38.0],
-                            egui::TextEdit::multiline(&mut comment)
-                                .id_salt(("annotation-comment", edit_node))
-                                .frame(egui::Frame::NONE)
-                                .margin(egui::Margin::ZERO)
-                                .hint_text("Add a note for this move…")
-                                .desired_rows(2)
-                                .desired_width(width),
+                    if edit_node > 0 {
+                        if let Some(nag) = nag_palette(ui, &selected_nags, false) {
+                            nag_action = Some((edit_node, Some(nag)));
+                        }
+                    } else {
+                        ui.label(
+                            RichText::new("Annotations belong to moves; select a move first.")
+                                .small()
+                                .weak()
+                                .italics(),
                         );
-                        if response.changed() {
-                            comment_update = Some((edit_node, comment.clone()));
-                        }
-                        if focus_comment && edit_node == node {
-                            response.request_focus();
-                        }
+                    }
+
+                    ui.add_space(7.0);
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Comment").small().strong());
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            ui.label(RichText::new("saved automatically").small().weak());
+                        });
                     });
+                    egui::Frame::new()
+                        .fill(Color32::from_rgb(0x1A, 0x1C, 0x1F))
+                        .corner_radius(6.0)
+                        .inner_margin(egui::Margin::symmetric(8, 5))
+                        .show(ui, |ui| {
+                            let width = ui.available_width();
+                            let response = ui.add_sized(
+                                [width, 38.0],
+                                egui::TextEdit::multiline(&mut comment)
+                                    .id_salt(("annotation-comment", edit_node))
+                                    .frame(egui::Frame::NONE)
+                                    .margin(egui::Margin::ZERO)
+                                    .hint_text("Add a note for this move…")
+                                    .desired_rows(2)
+                                    .desired_width(width),
+                            );
+                            if response.changed() {
+                                comment_update = Some((edit_node, comment.clone()));
+                            }
+                            if focus_comment && edit_node == node {
+                                response.request_focus();
+                            }
+                        });
+                });
+            ann_response.response.context_menu(|ui| {
+                if ui.button("Hide annotations").clicked() {
+                    self.show_annotations = false;
+                    self.save_display_prefs();
+                    ui.close();
+                }
             });
+        }
 
         if tag_update.is_some()
             || tag_delete.is_some()
@@ -9286,6 +9514,18 @@ impl App {
                     black: indexed.black().to_string(),
                     white_title: title_from_tag(indexed.header("WhiteTitle")),
                     black_title: title_from_tag(indexed.header("BlackTitle")),
+                    white_country: player_country_from_header(
+                        indexed
+                            .header("WhiteCountry")
+                            .or_else(|| indexed.header("WhiteFed")),
+                    )
+                    .map(|c| c.badge),
+                    black_country: player_country_from_header(
+                        indexed
+                            .header("BlackCountry")
+                            .or_else(|| indexed.header("BlackFed")),
+                    )
+                    .map(|c| c.badge),
                     white_fide_id: player_fide_id_from_header(indexed.header("WhiteFideId")),
                     black_fide_id: player_fide_id_from_header(indexed.header("BlackFideId")),
                     subtitle: format!(
@@ -9750,9 +9990,11 @@ impl App {
                                     false,
                                     "",
                                     RowName::new(&row.white, row.white_title)
+                                        .with_country(row.white_country)
                                         .with_fide_id(row.white_fide_id.as_deref()),
                                     Some(
                                         RowName::new(&row.black, row.black_title)
+                                            .with_country(row.black_country)
                                             .with_fide_id(row.black_fide_id.as_deref()),
                                     ),
                                     "",
@@ -9828,11 +10070,17 @@ impl App {
                                         game.white(),
                                         player_title(game, Color::White),
                                     )
+                                    .with_country(
+                                        player_country(game, Color::White).map(|c| c.badge),
+                                    )
                                     .with_fide_id(player_fide_id(game, Color::White)),
                                     Some(
                                         RowName::new(
                                             game.black(),
                                             player_title(game, Color::Black),
+                                        )
+                                        .with_country(
+                                            player_country(game, Color::Black).map(|c| c.badge),
                                         )
                                         .with_fide_id(player_fide_id(game, Color::Black)),
                                     ),
@@ -10129,92 +10377,39 @@ impl App {
     }
 
     fn bottom_bar(&mut self, root: &mut Ui) {
+        if !self.show_nav_buttons {
+            return;
+        }
         egui::Panel::bottom("nav").show(root, |ui| {
             ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                if self.show_nav_buttons {
-                    if ui
-                        .button("|<")
-                        .on_hover_text("Start (Home / PageUp)")
-                        .clicked()
-                    {
-                        self.goto(0);
-                    }
-                    if ui.button("<").on_hover_text("Previous move (←)").clicked() {
-                        self.prev_move();
-                    }
-                    if ui.button(">").on_hover_text("Next move (→)").clicked() {
-                        self.next_move();
-                    }
-                    if ui
-                        .button(">|")
-                        .on_hover_text("End (End / PageDown)")
-                        .clicked()
-                    {
-                        self.go_end();
-                    }
-                    ui.separator();
+            let nav_response = ui.horizontal(|ui| {
+                if ui
+                    .button("|<")
+                    .on_hover_text("Start (Home / PageUp)")
+                    .clicked()
+                {
+                    self.goto(0);
                 }
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if let Some(game) = self.current.as_ref() {
-                        let fen = fen_string(&game.nodes[self.node].pos);
-                        let width = (ui.available_width() - 8.0).max(80.0);
-                        let mut copy_clicked = false;
-                        let frame = egui::Frame::new()
-                            .fill(Color32::from_rgb(0x18, 0x1A, 0x1C))
-                            .corner_radius(6.0)
-                            .inner_margin(egui::Margin::symmetric(7, 3))
-                            .show(ui, |ui| {
-                                ui.set_width(width);
-                                ui.horizontal(|ui| {
-                                    // The label is the natural click target.
-                                    // Selectable labels otherwise consume the
-                                    // click for text selection and the copy
-                                    // never fires.
-                                    let label = ui.add(
-                                        egui::Label::new(
-                                            RichText::new(&fen)
-                                                .monospace()
-                                                .size(10.5)
-                                                .color(Color32::from_gray(200)),
-                                        )
-                                        .truncate()
-                                        .selectable(false)
-                                        .sense(Sense::click()),
-                                    );
-                                    if label.clicked() {
-                                        copy_clicked = true;
-                                    }
-                                    label.on_hover_text("Click to copy FEN");
-                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                        ui.label(
-                                            RichText::new(format!(
-                                                "move {} / {}",
-                                                full_moves(depth_of(game, self.node)),
-                                                full_moves(game.mainline_len())
-                                            ))
-                                            .weak()
-                                            .size(10.5),
-                                        );
-                                    });
-                                });
-                            });
-                        // Also accept clicks on the strip's padding.
-                        let response = ui.interact(
-                            frame.response.rect,
-                            ui.scope_id().with("bottom-fen-copy"),
-                            Sense::click(),
-                        );
-                        if response.clicked() {
-                            copy_clicked = true;
-                        }
-                        if copy_clicked {
-                            ui.ctx().copy_text(fen);
-                            self.status = "FEN copied to clipboard.".to_string();
-                        }
-                        response.on_hover_text("Click to copy FEN");
-                    }
-                });
+                if ui.button("<").on_hover_text("Previous move (←)").clicked() {
+                    self.prev_move();
+                }
+                if ui.button(">").on_hover_text("Next move (→)").clicked() {
+                    self.next_move();
+                }
+                if ui
+                    .button(">|")
+                    .on_hover_text("End (End / PageDown)")
+                    .clicked()
+                {
+                    self.go_end();
+                }
+            });
+            nav_response.response.context_menu(|ui| {
+                if ui.button("Hide navigation buttons").clicked() {
+                    self.show_nav_buttons = false;
+                    self.save_display_prefs();
+                    ui.close();
+                }
             });
             ui.add_space(4.0);
         });
@@ -10353,6 +10548,14 @@ impl App {
                                             let black_fide_id = player_fide_id_from_header(
                                                 slot.header("BlackFideId"),
                                             );
+                                            let white_country = player_country_from_header(
+                                                slot.header("WhiteCountry")
+                                                    .or_else(|| slot.header("WhiteFed")),
+                                            );
+                                            let black_country = player_country_from_header(
+                                                slot.header("BlackCountry")
+                                                    .or_else(|| slot.header("BlackFed")),
+                                            );
                                             let subtitle =
                                                 format!("{} · {}", slot.event(), slot.date());
                                             let width = ui.available_width();
@@ -10361,9 +10564,13 @@ impl App {
                                                 false,
                                                 "",
                                                 RowName::new(slot.white(), white_title)
+                                                    .with_country(white_country.map(|c| c.badge))
                                                     .with_fide_id(white_fide_id.as_deref()),
                                                 Some(
                                                     RowName::new(slot.black(), black_title)
+                                                        .with_country(
+                                                            black_country.map(|c| c.badge),
+                                                        )
                                                         .with_fide_id(black_fide_id.as_deref()),
                                                 ),
                                                 "",
@@ -10884,20 +11091,40 @@ impl App {
 
                 ui.add_space(8.0);
                 ui.separator();
-                ui.heading("Display");
+                ui.heading("View segments");
+                ui.label(
+                    RichText::new("Choose which interface elements to display in the workspace.")
+                        .small()
+                        .weak(),
+                );
+                ui.checkbox(&mut self.settings_show_pgn_tags, "Show editable PGN tags");
+                ui.checkbox(
+                    &mut self.settings_show_annotations,
+                    "Show move annotations and comment editor",
+                );
+                ui.checkbox(
+                    &mut self.settings_online_reference,
+                    "Show Lichess / online reference side panel",
+                );
+                ui.checkbox(
+                    &mut self.settings_show_player_photos,
+                    "Show player portraits",
+                );
                 ui.checkbox(
                     &mut self.settings_show_clocks,
                     "Show PGN clocks in the board strips",
-                )
-                .on_hover_text(
-                    "Show remaining time from [%clk] comments above and below the board when the game has clocks.",
                 );
                 ui.checkbox(
                     &mut self.settings_engine_bar,
                     "Show the evaluation bar beside the board",
-                )
-                .on_hover_text(
-                    "Show the vertical White/Black evaluation bar using the local engine, Lichess cloud evaluation, or a PGN [%eval] fallback.",
+                );
+                ui.checkbox(
+                    &mut self.settings_show_nav_buttons,
+                    "Show move navigation buttons",
+                );
+                ui.checkbox(
+                    &mut self.settings_show_empty_pgn_tags,
+                    "Show absent or empty PGN tags",
                 );
                 ui.add_space(4.0);
                 ui.horizontal_wrapped(|ui| {
@@ -11316,20 +11543,23 @@ impl eframe::App for App {
 
         egui::CentralPanel::default_margins().show(ui, |ui| {
             let avail = ui.available_size();
-            // The 140 px reserve covers the two player strips and spacing at
-            // the default 38 px avatar. Larger portraits need proportionally
-            // more room, otherwise the board is clipped at the bottom.
-            let photo_extra = if self.show_player_photos && self.photos.is_some() {
-                2.0 * (self.photo_size.pixels() - 38.0)
+            let top_strip_h = if self.show_player_photos && self.photos.is_some() {
+                self.photo_size.pixels() + 8.0
             } else {
-                0.0
+                27.0
             };
+            let bottom_strip_h = if self.show_player_photos && self.photos.is_some() {
+                self.photo_size.pixels() + 8.0
+            } else {
+                27.0
+            };
+            let vertical_padding = top_strip_h + bottom_strip_h + 20.0;
             let bar_extra = if self.engine_bar {
                 eval_bar::WIDTH + eval_bar::GAP
             } else {
                 0.0
             };
-            let side = ((avail.x - bar_extra).min(avail.y - 140.0 - photo_extra) - 24.0).max(120.0);
+            let side = ((avail.x - bar_extra - 8.0).min(avail.y - vertical_padding)).max(120.0);
             ui.with_layout(Layout::top_down(Align::Center), |ui| {
                 ui.add_space(6.0);
                 let hover = self.hover_preview.as_ref();
@@ -11346,6 +11576,7 @@ impl eframe::App for App {
                             game.black().to_string()
                         },
                         title: player_title(game, color).map(str::to_string),
+                        country: player_country(game, color).map(|c| c.badge),
                         fide_id: player_fide_id(game, color).map(str::to_string),
                         rating: player_rating(
                             game,
@@ -11380,7 +11611,7 @@ impl eframe::App for App {
                     let top_champion = champions::champion(&meta.top.name, self.champion_lineage);
                     let bottom_champion =
                         champions::champion(&meta.bottom.name, self.champion_lineage);
-                    let top_clicked = player_strip(
+                    let top_action = player_strip(
                         ui,
                         side,
                         &meta.top,
@@ -11388,11 +11619,12 @@ impl eframe::App for App {
                         top_photo.as_ref(),
                         self.photo_size,
                         top_champion,
+                        None,
                     );
                     ui.add_space(2.0);
                     let event = if self.engine_bar {
                         let mut event = None;
-                        ui.allocate_ui_with_layout(
+                        let bar_response = ui.allocate_ui_with_layout(
                             vec2(side + eval_bar::WIDTH + eval_bar::GAP, side),
                             Layout::left_to_right(Align::Center),
                             |ui| {
@@ -11413,6 +11645,13 @@ impl eframe::App for App {
                                 );
                             },
                         );
+                        bar_response.response.context_menu(|ui| {
+                            if ui.button("Hide evaluation bar").clicked() {
+                                self.engine_bar = false;
+                                self.save_display_prefs();
+                                ui.close();
+                            }
+                        });
                         event
                     } else {
                         board::draw(
@@ -11430,7 +11669,14 @@ impl eframe::App for App {
                         )
                     };
                     ui.add_space(2.0);
-                    let bottom_clicked = player_strip(
+                    let move_counter_text = self.current.as_ref().map(|g| {
+                        format!(
+                            "move {} / {}",
+                            full_moves(depth_of(g, self.node)),
+                            full_moves(g.mainline_len())
+                        )
+                    });
+                    let bottom_action = player_strip(
                         ui,
                         side,
                         &meta.bottom,
@@ -11438,12 +11684,19 @@ impl eframe::App for App {
                         bottom_photo.as_ref(),
                         self.photo_size,
                         bottom_champion,
+                        move_counter_text.as_deref(),
                     );
-                    if top_clicked {
+                    if top_action.photo_clicked {
                         self.photo_viewer = Some(meta.top.name.clone());
                     }
-                    if bottom_clicked {
+                    if top_action.name_clicked {
+                        self.open_player_profile(&meta.top.name);
+                    }
+                    if bottom_action.photo_clicked {
                         self.photo_viewer = Some(meta.bottom.name.clone());
+                    }
+                    if bottom_action.name_clicked {
+                        self.open_player_profile(&meta.bottom.name);
                     }
                     ui.add_space(4.0);
                     if let Some(event) = event {
@@ -11489,7 +11742,14 @@ impl eframe::App for App {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct PlayerStripAction {
+    photo_clicked: bool,
+    name_clicked: bool,
+}
+
 /// Player name, rating and (optionally) clock above/below the board.
+#[allow(clippy::too_many_arguments)]
 fn player_strip(
     ui: &mut Ui,
     side: f32,
@@ -11498,7 +11758,8 @@ fn player_strip(
     photo: Option<&egui::TextureHandle>,
     photo_size: PhotoSize,
     champion: Option<&'static champions::Champion>,
-) -> bool {
+    move_counter: Option<&str>,
+) -> PlayerStripAction {
     let has_team = player
         .team
         .as_ref()
@@ -11582,14 +11843,14 @@ fn player_strip(
             ..Default::default()
         },
     );
-    if let Some(id) = &player.fide_id {
+    if let Some(country) = player.country {
         let format = TextFormat {
             font_id: FontId::proportional(11.0),
             color: Color32::from_gray(150),
             ..Default::default()
         };
         label.append(" · ", 0.0, format.clone());
-        label.append(id, 0.0, format);
+        label.append(country, 0.0, format);
     }
     if champion.is_some() {
         label.append(
@@ -11613,13 +11874,14 @@ fn player_strip(
             },
         );
     }
-    let name_clip = egui::Rect::from_min_max(
-        rect.min,
-        pos2(
-            rect.right() - if show_clock { 104.0 } else { 8.0 },
-            rect.bottom(),
-        ),
-    );
+    let right_limit = if move_counter.is_some() {
+        (rect.center().x - 45.0).max(text_left + 40.0)
+    } else if show_clock {
+        rect.right() - 104.0
+    } else {
+        rect.right() - 8.0
+    };
+    let name_clip = egui::Rect::from_min_max(rect.min, pos2(right_limit, rect.bottom()));
     let name_painter = ui.painter_at(name_clip);
     let name_galley = name_painter.layout_job(label);
     let name_y = if has_photo {
@@ -11640,9 +11902,23 @@ fn player_strip(
     });
     name_painter.galley(
         pos2(text_left, name_y),
-        name_galley,
+        name_galley.clone(),
         Color32::from_gray(226),
     );
+    let name_hit_rect = egui::Rect::from_min_size(pos2(text_left, name_y), name_galley.size());
+    let name_response = ui.interact(
+        name_hit_rect.expand2(vec2(2.0, 2.0)),
+        response.id.with("name"),
+        Sense::click(),
+    );
+    if name_response.hovered() && !crown_hovered {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        name_response
+            .clone()
+            .on_hover_text(format!("Click to view {}'s profile", player.name));
+    }
+    let name_clicked = name_response.clicked();
+
     if let Some(team) = player.team.as_ref().filter(|team| !team.trim().is_empty()) {
         let team_galley = name_painter.layout_no_wrap(
             team.trim().to_string(),
@@ -11659,6 +11935,19 @@ fn player_strip(
             team_galley,
             Color32::from_gray(145),
         );
+    }
+
+    if let Some(counter) = move_counter {
+        let counter_galley = painter.layout_no_wrap(
+            counter.to_string(),
+            FontId::proportional(11.5),
+            Color32::from_gray(155),
+        );
+        let counter_pos = pos2(
+            rect.center().x - counter_galley.size().x / 2.0,
+            rect.center().y - counter_galley.size().y / 2.0,
+        );
+        painter.galley(counter_pos, counter_galley, Color32::from_gray(155));
     }
 
     if show_clock {
@@ -11687,7 +11976,7 @@ fn player_strip(
         painter.galley(clock_rect.min, clock_galley, color);
     }
 
-    if !crown_hovered {
+    if !crown_hovered && !name_response.hovered() {
         response.on_hover_text(format!(
             "{} · {}{}{} · {}",
             color_name(player.color),
@@ -11705,7 +11994,10 @@ fn player_strip(
             player.rating.as_deref().unwrap_or("no rating")
         ));
     }
-    photo_clicked
+    PlayerStripAction {
+        photo_clicked,
+        name_clicked,
+    }
 }
 
 /// Make a crown glyph painted as part of a larger text layout interactive, so
@@ -12492,18 +12784,18 @@ fn compact_text_tag(
         if is_site && label.clicked() {
             let site = game.header("Site").unwrap_or("").trim();
             if !pgn_tag_is_empty(site) {
-                ui.ctx()
-                    .open_url(egui::OpenUrl::new_tab(map_search_url(site)));
+                open_browser_url(ui.ctx(), &map_search_url(site));
             }
         }
         label.on_hover_text(if is_site {
-            "Click to search this venue on OpenStreetMap"
+            "Click to search this venue on OpenStreetMap in your browser"
         } else {
             name
         });
         if let Some(index) = header_index(game, name) {
             let mut value = game.headers[index].1.clone();
-            let width = (ui.available_width() - 2.0).max(36.0);
+            let button_space = if is_site { 28.0 } else { 0.0 };
+            let width = (ui.available_width() - 2.0 - button_space).max(36.0);
             let response = ui.add_sized(
                 [width, 19.0],
                 egui::TextEdit::singleline(&mut value)
@@ -12514,7 +12806,18 @@ fn compact_text_tag(
                     .hint_text("value"),
             );
             if response.changed() {
-                *tag_update = Some((index, value));
+                *tag_update = Some((index, value.clone()));
+            }
+            if is_site {
+                let site = value.trim();
+                let has_site = !pgn_tag_is_empty(site);
+                if ui
+                    .add_enabled(has_site, egui::Button::new("🗺 ↗").small())
+                    .on_hover_text("Search this venue on OpenStreetMap in your browser")
+                    .clicked()
+                {
+                    open_browser_url(ui.ctx(), &map_search_url(site));
+                }
             }
         } else {
             ui.label(RichText::new("—").weak());
@@ -12919,6 +13222,23 @@ fn map_search_url(site: &str) -> String {
     )
 }
 
+/// Open an external URL in the user's default browser, using egui's platform
+/// bridge and falling back to the `webbrowser` crate for Wayland/X11 desktop
+/// environments.
+fn open_browser_url(ctx: &egui::Context, url: &str) {
+    ctx.open_url(egui::OpenUrl::new_tab(url));
+    let _ = webbrowser::open(url);
+}
+
+/// Copy text to the clipboard, synchronizing with egui's context and
+/// directly updating the system clipboard with `arboard` as a fallback.
+fn copy_to_clipboard(ctx: &egui::Context, text: &str) {
+    ctx.copy_text(text.to_string());
+    if let Ok(mut clipboard) = arboard::Clipboard::new() {
+        let _ = clipboard.set_text(text.to_string());
+    }
+}
+
 /// Header card above the PGN move list. Date sits on the left, the tournament
 /// is centered, and the result stays on the right.
 fn game_header_card(
@@ -13052,6 +13372,7 @@ fn game_header_card(
                 ui,
                 game.white(),
                 player_title(game, Color::White),
+                player_country(game, Color::White).map(|c| c.badge),
                 player_fide_id(game, Color::White),
                 player_rating(game, Color::White, priority, show_all_ratings),
                 team_for(game, Color::White),
@@ -13062,6 +13383,7 @@ fn game_header_card(
                 ui,
                 game.black(),
                 player_title(game, Color::Black),
+                player_country(game, Color::Black).map(|c| c.badge),
                 player_fide_id(game, Color::Black),
                 player_rating(game, Color::Black, priority, show_all_ratings),
                 team_for(game, Color::Black),
@@ -13106,10 +13428,12 @@ fn date_chip(ui: &mut Ui, text: &str) -> egui::Response {
         .inner
 }
 
+#[allow(clippy::too_many_arguments)]
 fn header_player_row(
     ui: &mut Ui,
     name: &str,
     title: Option<&str>,
+    country: Option<&str>,
     fide_id: Option<&str>,
     rating: Option<String>,
     team: Option<&str>,
@@ -13159,6 +13483,15 @@ fn header_player_row(
                     ..Default::default()
                 },
             );
+            if let Some(country) = country {
+                let format = TextFormat {
+                    font_id: FontId::proportional(10.5),
+                    color: Color32::from_gray(150),
+                    ..Default::default()
+                };
+                label.append(" · ", 0.0, format.clone());
+                label.append(country, 0.0, format);
+            }
             if let Some(id) = fide_id {
                 let format = TextFormat {
                     font_id: FontId::proportional(10.5),
@@ -13220,6 +13553,22 @@ fn player_fide_id(game: &Game, color: Color) -> Option<&str> {
         Color::White => "WhiteFideId",
         Color::Black => "BlackFideId",
     }))
+}
+
+fn player_country_from_header(raw: Option<&str>) -> Option<Country> {
+    country::from_header(raw)
+}
+
+fn player_country(game: &Game, color: Color) -> Option<Country> {
+    let raw = match color {
+        Color::White => game
+            .header("WhiteCountry")
+            .or_else(|| game.header("WhiteFed")),
+        Color::Black => game
+            .header("BlackCountry")
+            .or_else(|| game.header("BlackFed")),
+    };
+    country::from_header(raw)
 }
 
 /// `3.4` means round 3, board 4. A plain value is a round with no board.
@@ -13988,6 +14337,7 @@ fn player_row(
     selected: bool,
     name: &str,
     title: Option<&str>,
+    country: Option<&str>,
     fide_id: Option<&str>,
     subtitle: &str,
     width: f32,
@@ -14053,6 +14403,7 @@ fn player_row(
         &mut job,
         name,
         title,
+        country,
         fide_id,
         &title_format,
         &name_format,
@@ -14098,6 +14449,7 @@ fn player_row(
 struct RowName<'a> {
     name: &'a str,
     title: Option<&'a str>,
+    country: Option<&'a str>,
     fide_id: Option<&'a str>,
 }
 
@@ -14106,8 +14458,14 @@ impl<'a> RowName<'a> {
         Self {
             name,
             title,
+            country: None,
             fide_id: None,
         }
+    }
+
+    fn with_country(mut self, country: Option<&'a str>) -> Self {
+        self.country = country;
+        self
     }
 
     fn with_fide_id(mut self, fide_id: Option<&'a str>) -> Self {
@@ -14116,10 +14474,12 @@ impl<'a> RowName<'a> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn append_player_name(
     job: &mut LayoutJob,
     name: &str,
     title: Option<&str>,
+    country: Option<&str>,
     fide_id: Option<&str>,
     title_format: &TextFormat,
     name_format: &TextFormat,
@@ -14130,6 +14490,10 @@ fn append_player_name(
         job.append(" ", 0.0, name_format.clone());
     }
     job.append(name, 0.0, name_format.clone());
+    if let Some(country) = country {
+        job.append(" · ", 0.0, fide_format.clone());
+        job.append(country, 0.0, fide_format.clone());
+    }
     if let Some(id) = fide_id {
         job.append(" · ", 0.0, fide_format.clone());
         job.append(id, 0.0, fide_format.clone());
@@ -14188,6 +14552,7 @@ fn game_row(
         &mut job,
         white.name,
         white.title,
+        white.country,
         white.fide_id,
         &title_format,
         &name_format,
@@ -14199,6 +14564,7 @@ fn game_row(
             &mut job,
             black.name,
             black.title,
+            black.country,
             black.fide_id,
             &title_format,
             &name_format,
@@ -15678,6 +16044,7 @@ mod tests {
             "Kasparov, Garry",
             Some("GM"),
             None,
+            None,
             &title_format,
             &name_format,
             &fide_format,
@@ -15690,6 +16057,7 @@ mod tests {
         append_player_name(
             &mut plain,
             "Kasparov, Garry",
+            None,
             None,
             None,
             &title_format,
@@ -15723,6 +16091,7 @@ mod tests {
             &mut job,
             "Carlsen, Magnus",
             Some("GM"),
+            None,
             Some("1503014"),
             &title_format,
             &name_format,
@@ -15732,6 +16101,79 @@ mod tests {
         let suffix = job.sections.last().unwrap();
         assert_eq!(suffix.format.color, Color32::from_gray(150));
         assert_eq!(suffix.format.font_id.size, 10.5);
+    }
+
+    #[test]
+    fn player_country_reads_tags_without_rewriting_them() {
+        let pgn = b"[Event \"Country\"]\n[White \"A\"]\n[WhiteCountry \" NOR \"]\n[Black \"B\"]\n[BlackFed \"USA\"]\n[Result \"*\"]\n\n*\n";
+        let mut games = domain::parse_pgn(&pgn[..]).unwrap();
+        let game = games.remove(0);
+        let white_country = player_country(&game, Color::White).unwrap();
+        assert_eq!(white_country.code, "NOR");
+        assert_eq!(white_country.flag, "🇳🇴");
+        assert_eq!(white_country.badge, "🇳🇴 NOR");
+        assert_eq!(
+            game.header("WhiteCountry"),
+            Some(" NOR "),
+            "display decoding must not rewrite the stored tag"
+        );
+
+        let black_country = player_country(&game, Color::Black).unwrap();
+        assert_eq!(black_country.code, "USA");
+        assert_eq!(black_country.flag, "🇺🇸");
+        assert_eq!(black_country.badge, "🇺🇸 USA");
+        assert_eq!(
+            game.header("BlackFed"),
+            Some("USA"),
+            "display decoding must not rewrite the stored tag"
+        );
+    }
+
+    #[test]
+    fn row_country_and_fide_id_are_muted_suffixes_after_the_name() {
+        let name_format = TextFormat {
+            font_id: FontId::proportional(14.0),
+            color: Color32::WHITE,
+            ..Default::default()
+        };
+        let title_format = TextFormat {
+            font_id: FontId::proportional(10.5),
+            color: GOLD,
+            ..Default::default()
+        };
+        let fide_format = TextFormat {
+            font_id: FontId::proportional(10.5),
+            color: Color32::from_gray(150),
+            ..Default::default()
+        };
+
+        // Both country and FIDE ID
+        let mut both = LayoutJob::default();
+        append_player_name(
+            &mut both,
+            "Carlsen, Magnus",
+            Some("GM"),
+            Some("🇳🇴 NOR"),
+            Some("1503014"),
+            &title_format,
+            &name_format,
+            &fide_format,
+        );
+        assert_eq!(both.text, "GM Carlsen, Magnus · 🇳🇴 NOR · 1503014");
+
+        // Only country
+        let mut only_country = LayoutJob::default();
+        append_player_name(
+            &mut only_country,
+            "Nakamura, Hikaru",
+            Some("GM"),
+            Some("🇺🇸 USA"),
+            None,
+            &title_format,
+            &name_format,
+            &fide_format,
+        );
+        assert_eq!(only_country.text, "GM Nakamura, Hikaru · 🇺🇸 USA");
     }
 
     fn test_app() -> App {
@@ -15802,6 +16244,7 @@ mod tests {
             wiki_job: None,
             wiki_for: None,
             wiki_state: WikiState::Idle,
+            wiki_expanded: false,
             player_book: None,
             player_book_rx: None,
             player_book_job: None,
@@ -15843,6 +16286,7 @@ mod tests {
             photo_viewer: None,
             show_nav_buttons: false,
             show_pgn_tags: true,
+            show_annotations: true,
             date_picker: None,
             date_picker_anchor: None,
             rating_priority: RatingPriority::Elo,
@@ -15940,6 +16384,12 @@ mod tests {
             settings_photo_size: PhotoSize::Small,
             settings_champion_lineage: ChampionLineage::Fide,
             settings_show_clocks: true,
+            settings_show_annotations: true,
+            settings_show_pgn_tags: true,
+            settings_show_nav_buttons: false,
+            settings_show_player_photos: true,
+            settings_show_empty_pgn_tags: false,
+            settings_online_reference: false,
             settings_engine_bar: true,
             settings_my_player_names: String::new(),
             settings_correspondence_enabled: true,
@@ -15966,6 +16416,7 @@ mod tests {
             key: players::player_key(name).unwrap(),
             title: None,
             fide_id: None,
+            country: None,
             white: players::PlayerRecord::default(),
             black: players::PlayerRecord::default(),
             elo_sum: 0,
@@ -17589,5 +18040,48 @@ mod tests {
         let current = app.current.as_ref().unwrap();
         assert_eq!(current.header("SetUp"), Some("1"));
         assert_eq!(current.header("FEN"), Some("4k3/8/8/8/8/8/8/4K3 w - - 0 1"));
+    }
+
+    #[test]
+    fn player_strip_renders_name_rating_and_move_counter() {
+        let ctx = egui::Context::default();
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let badge = PlayerBadge {
+                name: "Carlsen, Magnus".to_string(),
+                title: Some("GM".to_string()),
+                country: Some("🇳🇴 NOR"),
+                fide_id: Some("1503014".to_string()),
+                rating: Some("2882".to_string()),
+                team: None,
+                clock: None,
+                color: Color::White,
+            };
+            let action = player_strip(
+                ui,
+                400.0,
+                &badge,
+                false,
+                None,
+                PhotoSize::Small,
+                None,
+                Some("move 14 / 35"),
+            );
+            assert!(!action.photo_clicked);
+            assert!(!action.name_clicked);
+        });
+        output.textures_delta.clear();
+    }
+
+    #[test]
+    fn view_preferences_round_trip_and_defaults() {
+        let mut app = test_app();
+        assert!(app.show_pgn_tags);
+        assert!(app.show_annotations);
+        app.show_annotations = false;
+        app.show_pgn_tags = false;
+        app.save_display_prefs();
+        let loaded = DisplayPrefs::load();
+        assert!(!loaded.show_annotations);
+        assert!(!loaded.show_pgn_tags);
     }
 }
