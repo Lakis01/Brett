@@ -356,6 +356,35 @@ pub trait GameLibrary: Send + Sync {
         let _ = (index, max_plies, consumer);
         Ok(false)
     }
+
+    /// Headers for a game by index, falling back to on-demand decoding when
+    /// the full game list is not pre-allocated in memory.
+    fn game_headers(&self, index: usize) -> Vec<(SharedStr, SharedStr)> {
+        self.games()
+            .get(index)
+            .map(|game| game.headers().to_vec())
+            .unwrap_or_default()
+    }
+
+    /// Player names for a game by index (White, Black).
+    fn game_players(&self, index: usize) -> (String, String) {
+        if let Some(game) = self.games().get(index) {
+            (game.white().to_string(), game.black().to_string())
+        } else {
+            let headers = self.game_headers(index);
+            let white = headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("White"))
+                .map(|(_, v)| v.to_string())
+                .unwrap_or_else(|| "?".to_string());
+            let black = headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("Black"))
+                .map(|(_, v)| v.to_string())
+                .unwrap_or_else(|| "?".to_string());
+            (white, black)
+        }
+    }
 }
 
 pub(crate) fn filter_games(games: &[IndexedGame], needle: &str) -> Vec<usize> {

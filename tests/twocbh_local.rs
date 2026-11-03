@@ -327,3 +327,50 @@ fn mega_record_three_loads_without_indexing_the_database() {
     assert_eq!(game.date(), "1475.??.??");
     assert!(game.mainline_len() > 20);
 }
+
+#[test]
+fn mega_library_opens_and_queries_in_virtual_mode() {
+    let Some(cbh) = env_path("BRETT_2CBH_MEGA") else {
+        return;
+    };
+    use brett::session::GameList;
+    use std::sync::Arc;
+
+    let t0 = std::time::Instant::now();
+    let library = Arc::new(TwoCbhLibrary::open(&cbh).unwrap());
+    let elapsed = t0.elapsed();
+    eprintln!(
+        "Opened Mega library with {} games in {:.3}s",
+        library.len(),
+        elapsed.as_secs_f64()
+    );
+    assert_eq!(library.len(), 11_741_260);
+
+    let (white, black) = library.game_players(0);
+    assert_eq!(white, "De Castellvi, Francisco");
+    assert_eq!(black, "Vinoles, Narcisco");
+
+    let headers = library.game_headers(0);
+    assert!(!headers.is_empty());
+    assert_eq!(
+        headers
+            .iter()
+            .find(|(k, _)| k.as_ref() == "White")
+            .unwrap()
+            .1
+            .as_ref(),
+        "De Castellvi, Francisco"
+    );
+
+    let game = library.load(0).unwrap();
+    assert_eq!(game.white(), "De Castellvi, Francisco");
+    assert!(game.mainline_len() > 20);
+
+    // Test session integration with on-demand header resolution
+    let session = GameList::from_library(library.clone());
+    assert_eq!(session.len(), 11_741_260);
+    let slot = session.slot(0).unwrap();
+    assert_eq!(slot.white(), "De Castellvi, Francisco");
+    assert_eq!(slot.black(), "Vinoles, Narcisco");
+    assert_eq!(slot.date(), "1475.??.??");
+}

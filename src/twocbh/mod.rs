@@ -38,6 +38,7 @@ pub use writer::{
 use std::ffi::OsString;
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -56,10 +57,9 @@ const LID_SOURCE: usize = 0x860;
 const START_ID_BASE: u32 = 0xFC40;
 const SEARCH_CACHE_MAX_GAMES: usize = 1_000_000;
 
-/// Above this many slots, indexing the whole database is not useful in the
-/// current in-memory game-list model.  The full Mega Database 2026 has
-/// 11,743,084 records; it is still readable through [`TwoCbhFile`].
-pub const MAX_INDEXED_GAMES: usize = 2_000_000;
+/// Upper safety bound on 2CBH slots to prevent integer overflow or runaway allocation.
+/// Mega Database 2026 has ~11,743,084 records and is indexed via lightweight/virtual slots.
+pub const MAX_INDEXED_GAMES: usize = 50_000_000;
 
 /// One game slot's location and state.
 #[derive(Clone, Debug)]
@@ -300,6 +300,7 @@ impl Content<'_> {
 pub struct TwoCbhLibrary {
     path: PathBuf,
     file: TwoCbhFile,
+    names: Arc<NameBase>,
     entries: Vec<Entry>,
     games: Vec<IndexedGame>,
     file_len: u64,
@@ -311,22 +312,25 @@ impl TwoCbhLibrary {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let started = Instant::now();
         let file = TwoCbhFile::open(path)?;
-        // Check the slot count before scanning every header.  This keeps a
-        // full-Mega open attempt from walking 11.7 million records just to
-        // reject the database, and it is a safe upper bound on the game count.
         let slots = file.slot_count().saturating_sub(1);
         if slots > MAX_INDEXED_GAMES {
             bail!(
-                "{} contains {slots} 2CBH slots; Brett indexes at most {MAX_INDEXED_GAMES}. \
-                 The file is still readable one record at a time through TwoCbhFile.",
+                "{} contains {slots} 2CBH slots; Brett indexes at most {MAX_INDEXED_GAMES}.",
                 file.path().display()
             );
         }
-        let names = NameBase::open(&file.lid_path)?;
+        let names = Arc::new(NameBase::open(&file.lid_path)?);
         let total = file.slot_count().saturating_sub(1);
+        // Databases up to 250k games pre-build eager AST/strings; larger collections
+        // (such as Mega Database with 11.75M+ games) use lazy headers on demand.
+        let build_eager = total <= 250_000;
         let build_search = total <= SEARCH_CACHE_MAX_GAMES;
-        let mut entries = Vec::new();
-        let mut games = Vec::new();
+        let mut entries = Vec::with_capacity(total.min(12_000_000));
+        let mut games = if build_eager {
+            Vec::with_capacity(total)
+        } else {
+            Vec::new()
+        };
         let mut strings = StringPool::default();
         for id in 1..file.count {
             let record = file.record(id)?;
@@ -334,19 +338,21 @@ impl TwoCbhLibrary {
             if kind & 1 == 0 || kind & 2 != 0 {
                 continue;
             }
-            let headers = base_headers(record, &names, &mut strings);
             entries.push(Entry {
                 id,
                 deleted: kind & 0x80 != 0,
             });
-            games.push(IndexedGame::cbh(
-                headers,
-                id,
-                le_u64(&record[8..16]),
-                le_u64(&record[16..24]),
-                kind & 0x80 != 0,
-                build_search,
-            ));
+            if build_eager {
+                let headers = base_headers(record, &names, &mut strings);
+                games.push(IndexedGame::cbh(
+                    headers,
+                    id,
+                    le_u64(&record[8..16]),
+                    le_u64(&record[16..24]),
+                    kind & 0x80 != 0,
+                    build_search,
+                ));
+            }
         }
 
         let mut file_len = file.cbh.len() as u64 + file.cbg.len() as u64;
@@ -357,6 +363,7 @@ impl TwoCbhLibrary {
         Ok(Self {
             path: file.cbh_path.clone(),
             file,
+            names,
             entries,
             games,
             file_len,
@@ -373,11 +380,15 @@ impl TwoCbhLibrary {
     }
 
     pub fn len(&self) -> usize {
-        self.games.len()
+        if !self.games.is_empty() {
+            self.games.len()
+        } else {
+            self.entries.len()
+        }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.games.is_empty()
+        self.len() == 0
     }
 
     pub fn indexed_in(&self) -> Duration {
@@ -393,7 +404,20 @@ impl TwoCbhLibrary {
     }
 
     pub fn filter(&self, needle: &str) -> Vec<usize> {
-        crate::library::filter_games(&self.games, needle)
+        if !self.games.is_empty() {
+            crate::library::filter_games(&self.games, needle)
+        } else {
+            let needle = needle.trim().to_lowercase();
+            if needle.is_empty() {
+                return (0..self.entries.len()).collect();
+            }
+            (0..self.entries.len())
+                .filter(|&index| {
+                    let (white, black) = self.game_players(index);
+                    white.to_lowercase().contains(&needle) || black.to_lowercase().contains(&needle)
+                })
+                .collect()
+        }
     }
 
     /// Decode one game on demand.  A damaged move stream is reported in
@@ -404,12 +428,50 @@ impl TwoCbhLibrary {
             .entries
             .get(index)
             .with_context(|| format!("2CBH game index {index} is out of range"))?;
-        let headers = self.games[index]
-            .headers()
-            .iter()
-            .map(|(key, value)| (key.to_string(), value.to_string()))
-            .collect();
+        let headers = if let Some(indexed) = self.games.get(index) {
+            indexed
+                .headers()
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect()
+        } else {
+            let record = self.file.record(entry.id)?;
+            let mut strings = StringPool::default();
+            base_headers(record, &self.names, &mut strings)
+                .into_iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect()
+        };
         load_game(&self.file, entry.id, headers, entry.deleted)
+    }
+
+    pub fn game_headers(&self, index: usize) -> Vec<(SharedStr, SharedStr)> {
+        if let Some(indexed) = self.games.get(index) {
+            return indexed.headers().to_vec();
+        }
+        let Some(entry) = self.entries.get(index) else {
+            return Vec::new();
+        };
+        let Ok(record) = self.file.record(entry.id) else {
+            return Vec::new();
+        };
+        let mut strings = StringPool::default();
+        base_headers(record, &self.names, &mut strings)
+    }
+
+    pub fn game_players(&self, index: usize) -> (String, String) {
+        if let Some(game) = self.games.get(index) {
+            return (game.white().to_string(), game.black().to_string());
+        }
+        let Some(entry) = self.entries.get(index) else {
+            return ("?".to_string(), "?".to_string());
+        };
+        let Ok(record) = self.file.record(entry.id) else {
+            return ("?".to_string(), "?".to_string());
+        };
+        let white = self.names.player(le_u32(&record[0x18..0x1c]));
+        let black = self.names.player(le_u32(&record[0x20..0x24]));
+        (white.name, black.name)
     }
 }
 
@@ -436,6 +498,14 @@ impl GameLibrary for TwoCbhLibrary {
 
     fn load(&self, index: usize) -> Result<Game> {
         TwoCbhLibrary::load(self, index)
+    }
+
+    fn game_headers(&self, index: usize) -> Vec<(SharedStr, SharedStr)> {
+        TwoCbhLibrary::game_headers(self, index)
+    }
+
+    fn game_players(&self, index: usize) -> (String, String) {
+        TwoCbhLibrary::game_players(self, index)
     }
 
     fn stream_mainline(

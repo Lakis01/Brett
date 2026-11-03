@@ -36,8 +36,6 @@ enum SlotSource {
     Local(Box<LocalSlot>),
 }
 
-const EMPTY_HEADERS: &[(SharedStr, SharedStr)] = &[];
-
 /// One game row in the editable session.
 ///
 /// Primary and merged database rows point at the source index instead of
@@ -47,6 +45,7 @@ pub struct GameSlot {
     pub id: usize,
     source: SlotSource,
     edited: Option<Box<HeaderOverride>>,
+    cached_headers: std::sync::OnceLock<Vec<(SharedStr, SharedStr)>>,
 }
 
 impl GameSlot {
@@ -55,6 +54,7 @@ impl GameSlot {
             id,
             source: SlotSource::Primary { library, index },
             edited: None,
+            cached_headers: std::sync::OnceLock::new(),
         }
     }
 
@@ -63,6 +63,7 @@ impl GameSlot {
             id,
             source: SlotSource::External { library, index },
             edited: None,
+            cached_headers: std::sync::OnceLock::new(),
         }
     }
 
@@ -77,6 +78,7 @@ impl GameSlot {
                 search,
             })),
             edited: None,
+            cached_headers: std::sync::OnceLock::new(),
         }
     }
 
@@ -86,11 +88,12 @@ impl GameSlot {
         }
         match &self.source {
             SlotSource::Primary { library, index } | SlotSource::External { library, index } => {
-                library
-                    .games()
-                    .get(*index)
-                    .map(|game| game.headers())
-                    .unwrap_or(EMPTY_HEADERS)
+                if let Some(game) = library.games().get(*index) {
+                    return game.headers();
+                }
+                self.cached_headers
+                    .get_or_init(|| library.game_headers(*index))
+                    .as_slice()
             }
             SlotSource::Local(local) => &local.headers,
         }
@@ -136,10 +139,12 @@ impl GameSlot {
         }
         match &self.source {
             SlotSource::Primary { library, index } | SlotSource::External { library, index } => {
-                library
-                    .games()
-                    .get(*index)
-                    .is_some_and(|game| game.matches(needle))
+                if let Some(game) = library.games().get(*index) {
+                    return game.matches(needle);
+                }
+                self.headers()
+                    .iter()
+                    .any(|(_, v)| v.to_lowercase().contains(needle))
             }
             SlotSource::Local(local) => local.search.contains(needle),
         }
@@ -324,8 +329,15 @@ impl GameList {
         edited: &HashMap<usize, Game>,
     ) -> Result<MergeReport> {
         let mut report = MergeReport::default();
-        for (index, indexed) in library.games().iter().enumerate() {
-            let headers = indexed.headers();
+        let count = library.len();
+        for index in 0..count {
+            let headers_vec;
+            let headers = if let Some(indexed) = library.games().get(index) {
+                indexed.headers()
+            } else {
+                headers_vec = library.game_headers(index);
+                &headers_vec
+            };
             let candidates = duplicate_candidates(&self.slots, headers);
             if !candidates.is_empty() {
                 let incoming = library

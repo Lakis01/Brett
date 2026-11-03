@@ -1676,6 +1676,21 @@ impl App {
     }
 
     fn load_file(&mut self, path: &std::path::Path) {
+        let path_buf;
+        let path = if path.is_dir() {
+            match find_database_in_dir(path) {
+                Ok(target) => {
+                    path_buf = target;
+                    path_buf.as_path()
+                }
+                Err(err) => {
+                    self.status = format!("{err}");
+                    return;
+                }
+            }
+        } else {
+            path
+        };
         let extension = path
             .extension()
             .and_then(|extension| extension.to_str())
@@ -1873,6 +1888,21 @@ impl App {
     }
 
     fn open_database_view(&mut self, path: &std::path::Path) {
+        let path_buf;
+        let path = if path.is_dir() {
+            match find_database_in_dir(path) {
+                Ok(target) => {
+                    path_buf = target;
+                    path_buf.as_path()
+                }
+                Err(err) => {
+                    self.status = format!("{err}");
+                    return;
+                }
+            }
+        } else {
+            path
+        };
         if self
             .library
             .as_ref()
@@ -1905,6 +1935,21 @@ impl App {
     }
 
     fn handle_dropped_file(&mut self, path: &std::path::Path) {
+        let path_buf;
+        let path = if path.is_dir() {
+            match find_database_in_dir(path) {
+                Ok(target) => {
+                    path_buf = target;
+                    path_buf.as_path()
+                }
+                Err(err) => {
+                    self.status = format!("{err}");
+                    return;
+                }
+            }
+        } else {
+            path
+        };
         if self.library.is_none() && self.session.is_empty() {
             self.load_file(path);
         } else {
@@ -7201,7 +7246,20 @@ impl App {
                 });
 
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.label(RichText::new(&self.status).weak());
+                    let is_err = self.status.starts_with("Could not")
+                        || self.status.contains("failed")
+                        || self.status.contains("error");
+                    let text = if is_err {
+                        RichText::new(&self.status).color(egui::Color32::from_rgb(235, 95, 85))
+                    } else {
+                        RichText::new(&self.status).weak()
+                    };
+                    ui.add(
+                        egui::Label::new(text)
+                            .truncate()
+                            .sense(egui::Sense::hover()),
+                    )
+                    .on_hover_text(&self.status);
                 });
             });
         });
@@ -7494,10 +7552,21 @@ impl App {
         );
         ui.add_space(4.0);
 
-        let rows = self.session.filter(&self.filter);
+        let filter_trimmed = self.filter.trim();
+        let is_filtered = !filter_trimmed.is_empty();
+        let rows = if is_filtered {
+            self.session.filter(filter_trimmed)
+        } else {
+            Vec::new()
+        };
+        let total_count = if is_filtered {
+            rows.len()
+        } else {
+            self.session.len()
+        };
 
-        if rows.is_empty() {
-            let message = if self.filter.trim().is_empty() {
+        if total_count == 0 {
+            let message = if !is_filtered {
                 "No games loaded."
             } else {
                 "No matching games."
@@ -7514,8 +7583,15 @@ impl App {
         egui::ScrollArea::vertical()
             .id_salt("game-list")
             .auto_shrink([false, false])
-            .show_rows(ui, row_h, rows.len(), |ui, range| {
-                for &id in &rows[range] {
+            .show_rows(ui, row_h, total_count, |ui, range| {
+                for pos in range {
+                    let Some(id) = (if is_filtered {
+                        rows.get(pos).copied()
+                    } else {
+                        self.session.id_at(pos)
+                    }) else {
+                        continue;
+                    };
                     let Some(slot) = self.session.slot(id) else {
                         continue;
                     };
@@ -10215,7 +10291,7 @@ impl App {
             self.tree_status = "Using the current database for the opening tree.".to_string();
             self.save_display_prefs();
         }
-        if choose_book && let Some(path) = open_dialog(None) {
+        if choose_book && let Some(path) = open_book_dialog(None) {
             self.book_path = path.display().to_string();
             self.save_display_prefs();
             self.start_book(path);
@@ -11443,8 +11519,19 @@ impl App {
                                     Some((payload.view, payload.id, view_index, count));
                             }
 
-                            let rows = view.session.filter(&view.filter);
-                            if rows.is_empty() {
+                            let filter_trimmed = view.filter.trim();
+                            let is_filtered = !filter_trimmed.is_empty();
+                            let rows = if is_filtered {
+                                view.session.filter(filter_trimmed)
+                            } else {
+                                Vec::new()
+                            };
+                            let total_count = if is_filtered {
+                                rows.len()
+                            } else {
+                                view.session.len()
+                            };
+                            if total_count == 0 {
                                 ui.label(RichText::new("No games.").weak());
                             } else {
                                 let row_h = 42.0;
@@ -11452,8 +11539,15 @@ impl App {
                                     .id_salt(("database-view-games", view_index))
                                     .max_height(230.0)
                                     .auto_shrink([false, false])
-                                    .show_rows(ui, row_h, rows.len(), |ui, range| {
-                                        for &id in &rows[range] {
+                                    .show_rows(ui, row_h, total_count, |ui, range| {
+                                        for pos in range {
+                                            let Some(id) = (if is_filtered {
+                                                rows.get(pos).copied()
+                                            } else {
+                                                view.session.id_at(pos)
+                                            }) else {
+                                                continue;
+                                            };
                                             let Some(slot) = view.session.slot(id) else {
                                                 continue;
                                             };
@@ -16730,23 +16824,80 @@ fn pv_score(cp: Option<i32>, mate: Option<i32>) -> String {
     cp.map(format_cp).unwrap_or_else(|| "—".to_string())
 }
 
+fn find_database_in_dir(dir: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
+    if !dir.is_dir() {
+        anyhow::bail!("{} is not a directory", dir.display());
+    }
+    let mut candidates_2cbh = Vec::new();
+    let mut candidates_cbh = Vec::new();
+    let mut candidates_si4 = Vec::new();
+    let mut candidates_pgn = Vec::new();
+
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            match ext.as_str() {
+                "2cbh" => candidates_2cbh.push(path),
+                "cbh" => candidates_cbh.push(path),
+                "si4" | "si3" => candidates_si4.push(path),
+                "pgn" => candidates_pgn.push(path),
+                _ => {}
+            }
+        }
+    }
+    candidates_2cbh.sort();
+    candidates_cbh.sort();
+    candidates_si4.sort();
+    candidates_pgn.sort();
+
+    if let Some(target) = candidates_2cbh.into_iter().next() {
+        return Ok(target);
+    }
+    if let Some(target) = candidates_cbh.into_iter().next() {
+        return Ok(target);
+    }
+    if let Some(target) = candidates_si4.into_iter().next() {
+        return Ok(target);
+    }
+    if let Some(target) = candidates_pgn.into_iter().next() {
+        return Ok(target);
+    }
+
+    anyhow::bail!(
+        "No supported chess database (.2cbh, .cbh, .si4, .pgn) found in directory {}",
+        dir.display()
+    )
+}
+
 fn open_library(path: &std::path::Path) -> anyhow::Result<Arc<dyn GameLibrary>> {
-    let extension = path
+    let resolved = if path.is_dir() {
+        find_database_in_dir(path)?
+    } else {
+        path.to_path_buf()
+    };
+    let extension = resolved
         .extension()
         .and_then(|extension| extension.to_str())
         .unwrap_or_default()
         .to_ascii_lowercase();
     if extension == "si4" || extension == "si3" {
-        ScidLibrary::open(path).map(|library| Arc::new(library) as Arc<dyn GameLibrary>)
+        ScidLibrary::open(&resolved).map(|library| Arc::new(library) as Arc<dyn GameLibrary>)
     } else if extension == "cbv" {
-        CbhLibrary::open_cbv(path).map(|library| Arc::new(library) as Arc<dyn GameLibrary>)
+        CbhLibrary::open_cbv(&resolved).map(|library| Arc::new(library) as Arc<dyn GameLibrary>)
     } else if extension == "cbh" {
-        CbhLibrary::open(path).map(|library| Arc::new(library) as Arc<dyn GameLibrary>)
+        CbhLibrary::open(&resolved).map(|library| Arc::new(library) as Arc<dyn GameLibrary>)
     } else if matches!(extension.as_str(), "2cbh" | "2cbg" | "2cba" | "2lid") {
-        TwoCbhLibrary::open(path).map(|library| Arc::new(library) as Arc<dyn GameLibrary>)
+        TwoCbhLibrary::open(&resolved).map(|library| Arc::new(library) as Arc<dyn GameLibrary>)
     } else {
-        PgnLibrary::build(path.to_path_buf())
-            .map(|library| Arc::new(library) as Arc<dyn GameLibrary>)
+        PgnLibrary::build(resolved).map(|library| Arc::new(library) as Arc<dyn GameLibrary>)
     }
 }
 
@@ -17166,10 +17317,11 @@ fn open_dialog(initial_dir: Option<&Path>) -> Option<std::path::PathBuf> {
     let mut zenity = vec![
         "--file-selection".to_string(),
         "--title=Open chess database".to_string(),
-        "--file-filter=Chess databases | *.pgn *.PGN *.si4 *.si3 *.cbh *.CBH *.2cbh *.2cbg *.2cba *.2lid".to_string(),
+        "--file-filter=Chess databases | *.pgn *.PGN *.si4 *.si3 *.cbh *.CBH *.2cbh *.2CBH"
+            .to_string(),
         "--file-filter=PGN files | *.pgn *.PGN".to_string(),
         "--file-filter=SCID databases | *.si4 *.si3".to_string(),
-        "--file-filter=ChessBase databases | *.cbh *.CBH *.2cbh *.2cbg *.2cba *.2lid".to_string(),
+        "--file-filter=ChessBase databases | *.cbh *.CBH *.2cbh *.2CBH".to_string(),
         "--file-filter=All files | *".to_string(),
     ];
     if let Some(dir) = initial_dir.filter(|path| path.is_dir()) {
@@ -17193,7 +17345,50 @@ fn open_dialog(initial_dir: Option<&Path>) -> Option<std::path::PathBuf> {
     let kdialog = [
         "--getopenfilename",
         start.as_str(),
-        "*.pgn *.PGN *.si4 *.si3 *.cbh *.CBH *.2cbh *.2cbg *.2cba *.2lid|Chess databases",
+        "*.pgn *.PGN *.si4 *.si3 *.cbh *.CBH *.2cbh *.2CBH|Chess databases",
+    ];
+    match Command::new("kdialog").args(kdialog).output() {
+        Ok(out) if out.status.success() => {
+            let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            (!path.is_empty()).then(|| std::path::PathBuf::from(path))
+        }
+        _ => None,
+    }
+}
+
+fn open_book_dialog(initial_dir: Option<&Path>) -> Option<std::path::PathBuf> {
+    use std::process::Command;
+
+    let mut zenity = vec![
+        "--file-selection".to_string(),
+        "--title=Open opening book".to_string(),
+        "--file-filter=Opening books | *.bin *.BIN *.ctg *.CTG *.abk *.ABK *.bkt *.BKT".to_string(),
+        "--file-filter=Polyglot books (*.bin) | *.bin *.BIN".to_string(),
+        "--file-filter=ChessBase books (*.ctg) | *.ctg *.CTG".to_string(),
+        "--file-filter=Arena books (*.abk) | *.abk *.ABK".to_string(),
+        "--file-filter=All files | *".to_string(),
+    ];
+    if let Some(dir) = initial_dir.filter(|path| path.is_dir()) {
+        zenity.push(format!("--filename={}", dir.display()));
+    }
+    match Command::new("zenity").args(&zenity).output() {
+        Ok(out) if out.status.success() => {
+            let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            return (!path.is_empty()).then(|| std::path::PathBuf::from(path));
+        }
+        Ok(_) => return None,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return None,
+    }
+
+    let start = initial_dir
+        .filter(|path| path.is_dir())
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| ".".to_string());
+    let kdialog = [
+        "--getopenfilename",
+        start.as_str(),
+        "*.bin *.BIN *.ctg *.CTG *.abk *.ABK *.bkt *.BKT|Opening books",
     ];
     match Command::new("kdialog").args(kdialog).output() {
         Ok(out) if out.status.success() => {

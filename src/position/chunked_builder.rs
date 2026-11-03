@@ -95,8 +95,14 @@ where
             let mut chunk_games = 0usize;
 
             for game_idx in start..end {
-                let indexed_game = &library.games()[game_idx];
-                let game_meta = GameMeta::from_shared_tags(indexed_game.headers());
+                let headers_vec;
+                let tags = if let Some(indexed_game) = library.games().get(game_idx) {
+                    indexed_game.headers()
+                } else {
+                    headers_vec = library.game_headers(game_idx);
+                    &headers_vec
+                };
+                let game_meta = GameMeta::from_shared_tags(tags);
                 if options
                     .build_options
                     .rating_filter

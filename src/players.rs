@@ -162,57 +162,111 @@ impl PlayerDirectory {
     pub fn build(library: &dyn GameLibrary) -> Self {
         let mut by_key: HashMap<String, PlayerSummary> = HashMap::new();
 
-        for (index, game) in library.games().iter().enumerate() {
-            let white_key = player_key(game.white());
-            let black_key = player_key(game.black());
-            let same_player = white_key.is_some() && white_key == black_key;
+        if !library.games().is_empty() {
+            for (index, game) in library.games().iter().enumerate() {
+                let white_key = player_key(game.white());
+                let black_key = player_key(game.black());
+                let same_player = white_key.is_some() && white_key == black_key;
 
-            if let Some(key) = &white_key {
-                let summary = by_key.entry(key.clone()).or_insert_with(|| PlayerSummary {
-                    name: game.white().to_string(),
-                    key: key.clone(),
-                    title: None,
-                    fide_id: None,
-                    country: None,
-                    white: PlayerRecord::default(),
-                    black: PlayerRecord::default(),
-                    elo_sum: 0,
-                    elo_count: 0,
-                    elo_max: 0,
-                    opponent_elo_sum: 0,
-                    opponent_elo_count: 0,
-                    first_year: 0,
-                    last_year: 0,
-                    game_indices: Vec::new(),
-                });
-                add_game(
-                    summary,
-                    game,
-                    Color::White,
-                    index,
-                    same_player.then_some(Color::Black),
-                );
+                if let Some(key) = &white_key {
+                    let summary = by_key.entry(key.clone()).or_insert_with(|| PlayerSummary {
+                        name: game.white().to_string(),
+                        key: key.clone(),
+                        title: None,
+                        fide_id: None,
+                        country: None,
+                        white: PlayerRecord::default(),
+                        black: PlayerRecord::default(),
+                        elo_sum: 0,
+                        elo_count: 0,
+                        elo_max: 0,
+                        opponent_elo_sum: 0,
+                        opponent_elo_count: 0,
+                        first_year: 0,
+                        last_year: 0,
+                        game_indices: Vec::new(),
+                    });
+                    add_game(
+                        summary,
+                        game,
+                        Color::White,
+                        index,
+                        same_player.then_some(Color::Black),
+                    );
+                }
+
+                if !same_player && let Some(key) = &black_key {
+                    let summary = by_key.entry(key.clone()).or_insert_with(|| PlayerSummary {
+                        name: game.black().to_string(),
+                        key: key.clone(),
+                        title: None,
+                        fide_id: None,
+                        country: None,
+                        white: PlayerRecord::default(),
+                        black: PlayerRecord::default(),
+                        elo_sum: 0,
+                        elo_count: 0,
+                        elo_max: 0,
+                        opponent_elo_sum: 0,
+                        opponent_elo_count: 0,
+                        first_year: 0,
+                        last_year: 0,
+                        game_indices: Vec::new(),
+                    });
+                    add_game(summary, game, Color::Black, index, None);
+                }
             }
+        } else {
+            let total = library.len();
+            for index in 0..total {
+                let (white_name, black_name) = library.game_players(index);
+                let white_key = player_key(&white_name);
+                let black_key = player_key(&black_name);
+                let same_player = white_key.is_some() && white_key == black_key;
 
-            if !same_player && let Some(key) = &black_key {
-                let summary = by_key.entry(key.clone()).or_insert_with(|| PlayerSummary {
-                    name: game.black().to_string(),
-                    key: key.clone(),
-                    title: None,
-                    fide_id: None,
-                    country: None,
-                    white: PlayerRecord::default(),
-                    black: PlayerRecord::default(),
-                    elo_sum: 0,
-                    elo_count: 0,
-                    elo_max: 0,
-                    opponent_elo_sum: 0,
-                    opponent_elo_count: 0,
-                    first_year: 0,
-                    last_year: 0,
-                    game_indices: Vec::new(),
-                });
-                add_game(summary, game, Color::Black, index, None);
+                if let Some(key) = &white_key {
+                    let summary = by_key.entry(key.clone()).or_insert_with(|| PlayerSummary {
+                        name: white_name.clone(),
+                        key: key.clone(),
+                        title: None,
+                        fide_id: None,
+                        country: None,
+                        white: PlayerRecord::default(),
+                        black: PlayerRecord::default(),
+                        elo_sum: 0,
+                        elo_count: 0,
+                        elo_max: 0,
+                        opponent_elo_sum: 0,
+                        opponent_elo_count: 0,
+                        first_year: 0,
+                        last_year: 0,
+                        game_indices: Vec::new(),
+                    });
+                    summary.white.games += 1;
+                    summary.game_indices.push(index);
+                }
+
+                if !same_player && let Some(key) = &black_key {
+                    let summary = by_key.entry(key.clone()).or_insert_with(|| PlayerSummary {
+                        name: black_name.clone(),
+                        key: key.clone(),
+                        title: None,
+                        fide_id: None,
+                        country: None,
+                        white: PlayerRecord::default(),
+                        black: PlayerRecord::default(),
+                        elo_sum: 0,
+                        elo_count: 0,
+                        elo_max: 0,
+                        opponent_elo_sum: 0,
+                        opponent_elo_count: 0,
+                        first_year: 0,
+                        last_year: 0,
+                        game_indices: Vec::new(),
+                    });
+                    summary.black.games += 1;
+                    summary.game_indices.push(index);
+                }
             }
         }
 
