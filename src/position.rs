@@ -20,7 +20,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
-use memmap2::{Mmap, MmapOptions};
 
 use crate::chess::{
     CastlingMode, Chess, Fen, File as ChessFile, Move, Position, Role, San, SanPlus, Square,
@@ -29,10 +28,15 @@ use crate::chess::{
 use crate::library::{GameLibrary, SharedStr, SourceMeta};
 use crate::pgn::reader::{Reader, Visitor};
 
-const MAGIC: &[u8; 8] = b"BRETTPOS";
-const VERSION: u32 = 3;
-const HEADER_LEN: usize = 80;
-const EDGE_SIZE: usize = 120;
+pub mod chunked_builder;
+pub mod compactor;
+pub mod segment;
+pub mod segmented_index;
+
+pub(crate) const MAGIC: &[u8; 8] = b"BRETTPOS";
+pub(crate) const VERSION: u32 = 3;
+pub(crate) const HEADER_LEN: usize = 80;
+pub(crate) const EDGE_SIZE: usize = 120;
 const NO_PROMOTION: u32 = 7;
 
 /// Number of quarterly date buckets retained per `(position, move)` edge
@@ -209,45 +213,67 @@ impl PositionStats {
     }
 }
 
+pub use segment::IndexSegment;
+pub use segmented_index::SegmentedIndex;
+
 /// A memory-mapped, read-only position index.
+///
+/// Supports single monolithic index files (`.brettpos`) as well as tiered
+/// multi-segment indices (`.bpx`) for progressive live availability.
+#[derive(Clone)]
 pub struct PositionIndex {
-    mmap: Mmap,
-    header: IndexHeader,
-    source: PathBuf,
+    inner: SegmentedIndex,
 }
 
 impl PositionIndex {
     /// Load an index file, validating its header and length.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        let file = File::open(path).with_context(|| format!("opening index {}", path.display()))?;
-        // SAFETY: the file is opened read-only and the mapping is not exposed
-        // mutably. The index writer replaces the file atomically.
-        let mmap = unsafe { MmapOptions::new().map(&file) }
-            .with_context(|| format!("mapping index {}", path.display()))?;
-        let header = IndexHeader::parse(&mmap)
-            .with_context(|| format!("reading index header from {}", path.display()))?;
-        let expected = HEADER_LEN
-            .checked_add(
-                usize::try_from(header.edge_count)
-                    .context("index edge count does not fit in memory")?
-                    .checked_mul(EDGE_SIZE)
-                    .context("index length overflow")?,
-            )
-            .context("index length overflow")?;
-        if mmap.len() < expected {
-            bail!(
-                "index {} is truncated: {} bytes, expected at least {}",
-                path.display(),
-                mmap.len(),
-                expected
-            );
+        let segment = IndexSegment::open(path)?;
+        let mut segments = vec![segment];
+        let file_stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        if let Some(parent) = path.parent() {
+            if let Ok(entries) = fs::read_dir(parent) {
+                for entry in entries.flatten() {
+                    let p = entry.path();
+                    if p != path && p.extension().is_some_and(|ext| ext == "bpx") {
+                        if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
+                            if stem.starts_with(file_stem) {
+                                if let Ok(seg) = IndexSegment::open(&p) {
+                                    segments.push(seg);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
-        Ok(Self {
-            mmap,
-            header,
-            source: path.to_path_buf(),
-        })
+        let inner = SegmentedIndex::from_segments(path, segments);
+        Ok(Self { inner })
+    }
+
+    pub fn from_segmented(inner: SegmentedIndex) -> Self {
+        Self { inner }
+    }
+
+    pub fn segmented(&self) -> &SegmentedIndex {
+        &self.inner
+    }
+
+    pub fn segments(&self) -> Arc<std::sync::RwLock<Vec<IndexSegment>>> {
+        self.inner.segments_arc()
+    }
+
+    pub fn add_segment(&self, segment: IndexSegment) {
+        self.inner.add_segment(segment);
+    }
+
+    pub fn set_segments(&self, segments: Vec<IndexSegment>) {
+        self.inner.set_segments(segments);
+    }
+
+    pub fn segment_count(&self) -> usize {
+        self.inner.segment_count()
     }
 
     /// Open the cached index for `source`, if it exists and is current.
@@ -533,136 +559,73 @@ impl PositionIndex {
     }
 
     pub fn path(&self) -> &Path {
-        &self.source
+        self.inner.path()
     }
 
     pub fn game_count(&self) -> usize {
-        self.header.game_count as usize
+        self.inner.game_count()
     }
 
     pub fn edge_count(&self) -> usize {
-        self.header.edge_count as usize
+        self.inner.edge_count()
     }
 
     pub fn position_count(&self) -> usize {
-        self.header.position_count as usize
+        self.inner.position_count()
     }
 
     pub fn build_time(&self) -> Duration {
-        Duration::from_millis(self.header.build_millis)
+        let segs = self.inner.segments_arc();
+        let segs = segs.read().expect("segments lock poisoned");
+        segs.first()
+            .map(|s| Duration::from_millis(s.header().build_millis))
+            .unwrap_or_default()
     }
 
     pub fn file_len(&self) -> u64 {
-        self.mmap.len() as u64
+        self.inner.file_len()
     }
 
     pub fn empty(&self) -> bool {
-        self.header.edge_count == 0
+        self.inner.empty()
     }
 
     /// Move records from `key`, in stored `(move code)` order, with quarterly
     /// buckets aligned to the latest dated quarter at `key`.
     pub fn moves(&self, key: u64) -> Vec<MoveStat> {
-        let start = self.lower_bound(key);
-        let end = self.upper_bound(key);
-        if start == end {
-            return Vec::new();
-        }
-        let records: Vec<EdgeRecord> = (start..end).map(|i| self.edge_at(i)).collect();
-        let pos_anchor = records.iter().map(|r| r.anchor_quarter).max().unwrap_or(0);
-        records
-            .into_iter()
-            .map(|mut record| {
-                if pos_anchor != 0 && record.anchor_quarter != 0 {
-                    record.advance_anchor(pos_anchor);
-                } else if pos_anchor != 0 {
-                    record.anchor_quarter = pos_anchor;
-                }
-                MoveStat {
-                    key: record.key,
-                    mv: record.mv,
-                    games: record.games,
-                    white: record.white,
-                    draw: record.draw,
-                    black: record.black,
-                    elo_sum: record.elo_sum,
-                    elo_count: record.elo_count,
-                    first_date: record.first_date,
-                    last_date: record.last_date,
-                    anchor_quarter: record.anchor_quarter,
-                    older_dated: record.older_dated,
-                    buckets: record.buckets,
-                }
-            })
-            .collect()
+        self.inner.moves(key)
     }
 
     /// Aggregated statistics for a position, or `None` if no indexed game
     /// reached it with a move available.
     pub fn stats(&self, key: u64) -> Option<PositionStats> {
-        let start = self.lower_bound(key);
-        let end = self.upper_bound(key);
-        if start == end {
-            return None;
-        }
-        let mut stats = PositionStats::default();
-        for index in start..end {
-            let record = self.edge_at(index);
-            stats.games += record.games;
-            stats.white += record.white;
-            stats.draw += record.draw;
-            stats.black += record.black;
-            stats.elo_sum += record.elo_sum;
-            stats.elo_count += record.elo_count;
-            if record.first_date != 0
-                && (stats.first_date == 0 || record.first_date < stats.first_date)
-            {
-                stats.first_date = record.first_date;
-            }
-            if record.last_date > stats.last_date {
-                stats.last_date = record.last_date;
-            }
-        }
-        Some(stats)
+        self.inner.stats(key)
     }
 
     fn source_matches(&self, meta: &SourceMeta) -> bool {
-        self.header.source_len == meta.len
-            && self.header.source_mtime_secs == meta.mtime_secs
-            && self.header.source_mtime_nanos == meta.mtime_nanos
-    }
-
-    fn edge_at(&self, index: usize) -> EdgeRecord {
-        let start = HEADER_LEN + index * EDGE_SIZE;
-        read_edge(&self.mmap[start..start + EDGE_SIZE])
-    }
-
-    fn lower_bound(&self, key: u64) -> usize {
-        let mut lo = 0;
-        let mut hi = self.edge_count();
-        while lo < hi {
-            let mid = (lo + hi) / 2;
-            if self.edge_at(mid).key < key {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
+        let segs = self.inner.segments_arc();
+        let segs = segs.read().expect("segments lock poisoned");
+        if let Some(base) = segs.first() {
+            let h = base.header();
+            h.source_len == meta.len
+                && h.source_mtime_secs == meta.mtime_secs
+                && h.source_mtime_nanos == meta.mtime_nanos
+        } else {
+            false
         }
-        lo
     }
 
-    fn upper_bound(&self, key: u64) -> usize {
-        let mut lo = 0;
-        let mut hi = self.edge_count();
-        while lo < hi {
-            let mid = (lo + hi) / 2;
-            if self.edge_at(mid).key <= key {
-                lo = mid + 1;
-            } else {
-                hi = mid;
+    pub(crate) fn edge_at(&self, index: usize) -> EdgeRecord {
+        let segs = self.inner.segments_arc();
+        let segs = segs.read().expect("segments lock poisoned");
+        let mut offset = index;
+        for seg in segs.iter() {
+            if offset < seg.edge_count() {
+                return seg.edge_at(offset);
             }
+            offset -= seg.edge_count();
         }
-        lo
+        panic!("edge_at out of bounds: index {index} >= total {}", self.edge_count());
     }
 }
 
@@ -733,24 +696,24 @@ fn castle_destination(king: Square, rook: Square) -> Square {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct EdgeRecord {
-    key: u64,
-    mv: u32,
-    games: u32,
-    white: u32,
-    draw: u32,
-    black: u32,
-    elo_sum: u64,
-    elo_count: u32,
-    first_date: u32,
-    last_date: u32,
-    anchor_quarter: u32,
-    older_dated: u32,
-    buckets: [u32; TREND_BUCKETS],
+pub(crate) struct EdgeRecord {
+    pub(crate) key: u64,
+    pub(crate) mv: u32,
+    pub(crate) games: u32,
+    pub(crate) white: u32,
+    pub(crate) draw: u32,
+    pub(crate) black: u32,
+    pub(crate) elo_sum: u64,
+    pub(crate) elo_count: u32,
+    pub(crate) first_date: u32,
+    pub(crate) last_date: u32,
+    pub(crate) anchor_quarter: u32,
+    pub(crate) older_dated: u32,
+    pub(crate) buckets: [u32; TREND_BUCKETS],
 }
 
 impl EdgeRecord {
-    fn advance_anchor(&mut self, new_q: u32) {
+    pub(crate) fn advance_anchor(&mut self, new_q: u32) {
         if new_q == 0 {
             return;
         }
@@ -775,7 +738,7 @@ impl EdgeRecord {
         self.anchor_quarter = new_q;
     }
 
-    fn add_quarter(&mut self, q: u32) {
+    pub(crate) fn add_quarter(&mut self, q: u32) {
         if q == 0 {
             return;
         }
@@ -796,7 +759,7 @@ impl EdgeRecord {
         }
     }
 
-    fn merge_from(&mut self, other: &Self) {
+    pub(crate) fn merge_from(&mut self, other: &Self) {
         self.games = self.games.saturating_add(other.games);
         self.white = self.white.saturating_add(other.white);
         self.draw = self.draw.saturating_add(other.draw);
@@ -823,20 +786,20 @@ impl EdgeRecord {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-struct IndexHeader {
-    source_len: u64,
-    source_mtime_secs: u64,
-    source_mtime_nanos: u32,
-    max_plies: u32,
-    edge_count: u64,
-    game_count: u64,
-    position_count: u64,
-    build_millis: u64,
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct IndexHeader {
+    pub(crate) source_len: u64,
+    pub(crate) source_mtime_secs: u64,
+    pub(crate) source_mtime_nanos: u32,
+    pub(crate) max_plies: u32,
+    pub(crate) edge_count: u64,
+    pub(crate) game_count: u64,
+    pub(crate) position_count: u64,
+    pub(crate) build_millis: u64,
 }
 
 impl IndexHeader {
-    fn to_bytes(self) -> [u8; HEADER_LEN] {
+    pub(crate) fn to_bytes(self) -> [u8; HEADER_LEN] {
         let mut bytes = [0u8; HEADER_LEN];
         bytes[0..8].copy_from_slice(MAGIC);
         bytes[8..12].copy_from_slice(&VERSION.to_le_bytes());
@@ -851,7 +814,7 @@ impl IndexHeader {
         bytes
     }
 
-    fn parse(bytes: &[u8]) -> Result<Self> {
+    pub(crate) fn parse(bytes: &[u8]) -> Result<Self> {
         if bytes.len() < HEADER_LEN {
             bail!("index header is shorter than {HEADER_LEN} bytes");
         }
@@ -955,7 +918,7 @@ fn write_index(path: &Path, header: &IndexHeader, records: &[EdgeRecord]) -> Res
     Ok(())
 }
 
-fn write_edge(bytes: &mut [u8; EDGE_SIZE], r: &EdgeRecord) {
+pub(crate) fn write_edge(bytes: &mut [u8; EDGE_SIZE], r: &EdgeRecord) {
     bytes[0..8].copy_from_slice(&r.key.to_le_bytes());
     bytes[8..12].copy_from_slice(&r.mv.to_le_bytes());
     bytes[12..16].copy_from_slice(&r.games.to_le_bytes());
@@ -974,7 +937,7 @@ fn write_edge(bytes: &mut [u8; EDGE_SIZE], r: &EdgeRecord) {
     }
 }
 
-fn read_edge(bytes: &[u8]) -> EdgeRecord {
+pub(crate) fn read_edge(bytes: &[u8]) -> EdgeRecord {
     let mut buckets = [0u32; TREND_BUCKETS];
     for (i, slot) in buckets.iter_mut().enumerate() {
         let start = 56 + i * 4;
