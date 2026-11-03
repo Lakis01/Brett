@@ -296,12 +296,20 @@ impl PositionIndex {
     pub fn open_cached(source: impl AsRef<Path>) -> Result<Option<Self>> {
         let source = source.as_ref();
         let meta = SourceMeta::read(source)?;
+        let sidecar = source.with_extension("brettpos");
+        if let Some(index) = Self::open_cached_at(source, &sidecar, &meta)? {
+            return Ok(Some(index));
+        }
         Self::open_cached_at(source, &cache_path(source), &meta)
     }
 
     /// Open the cached index for a database, if it exists and is current.
     pub fn open_cached_for(library: &dyn GameLibrary) -> Result<Option<Self>> {
         let meta = library.source_meta()?;
+        let sidecar = library.path().with_extension("brettpos");
+        if let Some(index) = Self::open_cached_at(library.path(), &sidecar, &meta)? {
+            return Ok(Some(index));
+        }
         let path = cache_path(library.path());
         Self::open_cached_at(library.path(), &path, &meta)
     }

@@ -715,6 +715,7 @@ pub struct App {
     index_job: Option<PathBuf>,
     index_status: String,
     confirm_large_index: bool,
+    prompt_persist_index: Option<PathBuf>,
     /// Folder of the last database opened or saved. Database pickers start
     /// here so the user usually lands in the right directory.
     last_database_dir: Option<PathBuf>,
@@ -1060,6 +1061,7 @@ impl App {
             index_job: None,
             index_status: "No position index yet.".to_string(),
             confirm_large_index: false,
+            prompt_persist_index: None,
             last_database_dir: display_prefs.last_database_dir.clone(),
             last_print_dir: display_prefs.last_print_dir.clone(),
             database_save_path: None,
@@ -1792,7 +1794,8 @@ impl App {
         if let Some(id) = self.session.id_at(0) {
             self.select_slot(id);
         }
-        if count > LARGE_DATABASE_GAMES {
+        self.prompt_persist_index = None;
+        if count > 2_000 {
             self.start_player_directory(library, path.to_path_buf());
         } else {
             self.players = PlayerDirectory::build(library.as_ref());
@@ -3588,6 +3591,12 @@ impl App {
                 Ok(TreeIndexMessage::Done(Ok((library, index)))) => {
                     self.tree_status =
                         format!("{} · {}", library.path().display(), index_summary(&index));
+                    if library.len() > LARGE_DATABASE_GAMES {
+                        let sidecar = library.path().with_extension("brettpos");
+                        if !sidecar.exists() {
+                            self.prompt_persist_index = Some(library.path().to_path_buf());
+                        }
+                    }
                     self.tree_library = Some(library);
                     self.tree_index = Some(index);
                     self.tree_index_job = None;
@@ -3718,6 +3727,14 @@ impl App {
                     self.index_status = index_summary(&index);
                     self.index = Some(index);
                     self.index_job = None;
+                    if let Some(library) = &self.library {
+                        if library.len() > LARGE_DATABASE_GAMES {
+                            let sidecar = library.path().with_extension("brettpos");
+                            if !sidecar.exists() {
+                                self.prompt_persist_index = Some(library.path().to_path_buf());
+                            }
+                        }
+                    }
                     keep = false;
                     break;
                 }
@@ -9996,6 +10013,8 @@ impl App {
         let mut choose_book = false;
         let mut clear_book = false;
         let mut build_index = false;
+        let mut save_sidecar = None;
+        let mut dismiss_prompt = false;
         let book = self.book.clone();
         let book_status = self.book_status.clone();
 
@@ -10062,6 +10081,37 @@ impl App {
                 });
                 ui.label(RichText::new(&self.tree_status).small().weak());
                 ui.add_space(4.0);
+
+                if let Some(source) = &self.prompt_persist_index {
+                    ui.add_space(4.0);
+                    egui::Frame::new()
+                        .fill(SURFACE)
+                        .corner_radius(8.0)
+                        .stroke(Stroke::new(1.0, GOLD))
+                        .inner_margin(8.0)
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new("⚡ Large Database Index Complete").strong().color(GOLD));
+                            });
+                            ui.label(
+                                RichText::new(format!(
+                                    "Save index alongside {} so it loads immediately next time?",
+                                    source.file_name().and_then(|n| n.to_str()).unwrap_or("database")
+                                ))
+                                .small(),
+                            );
+                            ui.add_space(3.0);
+                            ui.horizontal(|ui| {
+                                if ui.button("Save Index to Database Folder").clicked() {
+                                    save_sidecar = Some(source.clone());
+                                }
+                                if ui.button("Dismiss").clicked() {
+                                    dismiss_prompt = true;
+                                }
+                            });
+                        });
+                    ui.add_space(4.0);
+                }
 
                 let tree_index = self.tree_index.as_ref().or(self.index.as_ref());
                 let tree_label = if self.tree_index.is_some() {
@@ -10361,6 +10411,27 @@ impl App {
 
         if build_index {
             self.request_index_build();
+        }
+        if let Some(source) = save_sidecar {
+            let cached = position::cache_path(&source);
+            let sidecar = source.with_extension("brettpos");
+            if cached.exists() {
+                match std::fs::copy(&cached, &sidecar) {
+                    Ok(_) => {
+                        self.status = format!("Index saved to {}", sidecar.display());
+                        self.prompt_persist_index = None;
+                    }
+                    Err(err) => {
+                        self.status =
+                            format!("Failed to save index to {}: {err:#}", sidecar.display());
+                    }
+                }
+            } else {
+                self.prompt_persist_index = None;
+            }
+        }
+        if dismiss_prompt {
+            self.prompt_persist_index = None;
         }
         if choose_tree && let Some(path) = open_dialog(None) {
             self.tree_path = path.display().to_string();
@@ -18143,6 +18214,7 @@ mod tests {
             index_job: None,
             index_status: String::new(),
             confirm_large_index: false,
+            prompt_persist_index: None,
             last_database_dir: None,
             last_print_dir: None,
             database_save_path: None,
