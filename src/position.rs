@@ -213,6 +213,7 @@ impl PositionStats {
     }
 }
 
+pub use chunked_builder::{ChunkedBuildOptions, DEFAULT_CHUNK_SIZE, build_chunked_parallel};
 pub use segment::IndexSegment;
 pub use segmented_index::SegmentedIndex;
 
@@ -1349,15 +1350,15 @@ fn write_merged_sources(
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-struct GameMeta {
-    outcome: Outcome,
-    white_elo: Option<u32>,
-    black_elo: Option<u32>,
-    date: u32,
+pub(crate) struct GameMeta {
+    pub(crate) outcome: Outcome,
+    pub(crate) white_elo: Option<u32>,
+    pub(crate) black_elo: Option<u32>,
+    pub(crate) date: u32,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-enum Outcome {
+pub(crate) enum Outcome {
     White,
     Draw,
     Black,
@@ -1366,7 +1367,7 @@ enum Outcome {
 }
 
 impl GameMeta {
-    fn average_elo(&self) -> Option<u32> {
+    pub(crate) fn average_elo(&self) -> Option<u32> {
         match (self.white_elo, self.black_elo) {
             (Some(white), Some(black)) => Some(((u64::from(white) + u64::from(black)) / 2) as u32),
             (Some(elo), None) | (None, Some(elo)) => Some(elo),
@@ -1374,7 +1375,7 @@ impl GameMeta {
         }
     }
 
-    fn from_tags(tags: &[(String, String)]) -> Self {
+    pub(crate) fn from_tags(tags: &[(String, String)]) -> Self {
         let mut meta = Self::default();
         for (key, value) in tags {
             meta.observe_tag(key, value);
@@ -1382,7 +1383,7 @@ impl GameMeta {
         meta
     }
 
-    fn from_shared_tags(tags: &[(SharedStr, SharedStr)]) -> Self {
+    pub(crate) fn from_shared_tags(tags: &[(SharedStr, SharedStr)]) -> Self {
         let mut meta = Self::default();
         for (key, value) in tags {
             meta.observe_tag(key.as_str(), value.as_str());
@@ -1390,7 +1391,7 @@ impl GameMeta {
         meta
     }
 
-    fn observe_tag(&mut self, key: &str, value: &str) {
+    pub(crate) fn observe_tag(&mut self, key: &str, value: &str) {
         if key.eq_ignore_ascii_case("Result") {
             self.outcome = match value {
                 "1-0" => Outcome::White,
@@ -1407,7 +1408,7 @@ impl GameMeta {
         }
     }
 
-    fn add_to(&self, record: &mut EdgeRecord) {
+    pub(crate) fn add_to(&self, record: &mut EdgeRecord) {
         record.games += 1;
         match self.outcome {
             Outcome::White => record.white += 1,

@@ -27,7 +27,7 @@ pub fn stream_2cbh_mainline<F>(
     consumer: &mut F,
 ) -> Result<()>
 where
-    F: FnMut(u64, u32),
+    F: FnMut(u64, u32) + ?Sized,
 {
     let mut current_pos = start_pos.clone();
     let mut plies = 0u32;

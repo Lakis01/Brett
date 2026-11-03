@@ -24,7 +24,7 @@ pub fn stream_cbh_mainline<F>(
     consumer: &mut F,
 ) -> Result<()>
 where
-    F: FnMut(u64, u32),
+    F: FnMut(u64, u32) + ?Sized,
 {
     let (table, pre, simple) = match mode {
         0 => (&tables::MODE_0, true, false),
@@ -50,7 +50,7 @@ where
     walker.walk(stream)
 }
 
-struct FastMainlineWalker<'a, F> {
+struct FastMainlineWalker<'a, F: ?Sized> {
     table: &'static [u8; 256],
     pre: bool,
     simple: bool,
@@ -64,7 +64,7 @@ struct FastMainlineWalker<'a, F> {
     consumer: &'a mut F,
 }
 
-impl<F: FnMut(u64, u32)> FastMainlineWalker<'_, F> {
+impl<F: ?Sized + FnMut(u64, u32)> FastMainlineWalker<'_, F> {
     fn walk(&mut self, stream: &[u8]) -> Result<()> {
         if self.simple {
             self.simple_stream(stream)

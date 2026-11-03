@@ -343,6 +343,19 @@ pub trait GameLibrary: Send + Sync {
     fn as_pgn(&self) -> Option<&PgnLibrary> {
         None
     }
+
+    /// Stream mainline moves directly to a consumer without allocating game trees.
+    /// Returns `Ok(true)` if supported and streamed, or `Ok(false)` to fall back
+    /// to loading full `Game` objects.
+    fn stream_mainline(
+        &self,
+        index: usize,
+        max_plies: u32,
+        consumer: &mut dyn FnMut(u64, u32),
+    ) -> Result<bool> {
+        let _ = (index, max_plies, consumer);
+        Ok(false)
+    }
 }
 
 pub(crate) fn filter_games(games: &[IndexedGame], needle: &str) -> Vec<usize> {

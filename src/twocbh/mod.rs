@@ -438,6 +438,49 @@ impl GameLibrary for TwoCbhLibrary {
         TwoCbhLibrary::load(self, index)
     }
 
+    fn stream_mainline(
+        &self,
+        index: usize,
+        max_plies: u32,
+        consumer: &mut dyn FnMut(u64, u32),
+    ) -> Result<bool> {
+        let entry = self
+            .entries
+            .get(index)
+            .with_context(|| format!("2CBH game index {index} is out of range"))?;
+        let content = self.file.content(entry.id)?;
+        let words = content.words();
+        let record_start = start_id_from_record(self.file.record(entry.id)?);
+        let (start_pos, chess960, move_tokens) = match content.kind {
+            1 => {
+                if words.first() != Some(&0xfffc) {
+                    bail!("2CBH game {} has no standard start marker", entry.id);
+                }
+                (crate::chess::Chess::default(), false, &words[1..])
+            }
+            2 => {
+                if words.first() != Some(&0xfffb) || words.get(2) != Some(&0xfffc) {
+                    bail!("2CBH game {} has a malformed Chess960 start marker", entry.id);
+                }
+                let start_id = *words.get(1).context("Chess960 start id is missing")?;
+                if let Some(record_start) = record_start
+                    && record_start != start_id
+                {
+                    bail!(
+                        "2CBH game {} says Chess960 start {start_id} in its move record but {record_start} in its header",
+                        entry.id
+                    );
+                }
+                let pos = moves::start_position_960(start_id)
+                    .with_context(|| format!("2CBH game {} Chess960 start {start_id}", entry.id))?;
+                (pos, true, &words[3..])
+            }
+            kind => bail!("2CBH game {} uses unknown encoding kind {kind}", entry.id),
+        };
+        fast_index::stream_2cbh_mainline(&start_pos, move_tokens, chess960, max_plies, consumer)?;
+        Ok(true)
+    }
+
     fn source_meta(&self) -> Result<SourceMeta> {
         let mut parts = vec![
             SourceMeta::read(&self.file.cbh_path)?,

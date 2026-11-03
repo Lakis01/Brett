@@ -384,6 +384,48 @@ impl GameLibrary for CbhLibrary {
         CbhLibrary::load(self, index)
     }
 
+    fn stream_mainline(
+        &self,
+        index: usize,
+        max_plies: u32,
+        consumer: &mut dyn FnMut(u64, u32),
+    ) -> Result<bool> {
+        let entry = self
+            .entries
+            .get(index)
+            .with_context(|| format!("ChessBase game index {index} is out of range"))?;
+        let (moves_offset, _) = match &self.wide {
+            Some(wide) => wide.offsets(entry.id, (entry.moves_offset, entry.annotations_offset))?,
+            None => (
+                u64::from(entry.moves_offset),
+                u64::from(entry.annotations_offset),
+            ),
+        };
+        let record = read_record(
+            &self.cbg_path,
+            moves_offset,
+            MAX_MOVE_RECORD,
+            "move",
+            entry.id,
+            MIN_CBG_HEADER,
+        )?;
+        let (start, consumed) = moves::decode_start(record.head[0], &record.bytes)
+            .with_context(|| format!("decoding start of ChessBase game {}", entry.id))?;
+        let mode = record.head[0] & 0x3f;
+        if mode == 11 {
+            return Ok(true);
+        }
+        fast_index::stream_cbh_mainline(
+            &start.pos,
+            mode,
+            &record.bytes[consumed..],
+            start.chess960,
+            max_plies,
+            consumer,
+        )?;
+        Ok(true)
+    }
+
     fn source_meta(&self) -> Result<SourceMeta> {
         let mut parts = vec![SourceMeta::read(&self.cbh_path)?];
         if self.path != self.cbh_path {
