@@ -420,25 +420,37 @@ impl PrepSession {
 
 /// One row of the opponent-prediction table, combining player likelihood with
 /// the normal position-tree statistics for the same candidate move.
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 struct PrepPredictionRow {
     mv: Move,
     san: String,
+    #[allow(dead_code)]
     probability: f64,
+    #[allow(dead_code)]
     probability_low: f64,
+    #[allow(dead_code)]
     probability_high: f64,
     player_games: u32,
+    player_wins: u32,
+    player_draws: u32,
+    player_losses: u32,
     recent_games: u32,
+    #[allow(dead_code)]
     prior_games: u32,
     last_date: u32,
+    #[allow(dead_code)]
     trend_pp: Option<f64>,
+    #[allow(dead_code)]
     tree: Option<position::MoveStat>,
 }
 
 struct PrepPredictionData {
     rows: Vec<PrepPredictionRow>,
     stats: Option<players::PlayerPositionStats>,
+    #[allow(dead_code)]
     prediction: players::Prediction,
+    #[allow(dead_code)]
     warning: Option<String>,
 }
 
@@ -10447,6 +10459,11 @@ impl App {
             .as_ref()
             .map(|index| index.moves(key))
             .unwrap_or_default();
+        let player_move_stats: HashMap<u32, players::PlayerMoveStat> = book
+            .moves(key)
+            .into_iter()
+            .map(|stat| (stat.mv, stat))
+            .collect();
         let rows = prediction
             .moves
             .iter()
@@ -10458,6 +10475,10 @@ impl App {
                     .iter()
                     .find(|stat| stat.mv == predicted.mv)
                     .copied();
+                let p_stat = player_move_stats.get(&predicted.mv);
+                let player_wins = p_stat.map(|s| s.wins).unwrap_or(0);
+                let player_draws = p_stat.map(|s| s.draws).unwrap_or(0);
+                let player_losses = p_stat.map(|s| s.losses).unwrap_or(0);
                 Some(PrepPredictionRow {
                     mv,
                     san,
@@ -10465,6 +10486,9 @@ impl App {
                     probability_low: predicted.probability_low,
                     probability_high: predicted.probability_high,
                     player_games: predicted.player_games,
+                    player_wins,
+                    player_draws,
+                    player_losses,
                     recent_games: predicted.recent_games,
                     prior_games: predicted.prior_games,
                     last_date: predicted.last_date,
@@ -10696,8 +10720,6 @@ impl App {
                 } else if let Some(data) = &prediction_data {
                     let rows = &data.rows;
                     let stats = &data.stats;
-                    let prediction = &data.prediction;
-                    let warning = &data.warning;
                     if let Some(stats) = stats {
                         ui.horizontal_wrapped(|ui| {
                             let games_here = if stats.games == 1 {
@@ -10733,158 +10755,70 @@ impl App {
                             .weak(),
                         );
                     }
-                    let prior_label = match prediction.prior_source {
-                        players::PriorSource::Reference => {
-                            format!("reference prior ({} games)", games_label(prediction.prior_games as usize))
-                        }
-                        players::PriorSource::CurrentDatabase => format!(
-                            "current-database prior ({} games)",
-                            games_label(prediction.prior_games as usize)
-                        ),
-                    };
-                    ui.label(
-                        RichText::new(format!(
-                            "Recency-weighted Bayes · {} player games · {} in the last 2 years · {}",
-                            prediction.player_games, prediction.recent_games, prior_label
-                        ))
-                        .weak()
-                        .small(),
-                    )
-                    .on_hover_text(
-                        "Posterior mean with an approximate 90% credible interval. The model uses exponential time decay (18-month half-life), a sample-size-shrunk Dirichlet background prior, and a two-year recent-window mixture. Probability is reserved for legal moves that are not in the data.",
-                    );
-                    if let Some(warning) = warning {
-                        ui.label(RichText::new(warning).small().color(Color32::from_rgb(
-                            0xD9, 0xA6, 0x6A,
-                        )));
-                    }
+                    let player_moves: Vec<_> = rows.iter().filter(|r| r.player_games > 0).collect();
 
-                    if let Some(top) = rows.first() {
+                    if player_moves.is_empty() {
                         ui.add_space(6.0);
-                        ui.horizontal_wrapped(|ui| {
-                            ui.label(RichText::new("Predicted:").strong());
-                            ui.label(
-                                RichText::new(domain::figurine_san(&top.san))
-                                    .monospace()
-                                    .size(18.0)
-                                    .strong(),
-                            );
-                            ui.label(
-                                RichText::new(format!(
-                                    "{:.0}% · 90% CI {:.0}–{:.0}%",
-                                    top.probability * 100.0,
-                                    top.probability_low * 100.0,
-                                    top.probability_high * 100.0
-                                ))
-                                .strong()
-                                .color(Color32::from_rgb(0x9F, 0xD0, 0xA8)),
-                            );
-                            ui.label(
-                                RichText::new(prediction.confidence_label())
-                                    .weak()
-                                    .small(),
-                            );
-                            if top.player_games == 0 {
-                                ui.label(RichText::new("prior only").weak().small());
-                            }
-                        });
-                    }
-
-                    if rows.is_empty() {
-                        ui.add_space(8.0);
-                        ui.label(RichText::new("No move observations to predict from.").weak());
+                        ui.label(
+                            RichText::new("No observed moves by this player in this position.")
+                                .weak()
+                                .italics(),
+                        );
                     } else {
                         ui.add_space(4.0);
-                        for row in rows {
-                            ui.horizontal(|ui| {
-                                let mut text = RichText::new(domain::figurine_san(&row.san))
-                                    .monospace()
-                                    .strong();
-                                if row.player_games == 0 {
-                                    text = text.weak();
+                        egui::Grid::new("prep-player-moves-grid")
+                            .num_columns(5)
+                            .striped(true)
+                            .spacing([12.0, 4.0])
+                            .show(ui, |ui| {
+                                for heading in ["Move", "Games", "Score", "Result (+/=/-)", "Last Played"] {
+                                    ui.label(RichText::new(heading).strong().small());
                                 }
-                                let response = ui
-                                    .selectable_label(false, text)
-                                    .on_hover_text("Hover to preview · click to play");
-                                if response.hovered() {
-                                    hover_preview = preview_after_move(pos, row.mv);
-                                }
-                                if response.clicked() {
-                                    clicked = Some(row.mv);
-                                }
-                                probability_bar(
-                                    ui,
-                                    row.probability,
-                                    row.probability_low,
-                                    row.probability_high,
-                                );
-                            });
-                            ui.horizontal_wrapped(|ui| {
-                                ui.add_space(4.0);
-                                let player = if row.player_games == 0 {
-                                    "player: no direct games".to_string()
-                                } else {
-                                    format!(
-                                        "player: {} · {} recent · last {}",
-                                        games_label(row.player_games as usize),
-                                        row.recent_games,
+                                ui.end_row();
+
+                                for row in &player_moves {
+                                    let text = RichText::new(domain::figurine_san(&row.san))
+                                        .monospace()
+                                        .strong();
+                                    let response = ui
+                                        .selectable_label(false, text)
+                                        .on_hover_text("Hover to preview · click to play");
+                                    if response.hovered() {
+                                        hover_preview = preview_after_move(pos, row.mv);
+                                    }
+                                    if response.clicked() {
+                                        clicked = Some(row.mv);
+                                    }
+
+                                    ui.label(row.player_games.to_string());
+
+                                    let decided = row.player_wins + row.player_draws + row.player_losses;
+                                    let score_pct = if decided > 0 {
+                                        (row.player_wins as f32 + row.player_draws as f32 * 0.5) / decided as f32 * 100.0
+                                    } else {
+                                        0.0
+                                    };
+                                    ui.label(format!("{score_pct:.0}%"));
+
+                                    ui.label(format!(
+                                        "+{} ={} -{}",
+                                        row.player_wins, row.player_draws, row.player_losses
+                                    ));
+
+                                    let date_str = if row.last_date > 0 {
                                         short_date(row.last_date)
-                                    )
-                                };
-                                ui.label(RichText::new(player).small().weak());
-                                let (trend, color) = trend_label(row.trend_pp);
-                                ui.label(RichText::new(trend).small().color(color));
+                                    } else {
+                                        "—".to_string()
+                                    };
+                                    let recent_suffix = if row.recent_games > 0 {
+                                        format!(" ({})", row.recent_games)
+                                    } else {
+                                        String::new()
+                                    };
+                                    ui.label(format!("{date_str}{recent_suffix}"));
+                                    ui.end_row();
+                                }
                             });
-                            ui.horizontal_wrapped(|ui| {
-                                ui.add_space(4.0);
-                                let tree = row.tree.map_or_else(
-                                    || "tree: no database games".to_string(),
-                                    |stat| {
-                                        let elo = stat
-                                            .elo_avg()
-                                            .map(|elo| format!("{elo:.0}"))
-                                            .unwrap_or_else(|| "—".to_string());
-                                        format!(
-                                            "tree: {} · score {:.0}% · W/D/B {}/{}/{} · Elo {} · {}",
-                                            games_label(stat.games as usize),
-                                            stat.score_white() * 100.0,
-                                            stat.white,
-                                            stat.draw,
-                                            stat.black,
-                                            elo,
-                                            date_range(stat.first_date, stat.last_date)
-                                        )
-                                    },
-                                );
-                                ui.label(RichText::new(tree).small().weak());
-                                ui.label(
-                                    RichText::new(format!(
-                                        "· model prior {}",
-                                        games_label(row.prior_games as usize)
-                                    ))
-                                    .small()
-                                    .weak(),
-                                );
-                            });
-                            ui.add_space(4.0);
-                            ui.separator();
-                        }
-                    }
-                    if prediction.unseen_probability > 0.001 {
-                        ui.add_space(2.0);
-                        ui.label(
-                            RichText::new(format!(
-                                "Other legal moves not in the data: {:.1}% ({} of {} legal moves)",
-                                prediction.unseen_probability * 100.0,
-                                prediction.unseen_moves,
-                                prediction.legal_moves
-                            ))
-                            .weak()
-                            .small(),
-                        )
-                        .on_hover_text(
-                            "Residual probability reserved for moves absent from the player book and the background prior. This is why a small sample never reaches 100%.",
-                        );
                     }
                 } else {
                     ui.add_space(4.0);
@@ -16971,6 +16905,7 @@ fn short_date(date: u32) -> String {
     }
 }
 
+#[allow(dead_code)]
 fn trend_label(trend: Option<f64>) -> (String, Color32) {
     match trend {
         Some(delta) if delta > 1.0 => (
@@ -16987,6 +16922,7 @@ fn trend_label(trend: Option<f64>) -> (String, Color32) {
 
 /// Horizontal probability bar used by the player-prediction table. The filled
 /// width is the posterior mean; the gold segment marks the 90% interval.
+#[allow(dead_code)]
 fn probability_bar(ui: &mut Ui, probability: f64, low: f64, high: f64) {
     let (rect, response) = ui.allocate_exact_size(vec2(84.0, 16.0), Sense::hover());
     let painter = ui.painter_at(rect);
