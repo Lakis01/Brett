@@ -154,6 +154,103 @@ impl SegmentedIndex {
         }
         Some(stats)
     }
+
+    /// Build and register a new delta segment from additional games without
+    /// rebuilding the existing segments.
+    pub fn append_delta_segment(
+        &self,
+        games: &[crate::domain::Game],
+        meta: crate::library::SourceMeta,
+        delta_path: impl AsRef<Path>,
+        options: super::BuildOptions,
+    ) -> anyhow::Result<super::BuildReport> {
+        let delta_path = delta_path.as_ref();
+        let started = std::time::Instant::now();
+        let mut records: std::collections::HashMap<(u64, u32), super::EdgeRecord> =
+            std::collections::HashMap::new();
+        let mut added_games = 0usize;
+
+        for game in games {
+            let game_meta = super::GameMeta::from_tags(&game.headers);
+            if options
+                .rating_filter
+                .is_some_and(|filter| !filter.accepts(&game_meta))
+            {
+                continue;
+            }
+            let mut game_keys = std::collections::HashSet::new();
+            let mut node = 0usize;
+            let mut plies = 0u32;
+            while let Some(&child) = game.nodes[node].children.first() {
+                let parent = &game.nodes[node];
+                let Some(ply) = game.nodes[child].mv.as_ref() else {
+                    break;
+                };
+                if ply.uci == "0000" {
+                    break;
+                }
+                let Ok(ucimove) = crate::chess::UciMove::from_ascii(ply.uci.as_bytes()) else {
+                    break;
+                };
+                let Ok(mv) = ucimove.to_move(&parent.pos) else {
+                    break;
+                };
+                let Some(code) = crate::position::encode_move(mv) else {
+                    break;
+                };
+                let key = parent.pos.position_hash();
+                if !game_keys.insert(key) {
+                    break;
+                }
+                let record = records.entry((key, code)).or_default();
+                record.key = key;
+                record.mv = code;
+                game_meta.add_to(record);
+                node = child;
+                plies += 1;
+                if plies >= options.max_plies {
+                    break;
+                }
+            }
+            added_games += 1;
+        }
+
+        let mut sorted_records: Vec<super::EdgeRecord> = records.into_values().collect();
+        sorted_records.sort_unstable_by(|a, b| a.key.cmp(&b.key).then(a.mv.cmp(&b.mv)));
+
+        let mut unique_positions = 0usize;
+        let mut last_key = None;
+        for r in &sorted_records {
+            if last_key != Some(r.key) {
+                unique_positions += 1;
+                last_key = Some(r.key);
+            }
+        }
+
+        let header = super::IndexHeader {
+            source_len: meta.len,
+            source_mtime_secs: meta.mtime_secs,
+            source_mtime_nanos: meta.mtime_nanos,
+            max_plies: options.max_plies,
+            edge_count: sorted_records.len() as u64,
+            game_count: added_games as u64,
+            position_count: unique_positions as u64,
+            build_millis: started.elapsed().as_millis() as u64,
+        };
+
+        IndexSegment::write_records(delta_path, header, &sorted_records)?;
+        let seg = IndexSegment::open(delta_path)?;
+        self.add_segment(seg);
+
+        Ok(super::BuildReport {
+            games: added_games,
+            edges: sorted_records.len(),
+            positions: unique_positions,
+            elapsed: started.elapsed(),
+            bytes: super::HEADER_LEN as u64
+                + sorted_records.len() as u64 * super::EDGE_SIZE as u64,
+        })
+    }
 }
 
 #[cfg(test)]

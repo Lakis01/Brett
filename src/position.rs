@@ -214,6 +214,7 @@ impl PositionStats {
 }
 
 pub use chunked_builder::{ChunkedBuildOptions, DEFAULT_CHUNK_SIZE, build_chunked_parallel};
+pub use compactor::compact_segments;
 pub use segment::IndexSegment;
 pub use segmented_index::SegmentedIndex;
 
@@ -275,6 +276,20 @@ impl PositionIndex {
 
     pub fn segment_count(&self) -> usize {
         self.inner.segment_count()
+    }
+
+    pub fn append_delta_segment(
+        &self,
+        games: &[crate::domain::Game],
+        meta: SourceMeta,
+        delta_path: impl AsRef<Path>,
+        options: BuildOptions,
+    ) -> Result<BuildReport> {
+        self.inner.append_delta_segment(games, meta, delta_path, options)
+    }
+
+    pub fn compact(&self, meta: SourceMeta, max_plies: u32) -> Result<BuildReport> {
+        compact_segments(&self.inner, self.path(), meta, max_plies)
     }
 
     /// Open the cached index for `source`, if it exists and is current.
@@ -1165,10 +1180,15 @@ impl Drop for EdgeAccumulator {
     }
 }
 
-enum MergeSource<'a> {
+pub(crate) enum MergeSource<'a> {
     RunFile(BufReader<File>),
     Index {
         index: &'a PositionIndex,
+        pos: usize,
+        end: usize,
+    },
+    Segment {
+        segment: &'a IndexSegment,
         pos: usize,
         end: usize,
     },
@@ -1193,6 +1213,15 @@ impl MergeSource<'_> {
                     Ok(None)
                 } else {
                     let record = index.edge_at(*pos);
+                    *pos += 1;
+                    Ok(Some(record))
+                }
+            }
+            Self::Segment { segment, pos, end } => {
+                if *pos >= *end {
+                    Ok(None)
+                } else {
+                    let record = segment.edge_at(*pos);
                     *pos += 1;
                     Ok(Some(record))
                 }
@@ -1235,7 +1264,7 @@ impl Ord for HeapItem {
     }
 }
 
-fn write_merged_sources(
+pub(crate) fn write_merged_sources(
     index_path: &Path,
     meta: SourceMeta,
     max_plies: u32,

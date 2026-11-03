@@ -29,7 +29,7 @@ use crate::domain::{self, Game};
 use crate::pgn::reader::{Reader, Visitor};
 
 /// Metadata used to decide whether a cached position index is still current.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SourceMeta {
     pub len: u64,
     pub mtime_secs: u64,
