@@ -6384,6 +6384,16 @@ impl App {
     fn select_source(&mut self, source_index: usize) {
         if let Some(id) = self.session.source_slot(source_index) {
             self.select_slot(id);
+        } else if let Some(library) = self.library.clone() {
+            match library.load(source_index) {
+                Ok(game) => {
+                    let id = self.session.insert_game(game, None);
+                    self.select_slot(id);
+                }
+                Err(err) => {
+                    self.status = format!("Could not load game {}: {err:#}", source_index + 1);
+                }
+            }
         } else {
             self.status = format!("Game {} is no longer in the session.", source_index + 1);
         }
@@ -7755,14 +7765,15 @@ impl App {
                 };
                 self.library
                     .as_ref()
-                    .and_then(|library| library.get(*index))
-                    .is_some_and(|entry| {
-                        let white = players::player_key(entry.white()).as_deref()
+                    .map(|library| {
+                        let (white_name, black_name) = library.game_players(*index);
+                        let white = players::player_key(&white_name).as_deref()
                             == Some(player.key.as_str());
-                        let black = players::player_key(entry.black()).as_deref()
+                        let black = players::player_key(&black_name).as_deref()
                             == Some(player.key.as_str());
                         if color == Color::White { white } else { black }
                     })
+                    .unwrap_or(false)
             })
             .collect();
         let mut back = false;
@@ -8031,41 +8042,103 @@ impl App {
                 .auto_shrink([false, false])
                 .show_rows(ui, row_h, total, |ui, range| {
                     for &idx in &game_indices[range] {
-                        let Some(entry) = self.library.as_ref().and_then(|l| l.get(idx)) else {
+                        let Some(library) = self.library.as_ref() else {
                             continue;
                         };
-                        let player_white = players::player_key(entry.white()).as_deref()
-                            == Some(player.key.as_str());
-                        let (opponent, opponent_color, color) = if player_white {
-                            (entry.black(), Color::Black, "White")
-                        } else {
-                            (entry.white(), Color::White, "Black")
-                        };
-                        let opponent_title = title_from_tag(entry.header(match opponent_color {
-                            Color::White => "WhiteTitle",
-                            Color::Black => "BlackTitle",
-                        }));
-                        let opponent_fide_id =
-                            player_fide_id_from_header(entry.header(match opponent_color {
-                                Color::White => "WhiteFideId",
-                                Color::Black => "BlackFideId",
-                            }));
-                        let opponent_country = player_country_from_header(
-                            entry
-                                .header(match opponent_color {
-                                    Color::White => "WhiteCountry",
-                                    Color::Black => "BlackCountry",
-                                })
-                                .or_else(|| {
-                                    entry.header(match opponent_color {
-                                        Color::White => "WhiteFed",
-                                        Color::Black => "BlackFed",
+                        let (opponent, opponent_title, opponent_fide_id, opponent_country, color, result, event, date) =
+                            if let Some(entry) = library.get(idx) {
+                                let player_white = players::player_key(entry.white()).as_deref()
+                                    == Some(player.key.as_str());
+                                let (opponent, opponent_color, color) = if player_white {
+                                    (entry.black().to_string(), Color::Black, "White")
+                                } else {
+                                    (entry.white().to_string(), Color::White, "Black")
+                                };
+                                let opponent_title = title_from_tag(entry.header(match opponent_color {
+                                    Color::White => "WhiteTitle",
+                                    Color::Black => "BlackTitle",
+                                }));
+                                let opponent_fide_id =
+                                    player_fide_id_from_header(entry.header(match opponent_color {
+                                        Color::White => "WhiteFideId",
+                                        Color::Black => "BlackFideId",
+                                    }));
+                                let opponent_country = player_country_from_header(
+                                    entry
+                                        .header(match opponent_color {
+                                            Color::White => "WhiteCountry",
+                                            Color::Black => "BlackCountry",
+                                        })
+                                        .or_else(|| {
+                                            entry.header(match opponent_color {
+                                                Color::White => "WhiteFed",
+                                                Color::Black => "BlackFed",
+                                            })
+                                        }),
+                                );
+                                (
+                                    opponent,
+                                    opponent_title,
+                                    opponent_fide_id,
+                                    opponent_country,
+                                    color,
+                                    entry.result().to_string(),
+                                    entry.event().to_string(),
+                                    entry.date().to_string(),
+                                )
+                            } else {
+                                let (white_name, black_name) = library.game_players(idx);
+                                let player_white = players::player_key(&white_name).as_deref()
+                                    == Some(player.key.as_str());
+                                let (opponent, opponent_color, color) = if player_white {
+                                    (black_name, Color::Black, "White")
+                                } else {
+                                    (white_name, Color::White, "Black")
+                                };
+                                let headers = library.game_headers(idx);
+                                let find_h = |name: &str| -> Option<&str> {
+                                    headers
+                                        .iter()
+                                        .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                                        .map(|(_, v)| v.as_str())
+                                };
+                                let opponent_title = title_from_tag(find_h(match opponent_color {
+                                    Color::White => "WhiteTitle",
+                                    Color::Black => "BlackTitle",
+                                }));
+                                let opponent_fide_id = player_fide_id_from_header(find_h(match opponent_color {
+                                    Color::White => "WhiteFideId",
+                                    Color::Black => "BlackFideId",
+                                }));
+                                let opponent_country = player_country_from_header(
+                                    find_h(match opponent_color {
+                                        Color::White => "WhiteCountry",
+                                        Color::Black => "BlackCountry",
                                     })
-                                }),
-                        );
+                                    .or_else(|| {
+                                        find_h(match opponent_color {
+                                            Color::White => "WhiteFed",
+                                            Color::Black => "BlackFed",
+                                        })
+                                    }),
+                                );
+                                let result = find_h("Result").unwrap_or("*").to_string();
+                                let event = find_h("Event").unwrap_or("?").to_string();
+                                let date = find_h("Date").unwrap_or("????.??.??").to_string();
+                                (
+                                    opponent,
+                                    opponent_title,
+                                    opponent_fide_id,
+                                    opponent_country,
+                                    color,
+                                    result,
+                                    event,
+                                    date,
+                                )
+                            };
                         let suffix = format!(" · as {color}");
                         let subtitle =
-                            format!("{} · {} · {}", entry.result(), entry.event(), entry.date());
+                            format!("{result} · {event} · {date}");
                         let selected = self
                             .session
                             .source_slot(idx)
@@ -8076,7 +8149,7 @@ impl App {
                             ui,
                             selected,
                             "vs ",
-                            RowName::new(opponent, opponent_title)
+                            RowName::new(&opponent, opponent_title)
                                 .with_country(opponent_country.map(|c| c.badge))
                                 .with_fide_id(opponent_fide_id.as_deref()),
                             None,
@@ -10519,33 +10592,105 @@ impl App {
         book.recent_games_for(key, prep.opponent_color(), limit)
             .into_iter()
             .filter_map(|game| {
-                let indexed = library.get(game.index)?;
+                let (
+                    white,
+                    black,
+                    white_title,
+                    black_title,
+                    white_country,
+                    black_country,
+                    white_fide_id,
+                    black_fide_id,
+                    result,
+                    event,
+                ) = if let Some(indexed) = library.get(game.index) {
+                    (
+                        indexed.white().to_string(),
+                        indexed.black().to_string(),
+                        title_from_tag(indexed.header("WhiteTitle")),
+                        title_from_tag(indexed.header("BlackTitle")),
+                        player_country_from_header(
+                            indexed
+                                .header("WhiteCountry")
+                                .or_else(|| indexed.header("WhiteFed")),
+                        )
+                        .map(|c| c.badge),
+                        player_country_from_header(
+                            indexed
+                                .header("BlackCountry")
+                                .or_else(|| indexed.header("BlackFed")),
+                        )
+                        .map(|c| c.badge),
+                        player_fide_id_from_header(indexed.header("WhiteFideId")),
+                        player_fide_id_from_header(indexed.header("BlackFideId")),
+                        indexed.result().to_string(),
+                        indexed.event().to_string(),
+                    )
+                } else {
+                    let headers = library.game_headers(game.index);
+                    if headers.is_empty() && game.index >= library.len() {
+                        return None;
+                    }
+                    let find_h = |name: &str| -> Option<&str> {
+                        headers
+                            .iter()
+                            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                            .map(|(_, v)| v.as_str())
+                    };
+                    let (white_name, black_name) = library.game_players(game.index);
+                    let white = if white_name != "?" {
+                        white_name
+                    } else {
+                        find_h("White").unwrap_or("?").to_string()
+                    };
+                    let black = if black_name != "?" {
+                        black_name
+                    } else {
+                        find_h("Black").unwrap_or("?").to_string()
+                    };
+                    let white_title = title_from_tag(find_h("WhiteTitle"));
+                    let black_title = title_from_tag(find_h("BlackTitle"));
+                    let white_country = player_country_from_header(
+                        find_h("WhiteCountry").or_else(|| find_h("WhiteFed")),
+                    )
+                    .map(|c| c.badge);
+                    let black_country = player_country_from_header(
+                        find_h("BlackCountry").or_else(|| find_h("BlackFed")),
+                    )
+                    .map(|c| c.badge);
+                    let white_fide_id = player_fide_id_from_header(find_h("WhiteFideId"));
+                    let black_fide_id = player_fide_id_from_header(find_h("BlackFideId"));
+                    let result = find_h("Result").unwrap_or("*").to_string();
+                    let event = find_h("Event").unwrap_or("?").to_string();
+                    (
+                        white,
+                        black,
+                        white_title,
+                        black_title,
+                        white_country,
+                        black_country,
+                        white_fide_id,
+                        black_fide_id,
+                        result,
+                        event,
+                    )
+                };
                 Some(PrepRecentRow {
                     index: game.index,
-                    white: indexed.white().to_string(),
-                    black: indexed.black().to_string(),
-                    white_title: title_from_tag(indexed.header("WhiteTitle")),
-                    black_title: title_from_tag(indexed.header("BlackTitle")),
-                    white_country: player_country_from_header(
-                        indexed
-                            .header("WhiteCountry")
-                            .or_else(|| indexed.header("WhiteFed")),
-                    )
-                    .map(|c| c.badge),
-                    black_country: player_country_from_header(
-                        indexed
-                            .header("BlackCountry")
-                            .or_else(|| indexed.header("BlackFed")),
-                    )
-                    .map(|c| c.badge),
-                    white_fide_id: player_fide_id_from_header(indexed.header("WhiteFideId")),
-                    black_fide_id: player_fide_id_from_header(indexed.header("BlackFideId")),
+                    white,
+                    black,
+                    white_title,
+                    black_title,
+                    white_country,
+                    black_country,
+                    white_fide_id,
+                    black_fide_id,
                     subtitle: format!(
                         "{} · as {} · {} · {}",
                         short_date(game.date),
                         color_name(game.color),
-                        outcome_label(indexed.result(), game.color),
-                        indexed.event()
+                        outcome_label(&result, game.color),
+                        event
                     ),
                 })
             })
