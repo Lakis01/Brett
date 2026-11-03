@@ -1140,3 +1140,33 @@ the database games list.
 
 **Depends on:** `src/app.rs` (`games_content`, `game_row`, `rows_are_draggable`).
 
+## 31. Engine Cloud Eval Box: Deduplicate Lichess Depth Display
+
+**Status:** queued.
+
+**Goal:** avoid showing redundant or duplicated Lichess depth indicators in the
+Engine tab's cloud evaluation candidate box.
+
+- Review formatters in `src/app.rs` (around `cloud_engine_table` and stacked variation
+  rendering) to ensure depth is rendered once centrally or cleanly alongside the
+  engine tag rather than duplicated across multiple columns/labels.
+
+**Depends on:** `src/app.rs` (`cloud_engine_table`, `engine_content_inner`).
+
+## 32. Cloud Evaluation Fetch Lifecycle & Deduplication Across Navigation
+
+**Status:** queued.
+
+**Goal:** audit and unify the ChessDB and Lichess cloud eval request triggers so
+positions are not fetched or aggregated multiple times when switching between the
+Moves panel and the Engine panel.
+
+- **Observed behavior:** navigating nodes in the Moves section triggers eval bar updates,
+  but switching tabs to the Engine section appears to trigger a second fetch/aggregation pass.
+- **Investigation & Fix:** verify cache keys and lifecycle in `maybe_request_cloud()`:
+  ensure the in-flight deduplication and completed FEN cache prevent duplicate HTTP requests
+  and avoid re-triggering spinners when the position evaluation is already cached.
+
+**Depends on:** `src/cloud.rs` and `src/app.rs` (`maybe_request_cloud`).
+
+
