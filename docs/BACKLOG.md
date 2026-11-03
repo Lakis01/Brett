@@ -1115,3 +1115,28 @@ via Vulkan and OpenCL backends alongside NVIDIA CUDA, as well as CPU fallbacks
   when GPU backend initialization fails, offering graceful fallback to CPU backends.
 
 **Depends on:** `src/engine/`, `src/analysis_cache.rs`, and `src/app.rs`.
+
+## 30. Touchscreen Gestures: Disambiguating Scroll vs. Drag Reordering in Database View
+
+**Status:** queued.
+
+**Goal:** make scrolling and drag-reordering feel natural and responsive on
+touchscreens (e.g. 2-in-1 convertible laptops, tablets, mobile devices) within
+the database games list.
+
+- **Current challenge:** disabling drag during touches allows vertical scrolling,
+  but makes drag-reordering games nearly impossible with a touchscreen or pen;
+  conversely, enabling drag on the entire row causes scrolling swipes to accidentally
+  trigger game reordering instead of smooth inertia scrolling.
+- **Dedicated drag handle or long-press gesture:**
+  - Introduce an explicit drag handle affordance (e.g. `⋮⋮` grip on the left of
+    reorderable rows) that initiates drag-and-drop immediately.
+  - Alternatively, use a touch-and-hold threshold (~250ms with visual elevation /
+    haptic feedback) before engaging drag-and-drop, allowing swift touch swipes
+    across the entire row to perform uninterrupted smooth scrolling.
+- **Directional gesture disambiguation:** differentiate vertical scroll gestures
+  from intentional horizontal or reorder gestures with direction-locking.
+- Add test coverage verifying touch vs mouse drag behavior.
+
+**Depends on:** `src/app.rs` (`games_content`, `game_row`, `rows_are_draggable`).
+

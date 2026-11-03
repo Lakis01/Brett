@@ -7586,8 +7586,6 @@ impl App {
                     };
                     let white_title = title_from_tag(slot.header("WhiteTitle"));
                     let black_title = title_from_tag(slot.header("BlackTitle"));
-                    let white_fide_id = player_fide_id_from_header(slot.header("WhiteFideId"));
-                    let black_fide_id = player_fide_id_from_header(slot.header("BlackFideId"));
                     let white_country = player_country_from_header(
                         slot.header("WhiteCountry")
                             .or_else(|| slot.header("WhiteFed")),
@@ -7604,12 +7602,10 @@ impl App {
                         selected,
                         "",
                         RowName::new(slot.white(), white_title)
-                            .with_country(white_country.map(|c| c.badge))
-                            .with_fide_id(white_fide_id.as_deref()),
+                            .with_country(white_country.map(|c| c.badge)),
                         Some(
                             RowName::new(slot.black(), black_title)
-                                .with_country(black_country.map(|c| c.badge))
-                                .with_fide_id(black_fide_id.as_deref()),
+                                .with_country(black_country.map(|c| c.badge)),
                         ),
                         "",
                         &subtitle,
@@ -11530,12 +11526,6 @@ impl App {
                                                 title_from_tag(slot.header("WhiteTitle"));
                                             let black_title =
                                                 title_from_tag(slot.header("BlackTitle"));
-                                            let white_fide_id = player_fide_id_from_header(
-                                                slot.header("WhiteFideId"),
-                                            );
-                                            let black_fide_id = player_fide_id_from_header(
-                                                slot.header("BlackFideId"),
-                                            );
                                             let white_country = player_country_from_header(
                                                 slot.header("WhiteCountry")
                                                     .or_else(|| slot.header("WhiteFed")),
@@ -11552,14 +11542,12 @@ impl App {
                                                 false,
                                                 "",
                                                 RowName::new(slot.white(), white_title)
-                                                    .with_country(white_country.map(|c| c.badge))
-                                                    .with_fide_id(white_fide_id.as_deref()),
+                                                    .with_country(white_country.map(|c| c.badge)),
                                                 Some(
                                                     RowName::new(slot.black(), black_title)
                                                         .with_country(
                                                             black_country.map(|c| c.badge),
-                                                        )
-                                                        .with_fide_id(black_fide_id.as_deref()),
+                                                        ),
                                                 ),
                                                 "",
                                                 &subtitle,
