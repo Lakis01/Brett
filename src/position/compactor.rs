@@ -28,7 +28,12 @@ pub fn compact_segments(
     let segs_arc = target_index.segments_arc();
     let (report, old_paths) = {
         let guard = segs_arc.read().expect("segments lock poisoned");
-        if guard.len() <= 1 && guard.first().map(|s| s.path() == consolidated_path).unwrap_or(false) {
+        if guard.len() <= 1
+            && guard
+                .first()
+                .map(|s| s.path() == consolidated_path)
+                .unwrap_or(false)
+        {
             return Ok(BuildReport {
                 games: target_index.game_count(),
                 edges: target_index.edge_count(),
@@ -82,9 +87,9 @@ pub fn compact_segments(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
     use crate::chess::Position;
     use crate::position::{BuildOptions, EdgeRecord, IndexHeader};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn compactor_merges_multiple_segments_and_removes_temporaries() {
@@ -92,7 +97,11 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!("brett-test-compact-{}-{}", std::process::id(), unique));
+        let dir = std::env::temp_dir().join(format!(
+            "brett-test-compact-{}-{}",
+            std::process::id(),
+            unique
+        ));
         std::fs::create_dir_all(&dir).unwrap();
 
         let seg1_path = dir.join("seg1.tmp.bpx");
@@ -169,7 +178,8 @@ mod tests {
         let index = SegmentedIndex::from_segments(&consolidated_path, vec![s1, s2]);
         assert_eq!(index.segment_count(), 2);
 
-        let report = compact_segments(&index, &consolidated_path, SourceMeta::default(), u32::MAX).unwrap();
+        let report =
+            compact_segments(&index, &consolidated_path, SourceMeta::default(), u32::MAX).unwrap();
         assert_eq!(report.games, 27);
         assert_eq!(report.positions, 2);
         assert_eq!(report.edges, 3); // (pos1, mv_a), (pos1, mv_b), (pos2, mv_a)
@@ -206,12 +216,15 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
-        let child_pos = start_pos.clone().play(
-            crate::chess::UciMove::from_ascii(b"e2e4")
-                .unwrap()
-                .to_move(&start_pos)
-                .unwrap(),
-        ).unwrap();
+        let child_pos = start_pos
+            .clone()
+            .play(
+                crate::chess::UciMove::from_ascii(b"e2e4")
+                    .unwrap()
+                    .to_move(&start_pos)
+                    .unwrap(),
+            )
+            .unwrap();
         pgn_game.nodes.push(crate::domain::Node {
             mv: Some(crate::domain::Ply {
                 san: "e4".to_string(),
@@ -230,7 +243,14 @@ mod tests {
         pgn_game.nodes[0].children.push(1);
 
         let delta_path = dir.join("delta-001.bpx");
-        index.append_delta_segment(&[pgn_game], SourceMeta::default(), &delta_path, BuildOptions::default()).unwrap();
+        index
+            .append_delta_segment(
+                &[pgn_game],
+                SourceMeta::default(),
+                &delta_path,
+                BuildOptions::default(),
+            )
+            .unwrap();
 
         assert_eq!(index.segment_count(), 2);
         assert_eq!(index.game_count(), 28);

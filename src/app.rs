@@ -60,22 +60,9 @@ const LARGE_PGN_BYTES: u64 = 100 * 1024 * 1024;
 const LARGE_DATABASE_GAMES: usize = 500_000;
 /// Completed reviews kept for reuse during this session.
 const REVIEW_CACHE_LIMIT: usize = 16;
-/// A full position index is useful for normal collections but is not yet
-/// viable for multi-million-game archives. The streaming/external-sort indexer
-/// is tracked in `docs/BACKLOG.md` as part of the M2b work.
-const FULL_INDEX_MAX_GAMES: usize = 1_000_000;
 /// Auto-building a full index above this size makes the app appear hung for
 /// minutes. Larger databases wait for an explicit, warned action.
 const AUTO_INDEX_MAX_GAMES: usize = 250_000;
-/// Reference/tree indexes are built in the background too, so use a file-size
-/// guard before opening a multi-gigabyte archive just to reject it.
-const LARGE_INDEX_FILE_BYTES: u64 = 1_000_000_000;
-
-fn index_source_too_large(path: &Path) -> bool {
-    std::fs::metadata(path)
-        .map(|metadata| metadata.len() > LARGE_INDEX_FILE_BYTES)
-        .unwrap_or(false)
-}
 /// Source collections that Brett must never write into. Exports go to a new
 /// path chosen by the user, normally under their home directory.
 ///
@@ -3337,17 +3324,6 @@ impl App {
         let Some(library) = self.library.clone() else {
             return;
         };
-        if library.len() > FULL_INDEX_MAX_GAMES {
-            self.index = None;
-            self.index_rx = None;
-            self.index_job = Some(library.path().to_path_buf());
-            self.index_status = format!(
-                "{} games · full position indexing is disabled for databases this large until the external-sort indexer is available",
-                games_label(library.len())
-            );
-            self.status = self.index_status.clone();
-            return;
-        }
         self.index = None;
         self.index_rx = None;
         self.index_job = Some(library.path().to_path_buf());
@@ -3388,8 +3364,7 @@ impl App {
     }
 
     /// Show the manual position-index action when no cached index is loaded.
-    /// Multi-million-game databases are refused until the external-sort
-    /// indexer lands; medium-large databases ask for confirmation first.
+    /// Medium-large databases ask for confirmation first.
     fn index_build_button(&self, ui: &mut Ui) -> bool {
         let Some(library) = &self.library else {
             return false;
@@ -3397,23 +3372,16 @@ impl App {
         if self.index.is_some() || self.index_rx.is_some() {
             return false;
         }
-        let too_large = library.len() > FULL_INDEX_MAX_GAMES;
         let warn = library.len() > AUTO_INDEX_MAX_GAMES;
-        let label = if too_large {
-            "Full position index unavailable for this database size"
-        } else if warn {
+        let label = if warn {
             "Build position index…"
         } else {
             "Build position index"
         };
-        let response = ui.add_enabled(!too_large, egui::Button::new(label));
-        let response = if too_large {
+        let response = ui.add(egui::Button::new(label));
+        let response = if warn {
             response.on_hover_text(
-                "Full indexing of multi-million-game databases needs the external-sort indexer planned in the backlog. Use a smaller opening-tree or reference database for now.",
-            )
-        } else if warn {
-            response.on_hover_text(
-                "This is a large database. Building the full position index can take several minutes and a lot of RAM. You will be asked to confirm.",
+                "This is a large database. Building the position index uses parallel chunked streaming. You will be asked to confirm.",
             )
         } else {
             response.on_hover_text("Build or load the cached position index for this database")
@@ -3511,18 +3479,6 @@ impl App {
             self.start_book(path);
             return;
         }
-        if index_source_too_large(&path) {
-            self.tree_index = None;
-            self.tree_library = None;
-            self.tree_index_rx = None;
-            self.tree_index_job = Some(path.clone());
-            self.tree_status = format!(
-                "{} is too large for automatic opening-tree indexing. Use a smaller tree database; full indexing above {} games is not available yet.",
-                path.display(),
-                games_label(FULL_INDEX_MAX_GAMES)
-            );
-            return;
-        }
         self.tree_index = None;
         self.tree_library = None;
         self.tree_index_rx = None;
@@ -3535,13 +3491,6 @@ impl App {
             let progress_ctx = ctx.clone();
             let result = (|| -> Result<(Arc<dyn GameLibrary>, PositionIndex), String> {
                 let library = open_library(&path).map_err(|err| format!("{err:#}"))?;
-                if library.len() > FULL_INDEX_MAX_GAMES {
-                    return Err(format!(
-                        "opening-tree database has {} games; full indexing is disabled above {} games",
-                        library.len(),
-                        FULL_INDEX_MAX_GAMES
-                    ));
-                }
                 let index = PositionIndex::build_cached_for(
                     library.clone(),
                     BuildOptions::default(),
@@ -3567,10 +3516,15 @@ impl App {
         loop {
             match rx.try_recv() {
                 Ok(TreeIndexMessage::Progress(progress)) => {
+                    let rate = if progress.elapsed.as_secs_f64() > 0.05 {
+                        (progress.games as f64 / progress.elapsed.as_secs_f64()).round() as usize
+                    } else {
+                        0
+                    };
                     self.tree_status = format!(
-                        "Indexing opening tree… {} games, {} moves ({:.1}s)",
-                        progress.games,
-                        progress.edges,
+                        "Indexing opening tree… {} games, {} moves ({rate} games/s · {:.1}s)",
+                        games_label(progress.games),
+                        positions_label(progress.edges),
                         progress.elapsed.as_secs_f64()
                     );
                 }
@@ -3607,16 +3561,6 @@ impl App {
         if self.correspondence_job.as_ref() == Some(&path) && self.correspondence_rx.is_some() {
             return;
         }
-        if index_source_too_large(&path) {
-            self.correspondence = None;
-            self.correspondence_rx = None;
-            self.correspondence_job = Some(path.clone());
-            self.correspondence_status = format!(
-                "{} is too large for automatic correspondence indexing. Use a smaller reference database.",
-                path.display()
-            );
-            return;
-        }
         self.correspondence = None;
         self.correspondence_job = Some(path.clone());
         self.correspondence_status =
@@ -3628,13 +3572,6 @@ impl App {
             let progress_ctx = ctx.clone();
             let result = (|| -> Result<PositionIndex, String> {
                 let library = open_library(&path).map_err(|err| format!("{err:#}"))?;
-                if library.len() > FULL_INDEX_MAX_GAMES {
-                    return Err(format!(
-                        "correspondence database has {} games; automatic indexing is disabled above {} games",
-                        library.len(),
-                        FULL_INDEX_MAX_GAMES
-                    ));
-                }
                 PositionIndex::build_cached_for(library, BuildOptions::default(), move |progress| {
                     let _ = progress_tx.send(CorrespondenceMessage::Progress(progress));
                     progress_ctx.request_repaint();
@@ -3655,10 +3592,15 @@ impl App {
         loop {
             match rx.try_recv() {
                 Ok(CorrespondenceMessage::Progress(progress)) => {
+                    let rate = if progress.elapsed.as_secs_f64() > 0.05 {
+                        (progress.games as f64 / progress.elapsed.as_secs_f64()).round() as usize
+                    } else {
+                        0
+                    };
                     self.correspondence_status = format!(
-                        "Indexing correspondence reference… {} games, {} moves ({:.1}s)",
-                        progress.games,
-                        progress.edges,
+                        "Indexing correspondence reference… {} games, {} moves ({rate} games/s · {:.1}s)",
+                        games_label(progress.games),
+                        positions_label(progress.edges),
                         progress.elapsed.as_secs_f64()
                     );
                 }
@@ -3703,10 +3645,15 @@ impl App {
         loop {
             match rx.try_recv() {
                 Ok(IndexMessage::Progress(progress)) => {
+                    let rate = if progress.elapsed.as_secs_f64() > 0.05 {
+                        (progress.games as f64 / progress.elapsed.as_secs_f64()).round() as usize
+                    } else {
+                        0
+                    };
                     self.index_status = format!(
-                        "Indexing positions… {} games, {} moves ({:.1}s)",
-                        progress.games,
-                        progress.edges,
+                        "Indexing positions… {} games, {} moves ({rate} games/s · {:.1}s)",
+                        games_label(progress.games),
+                        positions_label(progress.edges),
                         progress.elapsed.as_secs_f64()
                     );
                 }
@@ -4209,17 +4156,6 @@ impl App {
     }
 
     fn start_reference(&mut self, job: ReferenceJob) {
-        if index_source_too_large(&job.path) {
-            self.reference = None;
-            self.reference_rx = None;
-            self.reference_job = None;
-            self.reference_status = format!(
-                "{} is too large for automatic reference indexing. Use a smaller reference database; full indexing above {} games is not available yet.",
-                job.path.display(),
-                games_label(FULL_INDEX_MAX_GAMES)
-            );
-            return;
-        }
         self.reference = None;
         self.reference_job = Some(job.clone());
         self.reference_status = format!(
@@ -4235,13 +4171,6 @@ impl App {
             let thread_job = job.clone();
             let result = open_library(&thread_job.path)
                 .and_then(|library| {
-                    if library.len() > FULL_INDEX_MAX_GAMES {
-                        return Err(anyhow::anyhow!(
-                            "reference database has {} games; full reference indexing is disabled above {} games",
-                            library.len(),
-                            FULL_INDEX_MAX_GAMES
-                        ));
-                    }
                     let filter = Some(thread_job.rating_filter());
                     let cache = position::reference_cache_path(&thread_job.path, filter);
                     if let Some(index) =
@@ -4279,8 +4208,14 @@ impl App {
             match rx.try_recv() {
                 Ok(ReferenceMessage::Progress(progress)) => {
                     if let Some(job) = &self.reference_job {
+                        let rate = if progress.elapsed.as_secs_f64() > 0.05 {
+                            (progress.games as f64 / progress.elapsed.as_secs_f64()).round()
+                                as usize
+                        } else {
+                            0
+                        };
                         self.reference_status = format!(
-                            "Indexing reference for {}… {} included, {} moves ({:.1}s)",
+                            "Indexing reference for {}… {} included, {} moves ({rate} games/s · {:.1}s)",
                             job.label(),
                             games_label(progress.games),
                             moves_label(progress.edges),

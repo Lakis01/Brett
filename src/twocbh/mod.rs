@@ -460,7 +460,10 @@ impl GameLibrary for TwoCbhLibrary {
             }
             2 => {
                 if words.first() != Some(&0xfffb) || words.get(2) != Some(&0xfffc) {
-                    bail!("2CBH game {} has a malformed Chess960 start marker", entry.id);
+                    bail!(
+                        "2CBH game {} has a malformed Chess960 start marker",
+                        entry.id
+                    );
                 }
                 let start_id = *words.get(1).context("Chess960 start id is missing")?;
                 if let Some(record_start) = record_start

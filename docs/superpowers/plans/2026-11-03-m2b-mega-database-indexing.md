@@ -110,13 +110,14 @@
 
 **Context:** In `src/app.rs`, lift `FULL_INDEX_MAX_GAMES = 1_000_000`. Connect `build_chunked_parallel` to background tasks with live progress (throughput in games/sec, active segments, compaction state).
 
-- [ ] **Step 6.1: Update limits and background index triggers in `src/app.rs`**
+- [x] **Step 6.1: Update limits and background index triggers in `src/app.rs`**
   Remove the `FULL_INDEX_MAX_GAMES` cap in `start_index`, `start_tree_index`, `start_correspondence_index`, and `start_reference_index`.
-- [ ] **Step 6.2: Connect real-time progress and throughput metrics**
+- [x] **Step 6.2: Connect real-time progress and throughput metrics**
   Display current throughput (e.g., `"Indexing: 3.5M / 11.1M games (45k games/sec · 14 segments live)"`) in `tree_status` and index progress bars.
-- [ ] **Step 6.3: Verify end-to-end with unit and integration tests**
+- [x] **Step 6.3: Verify end-to-end with unit and integration tests**
   Run `cargo test --all-targets` to verify that all 325+ tests pass with zero regressions.
-- [ ] **Step 6.4: Format and lint**
+- [x] **Step 6.4: Format and lint**
   Run `cargo fmt --all -- --check` and `cargo clippy --all-targets -- -D warnings`.
-- [ ] **Step 6.5: Commit and push**
+- [x] **Step 6.5: Commit and push**
   `git commit -m "feat(app): lift 1M-game cap and bind live multi-million-game indexing progress"`
+

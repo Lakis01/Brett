@@ -156,4 +156,3 @@ mod tests {
         assert_eq!(streamed.len(), 6);
     }
 }
-

@@ -1,9 +1,9 @@
 //! Parallel chunked position index builder with in-memory edge aggregation.
 
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use anyhow::Result;
@@ -11,9 +11,7 @@ use rayon::prelude::*;
 
 use super::segment::IndexSegment;
 use super::segmented_index::SegmentedIndex;
-use super::{
-    BuildOptions, BuildProgress, BuildReport, EdgeRecord, GameMeta, IndexHeader,
-};
+use super::{BuildOptions, BuildProgress, BuildReport, EdgeRecord, GameMeta, IndexHeader};
 use crate::library::GameLibrary;
 
 pub const DEFAULT_CHUNK_SIZE: usize = 250_000;
@@ -38,6 +36,12 @@ impl Default for ChunkedBuildOptions {
 /// Each chunk aggregates edges in memory, sorts them, and flushes an immutable
 /// `.tmp_segment_XXX.bpx` file. If `live_index` is provided, flushed segments
 /// are registered progressively so that opening-tree queries work immediately.
+struct ChunkResult {
+    games: usize,
+    edges: usize,
+    unique_positions: usize,
+}
+
 pub fn build_chunked_parallel<F>(
     library: &dyn GameLibrary,
     cache_base_path: impl AsRef<Path>,
@@ -84,7 +88,7 @@ where
     let completed_games = Arc::new(AtomicUsize::new(0));
     let completed_edges = Arc::new(AtomicUsize::new(0));
 
-    let segment_results: Result<Vec<(usize, PathBuf, usize, usize, usize)>> = chunk_ranges
+    let segment_results: Result<Vec<ChunkResult>> = chunk_ranges
         .into_par_iter()
         .map(|(chunk_id, start, end)| {
             let mut records: HashMap<(u64, u32), EdgeRecord> = HashMap::new();
@@ -128,7 +132,8 @@ where
                         if ply.uci == "0000" {
                             break;
                         }
-                        let Ok(ucimove) = crate::chess::UciMove::from_ascii(ply.uci.as_bytes()) else {
+                        let Ok(ucimove) = crate::chess::UciMove::from_ascii(ply.uci.as_bytes())
+                        else {
                             break;
                         };
                         let Ok(mv) = ucimove.to_move(&parent.pos) else {
@@ -169,8 +174,7 @@ where
                 }
             }
 
-            let seg_path = cache_base
-                .with_extension(format!("tmp_segment_{chunk_id:04}.bpx"));
+            let seg_path = cache_base.with_extension(format!("tmp_segment_{chunk_id:04}.bpx"));
 
             let seg_header = IndexHeader {
                 source_len: meta.len,
@@ -190,8 +194,10 @@ where
                 target.add_segment(seg);
             }
 
-            let games_done = completed_games.fetch_add(chunk_games, Ordering::Relaxed) + chunk_games;
-            let edges_done = completed_edges.fetch_add(sorted_records.len(), Ordering::Relaxed) + sorted_records.len();
+            let games_done =
+                completed_games.fetch_add(chunk_games, Ordering::Relaxed) + chunk_games;
+            let edges_done = completed_edges.fetch_add(sorted_records.len(), Ordering::Relaxed)
+                + sorted_records.len();
 
             progress(BuildProgress {
                 games: games_done,
@@ -199,14 +205,18 @@ where
                 elapsed: started.elapsed(),
             });
 
-            Ok((chunk_id, seg_path, chunk_games, sorted_records.len(), unique_positions))
+            Ok(ChunkResult {
+                games: chunk_games,
+                edges: sorted_records.len(),
+                unique_positions,
+            })
         })
         .collect();
 
     let segments = segment_results?;
-    let total_indexed_games: usize = segments.iter().map(|s| s.2).sum();
-    let total_indexed_edges: usize = segments.iter().map(|s| s.3).sum();
-    let total_positions: usize = segments.iter().map(|s| s.4).sum();
+    let total_indexed_games: usize = segments.iter().map(|s| s.games).sum();
+    let total_indexed_edges: usize = segments.iter().map(|s| s.edges).sum();
+    let total_positions: usize = segments.iter().map(|s| s.unique_positions).sum();
 
     Ok(BuildReport {
         games: total_indexed_games,
@@ -220,8 +230,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
     use crate::library::PgnLibrary;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     const SAMPLE_PGN: &str = r#"[Event "Game 1"]
 [White "Player A"]
@@ -258,7 +268,11 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!("brett-test-chunked-{}-{}", std::process::id(), unique));
+        let dir = std::env::temp_dir().join(format!(
+            "brett-test-chunked-{}-{}",
+            std::process::id(),
+            unique
+        ));
         std::fs::create_dir_all(&dir).unwrap();
 
         let pgn_path = dir.join("test.pgn");
@@ -275,14 +289,9 @@ mod tests {
             chunk_size: 2, // 2 games per chunk -> 2 chunks
         };
 
-        let report = build_chunked_parallel(
-            &library,
-            &cache_base,
-            options,
-            Some(&live_index),
-            |_| {},
-        )
-        .unwrap();
+        let report =
+            build_chunked_parallel(&library, &cache_base, options, Some(&live_index), |_| {})
+                .unwrap();
 
         assert_eq!(report.games, 4);
         assert_eq!(live_index.segment_count(), 2);
@@ -291,9 +300,10 @@ mod tests {
         // Verify e4 was played in games 1, 2, 4 (3 games)
         let root_key = crate::chess::Chess::default().position_hash();
         let moves = live_index.moves(root_key);
-        let e4_stat = moves.iter().find(|m| {
-            m.san(&crate::chess::Chess::default()).as_deref() == Some("e4")
-        }).unwrap();
+        let e4_stat = moves
+            .iter()
+            .find(|m| m.san(&crate::chess::Chess::default()).as_deref() == Some("e4"))
+            .unwrap();
         assert_eq!(e4_stat.games, 3);
         assert_eq!(e4_stat.white, 2);
         assert_eq!(e4_stat.black, 1);

@@ -22,7 +22,8 @@ impl IndexSegment {
     /// Open a segment file, validating its magic, version, and length.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        let file = File::open(path).with_context(|| format!("opening segment {}", path.display()))?;
+        let file =
+            File::open(path).with_context(|| format!("opening segment {}", path.display()))?;
         let mmap = unsafe { MmapOptions::new().map(&file) }
             .with_context(|| format!("mapping segment {}", path.display()))?;
         let header = IndexHeader::parse(&mmap)
@@ -57,7 +58,8 @@ impl IndexSegment {
         records: &[EdgeRecord],
     ) -> Result<()> {
         let path = path.as_ref();
-        let file = File::create(path).with_context(|| format!("creating segment {}", path.display()))?;
+        let file =
+            File::create(path).with_context(|| format!("creating segment {}", path.display()))?;
         let mut writer = BufWriter::new(file);
         writer.write_all(&header.to_bytes())?;
         let mut buf = [0u8; EDGE_SIZE];

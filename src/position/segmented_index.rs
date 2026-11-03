@@ -29,7 +29,10 @@ impl SegmentedIndex {
     }
 
     pub fn add_segment(&self, segment: IndexSegment) {
-        self.segments.write().expect("segments lock poisoned").push(segment);
+        self.segments
+            .write()
+            .expect("segments lock poisoned")
+            .push(segment);
     }
 
     pub fn set_segments(&self, segments: Vec<IndexSegment>) {
@@ -143,9 +146,7 @@ impl SegmentedIndex {
             stats.black += mv.black;
             stats.elo_sum += mv.elo_sum;
             stats.elo_count += mv.elo_count;
-            if mv.first_date != 0
-                && (stats.first_date == 0 || mv.first_date < stats.first_date)
-            {
+            if mv.first_date != 0 && (stats.first_date == 0 || mv.first_date < stats.first_date) {
                 stats.first_date = mv.first_date;
             }
             if mv.last_date > stats.last_date {
@@ -247,8 +248,7 @@ impl SegmentedIndex {
             edges: sorted_records.len(),
             positions: unique_positions,
             elapsed: started.elapsed(),
-            bytes: super::HEADER_LEN as u64
-                + sorted_records.len() as u64 * super::EDGE_SIZE as u64,
+            bytes: super::HEADER_LEN as u64 + sorted_records.len() as u64 * super::EDGE_SIZE as u64,
         })
     }
 }
@@ -256,8 +256,8 @@ impl SegmentedIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
     use crate::position::{IndexHeader, IndexSegment};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn multi_segment_merges_records_accurately() {
@@ -265,7 +265,11 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!("brett-test-segmented-{}-{}", std::process::id(), unique));
+        let dir = std::env::temp_dir().join(format!(
+            "brett-test-segmented-{}-{}",
+            std::process::id(),
+            unique
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let seg1_path = dir.join("seg1.bpx");
         let seg2_path = dir.join("seg2.bpx");

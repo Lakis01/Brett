@@ -351,14 +351,10 @@ impl<F: ?Sized + FnMut(u64, u32)> FastMainlineWalker<'_, F> {
             .piece_at(from)
             .with_context(|| format!("no piece on {from} (word {word:#06x})"))?;
         if piece.color != self.current_pos.turn() {
-            bail!(
-                "move starts from an opponent piece on {from} (word {word:#06x})"
-            );
+            bail!("move starts from an opponent piece on {from} (word {word:#06x})");
         }
         if self.current_pos.us().contains(to) {
-            bail!(
-                "the move {from}-{to} lands on a piece of the side to move (word {word:#06x})"
-            );
+            bail!("the move {from}-{to} lands on a piece of the side to move (word {word:#06x})");
         }
         let mv = if piece.role == Role::Pawn && Some(to) == self.current_pos.maybe_ep_square() {
             Move::EnPassant { from, to }
@@ -366,7 +362,11 @@ impl<F: ?Sized + FnMut(u64, u32)> FastMainlineWalker<'_, F> {
             Move::Normal {
                 role: piece.role,
                 from,
-                capture: self.current_pos.board().piece_at(to).map(|piece| piece.role),
+                capture: self
+                    .current_pos
+                    .board()
+                    .piece_at(to)
+                    .map(|piece| piece.role),
                 to,
                 promotion,
             }
@@ -540,7 +540,9 @@ mod tests {
         use crate::chess::Fen;
         // Start position with pawn ready to promote on a7
         let fen: Fen = "8/P7/8/8/8/8/8/4K2k w - - 0 1".parse().unwrap();
-        let start_pos: Chess = fen.into_position(crate::chess::CastlingMode::Standard).unwrap();
+        let start_pos: Chess = fen
+            .into_position(crate::chess::CastlingMode::Standard)
+            .unwrap();
 
         let mut compact = Compact::new(&tables::MODE_0, true);
         // a7-a8=Q

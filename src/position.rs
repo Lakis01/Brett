@@ -234,19 +234,18 @@ impl PositionIndex {
         let segment = IndexSegment::open(path)?;
         let mut segments = vec![segment];
         let file_stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-        if let Some(parent) = path.parent() {
-            if let Ok(entries) = fs::read_dir(parent) {
-                for entry in entries.flatten() {
-                    let p = entry.path();
-                    if p != path && p.extension().is_some_and(|ext| ext == "bpx") {
-                        if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
-                            if stem.starts_with(file_stem) {
-                                if let Ok(seg) = IndexSegment::open(&p) {
-                                    segments.push(seg);
-                                }
-                            }
-                        }
-                    }
+        if let Some(parent) = path.parent()
+            && let Ok(entries) = fs::read_dir(parent)
+        {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p != path
+                    && p.extension().is_some_and(|ext| ext == "bpx")
+                    && let Some(stem) = p.file_stem().and_then(|s| s.to_str())
+                    && stem.starts_with(file_stem)
+                    && let Ok(seg) = IndexSegment::open(&p)
+                {
+                    segments.push(seg);
                 }
             }
         }
@@ -285,7 +284,8 @@ impl PositionIndex {
         delta_path: impl AsRef<Path>,
         options: BuildOptions,
     ) -> Result<BuildReport> {
-        self.inner.append_delta_segment(games, meta, delta_path, options)
+        self.inner
+            .append_delta_segment(games, meta, delta_path, options)
     }
 
     pub fn compact(&self, meta: SourceMeta, max_plies: u32) -> Result<BuildReport> {
@@ -351,26 +351,40 @@ impl PositionIndex {
     pub fn build_cached_for(
         library: Arc<dyn GameLibrary>,
         options: BuildOptions,
-        progress: impl FnMut(BuildProgress),
+        progress: impl FnMut(BuildProgress) + Send,
     ) -> Result<Self> {
         let path = cache_path(library.path());
         Self::build_cached_for_at(library, path, options, progress)
     }
 
-    /// Build a cache index at an explicit path. Reference indexes use this so
-    /// their rating-filtered cache can never be mistaken for the player index.
+    /// Build a cache index at an explicit path using parallel chunked streaming
+    /// and background compaction.
     pub fn build_cached_for_at(
         library: Arc<dyn GameLibrary>,
         index_path: impl AsRef<Path>,
         options: BuildOptions,
-        progress: impl FnMut(BuildProgress),
+        progress: impl FnMut(BuildProgress) + Send,
     ) -> Result<Self> {
         let index_path = index_path.as_ref();
-        if let Some(pgn) = library.as_pgn() {
-            Self::build_to(pgn.path(), index_path, options, progress)?;
-        } else {
-            Self::build_library_to(library.as_ref(), index_path, options, progress)?;
-        }
+        let meta = library.source_meta()?;
+        let chunk_options = ChunkedBuildOptions {
+            build_options: options,
+            chunk_size: DEFAULT_CHUNK_SIZE,
+        };
+        let live_index = SegmentedIndex::new(index_path);
+        let progress_mutex = std::sync::Mutex::new(progress);
+        build_chunked_parallel(
+            library.as_ref(),
+            index_path,
+            chunk_options,
+            Some(&live_index),
+            |p| {
+                if let Ok(mut guard) = progress_mutex.lock() {
+                    guard(p);
+                }
+            },
+        )?;
+        compact_segments(&live_index, index_path, meta, options.max_plies)?;
         Self::open(index_path)
     }
 
@@ -641,7 +655,10 @@ impl PositionIndex {
             }
             offset -= seg.edge_count();
         }
-        panic!("edge_at out of bounds: index {index} >= total {}", self.edge_count());
+        panic!(
+            "edge_at out of bounds: index {index} >= total {}",
+            self.edge_count()
+        );
     }
 }
 
