@@ -457,16 +457,17 @@ pub fn player_key(name: &str) -> Option<String> {
     Some(words.join(" "))
 }
 
-static CHESSCOM_SITE_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-    regex::Regex::new(r"(?i)\bchess\.?com\b").expect("valid regex")
-});
+static CHESSCOM_SITE_RE: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| regex::Regex::new(r"(?i)\bchess\.?com\b").expect("valid regex"));
 
-static CHESSCOM_ONLINE_EVENT_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-    regex::Regex::new(
+static CHESSCOM_ONLINE_EVENT_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(
+    || {
+        regex::Regex::new(
         r"(?i)(\btitled\s+tuesday\b|\bpro(?:\s+chess)?\s+league\b|\barena\s+kings\b|\b(?:speed|bullet)\s+chess\s+championship\b)",
     )
     .expect("valid regex")
-});
+    },
+);
 
 static ONLINE_SITE_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
     regex::Regex::new(r"(?i)^(?:\?|int|internet|online|tornelo|chess\.com.*)$")
@@ -497,9 +498,7 @@ pub fn is_chesscom_event(event: &str, site: &str) -> bool {
 
     // 3. Event mentions Chess.com and site is either missing, generic online/int, or not physical
     if CHESSCOM_SITE_RE.is_match(event_trimmed)
-        && (site_trimmed.is_empty()
-            || site_trimmed == "?"
-            || ONLINE_SITE_RE.is_match(site_trimmed))
+        && (site_trimmed.is_empty() || site_trimmed == "?" || ONLINE_SITE_RE.is_match(site_trimmed))
     {
         return true;
     }
@@ -1759,19 +1758,34 @@ mod tests {
     #[test]
     fn chesscom_tournament_exclusion_regex() {
         // Online Chess.com events are excluded
-        assert!(is_chesscom_event("Titled Tuesday intern op 21st Feb Early", "Chess.com INT"));
+        assert!(is_chesscom_event(
+            "Titled Tuesday intern op 21st Feb Early",
+            "Chess.com INT"
+        ));
         assert!(is_chesscom_event("Titled Tuesday", ""));
         assert!(is_chesscom_event("Arena Kings Season 9", "?"));
-        assert!(is_chesscom_event("Speed Chess Championship Main Event", "chess.com"));
+        assert!(is_chesscom_event(
+            "Speed Chess Championship Main Event",
+            "chess.com"
+        ));
         assert!(is_chesscom_event("Bullet Chess Championship", "Internet"));
-        assert!(is_chesscom_event("PRO Chess League Prelims", "chess.com INT"));
+        assert!(is_chesscom_event(
+            "PRO Chess League Prelims",
+            "chess.com INT"
+        ));
         assert!(is_chesscom_event("Random Online Blitz", "Chess.com"));
 
         // OTB tournaments are preserved, even if sponsored by Chess.com
         assert!(!is_chesscom_event("Tata Steel Masters", "Wijk aan Zee"));
         assert!(!is_chesscom_event("World Championship Match", "Dubai"));
-        assert!(!is_chesscom_event("Chess.com Isle of Man International", "Douglas, Isle of Man"));
-        assert!(!is_chesscom_event("FIDE Chess.com Grand Swiss", "Douglas IOM"));
+        assert!(!is_chesscom_event(
+            "Chess.com Isle of Man International",
+            "Douglas, Isle of Man"
+        ));
+        assert!(!is_chesscom_event(
+            "FIDE Chess.com Grand Swiss",
+            "Douglas IOM"
+        ));
     }
 
     #[test]
@@ -1785,7 +1799,11 @@ mod tests {
 
 1. e4 e5 2. Nf3 Nc6 1-0
 "#;
-        let base_game = crate::domain::parse_pgn(pgn.as_bytes()).unwrap().into_iter().next().unwrap();
+        let base_game = crate::domain::parse_pgn(pgn.as_bytes())
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
 
         let mut online_game = base_game.clone();
         online_game.set_header("Event", "Titled Tuesday 2024".to_string());

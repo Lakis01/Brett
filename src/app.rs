@@ -313,6 +313,7 @@ impl EngineSlotState {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 enum PlayerBookMessage {
     Progress { done: usize, total: usize },
     Done(Result<PlayerBook, String>),
@@ -3727,12 +3728,12 @@ impl App {
                     self.index_status = index_summary(&index);
                     self.index = Some(index);
                     self.index_job = None;
-                    if let Some(library) = &self.library {
-                        if library.len() > LARGE_DATABASE_GAMES {
-                            let sidecar = library.path().with_extension("brettpos");
-                            if !sidecar.exists() {
-                                self.prompt_persist_index = Some(library.path().to_path_buf());
-                            }
+                    if let Some(library) = &self.library
+                        && library.len() > LARGE_DATABASE_GAMES
+                    {
+                        let sidecar = library.path().with_extension("brettpos");
+                        if !sidecar.exists() {
+                            self.prompt_persist_index = Some(library.path().to_path_buf());
                         }
                     }
                     keep = false;
@@ -8062,100 +8063,109 @@ impl App {
                         let Some(library) = self.library.as_ref() else {
                             continue;
                         };
-                        let (opponent, opponent_title, opponent_fide_id, opponent_country, color, result, event, date) =
-                            if let Some(entry) = library.get(idx) {
-                                let player_white = players::player_key(entry.white()).as_deref()
-                                    == Some(player.key.as_str());
-                                let (opponent, opponent_color, color) = if player_white {
-                                    (entry.black().to_string(), Color::Black, "White")
-                                } else {
-                                    (entry.white().to_string(), Color::White, "Black")
-                                };
-                                let opponent_title = title_from_tag(entry.header(match opponent_color {
-                                    Color::White => "WhiteTitle",
-                                    Color::Black => "BlackTitle",
-                                }));
-                                let opponent_fide_id =
-                                    player_fide_id_from_header(entry.header(match opponent_color {
-                                        Color::White => "WhiteFideId",
-                                        Color::Black => "BlackFideId",
-                                    }));
-                                let opponent_country = player_country_from_header(
-                                    entry
-                                        .header(match opponent_color {
-                                            Color::White => "WhiteCountry",
-                                            Color::Black => "BlackCountry",
-                                        })
-                                        .or_else(|| {
-                                            entry.header(match opponent_color {
-                                                Color::White => "WhiteFed",
-                                                Color::Black => "BlackFed",
-                                            })
-                                        }),
-                                );
-                                (
-                                    opponent,
-                                    opponent_title,
-                                    opponent_fide_id,
-                                    opponent_country,
-                                    color,
-                                    entry.result().to_string(),
-                                    entry.event().to_string(),
-                                    entry.date().to_string(),
-                                )
+                        let (
+                            opponent,
+                            opponent_title,
+                            opponent_fide_id,
+                            opponent_country,
+                            color,
+                            result,
+                            event,
+                            date,
+                        ) = if let Some(entry) = library.get(idx) {
+                            let player_white = players::player_key(entry.white()).as_deref()
+                                == Some(player.key.as_str());
+                            let (opponent, opponent_color, color) = if player_white {
+                                (entry.black().to_string(), Color::Black, "White")
                             } else {
-                                let (white_name, black_name) = library.game_players(idx);
-                                let player_white = players::player_key(&white_name).as_deref()
-                                    == Some(player.key.as_str());
-                                let (opponent, opponent_color, color) = if player_white {
-                                    (black_name, Color::Black, "White")
-                                } else {
-                                    (white_name, Color::White, "Black")
-                                };
-                                let headers = library.game_headers(idx);
-                                let find_h = |name: &str| -> Option<&str> {
-                                    headers
-                                        .iter()
-                                        .find(|(k, _)| k.eq_ignore_ascii_case(name))
-                                        .map(|(_, v)| v.as_str())
-                                };
-                                let opponent_title = title_from_tag(find_h(match opponent_color {
+                                (entry.white().to_string(), Color::White, "Black")
+                            };
+                            let opponent_title =
+                                title_from_tag(entry.header(match opponent_color {
                                     Color::White => "WhiteTitle",
                                     Color::Black => "BlackTitle",
                                 }));
-                                let opponent_fide_id = player_fide_id_from_header(find_h(match opponent_color {
+                            let opponent_fide_id =
+                                player_fide_id_from_header(entry.header(match opponent_color {
                                     Color::White => "WhiteFideId",
                                     Color::Black => "BlackFideId",
                                 }));
-                                let opponent_country = player_country_from_header(
-                                    find_h(match opponent_color {
+                            let opponent_country = player_country_from_header(
+                                entry
+                                    .header(match opponent_color {
                                         Color::White => "WhiteCountry",
                                         Color::Black => "BlackCountry",
                                     })
                                     .or_else(|| {
-                                        find_h(match opponent_color {
+                                        entry.header(match opponent_color {
                                             Color::White => "WhiteFed",
                                             Color::Black => "BlackFed",
                                         })
                                     }),
-                                );
-                                let result = find_h("Result").unwrap_or("*").to_string();
-                                let event = find_h("Event").unwrap_or("?").to_string();
-                                let date = find_h("Date").unwrap_or("????.??.??").to_string();
-                                (
-                                    opponent,
-                                    opponent_title,
-                                    opponent_fide_id,
-                                    opponent_country,
-                                    color,
-                                    result,
-                                    event,
-                                    date,
-                                )
+                            );
+                            (
+                                opponent,
+                                opponent_title,
+                                opponent_fide_id,
+                                opponent_country,
+                                color,
+                                entry.result().to_string(),
+                                entry.event().to_string(),
+                                entry.date().to_string(),
+                            )
+                        } else {
+                            let (white_name, black_name) = library.game_players(idx);
+                            let player_white = players::player_key(&white_name).as_deref()
+                                == Some(player.key.as_str());
+                            let (opponent, opponent_color, color) = if player_white {
+                                (black_name, Color::Black, "White")
+                            } else {
+                                (white_name, Color::White, "Black")
                             };
+                            let headers = library.game_headers(idx);
+                            let find_h = |name: &str| -> Option<&str> {
+                                headers
+                                    .iter()
+                                    .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                                    .map(|(_, v)| v.as_str())
+                            };
+                            let opponent_title = title_from_tag(find_h(match opponent_color {
+                                Color::White => "WhiteTitle",
+                                Color::Black => "BlackTitle",
+                            }));
+                            let opponent_fide_id =
+                                player_fide_id_from_header(find_h(match opponent_color {
+                                    Color::White => "WhiteFideId",
+                                    Color::Black => "BlackFideId",
+                                }));
+                            let opponent_country = player_country_from_header(
+                                find_h(match opponent_color {
+                                    Color::White => "WhiteCountry",
+                                    Color::Black => "BlackCountry",
+                                })
+                                .or_else(|| {
+                                    find_h(match opponent_color {
+                                        Color::White => "WhiteFed",
+                                        Color::Black => "BlackFed",
+                                    })
+                                }),
+                            );
+                            let result = find_h("Result").unwrap_or("*").to_string();
+                            let event = find_h("Event").unwrap_or("?").to_string();
+                            let date = find_h("Date").unwrap_or("????.??.??").to_string();
+                            (
+                                opponent,
+                                opponent_title,
+                                opponent_fide_id,
+                                opponent_country,
+                                color,
+                                result,
+                                event,
+                                date,
+                            )
+                        };
                         let suffix = format!(" · as {color}");
-                        let subtitle =
-                            format!("{result} · {event} · {date}");
+                        let subtitle = format!("{result} · {event} · {date}");
                         let selected = self
                             .session
                             .source_slot(idx)
