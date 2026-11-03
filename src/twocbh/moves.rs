@@ -234,7 +234,7 @@ fn append_node(game: &mut Game, parent: usize, ply: Ply, after: Chess, variation
     id
 }
 
-fn move_from_token(pos: &Chess, entry: [u16; 8]) -> Result<Move> {
+pub(crate) fn move_from_token(pos: &Chess, entry: [u16; 8]) -> Result<Move> {
     let [from, to_code, piece, aux, b3, b2, special6, special7] = entry;
     let from = from_stored_square(from as u8);
     let to = from_stored_square(to_code as u8);

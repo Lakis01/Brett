@@ -21,6 +21,7 @@
 //! adds the game list used by the application and refuses to index databases
 //! above [`MAX_INDEXED_GAMES`].
 
+pub mod fast_index;
 mod moves;
 mod tokens;
 pub mod writer;
