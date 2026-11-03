@@ -1,9 +1,9 @@
-# Provenance audit: SCID, CBH, CBV, and fixtures
+# Provenance audit: SCID, CBH, CBV, and test data
 
 **Audit date:** 2026-10-31
 **Scope:** the native SCID reader/writer, the classic ChessBase CBH reader,
 the current ChessBase 2CBH reader, the `.cbv` container path, the photo-pack
-converter, and the committed format fixtures.
+converter, and the inline or generated format test data.
 **Status:** complete for the current tree. This is an engineering provenance
 record, not legal advice.
 
@@ -15,7 +15,7 @@ formats. The audit answers three questions for each component:
 1. Was any third-party **code** copied, linked, or ported?
 2. If code was reused, was it under a licence compatible with Brett's MIT
    distribution?
-3. Are the committed **fixtures** redistributable, and do they contain only
+3. Is the committed **test data** redistributable, and does it contain only
    generated data or public-domain content?
 
 Format facts — field layouts, byte offsets, table values, and observed
@@ -27,7 +27,7 @@ is. This audit separates the two deliberately.
 | Component | Path | Origin and method | Code reused | Licence status |
 | --- | --- | --- | --- | --- |
 | Native SCID reader/writer | `src/scid.rs` | Independent implementation from the published SCID on-disk format; GPL SCID source and docs used as a format reference only | None | Brett MIT. No SCID code linked, copied, or invoked at runtime. |
-| SCID fixtures | `fixtures/scid/opera.{si4,sn4,sg4}` | Generated with the `pgnscid` build tool from the public-domain Opera Game in `fixtures/opera.pgn` | Generated data only | Committed fixture contains one public-domain game plus Brett-authored annotation markers. SCID tools are not redistributed. |
+| SCID test data | `src/test_data.rs`, `src/scid.rs` tests | Public-domain Opera Game embedded inline; the SCID database is generated in a temporary directory by Brett's MIT writer at test time | Generated data only | No fixture files are committed, and SCID tools are not redistributed. |
 | Classic CBH reader | `src/cbh/` | Independent decoder, annotation mapping, entity-name handling, and tests; validated against the MIT `cbvault` reader | Four 256-byte move-encoding tables from MIT `cbvault` (`src/cbh/tables.rs`) | Brett MIT plus the MIT table notice in `THIRD_PARTY_NOTICES.md`. |
 | Classic CBH fixtures | `src/cbh/tests.rs` | Synthetic database generated at test time; the personal validation sample lives under git-ignored `fixtures/local/` and is never redistributed | Generated data only | No third-party database content committed. |
 | Current 2CBH reader | `src/twocbh/` | Independent clean-room decoder: container framing, `.2lid` names, header mapping, generated move-token table, standard and Chess960 starts, castling, promotions, en passant, and nested variations | None. The 65,536-entry token table is generated from move geometry; no ChessBase table dump, binary, or code is used | Brett MIT. Real-database validation is env-gated and its files are not committed. |
@@ -77,7 +77,8 @@ MIT-era commit, and the AGPL boundary explicitly.
   files.
 - The upstream `oschess-cb-bridge` `LICENSE` at the ported commit and on
   `main`.
-- Fixture READMEs and generation scripts for the committed SCID database.
+- The SCID writer tests and the inline public-domain game data that replaced the
+  former committed database fixture.
 - `THIRD_PARTY_NOTICES.md`, `docs/CBH.md`, and `docs/PHOTOS.md` for statements
   that no longer matched the dependency graph.
 

@@ -66,11 +66,10 @@ documentation were used as a format reference only.
 - **Relationship:** no SCID source code is linked, copied, or distributed in
   Brett. Brett does not invoke `scidpgn` or any other SCID executable at
   runtime.
-- **Test fixture:** `fixtures/scid/opera.*` was generated from the
-  public-domain Opera Game in `fixtures/opera.pgn` using the `pgnscid` build
-  tool. The generated database contains only that public-domain game and
-  Brett-authored annotation markers. The SCID tools themselves are not
-  redistributed.
+- **Test data:** the public-domain Opera Game is embedded inline in
+  `src/test_data.rs`. SCID tests generate a database in a temporary directory
+  with Brett's MIT writer; no database fixture files are committed. The SCID
+  tools themselves are not redistributed.
 
 The SCID trademark and project names belong to their respective owners. This
 notice does not imply endorsement by the SCID project.

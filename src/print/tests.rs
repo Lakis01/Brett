@@ -21,7 +21,7 @@ fn parse(pgn: &str) -> Game {
 }
 
 fn opera() -> Game {
-    parse(include_str!("../../fixtures/opera.pgn"))
+    parse(crate::test_data::OPERA_PGN)
 }
 
 fn moves(items: &[PrintItem]) -> Vec<String> {

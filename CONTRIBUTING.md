@@ -37,7 +37,7 @@ cargo check --all-targets
 cargo test --all-targets
 cargo clippy --all-targets -- -D warnings
 
-cargo run --release -- fixtures/opera.pgn
+cargo run --release
 cargo run --release -- /path/to/database.si4
 ```
 
@@ -50,9 +50,10 @@ cargo run --example position_report -- file.pgn
 cargo run --example scid_report -- file.si4
 ```
 
-`fixtures/opera.pgn` is public domain. The generated SCID fixture under
-`fixtures/scid/` is safe to commit. Everything under `fixtures/local/` is local
-test data and is git-ignored; never redistribute it.
+No PGN or SCID fixtures are committed. Tests embed the public-domain Opera
+Game inline in `src/test_data.rs` and generate SCID databases in temporary
+directories with Brett's writer at test time. Everything under
+`fixtures/local/` is local test data and is git-ignored; never redistribute it.
 
 ## Secrets and personal settings
 

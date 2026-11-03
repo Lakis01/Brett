@@ -350,7 +350,7 @@ mod tests {
 
     #[test]
     fn round_trips_the_fixture_tree() {
-        let game = parse_pgn(include_bytes!("../fixtures/opera.pgn"))
+        let game = parse_pgn(crate::test_data::OPERA_PGN.as_bytes())
             .unwrap()
             .remove(0);
         let text = game_to_pgn(&game);

@@ -136,6 +136,8 @@ impl Cache {
         let key = query_key(name)?;
         if let Some(title) = self.queries.get(&key)
             && let Some(summary) = self.summaries.get(title)
+            && is_confident(summary)
+            && title_matches_name(name, &summary.title)
         {
             return Some(Lookup::Summary(summary.clone()));
         }
@@ -304,7 +306,7 @@ fn lookup_with(
         Ok(value) => {
             if let Some(summary) = Summary::from_value(&value) {
                 direct_title = Some(summary.title.clone());
-                if is_confident(&summary) {
+                if is_confident(&summary) && title_matches_name(name, &summary.title) {
                     return Ok(Lookup::Summary(summary));
                 }
             }
@@ -336,6 +338,9 @@ fn lookup_with(
             else {
                 continue;
             };
+            if !title_matches_name(name, title) {
+                continue;
+            }
             let preferred = page
                 .get("description")
                 .and_then(Value::as_str)
@@ -359,7 +364,7 @@ fn lookup_with(
             Ok(value) => {
                 if let Some(summary) = Summary::from_value(&value) {
                     parsed_any = true;
-                    if is_confident(&summary) {
+                    if is_confident(&summary) && title_matches_name(name, &summary.title) {
                         return Ok(Lookup::Summary(summary));
                     }
                 }
@@ -539,6 +544,63 @@ fn is_confident(summary: &Summary) -> bool {
 fn has_word(text: &str, word: &str) -> bool {
     text.split(|ch: char| !ch.is_alphanumeric())
         .any(|token| token == word)
+}
+
+fn name_tokens(text: &str) -> Vec<String> {
+    text.split(|ch: char| !ch.is_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .map(|token| deunicode::deunicode(token).to_lowercase())
+        .collect()
+}
+
+/// Split a PGN name into tokens, putting `Surname, Given` back into
+/// given-name order so both spellings match the same article.
+fn query_name_tokens(name: &str) -> Vec<String> {
+    let name = name.trim();
+    if let Some((surname, given)) = name.split_once(',') {
+        let mut tokens = name_tokens(given);
+        tokens.extend(name_tokens(surname));
+        tokens
+    } else {
+        name_tokens(name)
+    }
+}
+
+/// True when an article title names the queried player.
+///
+/// Search results for abbreviated PGN names such as `Bacrot, E` often contain
+/// a confident but unrelated chess player. Multi-letter query tokens (the
+/// surname and any spelled-out given names) must all appear in the title;
+/// single-letter initials may be absent so `Gawain C B Jones` still matches
+/// `Gawain Jones`. Prefix matching covers conventional abbreviations:
+/// `Svane, R` matches `Rasmus Svane` and `Buhmann,R` matches `Rainer Buhmann`.
+fn title_matches_name(name: &str, title: &str) -> bool {
+    let query = query_name_tokens(name);
+    let title = title.split('(').next().unwrap_or(title);
+    let title_tokens = name_tokens(title);
+    if query.is_empty() || title_tokens.is_empty() {
+        return false;
+    }
+
+    let mut used = vec![false; title_tokens.len()];
+    let mut required = 0;
+    for token in &query {
+        if token.chars().count() == 1 {
+            continue;
+        }
+        required += 1;
+        let Some(index) = title_tokens
+            .iter()
+            .enumerate()
+            .find_map(|(index, candidate)| {
+                (!used[index] && candidate.starts_with(token.as_str())).then_some(index)
+            })
+        else {
+            return false;
+        };
+        used[index] = true;
+    }
+    required > 0
 }
 
 /// Normalized identity used for the cache's name index.
@@ -833,6 +895,81 @@ mod tests {
             Lookup::Summary(summary) => assert_eq!(summary.title, "Magnus Carlsen"),
             Lookup::Ambiguous { .. } => panic!("expected a confident summary"),
         }
+    }
+
+    #[test]
+    fn abbreviated_names_match_their_expanded_article_titles() {
+        assert!(title_matches_name("Bacrot, E", "Étienne Bacrot"));
+        assert!(title_matches_name("Svane, R", "Rasmus Svane"));
+        assert!(title_matches_name("Buhmann,R", "Rainer Buhmann"));
+        assert!(title_matches_name("Carlsen, Magnus", "Magnus Carlsen"));
+        assert!(!title_matches_name("Bacrot, E", "Magnus Carlsen"));
+        assert!(!title_matches_name("Bacrot, E", "World Chess Championship"));
+    }
+
+    #[test]
+    fn lookup_skips_a_confident_chess_player_with_a_different_name() {
+        let result = lookup_with("Bacrot, E", |url| {
+            if url.contains("/summary/Bacrot%2C_E") {
+                return Err(FetchError::NotFound);
+            }
+            if url.contains("/search/page") {
+                return Ok(json!({
+                    "pages": [
+                        {
+                            "title": "Magnus Carlsen",
+                            "description": "Norwegian chess grandmaster",
+                        },
+                        {
+                            "title": "Étienne Bacrot",
+                            "description": "French chess grandmaster",
+                        }
+                    ]
+                }));
+            }
+            if url.contains("tienne_Bacrot") {
+                return Ok(summary_json(
+                    "Étienne Bacrot",
+                    "French chess grandmaster",
+                    "Étienne Bacrot is a French chess grandmaster.",
+                ));
+            }
+            if url.contains("/summary/Magnus_Carlsen") {
+                return Ok(summary_json(
+                    "Magnus Carlsen",
+                    "Norwegian chess grandmaster",
+                    "Sven Magnus Øen Carlsen is a Norwegian chess grandmaster.",
+                ));
+            }
+            Err(FetchError::NotFound)
+        })
+        .unwrap();
+        match result {
+            Lookup::Summary(summary) => assert_eq!(summary.title, "Étienne Bacrot"),
+            Lookup::Ambiguous { .. } => panic!("expected the matching player"),
+        }
+    }
+
+    #[test]
+    fn cache_ignores_a_saved_summary_for_a_different_player() {
+        let summary = summary_json(
+            "Magnus Carlsen",
+            "Norwegian chess grandmaster",
+            "Sven Magnus Øen Carlsen is a Norwegian chess grandmaster.",
+        );
+        let cache = Cache::from_json(
+            &json!({
+                "summaries": { "Magnus Carlsen": summary },
+                "queries": { "bacrot e": "Magnus Carlsen" },
+                "ambiguous": {},
+            })
+            .to_string(),
+        );
+        assert_eq!(
+            cache.get("Bacrot, E"),
+            None,
+            "a stale mismatched mapping must be ignored"
+        );
     }
 
     #[test]

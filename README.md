@@ -6,8 +6,7 @@ preparation, game review, database management, and deep position analysis.
 ## Quick start (Linux)
 
 ```sh
-cargo build --release
-./target/release/brett fixtures/opera.pgn
+cargo run --release
 ```
 
 You need Rust 1.97 or newer (the chess and PGN crates require it), a C
@@ -16,10 +15,12 @@ toolchain, the X11/Wayland development packages required by `eframe`, and
 Stockfish is optional: Brett looks for `$BRETT_ENGINE`, then
 `/usr/bin/stockfish`, and any UCI engine can be selected in the Engine tab.
 
-The first launch opens the bundled public-domain game. Use **File → Open
-database…** or drop a `.pgn`, `.si4`, `.si3`, or `.cbh` onto the window. Personal
-settings, caches, and secrets live outside the repository; see
-[CONTRIBUTING.md](CONTRIBUTING.md) and [Data safety](#data-safety).
+The first launch opens an empty workspace with an **Open** prompt. Use
+**File → Open database…** or drop a `.pgn`, `.si4`, `.si3`, `.cbh`, or `.2cbh`
+onto the window. You can also pass a database path on the command line:
+`cargo run --release -- /path/to/database.pgn`. Personal settings, caches, and
+secrets live outside the repository; see [CONTRIBUTING.md](CONTRIBUTING.md) and
+[Data safety](#data-safety).
 
 ## Platform support
 

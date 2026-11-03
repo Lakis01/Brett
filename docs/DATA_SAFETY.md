@@ -104,16 +104,16 @@ written back to the source database.
 3. Keep derived fixtures out of version control: `fixtures/local/` is
    git-ignored.
 
-`fixtures/opera.pgn` is public domain and safe to commit. The small SCID
-fixture under `fixtures/scid/` is generated from it with `pgnscid`; see
-`fixtures/scid/README.md`. Everything under `fixtures/local/` is for local
-testing only and must never be redistributed.
+No PGN or SCID database fixtures are committed. Tests embed the public-domain
+Opera Game inline in `src/test_data.rs` and generate SCID databases in
+temporary directories at test time. Everything under `fixtures/local/` is for
+local testing only and must never be redistributed.
 
 ## Enforcement
 
 - Import code opens source files read-only (`File::open`, no write flags).
 - SCID and CBH companion files are checked for existence but never created.
-- Tests never touch the real database directory; they use committed fixtures,
-  synthetic databases, or copies.
+- Tests never touch the real database directory; they use inline public-domain
+  test data, synthetic databases, or temporary copies.
 - The only tools allowed to touch the source tree are read-only inspectors
   (`ls`, `stat`, checksum tools). Converters run on copies.

@@ -153,7 +153,8 @@ fn child_positions_and_score_are_queryable() {
 
 #[test]
 fn only_mainlines_are_counted() {
-    let pgn_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/opera.pgn");
+    let pgn_path = temp_path("opera", "pgn");
+    std::fs::write(&pgn_path, brett::test_data::OPERA_PGN).unwrap();
     let index_path = temp_path("opera", "brettpos");
     PositionIndex::build_to(&pgn_path, &index_path, BuildOptions::default(), |_| {}).unwrap();
     let index = PositionIndex::open(&index_path).unwrap();
@@ -171,6 +172,7 @@ fn only_mainlines_are_counted() {
     assert_eq!(moves[0].san(&d4.pos).as_deref(), Some("Bg4"));
     assert_eq!(moves[0].games, 1);
 
+    std::fs::remove_file(pgn_path).unwrap();
     std::fs::remove_file(index_path).unwrap();
 }
 

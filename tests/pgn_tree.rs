@@ -2,7 +2,7 @@ use brett::chess::{Color, Move, Position, Role, Square};
 use brett::domain::{self, Game, Token};
 
 fn opera() -> Game {
-    let games = domain::parse_pgn(include_bytes!("../fixtures/opera.pgn")).unwrap();
+    let games = domain::parse_pgn(brett::test_data::OPERA_PGN.as_bytes()).unwrap();
     assert_eq!(games.len(), 1);
     games.into_iter().next().unwrap()
 }

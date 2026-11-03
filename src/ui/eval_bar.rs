@@ -16,9 +16,9 @@ const CENTER_TICK: Color32 = Color32::from_rgba_premultiplied(0x77, 0x96, 0x56, 
 /// Draw a vertical evaluation bar of height `side`.
 ///
 /// White fills from the bottom upward regardless of board orientation.
-pub fn draw(ui: &mut Ui, eval: Option<BoardEval>, side: f32) {
+pub fn draw(ui: &mut Ui, eval: Option<BoardEval>, side: f32) -> egui::Response {
     let side = side.clamp(64.0, 4096.0);
-    let (rect, response) = ui.allocate_exact_size(Vec2::new(WIDTH, side), Sense::hover());
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(WIDTH, side), Sense::click());
     let painter = ui.painter_at(rect);
 
     let white_fraction = eval
@@ -61,5 +61,5 @@ pub fn draw(ui: &mut Ui, eval: Option<BoardEval>, side: f32) {
         Some(eval) => eval.tooltip(),
         None => "Evaluation bar · waiting for evaluation".to_string(),
     };
-    response.on_hover_text(tip);
+    response.on_hover_text(tip)
 }

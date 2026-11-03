@@ -32,6 +32,8 @@ pub mod scid;
 pub mod session;
 pub mod settings;
 pub mod setup;
+#[doc(hidden)]
+pub mod test_data;
 pub mod titles;
 pub mod twocbh;
 pub mod ui;

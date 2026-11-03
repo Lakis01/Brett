@@ -96,11 +96,10 @@ cargo run --example scid_export -- input.pgn /tmp/opencode/output.si4
 
 ## Validation
 
-The committed fixture is generated from the public-domain Opera Game in
-[`fixtures/opera.pgn`](../fixtures/opera.pgn) and exercises a comment, a
-variation, a NAG, castling, promotion, and the normal header/namebase path.
-Regeneration is documented in
-[`fixtures/scid/README.md`](../fixtures/scid/README.md).
+The reader and writer tests generate a SCID4 database at test time from the
+public-domain Opera Game embedded inline in [`src/test_data.rs`](../src/test_data.rs).
+The round trip exercises a comment, a variation, a NAG, castling, promotion, and
+the normal header/namebase path, so no database fixture is committed.
 
 The reader has also been run against every `.si4` database in the local
 reference corpus. The largest is `Frese Sammlung`:
@@ -191,5 +190,5 @@ SCID's own tools for comparison, copy the triple to `/tmp/opencode` first; see
 | `src/position.rs` | Generic position-index builder and cache fingerprint |
 | `src/players.rs` | Player directory and preparation books |
 | `src/app.rs` | Format detection, opening, game selection |
-| `fixtures/scid/` | Public-domain generated SCID fixture |
+| `src/test_data.rs` | Inline public-domain Opera Game used by parser and SCID tests |
 | `examples/scid_report.rs` | Full-corpus decode check |

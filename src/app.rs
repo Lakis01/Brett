@@ -897,7 +897,6 @@ pub struct App {
     engine_cache_saved_notice: Option<(u64, u32, Instant)>,
     cached_analyses_pos: Option<u64>,
     engine_request: u64,
-    engine_fen: Option<String>,
     engine_infos: BTreeMap<usize, EngineInfo>,
     engine_bestmove: Option<String>,
     engine_searching: bool,
@@ -1247,7 +1246,6 @@ impl App {
             engine_cache_saved_notice: None,
             cached_analyses_pos: None,
             engine_request: 0,
-            engine_fen: None,
             engine_infos: BTreeMap::new(),
             engine_bestmove: None,
             engine_searching: false,
@@ -4678,7 +4676,6 @@ impl App {
             self.engine_slots[i].ready = false;
         }
         self.engine_request = 0;
-        self.engine_fen = None;
         self.engine_infos.clear();
         self.engine_bestmove = None;
         self.engine_searching = false;
@@ -4698,7 +4695,6 @@ impl App {
             self.engine_slots[i].searching = false;
         }
         self.engine_request = 0;
-        self.engine_fen = None;
         self.engine_infos.clear();
         self.engine_bestmove = None;
         self.engine_searching = false;
@@ -5388,7 +5384,12 @@ impl App {
                 WikiState::Idle | WikiState::Failed(_) => {}
             }
         }
-        if let Some(lookup) = self.wiki_cache.get(&player.name) {
+        let lookup_name = self.wiki_lookup_name(player);
+        if let Some(lookup) = self
+            .wiki_cache
+            .get(&player.name)
+            .or_else(|| self.wiki_cache.get(&lookup_name))
+        {
             self.wiki_rx = None;
             self.wiki_job = None;
             self.wiki_for = Some(player.key.clone());
@@ -5398,12 +5399,21 @@ impl App {
         self.start_wiki_lookup(player);
     }
 
+    /// Prefer the photo pack's full spelling so abbreviated PGN names search
+    /// Wikipedia with a real first name (`Svane, R` -> `Rasmus Svane`).
+    fn wiki_lookup_name(&self, player: &PlayerSummary) -> String {
+        self.photos
+            .as_ref()
+            .and_then(|photos| photos.full_name(&player.name))
+            .unwrap_or_else(|| player.name.clone())
+    }
+
     fn start_wiki_lookup(&mut self, player: &PlayerSummary) {
         if self.wiki_job.as_deref() == Some(player.key.as_str()) && self.wiki_rx.is_some() {
             return;
         }
         let key = player.key.clone();
-        let name = player.name.clone();
+        let name = self.wiki_lookup_name(player);
         let (tx, rx) = mpsc::channel();
         let ctx = self.ctx.clone();
         std::thread::spawn(move || {
@@ -6287,54 +6297,7 @@ impl App {
         let fen = Fen::from_position(pos, EnPassantMode::Legal).to_string();
         let turn = pos.turn();
 
-        let local = if self.engine_fen.as_deref() == Some(fen.as_str()) {
-            self.engine_infos
-                .get(&1)
-                .or_else(|| self.engine_infos.values().next())
-                .and_then(|info| {
-                    info.score
-                        .map(|score| BoardEval::from_local(score, turn, info.depth))
-                })
-        } else if let Some((rev_fen, rev_turn, info)) = self
-            .review
-            .as_ref()
-            .and_then(ReviewState::current_search_eval)
-            && rev_fen == fen
-        {
-            info.score
-                .map(|score| BoardEval::from_local(score, rev_turn, info.depth))
-        } else if !self.cached_analyses.is_empty() {
-            let sf = self.cached_analyses.iter().find(|a| {
-                a.engine_family == crate::analysis_cache::EngineFamily::Stockfish && a.multipv == 1
-            });
-            let lc0 = self.cached_analyses.iter().find(|a| {
-                a.engine_family == crate::analysis_cache::EngineFamily::Leela && a.multipv == 1
-            });
-            if let Some(sf) = sf {
-                let score = if let Some(mate) = sf.score_mate {
-                    Score::Mate(mate)
-                } else if let Some(cp) = sf.score_cp {
-                    Score::Cp(cp)
-                } else {
-                    Score::Cp(0)
-                };
-                Some(BoardEval::from_local(score, turn, sf.depth))
-            } else if let Some(lc0) = lc0 {
-                let score = if let Some(mate) = lc0.score_mate {
-                    Score::Mate(mate)
-                } else if let Some(cp) = lc0.score_cp {
-                    let translated = crate::analysis_cache::leela_to_stockfish_cp(cp);
-                    Score::Cp(translated)
-                } else {
-                    Score::Cp(0)
-                };
-                Some(BoardEval::from_local(score, turn, lc0.depth))
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+        let local = self.local_board_eval(&fen, turn);
 
         let cloud_eval = self
             .cloud
@@ -6356,6 +6319,73 @@ impl App {
         let pgn = node.eval.and_then(BoardEval::from_pgn);
 
         eval::choose(local, cloud, pgn)
+    }
+
+    /// Deepest available local evaluation for `fen`: live engine slots, the
+    /// running review search, and the on-disk cache. Leela centipawns are
+    /// translated to Stockfish's scale and every engine family participates,
+    /// including generic UCI engines.
+    fn local_board_eval(&self, fen: &str, turn: Color) -> Option<BoardEval> {
+        use crate::analysis_cache::EngineFamily;
+
+        let mut best = None;
+
+        for slot in &self.engine_slots {
+            if slot.fen.as_deref() != Some(fen) {
+                continue;
+            }
+            let Some(info) = slot.infos.get(&1).or_else(|| slot.infos.values().next()) else {
+                continue;
+            };
+            let Some(score) = info.score else {
+                continue;
+            };
+            let family = crate::analysis_cache::parse_engine_identity(&slot.name).family;
+            let score = match (family, score) {
+                (EngineFamily::Leela, Score::Cp(cp)) => {
+                    Score::Cp(crate::analysis_cache::leela_to_stockfish_cp(cp))
+                }
+                _ => score,
+            };
+            keep_deeper(&mut best, BoardEval::from_local(score, turn, info.depth));
+        }
+
+        if let Some((rev_fen, rev_turn, info)) = self
+            .review
+            .as_ref()
+            .and_then(ReviewState::current_search_eval)
+            && rev_fen == fen
+            && let Some(score) = info.score
+        {
+            keep_deeper(
+                &mut best,
+                BoardEval::from_local(score, rev_turn, info.depth),
+            );
+        }
+
+        for analysis in &self.cached_analyses {
+            if analysis.multipv != 1 {
+                continue;
+            }
+            let score = if let Some(mate) = analysis.score_mate {
+                Score::Mate(mate)
+            } else if let Some(cp) = analysis.score_cp {
+                match analysis.engine_family {
+                    EngineFamily::Leela => {
+                        Score::Cp(crate::analysis_cache::leela_to_stockfish_cp(cp))
+                    }
+                    EngineFamily::Stockfish | EngineFamily::Generic => Score::Cp(cp),
+                }
+            } else {
+                continue;
+            };
+            keep_deeper(
+                &mut best,
+                BoardEval::from_local(score, turn, analysis.depth),
+            );
+        }
+
+        best
     }
 
     /// Load a game by its original source index. Player lists use this path.
@@ -7586,7 +7616,9 @@ impl App {
                         width,
                         row_h - 2.0,
                     );
-                    response.dnd_set_drag_payload(GameRowDrag { id });
+                    if response.sense.senses_drag() {
+                        response.dnd_set_drag_payload(GameRowDrag { id });
+                    }
 
                     let pointer = ui.ctx().pointer_interact_pos();
                     let hovering_drag = response.dnd_hover_payload::<GameRowDrag>().is_some()
@@ -8183,8 +8215,9 @@ impl App {
     fn moves_panel(&mut self, root: &mut Ui) {
         egui::Panel::right("moves")
             .default_size(390.0)
-            .size_range(280.0..=560.0)
+            .size_range(280.0..=650.0)
             .show(root, |ui| {
+                ui.set_max_width(ui.available_width());
                 ui.add_space(6.0);
                 ui.horizontal_wrapped(|ui| {
                     for tab in RightTab::ALL {
@@ -8274,13 +8307,17 @@ impl App {
     }
 
     fn section_content(&mut self, tab: RightTab, ui: &mut Ui) {
+        ui.set_max_width(ui.available_width());
         match tab {
             RightTab::Moves if self.recent_preview.is_some() => self.preview_content(ui),
             RightTab::Moves => {
-                egui::ScrollArea::vertical()
+                egui::ScrollArea::both()
                     .id_salt("moves-tab-scroll")
                     .auto_shrink([false, false])
-                    .show(ui, |ui| self.moves_content(ui));
+                    .show(ui, |ui| {
+                        ui.set_max_width(ui.available_width());
+                        self.moves_content(ui);
+                    });
             }
             RightTab::Tree => self.tree_content(ui),
             RightTab::Engine => self.engine_content(ui),
@@ -8313,10 +8350,11 @@ impl App {
             .unwrap_or_else(|| "No database open".to_string());
         let reference_status = self.reference_status.clone();
 
-        egui::ScrollArea::vertical()
+        egui::ScrollArea::both()
             .id_salt("cloud-references")
             .auto_shrink([false, false])
             .show(ui, |ui| {
+                ui.set_max_width(ui.available_width());
                 ui.horizontal(|ui| {
                     ui.heading("References");
                     if loading {
@@ -8503,10 +8541,11 @@ impl App {
     fn engine_content(&mut self, ui: &mut Ui) {
         self.maybe_engine_analysis();
         self.maybe_request_cloud();
-        egui::ScrollArea::vertical()
+        egui::ScrollArea::both()
             .id_salt("engine-tab")
             .auto_shrink([false, false])
             .show(ui, |ui| {
+                ui.set_max_width(ui.available_width());
                 self.engine_content_inner(ui);
             });
     }
@@ -9562,11 +9601,13 @@ impl App {
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("Moves").size(15.0).strong());
-                    ui.label(
-                        RichText::new(format!("{} moves", full_moves(game.mainline_len())))
-                            .weak()
-                            .small(),
-                    );
+                    if ui.available_width() > 160.0 {
+                        ui.label(
+                            RichText::new(format!("{} moves", full_moves(game.mainline_len())))
+                                .weak()
+                                .small(),
+                        );
+                    }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         result_badge(ui, game.result());
                         if ui
@@ -9866,10 +9907,11 @@ impl App {
         let book = self.book.clone();
         let book_status = self.book_status.clone();
 
-        egui::ScrollArea::vertical()
+        egui::ScrollArea::both()
             .id_salt("tree-tab")
             .auto_shrink([false, false])
             .show(ui, |ui| {
+                ui.set_max_width(ui.available_width());
                 ui.horizontal(|ui| {
                     ui.heading("Tree");
                     if self.cloud_rx.is_some() || self.explorer_rx.is_some() {
@@ -11405,6 +11447,7 @@ impl App {
                             let name = view.name();
                             let count = view.session.len();
                             ui.horizontal(|ui| {
+                                let can_drag = rows_are_draggable(ui);
                                 let handle = ui
                                     .add(
                                         egui::Label::new(
@@ -11412,12 +11455,18 @@ impl App {
                                                 .color(Color32::from_gray(150))
                                                 .size(14.0),
                                         )
-                                        .sense(Sense::drag()),
+                                        .sense(if can_drag {
+                                            Sense::drag()
+                                        } else {
+                                            Sense::hover()
+                                        }),
                                     )
                                     .on_hover_text(
                                         "Drag this database onto the current list or another view to merge",
                                     );
-                                handle.dnd_set_drag_payload(ViewDatabaseDrag { view: view_index });
+                                if can_drag {
+                                    handle.dnd_set_drag_payload(ViewDatabaseDrag { view: view_index });
+                                }
                                 ui.label(RichText::new(name).strong());
                                 ui.label(RichText::new(games_label(count)).small().weak());
                                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -11517,10 +11566,12 @@ impl App {
                                                 width,
                                                 row_h - 2.0,
                                             );
-                                            response.dnd_set_drag_payload(ViewGameDrag {
-                                                view: view_index,
-                                                id,
-                                            });
+                                            if response.sense.senses_drag() {
+                                                response.dnd_set_drag_payload(ViewGameDrag {
+                                                    view: view_index,
+                                                    id,
+                                                });
+                                            }
                                             let pointer = ui.ctx().pointer_interact_pos();
                                             let hovering = response
                                                 .dnd_hover_payload::<GameRowDrag>()
@@ -12712,12 +12763,13 @@ impl eframe::App for App {
                     ui.add_space(2.0);
                     let event = if self.engine_bar {
                         let mut event = None;
-                        let bar_response = ui.allocate_ui_with_layout(
+                        let mut bar_response = None;
+                        ui.allocate_ui_with_layout(
                             vec2(side + eval_bar::WIDTH + eval_bar::GAP, side),
                             Layout::left_to_right(Align::Center),
                             |ui| {
                                 ui.spacing_mut().item_spacing.x = eval_bar::GAP;
-                                eval_bar::draw(ui, board_eval, side);
+                                bar_response = Some(eval_bar::draw(ui, board_eval, side));
                                 event = board::draw(
                                     ui,
                                     &self.textures,
@@ -12733,13 +12785,15 @@ impl eframe::App for App {
                                 );
                             },
                         );
-                        bar_response.response.context_menu(|ui| {
-                            if ui.button("Hide evaluation bar").clicked() {
-                                self.engine_bar = false;
-                                self.save_display_prefs();
-                                ui.close();
-                            }
-                        });
+                        if let Some(bar_response) = bar_response {
+                            bar_response.context_menu(|ui| {
+                                if ui.button("Hide evaluation bar").clicked() {
+                                    self.engine_bar = false;
+                                    self.save_display_prefs();
+                                    ui.close();
+                                }
+                            });
+                        }
                         event
                     } else {
                         board::draw(
@@ -14092,7 +14146,7 @@ fn compact_eco_opening_tag(
         let mut opening = opening_index
             .map(|index| game.headers[index].1.clone())
             .unwrap_or_default();
-        let width = (ui.available_width() - 2.0).max(60.0);
+        let width = (ui.available_width() - 2.0).max(30.0);
         let opening_response = ui.add_sized(
             [width, 19.0],
             egui::TextEdit::singleline(&mut opening)
@@ -14387,75 +14441,110 @@ fn game_header_card(
                 }
                 (e, o, _) => (e, o, false),
             };
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing = vec2(6.0, 4.0);
-                let response = date_chip(ui, game.date());
-                if response.clicked() {
-                    *date_clicked = Some(response.rect.left_bottom());
-                }
-                response.on_hover_text("Click to choose a date");
-                let board = board.filter(|board| !board.is_empty());
-                let show_round = !round.is_empty() && round != "?";
-                // When an Opening tag is present, the ECO moves down beside
-                // it; otherwise it stays in this compact top bar.
-                let show_eco = opening.is_none() && eco.is_some();
-                // Prefer the full Round/Board words. Only fall back to R/B
-                // when the event would otherwise be squeezed below a usable
-                // width. The result always keeps its reserved space at the
-                // right edge.
-                let round_full = format!("Round {round}");
-                let round_short = format!("R {round}");
-                let board_full = board.as_deref().map(|board| format!("Board {board}"));
-                let board_short = board.as_deref().map(|board| format!("B {board}"));
-                let chip_width = |text: &str| text.chars().count() as f32 * 6.8 + 14.0;
-                let reserve_for = |round: &str, board: Option<&str>| {
-                    let mut reserve = 70.0;
-                    if show_round {
-                        reserve += chip_width(round);
-                    }
-                    if let Some(board) = board {
-                        reserve += chip_width(board);
-                    }
-                    if show_eco {
-                        reserve += 34.0;
-                    }
-                    reserve
-                };
-                let available = ui.available_width();
-                let full_reserve = reserve_for(&round_full, board_full.as_deref());
-                let use_short = available - full_reserve < 96.0;
-                let (round_text, board_text, reserve) = if use_short {
-                    (
-                        round_short.as_str(),
-                        board_short.as_deref(),
-                        reserve_for(&round_short, board_short.as_deref()),
-                    )
-                } else {
-                    (
-                        round_full.as_str(),
-                        board_full.as_deref(),
-                        full_reserve,
-                    )
-                };
-                let event_width = (available - reserve).max(48.0);
-                ui.add_sized(
-                    [event_width, 20.0],
-                    egui::Label::new(RichText::new(event).small().strong().color(GOLD)).truncate(),
-                )
-                .on_hover_text(event);
+            let board = board.filter(|board| !board.is_empty());
+            let show_round = !round.is_empty() && round != "?";
+            // When an Opening tag is present, the ECO moves down beside
+            // it; otherwise it stays in this compact top bar.
+            let show_eco = opening.is_none() && eco.is_some();
+            // Prefer the full Round/Board words. Only fall back to R/B
+            // when the event would otherwise be squeezed below a usable
+            // width. The result always keeps its reserved space at the
+            // right edge.
+            let round_full = format!("Round {round}");
+            let round_short = format!("R {round}");
+            let board_full = board.as_deref().map(|board| format!("Board {board}"));
+            let board_short = board.as_deref().map(|board| format!("B {board}"));
+            let chip_width = |text: &str| text.chars().count() as f32 * 6.8 + 14.0;
+            let reserve_for = |round: &str, board: Option<&str>| {
+                let mut reserve = 70.0;
                 if show_round {
-                    meta_chip_hover(ui, round_text, &format!("Round {round}"));
+                    reserve += chip_width(round);
                 }
-                if let Some(board) = board_text {
-                    meta_chip_hover(ui, board, &format!("Board {board}"));
+                if let Some(board) = board {
+                    reserve += chip_width(board);
                 }
-                if show_eco && let Some(eco) = eco {
-                    meta_chip(ui, eco);
+                if show_eco {
+                    reserve += 34.0;
                 }
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    result_badge(ui, game.result());
+                reserve
+            };
+            let available = ui.available_width();
+            let full_reserve = reserve_for(&round_full, board_full.as_deref());
+            let use_short = available - full_reserve < 96.0;
+            let (round_text, board_text, reserve) = if use_short {
+                (
+                    round_short.as_str(),
+                    board_short.as_deref(),
+                    reserve_for(&round_short, board_short.as_deref()),
+                )
+            } else {
+                (
+                    round_full.as_str(),
+                    board_full.as_deref(),
+                    full_reserve,
+                )
+            };
+
+            if available < 340.0 {
+                // Two compact rows so small widths never overflow or force panel expansion
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing = vec2(6.0, 4.0);
+                    let event_width = (ui.available_width() - 56.0).max(40.0);
+                    ui.add_sized(
+                        [event_width, 20.0],
+                        egui::Label::new(RichText::new(event).small().strong().color(GOLD)).truncate(),
+                    )
+                    .on_hover_text(event);
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        result_badge(ui, game.result());
+                    });
                 });
-            });
+                ui.add_space(3.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing = vec2(6.0, 4.0);
+                    let response = date_chip(ui, game.date());
+                    if response.clicked() {
+                        *date_clicked = Some(response.rect.left_bottom());
+                    }
+                    response.on_hover_text("Click to choose a date");
+                    if show_round {
+                        meta_chip_hover(ui, round_short.as_str(), &format!("Round {round}"));
+                    }
+                    if let Some(board) = board_short.as_deref() {
+                        meta_chip_hover(ui, board, &format!("Board {board}"));
+                    }
+                    if show_eco && let Some(eco) = eco {
+                        meta_chip(ui, eco);
+                    }
+                });
+            } else {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing = vec2(6.0, 4.0);
+                    let response = date_chip(ui, game.date());
+                    if response.clicked() {
+                        *date_clicked = Some(response.rect.left_bottom());
+                    }
+                    response.on_hover_text("Click to choose a date");
+                    let event_width = (available - reserve).max(30.0);
+                    ui.add_sized(
+                        [event_width, 20.0],
+                        egui::Label::new(RichText::new(event).small().strong().color(GOLD)).truncate(),
+                    )
+                    .on_hover_text(event);
+                    if show_round {
+                        meta_chip_hover(ui, round_text, &format!("Round {round}"));
+                    }
+                    if let Some(board) = board_text {
+                        meta_chip_hover(ui, board, &format!("Board {board}"));
+                    }
+                    if show_eco && let Some(eco) = eco {
+                        meta_chip(ui, eco);
+                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        result_badge(ui, game.result());
+                    });
+                });
+            }
             ui.add_space(6.0);
             header_player_row(
                 ui,
@@ -14540,8 +14629,11 @@ fn header_player_row(
             4.0,
             Stroke::new(1.0, Color32::from_gray(120)),
         );
-        let width = (ui.available_width() - 48.0).max(80.0);
+        let rating_reserve = if rating.is_some() { 56.0 } else { 0.0 };
+        let spacing = ui.spacing().item_spacing.x;
+        let width = (ui.available_width() - rating_reserve - spacing).max(40.0);
         ui.vertical(|ui| {
+            ui.set_max_width(width);
             let mut label = LayoutJob::default();
             if let Some(title) = title {
                 label.append(
@@ -14599,10 +14691,13 @@ fn header_player_row(
                 },
             );
             if let Some(team) = team.filter(|team| !team.trim().is_empty()) {
-                ui.label(
-                    RichText::new(team.trim())
-                        .small()
-                        .color(Color32::from_gray(150)),
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(team.trim())
+                            .small()
+                            .color(Color32::from_gray(150)),
+                    )
+                    .truncate(),
                 )
                 .on_hover_text("Team");
             }
@@ -15589,6 +15684,23 @@ fn append_player_name(
     }
 }
 
+/// Keep the deepest local evaluation; equal depths keep the earlier source.
+fn keep_deeper(best: &mut Option<BoardEval>, candidate: BoardEval) {
+    if best
+        .as_ref()
+        .is_none_or(|current| candidate.depth > current.depth)
+    {
+        *best = Some(candidate);
+    }
+}
+
+/// Drag-to-reorder is unavailable while a finger is on the screen, so a
+/// touch scroll gesture never turns into a game drag. Mouse and trackpad
+/// input keeps the full drag-and-drop behaviour.
+fn rows_are_draggable(ui: &Ui) -> bool {
+    !ui.input(|input| input.any_touches())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn game_row(
     ui: &mut Ui,
@@ -15601,7 +15713,12 @@ fn game_row(
     width: f32,
     height: f32,
 ) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(vec2(width, height), Sense::click_and_drag());
+    let sense = if rows_are_draggable(ui) {
+        Sense::click_and_drag()
+    } else {
+        Sense::click()
+    };
+    let (rect, response) = ui.allocate_exact_size(vec2(width, height), sense);
     let visuals = ui.visuals();
     let bg = if selected {
         visuals.selection.bg_fill
@@ -17596,6 +17713,55 @@ mod tests {
     }
 
     #[test]
+    fn game_rows_are_click_only_while_a_touch_is_active() {
+        fn row_sense(events: Vec<egui::Event>) -> egui::Sense {
+            let ctx = egui::Context::default();
+            let mut sense = None;
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(400.0, 200.0),
+                )),
+                events,
+                ..Default::default()
+            };
+            let output = ctx.run_ui(input, |ui| {
+                let response = game_row(
+                    ui,
+                    false,
+                    "",
+                    RowName::new("Morphy, Paul", None),
+                    Some(RowName::new("Duke Karl", None)),
+                    "",
+                    "Paris · 1858",
+                    300.0,
+                    40.0,
+                );
+                sense = Some(response.sense);
+            });
+            output.drop_without_applying_deltas();
+            sense.unwrap()
+        }
+
+        let touch = row_sense(vec![egui::Event::Touch {
+            device_id: egui::TouchDeviceId(0),
+            id: egui::TouchId(0),
+            phase: egui::TouchPhase::Start,
+            pos: egui::Pos2::new(40.0, 40.0),
+            force: None,
+        }]);
+        assert!(touch.senses_click());
+        assert!(
+            !touch.senses_drag(),
+            "a finger held on a game row must scroll, not start a drag"
+        );
+
+        let mouse = row_sense(vec![egui::Event::PointerMoved(egui::Pos2::new(40.0, 40.0))]);
+        assert!(mouse.senses_click());
+        assert!(mouse.senses_drag(), "mouse rows must stay draggable");
+    }
+
+    #[test]
     fn row_country_and_fide_id_are_muted_suffixes_after_the_name() {
         let name_format = TextFormat {
             font_id: FontId::proportional(14.0),
@@ -17642,8 +17808,115 @@ mod tests {
         assert_eq!(only_country.text, "GM Nakamura, Hikaru · 🇺🇸 USA");
     }
 
+    fn live_engine_info(score: Score, depth: u32) -> EngineInfo {
+        EngineInfo {
+            multipv: 1,
+            depth,
+            score: Some(score),
+            ..Default::default()
+        }
+    }
+
+    fn cached_analysis(
+        family: crate::analysis_cache::EngineFamily,
+        depth: u32,
+        score_cp: i32,
+    ) -> crate::analysis_cache::CachedAnalysis {
+        crate::analysis_cache::CachedAnalysis {
+            pos_hash: 0,
+            fen: String::new(),
+            engine_family: family,
+            engine_name: format!("{family:?}"),
+            multipv: 1,
+            depth,
+            seldepth: None,
+            score_cp: Some(score_cp),
+            score_mate: None,
+            nodes: None,
+            time_ms: None,
+            nps: None,
+            pv: Vec::new(),
+            quality_score: 0.0,
+            analyzed_at: 0,
+        }
+    }
+
+    #[test]
+    fn eval_bar_uses_the_deepest_live_engine_and_translates_leela() {
+        use crate::analysis_cache::EngineFamily;
+
+        let mut app = test_app();
+        let fen = app.current_fen().unwrap();
+        assert_eq!(app.current_position().unwrap().turn(), Color::White);
+
+        app.engine_slots[0].name = "Stockfish 17".to_string();
+        app.engine_slots[0].fen = Some(fen.clone());
+        app.engine_slots[0]
+            .infos
+            .insert(1, live_engine_info(Score::Cp(30), 18));
+
+        app.engine_slots[1].name = "Lc0 v0.31".to_string();
+        app.engine_slots[1].fen = Some(fen.clone());
+        app.engine_slots[1]
+            .infos
+            .insert(1, live_engine_info(Score::Cp(100), 24));
+
+        app.engine_slots[2].name = "Berserk 13".to_string();
+        app.engine_slots[2].fen = Some(fen);
+        app.engine_slots[2]
+            .infos
+            .insert(1, live_engine_info(Score::Cp(45), 20));
+
+        let eval = app.current_board_eval().unwrap();
+        assert_eq!(eval.depth, 24, "the deepest live engine supplies the bar");
+        assert_eq!(
+            eval.score,
+            crate::eval::WhiteScore::Cp(crate::analysis_cache::leela_to_stockfish_cp(100)),
+            "Leela centipawns are translated before display"
+        );
+        assert_eq!(eval.source, crate::eval::EvalSource::Local);
+        assert_eq!(
+            crate::analysis_cache::parse_engine_identity(&app.engine_slots[2].name).family,
+            EngineFamily::Generic
+        );
+    }
+
+    #[test]
+    fn eval_bar_flips_black_to_move_live_scores_for_a_generic_engine() {
+        let mut app = test_app();
+        app.goto(1);
+        let fen = app.current_fen().unwrap();
+        assert_eq!(app.current_position().unwrap().turn(), Color::Black);
+
+        app.engine_slots[2].name = "Berserk 13".to_string();
+        app.engine_slots[2].fen = Some(fen);
+        app.engine_slots[2]
+            .infos
+            .insert(1, live_engine_info(Score::Cp(40), 21));
+
+        let eval = app.current_board_eval().unwrap();
+        assert_eq!(eval.score, crate::eval::WhiteScore::Cp(-40));
+        assert_eq!(eval.depth, 21);
+    }
+
+    #[test]
+    fn eval_bar_uses_the_deepest_cached_analysis_across_engine_families() {
+        use crate::analysis_cache::EngineFamily;
+
+        let mut app = test_app();
+        app.cached_analyses = vec![
+            cached_analysis(EngineFamily::Stockfish, 18, 20),
+            cached_analysis(EngineFamily::Leela, 24, 50),
+            cached_analysis(EngineFamily::Generic, 26, -35),
+        ];
+
+        let eval = app.current_board_eval().unwrap();
+        assert_eq!(eval.depth, 26);
+        assert_eq!(eval.score, crate::eval::WhiteScore::Cp(-35));
+    }
+
     fn test_app() -> App {
-        let mut games = domain::parse_pgn(include_bytes!("../fixtures/opera.pgn")).unwrap();
+        let mut games = domain::parse_pgn(crate::test_data::OPERA_PGN.as_bytes()).unwrap();
         let ctx = egui::Context::default();
         App {
             library: None,
@@ -17812,7 +18085,6 @@ mod tests {
             engine_cache_saved_notice: None,
             cached_analyses_pos: None,
             engine_request: 0,
-            engine_fen: None,
             engine_infos: BTreeMap::new(),
             engine_bestmove: None,
             engine_searching: false,
@@ -17906,6 +18178,61 @@ mod tests {
             last_year: 0,
             game_indices: Vec::new(),
         }
+    }
+
+    fn test_photo_library(
+        entries: &[(&str, &[u8])],
+    ) -> (std::path::PathBuf, crate::photos::PhotoLibrary) {
+        use std::io::Write;
+
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "brett-wiki-photos-{}-{}.bin",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut index = Vec::new();
+        let mut data = Vec::new();
+        let mut offset = 8 + entries
+            .iter()
+            .map(|(key, _)| 1 + key.len() + 8)
+            .sum::<usize>();
+        for (key, bytes) in entries {
+            index.push(key.len() as u8);
+            index.extend_from_slice(key.as_bytes());
+            index.extend_from_slice(&(offset as u32).to_le_bytes());
+            index.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            data.extend_from_slice(bytes);
+            offset += bytes.len();
+        }
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(b"BPF1").unwrap();
+        file.write_all(&(entries.len() as u32).to_le_bytes())
+            .unwrap();
+        file.write_all(&index).unwrap();
+        file.write_all(&data).unwrap();
+        let library = crate::photos::PhotoLibrary::open(&path).unwrap();
+        (path, library)
+    }
+
+    #[test]
+    fn wikipedia_lookup_uses_the_photo_pack_full_name() {
+        let mut app = test_app();
+        let (path, photos) = test_photo_library(&[("bacrot etienne", b"bacrot")]);
+        app.photos = Some(photos);
+        assert_eq!(
+            app.wiki_lookup_name(&wiki_player("Bacrot, E")),
+            "Etienne Bacrot"
+        );
+        assert_eq!(
+            app.wiki_lookup_name(&wiki_player("Carlsen, Magnus")),
+            "Carlsen, Magnus",
+            "players without a photo-pack match keep the database spelling"
+        );
+        std::fs::remove_file(path).unwrap();
     }
 
     fn wiki_summary(title: &str) -> crate::wiki::Summary {
@@ -19068,7 +19395,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let pgn_path = dir.join("reference.pgn");
         let index_path = dir.join("reference.brettpos");
-        std::fs::write(&pgn_path, include_bytes!("../fixtures/opera.pgn")).unwrap();
+        std::fs::write(&pgn_path, crate::test_data::OPERA_PGN).unwrap();
         PositionIndex::build_to(&pgn_path, &index_path, BuildOptions::default(), |_| {}).unwrap();
         let index = PositionIndex::open(&index_path).unwrap();
         let mut app = test_app();

@@ -1217,15 +1217,37 @@ impl PieceLists {
 mod tests {
     use super::*;
 
-    fn fixture(name: &str) -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("fixtures/scid")
-            .join(name)
+    struct OperaScid {
+        dir: PathBuf,
+        path: PathBuf,
+    }
+
+    impl OperaScid {
+        fn new() -> Self {
+            let unique = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0);
+            let dir = std::env::temp_dir()
+                .join(format!("brett-scid-opera-{}-{unique}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("opera.si4");
+            let games = crate::domain::parse_pgn(crate::test_data::OPERA_PGN.as_bytes()).unwrap();
+            write_database(&path, "Opera Game", games.into_iter().map(Ok)).unwrap();
+            Self { dir, path }
+        }
+    }
+
+    impl Drop for OperaScid {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
     }
 
     #[test]
     fn opens_a_scid4_database() {
-        let library = ScidLibrary::open(fixture("opera.si4")).unwrap();
+        let database = OperaScid::new();
+        let library = ScidLibrary::open(&database.path).unwrap();
         assert_eq!(library.len(), 1);
         let game = library.get(0).unwrap();
         assert_eq!(game.white(), "Paul Morphy");
@@ -1235,7 +1257,8 @@ mod tests {
 
     #[test]
     fn decodes_the_reference_game() {
-        let library = ScidLibrary::open(fixture("opera.si4")).unwrap();
+        let database = OperaScid::new();
+        let library = ScidLibrary::open(&database.path).unwrap();
         let game = library.load(0).unwrap();
         assert!(game.errors.is_empty(), "{:?}", game.errors);
         let sans: Vec<_> = game
@@ -1265,7 +1288,8 @@ mod tests {
 
     #[test]
     fn decodes_comments_nags_and_variations() {
-        let library = ScidLibrary::open(fixture("opera.si4")).unwrap();
+        let database = OperaScid::new();
+        let library = ScidLibrary::open(&database.path).unwrap();
         let game = library.load(0).unwrap();
         assert!(game.errors.is_empty(), "{:?}", game.errors);
         assert!(game.mainline_len() > 30);
@@ -1299,7 +1323,8 @@ mod tests {
 
     #[test]
     fn scid_namebase_has_no_separate_title_field() {
-        let library = ScidLibrary::open(fixture("opera.si4")).unwrap();
+        let database = OperaScid::new();
+        let library = ScidLibrary::open(&database.path).unwrap();
         let game = library.get(0).unwrap();
         assert_eq!(game.white(), "Paul Morphy");
         assert!(game.header("WhiteTitle").is_none());

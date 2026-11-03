@@ -205,7 +205,7 @@ Describe the Typst target, diagram selection, output folder layout, compiler req
 
 - [ ] **Step 2: Generate and compile a sample**
 
-Run a local unit test or a small example that writes a `.typ` file from `fixtures/opera.pgn`, then run `typst compile` manually. Inspect the PDF for two columns, bold mainline, indented variations, and a real board. Confirm no `(Diagram)` placeholder is emitted.
+Run a local unit test or a small example that writes a `.typ` file from the inline Opera Game in `src/test_data.rs`, then run `typst compile` manually. Inspect the PDF for two columns, bold mainline, indented variations, and a real board. Confirm no `(Diagram)` placeholder is emitted.
 
 - [ ] **Step 3: Run the full verification**
 

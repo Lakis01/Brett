@@ -135,18 +135,54 @@ impl PhotoLibrary {
     /// names. A surname must match exactly and every pack token must be
     /// accounted for, so `Magnus Carlsen Jr` does not borrow Carlsen's photo.
     pub fn bytes(&self, name: &str) -> Option<&[u8]> {
+        let index = self.matching_entry(name)?;
+        self.bytes_at(index)
+    }
+
+    /// Resolve an abbreviated PGN name to a `Given Surname` spelling using the
+    /// photo pack's canonical full-name keys.
+    ///
+    /// This is only attempted when the matched key leaves exactly one given
+    /// name token, because pack keys are sorted and a longer name cannot be
+    /// reordered reliably. The result feeds Wikipedia searches, where
+    /// `Svane, R` then finds `Rasmus Svane`.
+    pub fn full_name(&self, name: &str) -> Option<String> {
+        let index = self.matching_entry(name)?;
+        let entry = self.entries.get(index)?;
+        let surname = surname(name)?;
+        let tokens: Vec<&str> = entry.key.split_whitespace().collect();
+        let surname_index = tokens.iter().position(|token| {
+            *token == surname || (token.chars().count() == 1 && surname.starts_with(*token))
+        })?;
+        let given: Vec<&str> = tokens
+            .iter()
+            .enumerate()
+            .filter_map(|(index, token)| (index != surname_index).then_some(*token))
+            .collect();
+        if given.len() != 1 {
+            return None;
+        }
+        Some(format!(
+            "{} {}",
+            title_case(given[0]),
+            title_case(tokens[surname_index])
+        ))
+    }
+
+    fn matching_entry(&self, name: &str) -> Option<usize> {
         let key = player_key(name)?;
-        if let Some(bytes) = self.bytes_for_key(&key) {
-            return Some(bytes);
+        if let Ok(index) = self
+            .entries
+            .binary_search_by(|entry| entry.key.as_str().cmp(key.as_str()))
+        {
+            return Some(index);
         }
         if let Some(&index) = self.folded.get(&folded_key(name)) {
-            return self.bytes_at(index);
+            return Some(index);
         }
-        let index = self
-            .entries
+        self.entries
             .iter()
-            .position(|entry| entry_matches_name(&entry.key, name))?;
-        self.bytes_at(index)
+            .position(|entry| entry_matches_name(&entry.key, name))
     }
 
     /// Find a player's encoded WebP bytes by canonical key.
@@ -166,6 +202,14 @@ impl PhotoLibrary {
 
 fn folded_key(key: &str) -> String {
     player_key(&deunicode::deunicode(key)).unwrap_or_default()
+}
+
+fn title_case(token: &str) -> String {
+    let mut chars = token.chars();
+    let Some(first) = chars.next() else {
+        return String::new();
+    };
+    first.to_uppercase().chain(chars).collect()
 }
 
 fn name_tokens(name: &str) -> Vec<String> {
@@ -364,6 +408,47 @@ mod tests {
         assert_eq!(library.bytes("Magnus Carlsen Jr"), None);
         assert_eq!(library.bytes("Ding Liren Fan"), None);
         assert_eq!(library.bytes("Hikaru Nakamura"), Some(&b"nakamura"[..]));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn abbreviated_names_resolve_to_the_pack_full_name() {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "brett-photos-full-name-{}-{}.bin",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        write_pack(
+            &path,
+            &[
+                ("bacrot etienne", b"bacrot"),
+                ("buhmann rainer", b"buhmann"),
+                ("carlsen magnus", b"carlsen"),
+                ("rasmus svane", b"svane"),
+            ],
+        );
+        let library = PhotoLibrary::open(&path).unwrap();
+        assert_eq!(
+            library.full_name("Bacrot, E").as_deref(),
+            Some("Etienne Bacrot")
+        );
+        assert_eq!(
+            library.full_name("Buhmann,R").as_deref(),
+            Some("Rainer Buhmann")
+        );
+        assert_eq!(
+            library.full_name("Svane, R").as_deref(),
+            Some("Rasmus Svane")
+        );
+        assert_eq!(
+            library.full_name("Carlsen, Magnus").as_deref(),
+            Some("Magnus Carlsen")
+        );
+        assert_eq!(library.full_name("Nobody, X"), None);
         let _ = std::fs::remove_file(path);
     }
 
