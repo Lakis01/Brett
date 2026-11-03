@@ -1194,73 +1194,6 @@ ChessDB.cn and Lichess Cloud Eval.
 **Goal:** expand the Stockfish quality heuristic to support unreleased developer builds
 and daily master snapshots (`stockfish-ubuntu-x86-64-avx2-git-YYYYMMDD`).
 
-- **Version model:** treat 1,5 years as roughly 1 major version bump (+ ~30 Elo baseline gain/year).
-- **Date extraction & interpolation:** deduce release or commit date from binary filename or
-  `uci` identity string (`git-YYYYMMDD`), and interpolate baseline Elo continuously between
-  the fixed anchors of stable releases:
-  - Stockfish 16: 2023-06-30
-  - Stockfish 16.1: 2024-02-24
-  - Stockfish 17: 2024-09-06
-  - Stockfish 18: future anchor
-- Linear interpolation between surrounding anchors assigns an accurate baseline rating for any
-  intermediate dev build, keeping the piecewise depth scaling heuristic fair when evaluating
-  whether a dev build at depth $d$ supersedes a stable release at depth $d + \Delta$.
-
-**Depends on:** `src/analysis_cache.rs` (`parse_engine_identity`, `quality_score`).
-
-## 35. File Picker Filter Polish: Hide Companion Files by Default
-
-**Status:** queued.
-
-**Goal:** present only the primary entry point files in the native file selection dialogs
-(Zenity and KDialog), hiding companion files and auxiliary data files by default.
-
-- **Database file picker:** show only `*.pgn`, `*.si4`, `*.si3`, `*.cbh`, and `*.2cbh`. Hide
-  companion files (`.2cba`, `.2cbg`, `.2lid`, `.2lcd`, `.2lgd`, `.cko`, `.cpo`, `.cba`, `.cbg`,
-  `.sn4`, `.sg4`, etc.). Opening the main `.2cbh` or `.cbh` file automatically opens all companions.
-- **Opening books picker:** introduce a dedicated book file filter displaying only `*.bin`,
-  `*.ctg`, `*.abk`, and `*.bkt`, hiding accompanying CTG files (`.cto`, `.ctn`).
-
-**Depends on:** `src/app.rs` (`open_dialog`, `open_book_dialog`).
-
-## 36. Mega Database Extended Features: Portraits and Tournament Results
-
-**Status:** queued.
-
-**Goal:** support portrait pictures and tournament results / crosstables bundled in Mega Database
-releases.
-
-- **Portraits:** inspect and decode player portraits from `PlayerData/Players.spf` or the
-  accompanying image directories when browsing players in the Players tab.
-- **Tournament crosstables:** parse `.html` tournament index directories and companion tournament
-  data tables bundled in Mega Database releases to render crosstables and event standings.
-
-**Depends on:** `src/twocbh/` and `src/players.rs`.
-
-
-
-
-**Goal:** avoid issuing unnecessary cloud evaluation requests for downstream positions
-when earlier positions along the same mainline or variation had zero hits in both
-ChessDB.cn and Lichess Cloud Eval.
-
-- **Heuristic rationale:** in opening books and master databases, once a game reaches a novelty
-  or rare move that is absent from ChessDB and Lichess Cloud, subsequent descendant positions
-  are almost guaranteed to also have zero cloud evaluations.
-- **Transposition edge case:** transpositions can theoretically re-enter known book lines
-  via alternative move orders. The pruning logic should track verified noveltiness per node
-  or along a contiguous sub-branch while allowing explicit manual refresh or transposition
-  detection when available.
-
-**Depends on:** `src/cloud.rs` (`request_all`, in-flight queue) and `src/app.rs` (`maybe_request_cloud`).
-
-## 34. Stockfish Decision Heuristic: Dev Build Continuous Calibration
-
-**Status:** queued.
-
-**Goal:** expand the Stockfish quality heuristic to support unreleased developer builds
-and daily master snapshots (`stockfish-ubuntu-x86-64-avx2-git-YYYYMMDD`).
-
 - **Version model:** treat 1 year as roughly 1 major version bump (+ ~40–50 Elo baseline gain/year).
 - **Date extraction & interpolation:** deduce release or commit date from binary filename or
   `uci` identity string (`git-YYYYMMDD`), and interpolate baseline Elo continuously between
@@ -1268,7 +1201,8 @@ and daily master snapshots (`stockfish-ubuntu-x86-64-avx2-git-YYYYMMDD`).
   - Stockfish 16: 2023-06-30
   - Stockfish 16.1: 2024-02-24
   - Stockfish 17: 2024-09-06
-  - Stockfish 18: future anchor
+  - Stockfish 18: ~2025-09-06 (projected anchor)
+  - Stockfish 19: ~2026-09-06 (projected anchor)
 - Linear interpolation between surrounding anchors assigns an accurate baseline rating for any
   intermediate dev build, keeping the piecewise depth scaling heuristic fair when evaluating
   whether a dev build at depth $d$ supersedes a stable release at depth $d + \Delta$.
@@ -1303,6 +1237,7 @@ releases.
   data tables bundled in Mega Database releases to render crosstables and event standings.
 
 **Depends on:** `src/twocbh/` and `src/players.rs`.
+
 
 
 
