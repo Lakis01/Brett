@@ -281,6 +281,10 @@ impl Game {
         self.header("Event").unwrap_or("?")
     }
 
+    pub fn site(&self) -> &str {
+        self.header("Site").unwrap_or("?")
+    }
+
     pub fn set_header(&mut self, key: &str, value: String) {
         if let Some((_, current)) = self
             .headers

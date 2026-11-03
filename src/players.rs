@@ -457,6 +457,56 @@ pub fn player_key(name: &str) -> Option<String> {
     Some(words.join(" "))
 }
 
+static CHESSCOM_SITE_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"(?i)\bchess\.?com\b").expect("valid regex")
+});
+
+static CHESSCOM_ONLINE_EVENT_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(
+        r"(?i)(\btitled\s+tuesday\b|\bpro(?:\s+chess)?\s+league\b|\barena\s+kings\b|\b(?:speed|bullet)\s+chess\s+championship\b)",
+    )
+    .expect("valid regex")
+});
+
+static ONLINE_SITE_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"(?i)^(?:\?|int|internet|online|tornelo|chess\.com.*)$")
+        .expect("valid regex")
+});
+
+/// Determine whether a game belongs to an online Chess.com event that should
+/// be excluded from serious opening preparation to avoid database pollution.
+///
+/// Returns `true` for online blitz/bullet/rapid events on Chess.com (such as
+/// Titled Tuesday, Arena Kings, Speed Chess Championship, or games with
+/// Site `Chess.com INT`). Physical OTB tournaments sponsored by Chess.com
+/// (e.g. `Chess.com Isle of Man International` with Site `Douglas, Isle of Man`)
+/// are kept.
+pub fn is_chesscom_event(event: &str, site: &str) -> bool {
+    let site_trimmed = site.trim();
+    let event_trimmed = event.trim();
+
+    // 1. Explicit online event names that are uniquely Chess.com
+    if CHESSCOM_ONLINE_EVENT_RE.is_match(event_trimmed) {
+        return true;
+    }
+
+    // 2. Site is explicitly Chess.com
+    if CHESSCOM_SITE_RE.is_match(site_trimmed) {
+        return true;
+    }
+
+    // 3. Event mentions Chess.com and site is either missing, generic online/int, or not physical
+    if CHESSCOM_SITE_RE.is_match(event_trimmed)
+        && (site_trimmed.is_empty()
+            || site_trimmed == "?"
+            || ONLINE_SITE_RE.is_match(site_trimmed))
+    {
+        return true;
+    }
+
+    false
+}
+
 /// One move played by the selected player from one position.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct PlayerMoveStat {
@@ -533,6 +583,8 @@ pub struct PredictionConfig {
     /// Total pseudo-games reserved for legal moves that are absent from both
     /// the player book and the background distribution.
     pub unseen_prior_games: f64,
+    /// Exclude online Chess.com tournaments to prevent database pollution.
+    pub exclude_chesscom: bool,
 }
 
 impl Default for PredictionConfig {
@@ -545,6 +597,7 @@ impl Default for PredictionConfig {
             smoothing: 0.05,
             recent_mix_games: 2.0,
             unseen_prior_games: 0.75,
+            exclude_chesscom: true,
         }
     }
 }
@@ -659,6 +712,9 @@ impl PlayerBook {
     }
 
     fn add_game(&mut self, game: &Game, game_index: Option<usize>) {
+        if self.config.exclude_chesscom && is_chesscom_event(game.event(), game.site()) {
+            return;
+        }
         let white_key = player_key(game.white());
         let black_key = player_key(game.black());
         let color = if white_key.as_deref() == Some(self.player_key.as_str()) {
@@ -1698,5 +1754,72 @@ mod tests {
             let (year, month, day) = civil_from_days(days);
             assert_eq!(year as u32 * 10_000 + month * 100 + day, date);
         }
+    }
+
+    #[test]
+    fn chesscom_tournament_exclusion_regex() {
+        // Online Chess.com events are excluded
+        assert!(is_chesscom_event("Titled Tuesday intern op 21st Feb Early", "Chess.com INT"));
+        assert!(is_chesscom_event("Titled Tuesday", ""));
+        assert!(is_chesscom_event("Arena Kings Season 9", "?"));
+        assert!(is_chesscom_event("Speed Chess Championship Main Event", "chess.com"));
+        assert!(is_chesscom_event("Bullet Chess Championship", "Internet"));
+        assert!(is_chesscom_event("PRO Chess League Prelims", "chess.com INT"));
+        assert!(is_chesscom_event("Random Online Blitz", "Chess.com"));
+
+        // OTB tournaments are preserved, even if sponsored by Chess.com
+        assert!(!is_chesscom_event("Tata Steel Masters", "Wijk aan Zee"));
+        assert!(!is_chesscom_event("World Championship Match", "Dubai"));
+        assert!(!is_chesscom_event("Chess.com Isle of Man International", "Douglas, Isle of Man"));
+        assert!(!is_chesscom_event("FIDE Chess.com Grand Swiss", "Douglas IOM"));
+    }
+
+    #[test]
+    fn player_book_excludes_chesscom_online_games() {
+        let pgn = r#"[Event "Test"]
+[Site "City"]
+[Date "2024.01.01"]
+[White "Carlsen, Magnus"]
+[Black "Nakamura, Hikaru"]
+[Result "1-0"]
+
+1. e4 e5 2. Nf3 Nc6 1-0
+"#;
+        let base_game = crate::domain::parse_pgn(pgn.as_bytes()).unwrap().into_iter().next().unwrap();
+
+        let mut online_game = base_game.clone();
+        online_game.set_header("Event", "Titled Tuesday 2024".to_string());
+        online_game.set_header("Site", "Chess.com INT".to_string());
+
+        let mut otb_game = base_game.clone();
+        otb_game.set_header("Event", "Tata Steel Masters".to_string());
+        otb_game.set_header("Site", "Wijk aan Zee".to_string());
+
+        let player = "Carlsen, Magnus";
+        let key = player_key(player).unwrap();
+
+        // With exclusion enabled (default):
+        let book = PlayerBook::from_games(
+            &key,
+            player,
+            &[online_game.clone(), otb_game.clone()],
+            PredictionConfig::default(),
+            2025_0101,
+        );
+        assert_eq!(book.games(), 1);
+
+        // With exclusion disabled:
+        let config_no_exclude = PredictionConfig {
+            exclude_chesscom: false,
+            ..PredictionConfig::default()
+        };
+        let book_all = PlayerBook::from_games(
+            &key,
+            player,
+            &[online_game, otb_game],
+            config_no_exclude,
+            2025_0101,
+        );
+        assert_eq!(book_all.games(), 2);
     }
 }
