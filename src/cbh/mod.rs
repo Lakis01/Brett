@@ -14,6 +14,7 @@
 //! not link to or copy a converter.
 
 mod annotations;
+pub mod fast_index;
 mod moves;
 mod tables;
 pub mod writer;
