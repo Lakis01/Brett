@@ -596,7 +596,7 @@ impl Default for PredictionConfig {
             smoothing: 0.05,
             recent_mix_games: 2.0,
             unseen_prior_games: 0.75,
-            exclude_chesscom: true,
+            exclude_chesscom: false,
         }
     }
 }
@@ -1816,28 +1816,28 @@ mod tests {
         let player = "Carlsen, Magnus";
         let key = player_key(player).unwrap();
 
-        // With exclusion enabled (default):
-        let book = PlayerBook::from_games(
+        // With exclusion disabled (default):
+        let book_default = PlayerBook::from_games(
             &key,
             player,
             &[online_game.clone(), otb_game.clone()],
             PredictionConfig::default(),
             2025_0101,
         );
-        assert_eq!(book.games(), 1);
+        assert_eq!(book_default.games(), 2);
 
-        // With exclusion disabled:
-        let config_no_exclude = PredictionConfig {
-            exclude_chesscom: false,
+        // With exclusion enabled:
+        let config_exclude = PredictionConfig {
+            exclude_chesscom: true,
             ..PredictionConfig::default()
         };
-        let book_all = PlayerBook::from_games(
+        let book_filtered = PlayerBook::from_games(
             &key,
             player,
             &[online_game, otb_game],
-            config_no_exclude,
+            config_exclude,
             2025_0101,
         );
-        assert_eq!(book_all.games(), 2);
+        assert_eq!(book_filtered.games(), 1);
     }
 }

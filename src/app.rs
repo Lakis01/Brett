@@ -779,6 +779,7 @@ pub struct App {
     player_book_status: String,
     prep: Option<PrepSession>,
     prep_recent_limit: usize,
+    prep_exclude_chesscom: bool,
     /// Ordered aliases for the user. The first match sets board orientation on
     /// open; the first alias replaces `You` in preparation tags.
     prep_player_names: Vec<String>,
@@ -799,6 +800,9 @@ pub struct App {
     correspondence_rx: Option<mpsc::Receiver<CorrespondenceMessage>>,
     correspondence_job: Option<PathBuf>,
     correspondence_status: String,
+    correspondence_download_dismissed: bool,
+    correspondence_download_rx: Option<mpsc::Receiver<Result<PathBuf, String>>>,
+    correspondence_download_status: String,
     /// Move whose annotation editor is open. Clicking an annotation or using
     /// the move context menu enters this mode.
     annotation_editor: Option<usize>,
@@ -1117,6 +1121,7 @@ impl App {
             player_book_status: "Select a player to build their preparation book.".to_string(),
             prep: None,
             prep_recent_limit: display_prefs.prep_recent_limit,
+            prep_exclude_chesscom: preparation_prefs.exclude_chesscom,
             prep_player_names: preparation_prefs.prep_player_names.clone(),
             recent_preview: None,
             reference_path,
@@ -1133,6 +1138,9 @@ impl App {
             correspondence_rx: None,
             correspondence_job: None,
             correspondence_status,
+            correspondence_download_dismissed: preparation_prefs.correspondence_download_dismissed,
+            correspondence_download_rx: None,
+            correspondence_download_status: String::new(),
             annotation_editor: None,
             annotation_focus: false,
             tags_expanded: false,
@@ -3628,6 +3636,30 @@ impl App {
         if self.correspondence_job.as_ref() == Some(&path) && self.correspondence_rx.is_some() {
             return;
         }
+        let library = match open_library(&path) {
+            Ok(lib) => lib,
+            Err(err) => {
+                self.correspondence_status = format!("Could not open {}: {err:#}", path.display());
+                return;
+            }
+        };
+        match PositionIndex::open_cached_for(library.as_ref()) {
+            Ok(Some(index)) => {
+                self.correspondence_status = format!(
+                    "Correspondence reference ready · {} games · {} positions",
+                    games_label(index.game_count()),
+                    positions_label(index.position_count())
+                );
+                self.correspondence = Some(index);
+                self.correspondence_job = None;
+                return;
+            }
+            Ok(None) => {}
+            Err(err) => {
+                tracing::warn!("could not open cached correspondence index: {err:#}");
+            }
+        }
+
         self.correspondence = None;
         self.correspondence_job = Some(path.clone());
         self.correspondence_status =
@@ -3637,14 +3669,15 @@ impl App {
         std::thread::spawn(move || {
             let progress_tx = tx.clone();
             let progress_ctx = ctx.clone();
-            let result = (|| -> Result<PositionIndex, String> {
-                let library = open_library(&path).map_err(|err| format!("{err:#}"))?;
-                PositionIndex::build_cached_for(library, BuildOptions::default(), move |progress| {
+            let result = PositionIndex::build_cached_for(
+                library,
+                BuildOptions::default(),
+                move |progress| {
                     let _ = progress_tx.send(CorrespondenceMessage::Progress(progress));
                     progress_ctx.request_repaint();
-                })
-                .map_err(|err| format!("{err:#}"))
-            })();
+                },
+            )
+            .map_err(|err| format!("{err:#}"));
             let _ = tx.send(CorrespondenceMessage::Done(result));
             ctx.request_repaint();
         });
@@ -3701,6 +3734,82 @@ impl App {
         }
         if keep {
             self.correspondence_rx = Some(rx);
+        }
+    }
+
+    fn download_and_unpack_correspondence() -> Result<PathBuf, String> {
+        let target_dir = local_share_correspondence_dir()
+            .ok_or_else(|| "Could not determine local data directory for download".to_string())?;
+        std::fs::create_dir_all(&target_dir)
+            .map_err(|err| format!("Failed to create directory {}: {err}", target_dir.display()))?;
+
+        let response = ureq::AgentBuilder::new()
+            .timeout(Duration::from_secs(180))
+            .build()
+            .get(CORRESPONDENCE_DOWNLOAD_URL)
+            .call()
+            .map_err(|err| format!("Download failed: {err}"))?;
+
+        let reader = response.into_reader();
+        let gz = flate2::read::GzDecoder::new(reader);
+        let mut archive = tar::Archive::new(gz);
+        archive
+            .unpack(&target_dir)
+            .map_err(|err| format!("Extracting correspondence database failed: {err}"))?;
+
+        let direct = target_dir.join("Correspondence_2350.si4");
+        let nested = target_dir.join("databases/iccf/Correspondence_2350.si4");
+        if direct.exists() {
+            Ok(direct)
+        } else if nested.exists() {
+            Ok(nested)
+        } else {
+            Err("Correspondence_2350.si4 not found in extracted archive".to_string())
+        }
+    }
+
+    fn start_correspondence_download(&mut self) {
+        if self.correspondence_download_rx.is_some() {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        self.correspondence_download_rx = Some(rx);
+        self.correspondence_download_status =
+            "Downloading correspondence reference (26 MB)…".to_string();
+        self.status = self.correspondence_download_status.clone();
+        let ctx = self.ctx.clone();
+        std::thread::spawn(move || {
+            let result = Self::download_and_unpack_correspondence();
+            let _ = tx.send(result);
+            ctx.request_repaint();
+        });
+    }
+
+    fn poll_correspondence_download(&mut self) {
+        let Some(rx) = self.correspondence_download_rx.take() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Ok(path)) => {
+                self.correspondence_download_status =
+                    "Correspondence database downloaded and ready.".to_string();
+                self.status = self.correspondence_download_status.clone();
+                self.correspondence_path = path.display().to_string();
+                self.correspondence_download_dismissed = true;
+                self.save_reference_prefs();
+                self.start_correspondence(path);
+            }
+            Ok(Err(err)) => {
+                self.correspondence_download_status = format!("Download failed: {err}");
+                self.status = self.correspondence_download_status.clone();
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                self.correspondence_download_rx = Some(rx);
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.correspondence_download_status = "Download stopped unexpectedly.".to_string();
+                self.status = self.correspondence_download_status.clone();
+            }
         }
     }
 
@@ -3895,6 +4004,8 @@ impl App {
             rating_band: self.reference_band.clamp(25, 1_000),
             rating_offset: self.reference_offset.clamp(-1_000, 1_000),
             prep_player_names: self.prep_player_names.clone(),
+            exclude_chesscom: self.prep_exclude_chesscom,
+            correspondence_download_dismissed: self.correspondence_download_dismissed,
         };
         if let Err(err) = prefs.save() {
             self.reference_status = format!("Could not save reference settings: {err:#}");
@@ -5596,11 +5707,10 @@ impl App {
         let Some(player) = self.players.get(index).cloned() else {
             return;
         };
-        if self
-            .player_book
-            .as_ref()
-            .is_some_and(|book| book.player_key() == player.key)
-        {
+        if self.player_book.as_ref().is_some_and(|book| {
+            book.player_key() == player.key
+                && book.config().exclude_chesscom == self.prep_exclude_chesscom
+        }) {
             return;
         }
         if self.player_book_job.as_deref() == Some(player.key.as_str())
@@ -5621,13 +5731,17 @@ impl App {
         );
         let (tx, rx) = mpsc::channel();
         let ctx = self.ctx.clone();
+        let config = players::PredictionConfig {
+            exclude_chesscom: self.prep_exclude_chesscom,
+            ..Default::default()
+        };
         std::thread::spawn(move || {
             let progress_tx = tx.clone();
             let progress_ctx = ctx.clone();
             let result = PlayerBook::build(
                 library.as_ref(),
                 &player,
-                players::PredictionConfig::default(),
+                config,
                 players::today(),
                 move |done, total| {
                     let _ = progress_tx.send(PlayerBookMessage::Progress { done, total });
@@ -9304,12 +9418,20 @@ impl App {
 
         if self.correspondence_enabled {
             ui.add_space(8.0);
-            let (correspondence_move, correspondence_preview) = correspondence_section(
-                ui,
-                self.correspondence.as_ref(),
-                &pos,
-                &self.correspondence_status,
-            );
+            let has_default = default_correspondence_path().is_some();
+            let downloading = self.correspondence_download_rx.is_some();
+            let (correspondence_move, correspondence_preview, req_download) =
+                correspondence_section(
+                    ui,
+                    self.correspondence.as_ref(),
+                    &pos,
+                    &self.correspondence_status,
+                    downloading,
+                    has_default,
+                );
+            if req_download {
+                self.start_correspondence_download();
+            }
             if correspondence_move.is_some() {
                 clicked_move = correspondence_move;
             }
@@ -10807,6 +10929,25 @@ impl App {
                 .weak(),
             );
         });
+        let mut toggle_exclude = false;
+        ui.horizontal(|ui| {
+            let mut exclude = self.prep_exclude_chesscom;
+            if ui
+                .checkbox(&mut exclude, "Exclude Chess.com games")
+                .on_hover_text("Filter out online Titled Tuesday, Arena Kings, and blitz/bullet server games from this preparation")
+                .changed()
+            {
+                self.prep_exclude_chesscom = exclude;
+                self.save_reference_prefs();
+                toggle_exclude = true;
+            }
+        });
+        if toggle_exclude && let Some(player_idx) = self.selected_player {
+            self.player_book = None;
+            self.player_book_rx = None;
+            self.player_book_job = None;
+            self.start_player_book(player_idx);
+        }
         ui.separator();
         if exit {
             self.exit_prep();
@@ -12790,6 +12931,7 @@ impl eframe::App for App {
         self.poll_wiki();
         self.poll_reference();
         self.poll_correspondence();
+        self.poll_correspondence_download();
         self.poll_online();
         self.poll_online_game();
         self.poll_online_reference();
@@ -12809,6 +12951,7 @@ impl eframe::App for App {
             || self.book_rx.is_some()
             || self.player_book_rx.is_some()
             || self.reference_rx.is_some()
+            || self.correspondence_download_rx.is_some()
             || self.online_rx.is_some()
             || self.online_game_rx.is_some()
             || self.online_ref_rx.is_some()
@@ -12856,6 +12999,50 @@ impl eframe::App for App {
         self.moves_panel(ui);
         self.sync_current_slot();
         self.bottom_bar(ui);
+
+        let mut trigger_download = false;
+        let mut dismiss_download = false;
+        if !self.correspondence_download_dismissed && default_correspondence_path().is_none() {
+            egui::Frame::new()
+                .fill(SURFACE)
+                .stroke(Stroke::new(1.0, GOLD))
+                .inner_margin(egui::Margin::symmetric(10, 6))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new("📦 Master Correspondence Opening Reference")
+                                .strong()
+                                .color(GOLD),
+                        );
+                        ui.label(
+                            RichText::new("87,927 games · 26 MB download, ~124 MB on disk.")
+                                .small()
+                                .weak(),
+                        );
+                        if self.correspondence_download_rx.is_some() {
+                            ui.label(
+                                RichText::new(&self.correspondence_download_status)
+                                    .small()
+                                    .color(GOLD),
+                            );
+                        } else {
+                            if ui.small_button("Download (26 MB)").clicked() {
+                                trigger_download = true;
+                            }
+                            if ui.small_button("Dismiss").clicked() {
+                                dismiss_download = true;
+                            }
+                        }
+                    });
+                });
+        }
+        if trigger_download {
+            self.start_correspondence_download();
+        }
+        if dismiss_download {
+            self.correspondence_download_dismissed = true;
+            self.save_reference_prefs();
+        }
 
         egui::CentralPanel::default_margins().show(ui, |ui| {
             let avail = ui.available_size();
@@ -15990,9 +16177,12 @@ fn correspondence_section(
     index: Option<&PositionIndex>,
     pos: &Chess,
     status: &str,
-) -> (Option<Move>, Option<HoverPreview>) {
+    downloading: bool,
+    has_default: bool,
+) -> (Option<Move>, Option<HoverPreview>, bool) {
     let mut clicked = None;
     let mut hover_preview = None;
+    let mut download_clicked = false;
 
     egui::Frame::new()
         .fill(SURFACE)
@@ -16014,6 +16204,19 @@ fn correspondence_section(
 
             let Some(index) = index else {
                 ui.label(RichText::new(status).small().weak().italics());
+                if !has_default {
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new("87,927 master correspondence games (26 MB download, ~124 MB on disk) with prebuilt index.")
+                            .small()
+                            .weak(),
+                    );
+                    if downloading {
+                        ui.label(RichText::new("Downloading correspondence reference…").small().color(GOLD));
+                    } else if ui.small_button("Download Correspondence Reference (26 MB)").clicked() {
+                        download_clicked = true;
+                    }
+                }
                 return;
             };
             let key = position::position_key(pos);
@@ -16108,7 +16311,7 @@ fn correspondence_section(
             }
         });
 
-    (clicked, hover_preview)
+    (clicked, hover_preview, download_clicked)
 }
 
 /// Merge remote cloud evaluations (chessdb.cn, Lichess cloud eval) with
@@ -17449,10 +17652,23 @@ fn default_reference_path() -> Option<PathBuf> {
         .find(|path| path.exists())
 }
 
+const CORRESPONDENCE_DOWNLOAD_URL: &str =
+    "https://github.com/Lakis01/Brett/releases/latest/download/correspondence-reference.tar.gz";
+
+fn local_share_correspondence_dir() -> Option<PathBuf> {
+    std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| home_path(".local/share"))
+        .map(|data| data.join("brett/databases/iccf"))
+}
+
+fn local_share_correspondence_path() -> Option<PathBuf> {
+    local_share_correspondence_dir().map(|dir| dir.join("Correspondence_2350.si4"))
+}
+
 /// The correspondence database used automatically in the Engine tab.
-/// `BRETT_CORRESPONDENCE` wins, then the snapshot bundled in a source
-/// checkout, then the conventional Brett Resources location. The file remains
-/// read-only; only a position-index cache is built.
+/// `BRETT_CORRESPONDENCE` wins, then local user data, then the snapshot bundled
+/// in a source checkout, then conventional locations.
 fn default_correspondence_path() -> Option<PathBuf> {
     let env = std::env::var_os("BRETT_CORRESPONDENCE")
         .map(PathBuf::from)
@@ -17464,6 +17680,7 @@ fn default_correspondence_path() -> Option<PathBuf> {
     let candidates = [
         Some(PathBuf::from("databases/iccf/Correspondence_2350.si4")),
         Some(manifest.join("Correspondence_2350.si4")),
+        local_share_correspondence_path(),
         executable.map(|dir| dir.join("databases/iccf/Correspondence_2350.si4")),
         home_path("Downloads/Brett Resources/Correspondence Database/Correspondence_2350.si4"),
         home_path("Downloads/CBH/Pimped Correspondence Database.cbh"),
@@ -18271,6 +18488,7 @@ mod tests {
             player_book_status: String::new(),
             prep: None,
             prep_recent_limit: 10,
+            prep_exclude_chesscom: false,
             prep_player_names: Vec::new(),
             recent_preview: None,
             reference_path: String::new(),
@@ -18287,6 +18505,9 @@ mod tests {
             correspondence_rx: None,
             correspondence_job: None,
             correspondence_status: String::new(),
+            correspondence_download_dismissed: false,
+            correspondence_download_rx: None,
+            correspondence_download_status: String::new(),
             annotation_editor: None,
             annotation_focus: false,
             tags_expanded: false,

@@ -296,6 +296,10 @@ pub struct PreparationPrefs {
     /// `You` in preparation tags; the first matching name orients the board to
     /// that side when a game is opened.
     pub prep_player_names: Vec<String>,
+    /// Whether online Chess.com tournaments should be excluded during preparation.
+    pub exclude_chesscom: bool,
+    /// Whether the prompt to download the correspondence reference has been dismissed.
+    pub correspondence_download_dismissed: bool,
 }
 
 impl Default for PreparationPrefs {
@@ -308,6 +312,8 @@ impl Default for PreparationPrefs {
             rating_band: 200,
             rating_offset: 0,
             prep_player_names: Vec::new(),
+            exclude_chesscom: false,
+            correspondence_download_dismissed: false,
         }
     }
 }
@@ -359,6 +365,14 @@ impl PreparationPrefs {
                     .collect()
             })
             .unwrap_or_default();
+        let exclude_chesscom = value
+            .get("exclude_chesscom")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let correspondence_download_dismissed = value
+            .get("correspondence_download_dismissed")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         Self {
             reference_path,
             correspondence_path,
@@ -367,6 +381,8 @@ impl PreparationPrefs {
             rating_band,
             rating_offset,
             prep_player_names,
+            exclude_chesscom,
+            correspondence_download_dismissed,
         }
     }
 
@@ -379,6 +395,8 @@ impl PreparationPrefs {
             "rating_band": self.rating_band,
             "rating_offset": self.rating_offset,
             "prep_player_names": self.prep_player_names,
+            "exclude_chesscom": self.exclude_chesscom,
+            "correspondence_download_dismissed": self.correspondence_download_dismissed,
         }))
         .unwrap_or_default()
     }
@@ -1279,6 +1297,8 @@ mod tests {
             rating_band: 250,
             rating_offset: 75,
             prep_player_names: vec!["Carlsen, Magnus".to_string()],
+            exclude_chesscom: false,
+            correspondence_download_dismissed: false,
         };
         assert_eq!(PreparationPrefs::from_json(&prefs.to_json()), prefs);
 

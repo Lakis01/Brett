@@ -1,6 +1,7 @@
 /target
 *.log
 .DS_Store
+*.brettpos
 
 # Local test data: never redistributed, may be copyrighted
 fixtures/local/

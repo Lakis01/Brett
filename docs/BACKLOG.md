@@ -1201,8 +1201,9 @@ and daily master snapshots (`stockfish-ubuntu-x86-64-avx2-git-YYYYMMDD`).
   - Stockfish 16: 2023-06-30
   - Stockfish 16.1: 2024-02-24
   - Stockfish 17: 2024-09-06
-  - Stockfish 18: ~2025-09-06 (projected anchor)
-  - Stockfish 19: ~2026-09-06 (projected anchor)
+  - Stockfish 17.1: 2025-03-30
+  - Stockfish 18: 2026-01-31
+  - Stockfish 19: 2026-09-05
 - Linear interpolation between surrounding anchors assigns an accurate baseline rating for any
   intermediate dev build, keeping the piecewise depth scaling heuristic fair when evaluating
   whether a dev build at depth $d$ supersedes a stable release at depth $d + \Delta$.

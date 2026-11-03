@@ -19,10 +19,21 @@ fn main() {
         "brett-position-report-{}.brettpos",
         std::process::id()
     ));
+    let path_buf = std::path::PathBuf::from(&path);
+    let lib: std::sync::Arc<dyn brett::library::GameLibrary> =
+        if path.ends_with(".si4") || path.ends_with(".si3") {
+            std::sync::Arc::new(brett::scid::ScidLibrary::open(&path_buf).unwrap())
+        } else {
+            std::sync::Arc::new(brett::library::PgnLibrary::build(&path_buf).unwrap())
+        };
     let started = Instant::now();
+    let options = BuildOptions {
+        max_plies: 40,
+        ..Default::default()
+    };
     let report =
-        match PositionIndex::build_to(&path, &index_path, BuildOptions::default(), |progress| {
-            if progress.games > 0 && progress.games % 10_000 == 0 {
+        match PositionIndex::build_library_to(lib.as_ref(), &index_path, options, |progress| {
+            if progress.games > 0 && progress.games % 20_000 == 0 {
                 eprintln!(
                     "  {} games, {} moves, {:.1}s",
                     progress.games,
@@ -33,7 +44,7 @@ fn main() {
         }) {
             Ok(report) => report,
             Err(err) => {
-                eprintln!("error: {err:#}");
+                eprintln!("error building index: {err:#}");
                 std::process::exit(1);
             }
         };
