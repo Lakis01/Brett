@@ -1246,6 +1246,39 @@ releases.
 
 **Depends on:** `src/twocbh/` and `src/players.rs`.
 
+## 37. Online Game Import: Chess.com and Lichess APIs
+
+**Status:** queued.
+
+**Goal:** Allow users to directly import game archives from Chess.com and Lichess into their active database or player preparation dossier.
+
+- **Chess.com Public API:**
+  - Query player archives via `https://api.chess.com/pub/player/{username}/games/{yyyy}/{mm}/pgn`.
+  - Credentials: Not required (PubAPI is unauthenticated).
+  - User-Agent: Provide custom, contact-bearing User-Agent header as required by Chess.com terms.
+  - Rate Limiting: IP-based (~60 req/min); download monthly archives sequentially with paced pauses.
+- **Lichess API:**
+  - Query user games via streaming endpoint `https://lichess.org/api/games/user/{username}`.
+  - Credentials: OAuth / Personal API Token support (`BRETT_LICHESS_TOKEN`).
+  - Rate Limiting: Unauthenticated allowed (~20 req/min), but personal tokens raise limit to 15 req/sec and unlock private/ongoing games.
+
+**Depends on:** `src/cloud.rs` and `src/app.rs`.
+
+## 38. Reverse-Engineer Special Later ChessBase Functions
+
+**Status:** future roadmap / research spike.
+
+**Goal:** Identify and recreate proprietary analytical, visual, and indexing features from ChessBase 16/17/18.
+
+- **Automated Tactical Analysis & Blunder Checks:** Full-game engine pass generating natural language descriptions, blunder tags, missed tactics, and interactive training drill questions.
+- **Novelty Detection:** Detect first-played OTB moves against reference databases (ICCF / Mega), annotating novelty move number, preceding games, and opening branch depth.
+- **Plan Explorer & Pawn Structure Classifier:** Automatically classify positions into classical pawn structures (Isolani/IQP, Carlsbad, Hanging Pawns, Hedgehog, French chain, King's Indian locked center) and surface common piece plans.
+- **Visual Piece Pressure & Control Heatmaps:** Attacking rays, defended vs undefended piece highlights, and square control differentials layered on the board.
+- **Search Accelerators & Fast Position Indexing:** Reverse-engineer `.cbj` and 2CBH search accelerator structures to achieve instant reference lookups without requiring multi-gigabyte external sidecars.
+
+**Depends on:** `src/twocbh/`, `src/eval.rs`, `src/review.rs`, and `src/ui/board.rs`.
+
+
 
 
 
