@@ -50,6 +50,62 @@ pub struct ParsedEngineVersion {
     pub baseline_elo: f64,
 }
 
+const SF_ANCHORS: &[(u32, f64)] = &[
+    (20230630, 3760.0), // SF 16
+    (20240224, 3790.0), // SF 16.1
+    (20240906, 3830.0), // SF 17
+    (20250330, 3860.0), // SF 17.1
+    (20260131, 3900.0), // SF 18
+    (20260905, 3940.0), // SF 19
+];
+
+fn ymd_to_days(ymd: u32) -> Option<i64> {
+    let year = (ymd / 10000) as i64;
+    let month = ((ymd % 10000) / 100) as i64;
+    let day = (ymd % 100) as i64;
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || !(2015..=2035).contains(&year) {
+        return None;
+    }
+    let m_days = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
+    let is_leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+    let mut days = (year - 2020) * 365 + ((year - 2020 + 3) / 4);
+    days += m_days[(month - 1) as usize];
+    if is_leap && month > 2 {
+        days += 1;
+    }
+    days += day - 1;
+    Some(days)
+}
+
+fn interpolate_sf_elo(date: u32) -> f64 {
+    let Some(target_days) = ymd_to_days(date) else {
+        return 3830.0;
+    };
+    let first = SF_ANCHORS.first().unwrap();
+    let first_days = ymd_to_days(first.0).unwrap();
+    if target_days <= first_days {
+        let diff_days = first_days - target_days;
+        return (first.1 - (diff_days as f64) * (45.0 / 365.25)).max(3400.0);
+    }
+    let last = SF_ANCHORS.last().unwrap();
+    let last_days = ymd_to_days(last.0).unwrap();
+    if target_days >= last_days {
+        let diff_days = target_days - last_days;
+        return (last.1 + (diff_days as f64) * (45.0 / 365.25)).min(4200.0);
+    }
+    for window in SF_ANCHORS.windows(2) {
+        let (d1, elo1) = window[0];
+        let (d2, elo2) = window[1];
+        let days1 = ymd_to_days(d1).unwrap();
+        let days2 = ymd_to_days(d2).unwrap();
+        if target_days >= days1 && target_days <= days2 {
+            let frac = (target_days - days1) as f64 / (days2 - days1) as f64;
+            return elo1 + frac * (elo2 - elo1);
+        }
+    }
+    3830.0
+}
+
 pub fn parse_engine_identity(name: &str) -> ParsedEngineVersion {
     let lower = name.trim().to_ascii_lowercase();
     let family = if lower.contains("stockfish") {
@@ -65,16 +121,19 @@ pub fn parse_engine_identity(name: &str) -> ParsedEngineVersion {
     let mut dev_date = None;
 
     if family == EngineFamily::Stockfish {
-        // Look for dev date, e.g. dev-20241018
-        if let Some(pos) = lower.find("dev-") {
-            let digits: String = lower[pos + 4..]
-                .chars()
-                .take_while(|c| c.is_ascii_digit())
-                .collect();
-            if digits.len() == 8
-                && let Ok(d) = digits.parse::<u32>()
-            {
-                dev_date = Some(d);
+        // Look for 8-digit date pattern YYYYMMDD (e.g. dev-YYYYMMDD, git-YYYYMMDD, sf_YYYYMMDD)
+        for i in 0..=lower.len().saturating_sub(8) {
+            let prev_digit = i > 0 && lower.as_bytes()[i - 1].is_ascii_digit();
+            let next_digit = i + 8 < lower.len() && lower.as_bytes()[i + 8].is_ascii_digit();
+            if !prev_digit && !next_digit {
+                let sub = &lower[i..i + 8];
+                if sub.chars().all(|c| c.is_ascii_digit())
+                    && let Ok(d) = sub.parse::<u32>()
+                    && ymd_to_days(d).is_some()
+                {
+                    dev_date = Some(d);
+                    break;
+                }
             }
         }
 
@@ -100,11 +159,12 @@ pub fn parse_engine_identity(name: &str) -> ParsedEngineVersion {
     let baseline_elo = match family {
         EngineFamily::Stockfish => {
             if let Some(date) = dev_date {
-                // Approximate scaling: Stockfish 17 was released Sept 2024 (~20240901)
-                let day_offset = (date as i64 - 20240901).max(0) as f64;
-                (3830.0 + day_offset * 0.25).min(4100.0)
+                interpolate_sf_elo(date)
             } else {
                 match (major, minor) {
+                    (Some(19), _) => 3940.0,
+                    (Some(18), _) => 3900.0,
+                    (Some(17), Some(1)) => 3860.0,
                     (Some(17), _) => 3830.0,
                     (Some(16), Some(1)) => 3790.0,
                     (Some(16), _) => 3760.0,
@@ -115,7 +175,7 @@ pub fn parse_engine_identity(name: &str) -> ParsedEngineVersion {
                     (Some(13), _) => 3570.0,
                     (Some(12), _) => 3520.0,
                     (Some(11), _) => 3450.0,
-                    (Some(m), _) if m > 17 => 3830.0 + (m - 17) as f64 * 40.0,
+                    (Some(m), _) if m > 19 => 3940.0 + (m - 19) as f64 * 40.0,
                     _ => 3400.0,
                 }
             }
@@ -892,7 +952,21 @@ mod tests {
         let sf_dev = parse_engine_identity("Stockfish dev-20241018");
         assert_eq!(sf_dev.family, EngineFamily::Stockfish);
         assert_eq!(sf_dev.dev_date, Some(20241018));
-        assert!(sf_dev.baseline_elo >= 3830.0);
+        assert!(sf_dev.baseline_elo > 3830.0 && sf_dev.baseline_elo < 3860.0);
+
+        let sf18 = parse_engine_identity("Stockfish 18");
+        assert_eq!(sf18.baseline_elo, 3900.0);
+
+        let sf19 = parse_engine_identity("Stockfish 19");
+        assert_eq!(sf19.baseline_elo, 3940.0);
+
+        let sf_git = parse_engine_identity("stockfish-ubuntu-x86-64-avx2-git-20241018");
+        assert_eq!(sf_git.dev_date, Some(20241018));
+        assert!(sf_git.baseline_elo > 3830.0 && sf_git.baseline_elo < 3860.0);
+
+        let sf_dev_18_19 = parse_engine_identity("Stockfish dev-20260315");
+        assert_eq!(sf_dev_18_19.dev_date, Some(20260315));
+        assert!(sf_dev_18_19.baseline_elo > 3900.0 && sf_dev_18_19.baseline_elo < 3940.0);
 
         let leela = parse_engine_identity("Lc0 v0.31.2");
         assert_eq!(leela.family, EngineFamily::Leela);

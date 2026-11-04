@@ -3361,62 +3361,137 @@ impl App {
             return;
         }
         let mut open = self.classify_openings_open;
-        let mut classify_current = false;
+        let mut close_dialog = false;
+        let mut classify_current_action: Option<bool> = None;
         let mut classify_all = false;
         let has_current = self.current.is_some();
         let session_len = self.session.len();
+
+        let (current_eco, current_opening, proposed) = if let Some(game) = self.game() {
+            let eco = game.header("ECO").map(str::to_string);
+            let opening = game.header("Opening").map(str::to_string);
+            let proposed = crate::eco::classify_game(game).cloned();
+            (eco, opening, proposed)
+        } else {
+            (None, None, None)
+        };
+        let has_existing = current_eco.is_some() || current_opening.is_some();
+
         egui::Window::new("Classify openings")
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
             .show(ctx, |ui| {
-                ui.set_min_width(360.0);
+                ui.set_min_width(420.0);
                 ui.label(
                     RichText::new(
-                        "Replay each game's mainline against the CC0 lichess-org/chess-openings dataset and write the deepest matching ECO and Opening tags.",
+                        "Replay game mainlines against the CC0 lichess-org/chess-openings dataset and write the deepest matching ECO and Opening tags.",
                     )
                     .small()
                     .weak(),
                 );
-                ui.add_space(6.0);
-                ui.checkbox(
-                    &mut self.classify_overwrite,
-                    "Overwrite existing ECO and Opening tags",
-                )
-                .on_hover_text(
-                    "When unchecked, games that already have ECO or Opening tags keep their imported metadata.",
-                );
                 ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    if ui
-                        .add_enabled(has_current, egui::Button::new("Classify current game"))
-                        .clicked()
-                    {
-                        classify_current = true;
-                    }
-                    let all_label = if session_len > 0 {
-                        format!("Classify session ({})", games_label(session_len))
-                    } else {
-                        "Classify session".to_string()
-                    };
-                    if ui
-                        .add_enabled(session_len > 0, egui::Button::new(all_label))
-                        .clicked()
-                    {
-                        classify_all = true;
-                    }
-                });
+
+                if has_current {
+                    egui::Frame::group(ui.style()).show(ui, |ui| {
+                        ui.label(RichText::new("Current Game").strong());
+                        ui.add_space(4.0);
+
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("Current tags:").weak());
+                            if has_existing {
+                                let eco_str = current_eco.as_deref().unwrap_or("—");
+                                let opening_str = current_opening.as_deref().unwrap_or("—");
+                                ui.label(RichText::new(format!("{eco_str}  ·  {opening_str}")).strong());
+                            } else {
+                                ui.label(RichText::new("None").italics());
+                            }
+                        });
+
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("Classified value:").weak());
+                            if let Some(entry) = &proposed {
+                                ui.label(
+                                    RichText::new(format!("{}  ·  {} (ply {})", entry.eco, entry.name, entry.plies))
+                                        .color(GOLD)
+                                        .strong(),
+                                );
+                            } else {
+                                ui.label(RichText::new("Unclassified (no matching book line)").italics());
+                            }
+                        });
+
+                        ui.add_space(6.0);
+                        if has_existing {
+                            ui.colored_label(
+                                GOLD,
+                                "Existing opening tags are present. Do you want to replace them with the classified values?",
+                            );
+                            ui.add_space(4.0);
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .add_enabled(
+                                        proposed.is_some(),
+                                        egui::Button::new(RichText::new("Replace Tags").strong()),
+                                    )
+                                    .clicked()
+                                {
+                                    classify_current_action = Some(true);
+                                    close_dialog = true;
+                                }
+                                if ui.button("Keep Existing").clicked() {
+                                    close_dialog = true;
+                                }
+                            });
+                        } else {
+                            if ui
+                                .add_enabled(
+                                    proposed.is_some(),
+                                    egui::Button::new(RichText::new("Apply Classification").strong()),
+                                )
+                                .clicked()
+                            {
+                                classify_current_action = Some(false);
+                                close_dialog = true;
+                            }
+                        }
+                    });
+                    ui.add_space(8.0);
+                }
+
+                if session_len > 0 {
+                    egui::CollapsingHeader::new(format!("Batch classify entire session ({})", games_label(session_len)))
+                        .default_open(!has_current)
+                        .show(ui, |ui| {
+                            ui.checkbox(
+                                &mut self.classify_overwrite,
+                                "Overwrite existing ECO and Opening tags in session games",
+                            )
+                            .on_hover_text(
+                                "When unchecked, games that already have ECO or Opening tags keep their imported metadata.",
+                            );
+                            ui.add_space(4.0);
+                            let all_label = format!("Classify session ({})", games_label(session_len));
+                            if ui.button(all_label).clicked() {
+                                classify_all = true;
+                                close_dialog = true;
+                            }
+                        });
+                }
+
                 if !self.classify_status.is_empty() {
                     ui.add_space(6.0);
                     ui.label(RichText::new(&self.classify_status).small().color(GOLD));
                 }
             });
+        if close_dialog {
+            open = false;
+        }
         self.classify_openings_open = open;
-        let overwrite = self.classify_overwrite;
-        if classify_current {
+        if let Some(overwrite) = classify_current_action {
             self.classify_current_game_opening(overwrite);
         } else if classify_all {
-            self.classify_session_openings(overwrite);
+            self.classify_session_openings(self.classify_overwrite);
         }
     }
 
@@ -10024,6 +10099,7 @@ impl App {
                     &mut self.board_tag_visible,
                     &self.forced_tag_visibility,
                     &mut date_clicked,
+                    &mut self.classify_openings_open,
                 );
             });
             tags_ui.response.context_menu(|ui| {
@@ -14121,6 +14197,7 @@ fn game_tags_card(
     board_visible: &mut bool,
     forced_tags: &HashSet<String>,
     date_clicked: &mut Option<egui::Pos2>,
+    classify_clicked: &mut bool,
 ) {
     let show_empty_now = *show_empty;
     let board_present = game
@@ -14241,7 +14318,7 @@ fn game_tags_card(
                 ui.add_space(3.0);
             }
             if eco_visible || opening_visible {
-                compact_eco_opening_tag(ui, game, tag_update, tag_add_value);
+                compact_eco_opening_tag(ui, game, tag_update, tag_add_value, classify_clicked);
                 ui.add_space(3.0);
             }
 
@@ -14651,6 +14728,7 @@ fn compact_eco_opening_tag(
     game: &Game,
     tag_update: &mut Option<(usize, String)>,
     tag_add_value: &mut Option<(&'static str, String)>,
+    classify_clicked: &mut bool,
 ) {
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 4.0;
@@ -14680,7 +14758,7 @@ fn compact_eco_opening_tag(
         let mut opening = opening_index
             .map(|index| game.headers[index].1.clone())
             .unwrap_or_default();
-        let width = (ui.available_width() - 2.0).max(30.0);
+        let width = (ui.available_width() - 60.0).max(30.0);
         let opening_response = ui.add_sized(
             [width, 19.0],
             egui::TextEdit::singleline(&mut opening)
@@ -14696,6 +14774,13 @@ fn compact_eco_opening_tag(
             } else if !opening.trim().is_empty() {
                 *tag_add_value = Some(("Opening", opening));
             }
+        }
+        if ui
+            .add(egui::Button::new(RichText::new("Classify").small()))
+            .on_hover_text("Classify opening from mainline moves")
+            .clicked()
+        {
+            *classify_clicked = true;
         }
     });
 }
@@ -16754,7 +16839,7 @@ fn cloud_engine_section(
                 }
                 if let Some(Ok(eval)) = snapshot.map(|snapshot| &snapshot.cloud_eval) {
                     ui.label(
-                        RichText::new(format!("Lichess d{} · {} PVs", eval.depth, eval.pvs.len()))
+                        RichText::new(format!("Lichess · {} PVs", eval.pvs.len()))
                             .small()
                             .color(GOLD),
                     );
