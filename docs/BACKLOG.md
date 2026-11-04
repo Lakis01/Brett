@@ -1159,27 +1159,30 @@ Moves panel and the Engine panel.
 
 **Depends on:** `src/cloud.rs` and `src/app.rs` (`maybe_request_cloud`).
 
-## 33. Cloud Evaluation Tree Pruning (No Hits Downstream)
+## 33. Database & Cloud Tree Pruning Logic (No Hits Downstream vs Transpositions)
 
-**Status:** queued.
+**Status:** on hold — flagged for investigation with a more capable reasoning model.
 
-**Goal:** avoid issuing unnecessary cloud evaluation requests for downstream positions
-when earlier positions along the same mainline or variation had zero hits in both
-ChessDB.cn and Lichess Cloud Eval.
+**Goal:** avoid issuing redundant or fruitless lookup requests for downstream positions
+when earlier positions along the same branch had zero hits.
 
-- **Heuristic rationale:** in opening books and master databases, once a game reaches a novelty
-  or rare move that is absent from ChessDB and Lichess Cloud, subsequent descendant positions
-  are almost guaranteed to also have zero cloud evaluations.
-- **Transposition edge case:** transpositions can theoretically re-enter known book lines
-  via alternative move orders. The pruning logic should track verified noveltiness per node
-  or along a contiguous sub-branch while allowing explicit manual refresh or transposition
-  detection when available.
+- **Broad Scope:** applies to any database lookup in general, whether **online** (ChessDB.cn,
+  Lichess Cloud Eval, Lichess Opening Explorer) or **local** (local position index, reference
+  databases, opening books).
+- **Heuristic rationale:** once a game enters a novelty or rare move absent from the reference
+  corpus, subsequent descendant positions along that branch are almost guaranteed to also have
+  zero hits. Pruning queries saves network traffic, disk I/O, and UI latency.
+- **Transposition edge case & investigation mandate:** transpositions can re-enter known book lines
+  via alternative move orders. The user explicitly flagged this logic to be thoroughly analyzed
+  and designed with a more capable reasoning model before writing any code.
 
-**Depends on:** `src/cloud.rs` (`request_all`, in-flight queue) and `src/app.rs` (`maybe_request_cloud`).
+**Depends on:** `src/cloud.rs`, `src/app.rs`, and position indexing/lookup infrastructure.
 
 ## 34. Stockfish Decision Heuristic: Dev Build Continuous Calibration
 
-**Status:** queued.
+**Status:** implemented (v0.1.6). Fully implemented in `src/engine/discovery.rs` with linear
+day interpolation between anchors SF 16, 17, 18, and 19.
+
 
 **Goal:** expand the Stockfish quality heuristic to support unreleased developer builds
 and daily master snapshots (`stockfish-ubuntu-x86-64-avx2-git-YYYYMMDD`).
