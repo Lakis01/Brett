@@ -750,33 +750,24 @@ than only showing all-time frequency, and make the trend visible at a glance.
 (predictor/reference distribution) and the Tree panel. **Unblocks:** trend-aware
 preparation and repertoire review.
 
-## 19. Player-photo pack redistribution
+## 19. Player Portraits Database: Direct SPF Loading & Lichess Outreach
 
-**Status:** local loading implemented; redistribution blocked on permission.
-The 2026-10-28 decision is to request written permission from the Scid authors;
-keep the pack local-only and out of releases until an answer is recorded.
+**Status:** local BPF1 loading implemented; direct SPF ingestion and Lichess outreach pending.
+The user intends to contact Lichess regarding obtaining and redistributing a permissively licensed
+player photo collection. The photo database is strictly local-only and **must NOT be hosted on GitHub**
+(neither in git history nor release assets) until copyright issues are resolved.
 
 - The optional BPF1 reader (`src/photos.rs`), WebP decoding, texture cache,
   **Settings → Show player photos**, **Settings → Photo size**
   (Small/Medium/Large), Players-list thumbnails, selected-player portrait, and
-  the standalone 240×300 viewer are implemented. Name lookup also handles
-  accent-folded and short pack keys. The gold world-champion crown, its
-  classical/FIDE lineage setting, and the hover explanation of each reign are
-  implemented separately in [`CHAMPIONS.md`](CHAMPIONS.md).
-- The pack is derived from Scid's `Player_photos.zip`
-  (`scid/PlayerData/Player_photos.zip`). The archive has no explicit
-  redistribution licence; Scid's `COPYING` identifies database files as
-  copyright Pascal Georges and asks users to contact the authors first.
-- Send a permission request that names the derived BPF1/WebP pack, the
-  intended distribution channel, and the required attribution; record the
-  answer and date in `docs/PHOTOS.md` and `THIRD_PARTY_NOTICES.md`.
-- `assets/photos.bin` is git-ignored and must not be committed or bundled in a
-  release, installer, or AppImage without written permission.
-- If permission is granted, record it and decide whether to ship a pack. Until
-  then, keep the `BRETT_PHOTOS`/`assets/photos.bin` discovery path and the
-  graceful no-pack fallback.
-- A separate public-domain/CC-licensed source is an alternative only after its
-  licence and attribution requirements are audited.
+  the standalone 240×300 viewer are implemented.
+- **Direct SPF Ingestion:** Inspect and decode player portraits directly from
+  `PlayerData/Players.spf` or companion image directories on the fly, eliminating the need to
+  pre-convert via Python scripts.
+- **Licensing & Outreach:** Reach out to Lichess regarding a permissively licensed photo archive.
+- **Strict Distribution Rule:** `assets/photos.bin` and `.spf` archives are git-ignored and must
+  never be committed to GitHub or bundled into release assets until licensing is formally resolved.
+
 - **Identity matching (queued 2026-10-29):** the current name-only lookup can
   attach the wrong portrait. Prefer a real FIDE ID when both the game and the
   pack expose one; otherwise use accent-folded, word-order-insensitive full-name
@@ -1097,26 +1088,21 @@ with ChessDB.cn and Lichess Cloud Eval in a stacked candidate variation table.
 
 **Depends on:** `src/engine/`, `src/cloud.rs`, `src/eval.rs`, and `src/settings.rs`.
 
-## 29. Leela Chess Zero (`lc0`) GPU acceleration & cross-vendor backend verification
+## 29. Leela Chess Zero (`lc0`) UCI Support & Engine Coexistence
 
-**Status:** queued.
+**Status:** resolved and implemented.
 
-**Goal:** ensure Leela Chess Zero (`lc0`) runs optimally across GPU backends,
-specifically supporting non-NVIDIA GPUs (Intel Iris Xe, AMD Radeon, Apple Silicon)
-via Vulkan and OpenCL backends alongside NVIDIA CUDA, as well as CPU fallbacks
-(eigen, onednn).
+**Conclusion:** Leela Chess Zero (`lc0`) operates strictly as a standard UCI engine via stdin/stdout.
+The GUI does not manage CUDA or GPU kernels directly; execution backends (CUDA, Vulkan, OpenCL,
+or CPU via OneDNN/Eigen) are chosen and managed internally by the `lc0` executable and its weights.
+No custom GPU or CUDA code is required in Brett.
 
-- Detect and support `lc0` configuration options via UCI: `WeightsFile`, `Backend`
-  (`vulkan`, `opencl`, `onednn`, `eigen`, `cuda`), `Threads`, `MinibatchSize`.
-- Verify engine initialization and search output across different backends,
-  handling cases where CUDA is unavailable or the default package requires
-  Vulkan/OpenCL drivers.
-- Verify evaluation score and nodes-per-second (NPS) reporting across Lc0 backends
-  and calibrate Leela centipawn translation under various network architectures.
-- Provide clear diagnostics and troubleshooting guidance in the Engine drawer
-  when GPU backend initialization fails, offering graceful fallback to CPU backends.
+Brett already fully supports Leela:
+- Auto-detects Leela from the UCI identity string (`lc0`, `leela`).
+- Automatically translates Leela's compressed centipawn scale to Stockfish-equivalent centipawns (`src/analysis_cache.rs::leela_to_stockfish_cp`).
+- Partitions cached evaluations separately so Leela and Stockfish evaluations coexist without overwriting.
+- Renders dedicated `Lc0` columns in the Cloud Engine table and integrates Leela scores into the board evaluation bar.
 
-**Depends on:** `src/engine/`, `src/analysis_cache.rs`, and `src/app.rs`.
 
 ## 30. Touchscreen Gestures: Disambiguating Scroll vs. Drag Reordering in Database View
 
