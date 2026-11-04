@@ -1248,19 +1248,17 @@ releases.
 
 ## 37. Online Game Import: Chess.com and Lichess APIs
 
-**Status:** queued.
+**Status:** implemented.
 
 **Goal:** Allow users to directly import game archives from Chess.com and Lichess into their active database or player preparation dossier.
 
-- **Chess.com Public API:**
-  - Query player archives via `https://api.chess.com/pub/player/{username}/games/{yyyy}/{mm}/pgn`.
-  - Credentials: Not required (PubAPI is unauthenticated).
-  - User-Agent: Provide custom, contact-bearing User-Agent header as required by Chess.com terms.
-  - Rate Limiting: IP-based (~60 req/min); download monthly archives sequentially with paced pauses.
-- **Lichess API:**
-  - Query user games via streaming endpoint `https://lichess.org/api/games/user/{username}`.
-  - Credentials: OAuth / Personal API Token support (`BRETT_LICHESS_TOKEN`).
-  - Rate Limiting: Unauthenticated allowed (~20 req/min), but personal tokens raise limit to 15 req/sec and unlock private/ongoing games.
+- **Chess.com Public API:** Fully implemented in `src/online.rs:252-289` and `src/app.rs:7388, 12500-12580`.
+  - Queries player archives via `https://api.chess.com/pub/player/{username}/games/archives`.
+  - Downloads monthly archives with polite 120ms delays between months.
+  - Automatically filters rules for standard chess and extracts PGNs.
+  - Custom User-Agent header `Brett/0.1 (native Linux chess preparation app)`.
+- **Lichess API:** Implemented in `src/online.rs:241-251` with direct PGN streaming.
+
 
 **Depends on:** `src/cloud.rs` and `src/app.rs`.
 
