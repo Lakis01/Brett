@@ -10,6 +10,11 @@ preparation, game review, database management, and deep position analysis.
 > workflows are firmly in place. Expect rough edges and evolving features in
 > this phase. Back up important databases before editing them in place.
 
+## Licensing
+
+* **Source Code:** Licensed under the [MIT License](LICENSE).
+* **Optional ICCF Reference Database:** Not covered by the MIT License. Game data is provided courtesy of the ICCF and is subject to a strict **Non-Commercial / No-Resale License** (see [LICENSE-CRB.txt](https://github.com/Lakis01/brett-correspondence_reference_base/blob/main/LICENSE-CRB.txt) and `LICENSE-ICCF.txt` upon download).
+
 ## Quick start (Linux)
 
 ```sh

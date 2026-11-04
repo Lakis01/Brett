@@ -131,11 +131,6 @@ jobs:
               -e "s/sha256sums=('SKIP')/sha256sums=('${SHA256}')/" \
               packaging/aur/brett-bin/PKGBUILD > "PKGBUILD"
 
-      - name: Build and package correspondence reference
-        run: |
-          cargo run --release --example build_correspondence_index databases/iccf/Correspondence_2350.si4 || true
-          tar -czf correspondence-reference.tar.gz databases/iccf
-
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:

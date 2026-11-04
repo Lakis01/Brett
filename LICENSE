@@ -1,3 +1,10 @@
+## Licensing
+
+* **Source Code:** Licensed under the [MIT License](LICENSE).
+* **Optional ICCF Reference Database:** Not covered by the MIT License. Game data is provided courtesy of the ICCF and is subject to a strict **Non-Commercial / No-Resale License** (see `LICENSE-ICCF.txt` upon download).
+
+---
+
 MIT License
 
 Copyright (c) 2026 Markus Hinterreiter

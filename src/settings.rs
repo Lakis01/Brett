@@ -610,6 +610,8 @@ pub struct DisplayPrefs {
     /// Folder of the last game exported for printing, used as the initial
     /// location for print exports.
     pub last_print_dir: Option<PathBuf>,
+    /// Last 5 loaded databases or opening books.
+    pub recent_files: Vec<PathBuf>,
     /// Maximum number of recent preparation games shown for a position.
     pub prep_recent_limit: usize,
     /// Show PGN fields that are absent or empty. Hidden by default so a game
@@ -669,6 +671,7 @@ impl Default for DisplayPrefs {
             opening_book_path: String::new(),
             last_database_dir: None,
             last_print_dir: None,
+            recent_files: Vec::new(),
             prep_recent_limit: 10,
             show_empty_pgn_tags: false,
             hover_moves: false,
@@ -753,6 +756,19 @@ impl DisplayPrefs {
             .map(str::trim)
             .filter(|path| !path.is_empty())
             .map(PathBuf::from);
+        let recent_files = value
+            .get("recent_files")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::trim)
+                    .filter(|path| !path.is_empty())
+                    .map(PathBuf::from)
+                    .take(5)
+                    .collect()
+            })
+            .unwrap_or_default();
         let prep_recent_limit = value
             .get("prep_recent_limit")
             .and_then(Value::as_u64)
@@ -854,6 +870,7 @@ impl DisplayPrefs {
             opening_book_path,
             last_database_dir,
             last_print_dir,
+            recent_files,
             prep_recent_limit,
             show_empty_pgn_tags,
             hover_moves,
@@ -887,6 +904,7 @@ impl DisplayPrefs {
             "opening_book_path": self.opening_book_path,
             "last_database_dir": self.last_database_dir.as_ref().map(|path| path.display().to_string()),
             "last_print_dir": self.last_print_dir.as_ref().map(|path| path.display().to_string()),
+            "recent_files": self.recent_files.iter().map(|path| path.display().to_string()).collect::<Vec<_>>(),
             "prep_recent_limit": self.prep_recent_limit,
             "show_empty_pgn_tags": self.show_empty_pgn_tags,
             "hover_moves": self.hover_moves,
@@ -1357,6 +1375,7 @@ mod tests {
             opening_book_path: "/tmp/perfect.abk".to_string(),
             last_database_dir: Some(PathBuf::from("/tmp/databases")),
             last_print_dir: Some(PathBuf::from("/tmp/prints")),
+            recent_files: vec![PathBuf::from("/tmp/game.pgn")],
             prep_recent_limit: 25,
             show_empty_pgn_tags: true,
             hover_moves: true,

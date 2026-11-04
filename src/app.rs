@@ -192,6 +192,13 @@ enum CorrespondenceMessage {
     Done(Result<PositionIndex, String>),
 }
 
+#[derive(Debug)]
+enum CorrespondenceDownloadMsg {
+    Progress(String),
+    Complete(PathBuf),
+    Failed(String),
+}
+
 enum BookMessage {
     Done(Result<Arc<Book>, String>),
 }
@@ -803,8 +810,9 @@ pub struct App {
     correspondence_job: Option<PathBuf>,
     correspondence_status: String,
     correspondence_prompt_open: bool,
+    correspondence_terms_accepted: bool,
     correspondence_download_dismissed: bool,
-    correspondence_download_rx: Option<mpsc::Receiver<Result<PathBuf, String>>>,
+    correspondence_download_rx: Option<mpsc::Receiver<CorrespondenceDownloadMsg>>,
     correspondence_download_status: String,
     /// Move whose annotation editor is open. Clicking an annotation or using
     /// the move context menu enters this mode.
@@ -941,8 +949,10 @@ pub struct App {
     print_export_open: bool,
     print_export_path: String,
     print_export_include_final: bool,
+    print_export_variation_depth: usize,
     print_export_compile_pdf: bool,
     print_export_status: String,
+    recent_files: Vec<PathBuf>,
     setup_open: bool,
     setup_state: crate::setup::PositionSetupState,
     classify_openings_open: bool,
@@ -1143,6 +1153,7 @@ impl App {
             correspondence_job: None,
             correspondence_status,
             correspondence_prompt_open: false,
+            correspondence_terms_accepted: false,
             correspondence_download_dismissed: preparation_prefs.correspondence_download_dismissed,
             correspondence_download_rx: None,
             correspondence_download_status: String::new(),
@@ -1298,8 +1309,10 @@ impl App {
             print_export_open: false,
             print_export_path: String::new(),
             print_export_include_final: true,
+            print_export_variation_depth: 2,
             print_export_compile_pdf: false,
             print_export_status: String::new(),
+            recent_files: display_prefs.recent_files.clone(),
             setup_open: false,
             setup_state: crate::setup::PositionSetupState::default(),
             classify_openings_open: false,
@@ -1810,6 +1823,7 @@ impl App {
             indexed_in.as_secs_f64()
         );
         self.status = self.index_status.clone();
+        self.record_recent_file(path);
         if let Some(id) = self.session.id_at(0) {
             self.select_slot(id);
         }
@@ -1963,6 +1977,7 @@ impl App {
                 self.views_open = true;
                 self.status = format!("Opened {} as a database view.", games_label(count));
                 self.remember_database_dir(path);
+                self.record_recent_file(path);
             }
             Err(err) => self.status = format!("Could not open {}: {err}", path.display()),
         }
@@ -3080,11 +3095,12 @@ impl App {
             owner: print_owner(),
             date: print_date(),
         };
-        let document = crate::print::build_document(
+        let document = crate::print::build_document_with_depth(
             &game,
             meta,
             &self.print_diagrams,
             self.print_export_include_final,
+            self.print_export_variation_depth,
         );
         let bundle = match crate::print::typst::write_bundle(&path, &document) {
             Ok(bundle) => bundle,
@@ -3155,6 +3171,12 @@ impl App {
                     &mut self.print_export_include_final,
                     "Include the final position diagram",
                 );
+                ui.horizontal(|ui| {
+                    ui.label("Variations depth:");
+                    ui.radio_value(&mut self.print_export_variation_depth, 0, "0 (Game only)");
+                    ui.radio_value(&mut self.print_export_variation_depth, 1, "1 (Direct only)");
+                    ui.radio_value(&mut self.print_export_variation_depth, 2, "2 (All)");
+                });
                 ui.checkbox(
                     &mut self.print_export_compile_pdf,
                     "Compile a PDF with Typst (optional)",
@@ -3502,6 +3524,7 @@ impl App {
             );
             return;
         }
+        self.record_recent_file(&path);
         self.book = None;
         self.book_rx = None;
         self.book_job = Some(path.clone());
@@ -3657,6 +3680,11 @@ impl App {
             let progress_ctx = ctx.clone();
             let result = (|| -> Result<PositionIndex, String> {
                 let library = open_library(&path).map_err(|err| format!("{err:#}"))?;
+                if let Some(cached) = PositionIndex::open_cached_for(library.as_ref())
+                    .map_err(|err| format!("{err:#}"))?
+                {
+                    return Ok(cached);
+                }
                 PositionIndex::build_cached_for(library, BuildOptions::default(), move |progress| {
                     let _ = progress_tx.send(CorrespondenceMessage::Progress(progress));
                     progress_ctx.request_repaint();
@@ -3726,24 +3754,33 @@ impl App {
         let Some(rx) = &self.correspondence_download_rx else {
             return;
         };
-        match rx.try_recv() {
-            Ok(Ok(path)) => {
-                self.correspondence_download_rx = None;
-                self.correspondence_download_status = "Download complete.".to_string();
-                self.correspondence_prompt_open = false;
-                self.correspondence_path = path.display().to_string();
-                self.settings_correspondence_path = path.display().to_string();
-                self.save_reference_prefs();
-                self.start_correspondence(path);
-            }
-            Ok(Err(err)) => {
-                self.correspondence_download_rx = None;
-                self.correspondence_download_status = format!("Download failed: {err}");
-            }
-            Err(mpsc::TryRecvError::Empty) => {}
-            Err(mpsc::TryRecvError::Disconnected) => {
-                self.correspondence_download_rx = None;
-                self.correspondence_download_status = "Download stopped unexpectedly.".to_string();
+        loop {
+            match rx.try_recv() {
+                Ok(CorrespondenceDownloadMsg::Progress(status)) => {
+                    self.correspondence_download_status = status;
+                }
+                Ok(CorrespondenceDownloadMsg::Complete(path)) => {
+                    self.correspondence_download_rx = None;
+                    self.correspondence_download_status = "Ready!".to_string();
+                    self.correspondence_prompt_open = false;
+                    self.correspondence_path = path.display().to_string();
+                    self.settings_correspondence_path = path.display().to_string();
+                    self.save_reference_prefs();
+                    self.start_correspondence(path);
+                    break;
+                }
+                Ok(CorrespondenceDownloadMsg::Failed(err)) => {
+                    self.correspondence_download_rx = None;
+                    self.correspondence_download_status = format!("Download failed: {err}");
+                    break;
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.correspondence_download_rx = None;
+                    self.correspondence_download_status =
+                        "Download stopped unexpectedly.".to_string();
+                    break;
+                }
             }
         }
     }
@@ -3754,16 +3791,13 @@ impl App {
         }
         let (tx, rx) = mpsc::channel();
         self.correspondence_download_rx = Some(rx);
-        self.correspondence_download_status =
-            "Downloading Correspondence_2350.tar.gz (26 MB)…".to_string();
+        self.correspondence_download_status = "Connecting to repository…".to_string();
         let target_dir = xdg_data_dir()
             .map(|d| d.join("brett/databases/iccf"))
             .unwrap_or_else(|| PathBuf::from("databases/iccf"));
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            let res = download_and_unpack_correspondence(&target_dir);
-            let _ = tx.send(res);
-            ctx.request_repaint();
+            download_and_unpack_correspondence(&target_dir, &tx, &ctx);
         });
     }
 
@@ -3772,28 +3806,32 @@ impl App {
             return;
         }
         let mut close = false;
+        let mut dismiss_permanently = false;
         let mut start_download = false;
-        egui::Window::new("Correspondence Reference Database")
+        egui::Window::new("ICCF Correspondence Reference Base")
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .show(ctx, |ui| {
-                ui.set_min_width(420.0);
+                ui.set_min_width(520.0);
                 ui.label(RichText::new("No correspondence reference database detected.").strong());
                 ui.add_space(4.0);
                 ui.label(
-                    "Brett uses an ICCF correspondence database (ratings 2350+, mainlines truncated \
-                     to 70 plies, with pre-computed position index) to provide reference statistics, \
-                     opening tree insights, and preparation trends.",
+                    "Brett uses a curated ICCF correspondence database (ratings 2350+, mainlines truncated \
+                     to 70 plies) to provide reference statistics, opening tree insights, and preparation trends. \
+                     The database comes with a precompiled index to make reference lookup instant.",
                 );
                 ui.add_space(6.0);
-                ui.label(RichText::new("Archive size: ~26 MB  •  Storage used: ~124 MB").weak());
+                ui.label(
+                    RichText::new("Archive size: ~25 MB download  •  Storage used: ~124 MB unpacked (10.8 MB games + 112.8 MB index)")
+                        .weak(),
+                );
                 ui.add_space(8.0);
 
                 if self.correspondence_download_rx.is_some() {
                     ui.horizontal(|ui| {
                         ui.spinner();
-                        ui.label(&self.correspondence_download_status);
+                        ui.label(RichText::new(&self.correspondence_download_status).strong());
                     });
                 } else {
                     if !self.correspondence_download_status.is_empty() {
@@ -3803,22 +3841,54 @@ impl App {
                         );
                         ui.add_space(4.0);
                     }
+                    egui::Frame::group(ui.style()).show(ui, |ui| {
+                        ui.set_max_width(500.0);
+                        ui.label(RichText::new("ICCF Database Terms of Use").strong());
+                        ui.add_space(2.0);
+                        ui.small(
+                            "The source game data in this database is provided courtesy of the International \
+                             Correspondence Chess Federation (ICCF) and has been filtered, truncated (70 plies), \
+                             and compiled for use with Brett.\n\n\
+                             By downloading this database, you agree to the following terms:\n\
+                             1. Non-Commercial Use Only: You may use this database free of charge for personal \
+                             study, game analysis, and tournament preparation.\n\
+                             2. No Resale or Commercial Distribution: You may not sell, rent, lease, sublicense, \
+                             or commercially exploit this database, nor bundle it with any paid software, service, \
+                             or commercial product, without prior written permission from the ICCF.\n\
+                             3. Preservation of Notice: Any permitted local copy or backup must retain this \
+                             copyright and database right notice.",
+                        );
+                    });
+                    ui.add_space(6.0);
                     ui.checkbox(
-                        &mut self.correspondence_download_dismissed,
-                        "Don't remind me again",
+                        &mut self.correspondence_terms_accepted,
+                        "I acknowledge and agree to the ICCF Database Terms of Use.",
                     );
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
-                        if ui.button(RichText::new("Download (26 MB)").strong()).clicked() {
+                        if ui
+                            .add_enabled(
+                                self.correspondence_terms_accepted,
+                                egui::Button::new(RichText::new("Download Database").strong()),
+                            )
+                            .clicked()
+                        {
                             start_download = true;
                         }
                         if ui.button("Not now").clicked() {
+                            close = true;
+                        }
+                        if ui.button("No and don't ask again").clicked() {
+                            dismiss_permanently = true;
                             close = true;
                         }
                     });
                 }
             });
 
+        if dismiss_permanently {
+            self.correspondence_download_dismissed = true;
+        }
         if close {
             self.correspondence_prompt_open = false;
             self.save_reference_prefs();
@@ -3941,6 +4011,7 @@ impl App {
             opening_book_path: self.book_path.clone(),
             last_database_dir: self.last_database_dir.clone(),
             last_print_dir: self.last_print_dir.clone(),
+            recent_files: self.recent_files.clone(),
             prep_recent_limit: self.prep_recent_limit.clamp(1, 50),
             show_empty_pgn_tags: self.show_empty_pgn_tags,
             hover_moves: self.hover_moves,
@@ -3965,6 +4036,25 @@ impl App {
         if let Err(err) = prefs.save() {
             self.status = format!("Could not save display settings: {err:#}");
         }
+    }
+
+    fn record_recent_file(&mut self, path: &Path) {
+        let path = path.to_path_buf();
+        self.recent_files.retain(|p| p != &path);
+        self.recent_files.insert(0, path);
+        self.recent_files.truncate(5);
+        self.save_display_prefs();
+    }
+
+    fn load_recent_file(&mut self, path: &Path) {
+        if is_book_file(path) {
+            self.book_path = path.display().to_string();
+            self.save_display_prefs();
+            self.start_book(path.to_path_buf());
+        } else {
+            self.load_file(path);
+        }
+        self.record_recent_file(path);
     }
 
     fn trend_config(&self) -> crate::recent::TrendConfig {
@@ -7109,6 +7199,32 @@ impl App {
                         }
                         ui.close();
                     }
+                    let mut recent_to_load = None;
+                    ui.menu_button("Open recent", |ui| {
+                        if self.recent_files.is_empty() {
+                            ui.add_enabled(false, egui::Button::new("No recent files"));
+                        } else {
+                            for path in &self.recent_files {
+                                let name = path
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().to_string())
+                                    .unwrap_or_else(|| path.display().to_string());
+                                let kind = if is_book_file(path) { "📖" } else { "📁" };
+                                if ui
+                                    .button(format!("{kind} {name}"))
+                                    .on_hover_text(path.display().to_string())
+                                    .clicked()
+                                {
+                                    recent_to_load = Some(path.clone());
+                                    ui.close();
+                                }
+                            }
+                        }
+                    });
+                    if let Some(path) = recent_to_load {
+                        self.load_recent_file(&path);
+                        ui.close();
+                    }
                     if ui.button("Merge database into current list…").clicked() {
                         if let Some(path) = open_dialog(self.last_database_dir.as_deref())
                             && let Ok(library) = open_library(&path)
@@ -7776,6 +7892,37 @@ impl App {
 
         let filter_trimmed = self.filter.trim();
         let is_filtered = !filter_trimmed.is_empty();
+
+        let mut open_player_name = None;
+        if filter_trimmed.len() >= 2 {
+            let player_matches = self.players.filter(filter_trimmed);
+            if !player_matches.is_empty() {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("👤 Players:").weak().size(11.0));
+                    for &idx in player_matches.iter().take(5) {
+                        if let Some(player) = self.players.get(idx) {
+                            let label = if let Some(elo) = player.elo_avg() {
+                                format!("{} ({})", player.name, elo.round() as u32)
+                            } else {
+                                player.name.clone()
+                            };
+                            if ui
+                                .button(RichText::new(label).size(11.0))
+                                .on_hover_text(format!("Open player profile for {}", player.name))
+                                .clicked()
+                            {
+                                open_player_name = Some(player.name.clone());
+                            }
+                        }
+                    }
+                });
+                ui.add_space(2.0);
+            }
+        }
+        if let Some(name) = open_player_name {
+            self.open_player_profile(&name);
+            return;
+        }
         let rows = if is_filtered {
             self.session.filter(filter_trimmed)
         } else {
@@ -17690,32 +17837,141 @@ fn xdg_data_dir() -> Option<PathBuf> {
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
 }
 
-fn download_and_unpack_correspondence(target_dir: &Path) -> Result<PathBuf, String> {
-    std::fs::create_dir_all(target_dir).map_err(|e| format!("creating directory: {e}"))?;
+fn download_and_unpack_correspondence(
+    target_dir: &Path,
+    tx: &mpsc::Sender<CorrespondenceDownloadMsg>,
+    ctx: &egui::Context,
+) {
+    use sha2::{Digest, Sha256};
+    use std::io::{Read, Write};
+
+    let report = |msg: &str| {
+        let _ = tx.send(CorrespondenceDownloadMsg::Progress(msg.to_string()));
+        ctx.request_repaint();
+    };
+
     let target_si4 = target_dir.join("Correspondence_2350.si4");
     if target_si4.exists() {
-        return Ok(target_si4);
+        let _ = tx.send(CorrespondenceDownloadMsg::Complete(target_si4));
+        ctx.request_repaint();
+        return;
     }
-    let url =
-        "https://github.com/Lakis01/Brett/releases/latest/download/Correspondence_2350.tar.gz";
+
+    if let Err(e) = std::fs::create_dir_all(target_dir) {
+        let _ = tx.send(CorrespondenceDownloadMsg::Failed(format!(
+            "creating directory: {e}"
+        )));
+        ctx.request_repaint();
+        return;
+    }
+
+    report("Downloading archive (25 MB)…");
+    let url = "https://github.com/Lakis01/brett-correspondence_reference_base/releases/latest/download/Correspondence_2350.tar.gz";
     let agent = ureq::AgentBuilder::new()
-        .timeout(std::time::Duration::from_secs(120))
+        .timeout(std::time::Duration::from_secs(300))
         .build();
-    let resp = agent
-        .get(url)
-        .call()
-        .map_err(|e| format!("HTTP request failed: {e}"))?;
-    let reader = resp.into_reader();
-    let gz = flate2::read::GzDecoder::new(reader);
-    let mut archive = tar::Archive::new(gz);
-    archive
-        .unpack(target_dir)
-        .map_err(|e| format!("extracting archive: {e}"))?;
-    if target_si4.exists() {
-        Ok(target_si4)
-    } else {
-        Err("Archive extracted, but Correspondence_2350.si4 was not found inside".to_string())
+    let resp = match agent.get(url).call() {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = tx.send(CorrespondenceDownloadMsg::Failed(format!(
+                "HTTP request failed: {e}"
+            )));
+            ctx.request_repaint();
+            return;
+        }
+    };
+
+    let temp_archive = target_dir.join("Correspondence_2350.tar.gz.download");
+    let mut file = match std::fs::File::create(&temp_archive) {
+        Ok(f) => f,
+        Err(e) => {
+            let _ = tx.send(CorrespondenceDownloadMsg::Failed(format!(
+                "creating temporary archive file: {e}"
+            )));
+            ctx.request_repaint();
+            return;
+        }
+    };
+
+    let mut reader = resp.into_reader();
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(n) => {
+                hasher.update(&buffer[..n]);
+                if let Err(e) = file.write_all(&buffer[..n]) {
+                    let _ = std::fs::remove_file(&temp_archive);
+                    let _ = tx.send(CorrespondenceDownloadMsg::Failed(format!(
+                        "writing temporary archive file: {e}"
+                    )));
+                    ctx.request_repaint();
+                    return;
+                }
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&temp_archive);
+                let _ = tx.send(CorrespondenceDownloadMsg::Failed(format!(
+                    "reading download stream: {e}"
+                )));
+                ctx.request_repaint();
+                return;
+            }
+        }
     }
+    drop(file);
+
+    report("Verifying checksum…");
+    let expected_sha256 = "36f041deeb381188f209a93b95383d2f469cc813f14d1db5901ae97662a2396e";
+    let computed_sha256 = format!("{:x}", hasher.finalize());
+    if computed_sha256 != expected_sha256 {
+        let _ = std::fs::remove_file(&temp_archive);
+        let _ = tx.send(CorrespondenceDownloadMsg::Failed(format!(
+            "SHA256 checksum mismatch: got {computed_sha256}, expected {expected_sha256}"
+        )));
+        ctx.request_repaint();
+        return;
+    }
+
+    report("Unpacking database and index…");
+    let archive_file = match std::fs::File::open(&temp_archive) {
+        Ok(f) => f,
+        Err(e) => {
+            let _ = std::fs::remove_file(&temp_archive);
+            let _ = tx.send(CorrespondenceDownloadMsg::Failed(format!(
+                "opening downloaded archive: {e}"
+            )));
+            ctx.request_repaint();
+            return;
+        }
+    };
+
+    let gz = flate2::read::GzDecoder::new(archive_file);
+    let mut archive = tar::Archive::new(gz);
+    archive.set_preserve_mtime(true);
+    if let Err(e) = archive.unpack(target_dir) {
+        let _ = std::fs::remove_file(&temp_archive);
+        let _ = tx.send(CorrespondenceDownloadMsg::Failed(format!(
+            "extracting archive: {e}"
+        )));
+        ctx.request_repaint();
+        return;
+    }
+
+    report("Deleting downloaded archive…");
+    let _ = std::fs::remove_file(&temp_archive);
+
+    if target_si4.exists() {
+        report("Ready!");
+        let _ = tx.send(CorrespondenceDownloadMsg::Complete(target_si4));
+    } else {
+        let _ = tx.send(CorrespondenceDownloadMsg::Failed(
+            "Archive extracted, but Correspondence_2350.si4 was not found inside".to_string(),
+        ));
+    }
+    ctx.request_repaint();
 }
 
 fn open_dialog(initial_dir: Option<&Path>) -> Option<std::path::PathBuf> {
@@ -17761,6 +18017,16 @@ fn open_dialog(initial_dir: Option<&Path>) -> Option<std::path::PathBuf> {
         }
         _ => None,
     }
+}
+
+fn is_book_file(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|s| s.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("bin" | "ctg" | "abk" | "bkt")
+    )
 }
 
 fn open_book_dialog(initial_dir: Option<&Path>) -> Option<std::path::PathBuf> {
@@ -18535,6 +18801,7 @@ mod tests {
             correspondence_job: None,
             correspondence_status: String::new(),
             correspondence_prompt_open: false,
+            correspondence_terms_accepted: false,
             correspondence_download_dismissed: false,
             correspondence_download_rx: None,
             correspondence_download_status: String::new(),
@@ -18651,8 +18918,10 @@ mod tests {
             print_export_open: false,
             print_export_path: String::new(),
             print_export_include_final: true,
+            print_export_variation_depth: 2,
             print_export_compile_pdf: false,
             print_export_status: String::new(),
+            recent_files: Vec::new(),
             setup_open: false,
             setup_state: crate::setup::PositionSetupState::default(),
             classify_openings_open: false,

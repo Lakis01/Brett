@@ -1,8 +1,11 @@
 # ICCF correspondence reference
 
 This directory carries the compiled ICCF correspondence reference used by
-Brett's Engine tab. Downloading it is optional: Brett runs without it, and all
-other database formats work without it. It is included here because a local
+Brett's Engine tab. The database is hosted separately in its own repository at
+https://github.com/Lakis01/brett-correspondence_reference_base and can be
+downloaded automatically on first launch or manually placed here.
+Downloading it is optional: Brett runs without it, and all
+other database formats work without it. It is provided because a local
 correspondence reference makes preparation materially better, and because the
 database is refreshed between releases rather than tied to a particular build.
 

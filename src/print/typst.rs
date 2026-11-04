@@ -140,17 +140,21 @@ fn source_with_diagram_dir(document: &PrintDocument, diagram_dir: &str) -> Strin
         &mut out,
     );
 
-    // The empty-game case has no move item to attach its start diagram to.
+    let result = document.game.result.trim();
+    if !result.is_empty() && result != "*" {
+        out.push_str(&format!(
+            "\n#block(above: 0.4em, below: 0.4em)[#text(weight: \"bold\", {})]\n",
+            typst_string(result)
+        ));
+    }
+
+    // Trailing diagrams (start diagram for empty games, or final-position diagram)
+    // are placed after the result.
     for (index, diagram) in document.diagrams.iter().enumerate() {
         if used.insert(index) {
             write_diagram(diagram, index, 0, diagram_dir, &mut out);
         }
     }
-
-    out.push_str(&format!(
-        "\n#block(above: 0.4em)[#text(weight: \"bold\", {})]\n",
-        typst_string(&document.game.result)
-    ));
     out
 }
 

@@ -377,6 +377,71 @@ fn typst_source_preserves_annotations_and_nested_indentation() {
 }
 
 #[test]
+fn variation_depth_and_final_comment_filtering() {
+    let pgn = r#"[Event "Deep"]
+[White "W"]
+[Black "B"]
+[Result "0-1"]
+
+1. e4 e5 (1... c5 2. Nf3 Nc6 (2... d6 3. d4)) 2. Nf3 {Midgame comment.} 2... Nc6 {Final position comment.} 0-1
+"#;
+    let game = parse(pgn);
+
+    // Depth 0: Mainline only
+    let doc_0 = build_document_with_depth(&game, meta(), &BTreeSet::new(), false, 0);
+    let items_0 = doc_0.game.items;
+    assert!(!items_0.iter().any(|i| matches!(i, PrintItem::Variation(_))));
+    // Verify final position comment is not emitted, but midgame comment is
+    assert!(
+        items_0
+            .iter()
+            .any(|i| matches!(i, PrintItem::Comment(c) if c == "Midgame comment."))
+    );
+    assert!(
+        !items_0
+            .iter()
+            .any(|i| matches!(i, PrintItem::Comment(c) if c == "Final position comment."))
+    );
+
+    // Depth 1: Direct variations only (no nested variations within variations)
+    let doc_1 = build_document_with_depth(&game, meta(), &BTreeSet::new(), false, 1);
+    let var_1 = doc_1
+        .game
+        .items
+        .iter()
+        .find_map(|i| match i {
+            PrintItem::Variation(v) => Some(v),
+            _ => None,
+        })
+        .unwrap();
+    // Inside the variation, there should be NO nested variations:
+    assert!(!var_1.iter().any(|i| matches!(i, PrintItem::Variation(_))));
+
+    // Depth 2: All variations (nested variations preserved)
+    let doc_2 = build_document_with_depth(&game, meta(), &BTreeSet::new(), false, 2);
+    let var_2 = doc_2
+        .game
+        .items
+        .iter()
+        .find_map(|i| match i {
+            PrintItem::Variation(v) => Some(v),
+            _ => None,
+        })
+        .unwrap();
+    assert!(var_2.iter().any(|i| matches!(i, PrintItem::Variation(_))));
+
+    // Typst source has bold result before final diagram
+    let doc_diagram = build_document_with_depth(&game, meta(), &BTreeSet::new(), true, 2);
+    let typst = crate::print::typst::source(&doc_diagram);
+    let result_pos = typst.find("#text(weight: \"bold\", \"0-1\")").unwrap();
+    let diag_pos = typst.find("diagram-01.svg").unwrap();
+    assert!(
+        result_pos < diag_pos,
+        "Bold result must come before the final diagram"
+    );
+}
+
+#[test]
 fn typst_source_preserves_custom_starts_and_chess960() {
     let game = parse(
         "[Event \"960\"]\n[Site \"?\"]\n[Date \"2026.01.01\"]\n[Round \"1\"]\n[White \"A\"]\n[Black \"B\"]\n[Result \"*\"]\n[FEN \"qnbnrkrb/pppppppp/8/8/8/8/PPPPPPPP/QNBNRKRB w GEge - 0 1\"]\n[Variant \"Fischerandom\"]\n[SetUp \"1\"]\n\n1. d4 d5 2. Nbc3 b6 3. O-O Ne6 *\n",

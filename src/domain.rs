@@ -220,10 +220,10 @@ impl ShapeColor {
     /// Decode the colour names used by SCID's `%draw` extension.
     pub fn from_scid_name(name: &str) -> Option<Self> {
         match name.trim().to_ascii_lowercase().as_str() {
-            "green" | "darkgreen" => Some(Self::Green),
-            "yellow" | "gold" | "orange" => Some(Self::Yellow),
-            "red" | "darkred" => Some(Self::Red),
-            "blue" | "skyblue" | "cyan" => Some(Self::Blue),
+            "green" | "darkgreen" | "lightgreen" | "g" => Some(Self::Green),
+            "yellow" | "gold" | "orange" | "y" => Some(Self::Yellow),
+            "red" | "darkred" | "lightred" | "r" => Some(Self::Red),
+            "blue" | "skyblue" | "cyan" | "lightblue" | "darkblue" | "b" => Some(Self::Blue),
             _ => None,
         }
     }
@@ -307,35 +307,33 @@ fn parse_comment_directives(text: &str) -> CommentDirectives {
             out.push_str(&rest[start..]);
             break;
         };
-        let body = &directive[..end];
-        let mut fields = body.split_whitespace();
-        let name = fields.next().unwrap_or_default();
+        let body = directive[..end].trim();
+        let (name, arg) = match body.find(|c: char| c.is_whitespace() || c == ':') {
+            Some(idx) => (&body[..idx], body[idx + 1..].trim()),
+            None => (body, ""),
+        };
         let parsed = if name.eq_ignore_ascii_case("clk") {
-            if let Some(value) = fields.next()
-                && let Some(parsed) = Clock::parse(value)
-            {
+            if let Some(parsed) = Clock::parse(arg.split_whitespace().next().unwrap_or(arg)) {
                 clock = Some(parsed);
             }
             true
         } else if name.eq_ignore_ascii_case("eval") {
-            if let Some(value) = fields.next()
-                && let Some(parsed) = PgnEval::parse(value)
-            {
+            if let Some(parsed) = PgnEval::parse(arg.split_whitespace().next().unwrap_or(arg)) {
                 eval = Some(parsed);
             }
             true
         } else if name.eq_ignore_ascii_case("csl") {
-            let parsed = parse_csl(fields.next().unwrap_or(""));
+            let parsed = parse_csl(arg);
             let kept = !parsed.is_empty();
             shapes.extend(parsed);
             kept
         } else if name.eq_ignore_ascii_case("cal") {
-            let parsed = parse_cal(fields.next().unwrap_or(""));
+            let parsed = parse_cal(arg);
             let kept = !parsed.is_empty();
             shapes.extend(parsed);
             kept
         } else if name.eq_ignore_ascii_case("draw") {
-            let parsed = parse_draw(fields.next().unwrap_or(""));
+            let parsed = parse_draw(arg);
             let kept = !parsed.is_empty();
             shapes.extend(parsed);
             kept
@@ -358,7 +356,7 @@ fn parse_comment_directives(text: &str) -> CommentDirectives {
 fn parse_csl(arg: &str) -> Vec<Shape> {
     let mut out = Vec::new();
     for item in arg
-        .split(',')
+        .split(|c: char| c == ',' || c.is_whitespace())
         .map(str::trim)
         .filter(|item| !item.is_empty())
     {
@@ -380,7 +378,7 @@ fn parse_csl(arg: &str) -> Vec<Shape> {
 fn parse_cal(arg: &str) -> Vec<Shape> {
     let mut out = Vec::new();
     for item in arg
-        .split(',')
+        .split(|c: char| c == ',' || c.is_whitespace())
         .map(str::trim)
         .filter(|item| !item.is_empty())
     {
@@ -400,21 +398,34 @@ fn parse_cal(arg: &str) -> Vec<Shape> {
 }
 
 fn parse_draw(arg: &str) -> Vec<Shape> {
-    let fields: Vec<&str> = arg.split(',').map(str::trim).collect();
+    let fields: Vec<&str> = arg
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
     match fields.as_slice() {
-        [kind, square, color] if kind.eq_ignore_ascii_case("square") => {
-            let (Some(square), Some(color)) =
-                (parse_square(square), ShapeColor::from_scid_name(color))
-            else {
-                return Vec::new();
-            };
-            vec![Shape::Square { color, square }]
+        [kind, a, b]
+            if kind.eq_ignore_ascii_case("square")
+                || kind.eq_ignore_ascii_case("circle")
+                || kind.eq_ignore_ascii_case("disk")
+                || kind.eq_ignore_ascii_case("mark")
+                || kind.eq_ignore_ascii_case("cross") =>
+        {
+            let square = parse_square(a).or_else(|| parse_square(b));
+            let color = ShapeColor::from_scid_name(b).or_else(|| ShapeColor::from_scid_name(a));
+            if let (Some(square), Some(color)) = (square, color) {
+                vec![Shape::Square { color, square }]
+            } else {
+                Vec::new()
+            }
         }
-        [kind, from, to, color] if kind.eq_ignore_ascii_case("arrow") => {
+        [kind, a, b, c]
+            if kind.eq_ignore_ascii_case("arrow") || kind.eq_ignore_ascii_case("line") =>
+        {
             let (Some(from), Some(to), Some(color)) = (
-                parse_square(from),
-                parse_square(to),
-                ShapeColor::from_scid_name(color),
+                parse_square(a),
+                parse_square(b),
+                ShapeColor::from_scid_name(c),
             ) else {
                 return Vec::new();
             };
@@ -1533,7 +1544,7 @@ mod tests {
         let games = parse_pgn(
             br#"[Event "SCID drawing"]
 
-1. e4 {[%draw arrow,e2,h5,skyBlue][%draw square,d4,red] Threat.} e5 *
+1. e4 {[%draw arrow,e2,h5,skyBlue][%draw square,d4,red][%draw circle,c5,red] Threat.} e5 *
 "#,
         )
         .unwrap();
@@ -1549,6 +1560,10 @@ mod tests {
                 Shape::Square {
                     color: ShapeColor::Red,
                     square: Square::D4,
+                },
+                Shape::Square {
+                    color: ShapeColor::Red,
+                    square: Square::C5,
                 },
             ]
         );

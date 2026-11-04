@@ -6,6 +6,11 @@
 # Local test data: never redistributed, may be copyrighted
 fixtures/local/
 
+# ICCF reference database is hosted at https://github.com/Lakis01/brett-correspondence_reference_base
+databases/iccf/*.si4
+databases/iccf/*.sg4
+databases/iccf/*.sn4
+
 # Optional player-photo pack derived from Scid's Player_photos.zip. It has no
 # explicit redistribution licence and is not part of Brett's MIT source.
 # See docs/PHOTOS.md. The libwebp helper is a build artifact of the converter.

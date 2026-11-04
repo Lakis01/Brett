@@ -74,9 +74,28 @@ pub fn draw(ui: &mut Ui, tex: &PieceTextures, st: BoardState<'_>, side: f32) -> 
     let drag_origin = press_origin
         .and_then(|p| square_at_pos(rect, cell, p, st.orientation))
         .or(hovered);
+    let (key_g, key_r, key_b, key_y) = ui.input(|i| {
+        (
+            i.key_down(egui::Key::G),
+            i.key_down(egui::Key::R),
+            i.key_down(egui::Key::B),
+            i.key_down(egui::Key::Y),
+        )
+    });
     let modifiers = ui.input(|i| i.modifiers);
-    let drawing_color = shape_color(&modifiers);
-    let shape_with_primary = modifiers.shift;
+    let drawing_color = if key_g {
+        ShapeColor::Green
+    } else if key_r {
+        ShapeColor::Red
+    } else if key_b {
+        ShapeColor::Blue
+    } else if key_y {
+        ShapeColor::Yellow
+    } else {
+        shape_color(&modifiers)
+    };
+    let shape_with_primary =
+        modifiers.shift || modifiers.ctrl || modifiers.alt || key_g || key_r || key_b || key_y;
     let secondary_drag = response.drag_started_by(PointerButton::Secondary)
         || response.dragged_by(PointerButton::Secondary)
         || response.drag_stopped_by(PointerButton::Secondary);
@@ -169,6 +188,12 @@ pub fn draw(ui: &mut Ui, tex: &PieceTextures, st: BoardState<'_>, side: f32) -> 
         );
     }
 
+    for &shape in st.shapes {
+        if matches!(shape, Shape::Square { .. }) {
+            draw_shape(&painter, shape, st.orientation, rect, cell);
+        }
+    }
+
     for row in 0..8 {
         for col in 0..8 {
             let sq = square_at(col, row, st.orientation);
@@ -204,7 +229,9 @@ pub fn draw(ui: &mut Ui, tex: &PieceTextures, st: BoardState<'_>, side: f32) -> 
     }
 
     for &shape in st.shapes {
-        draw_shape(&painter, shape, st.orientation, rect, cell);
+        if matches!(shape, Shape::Arrow { .. }) {
+            draw_shape(&painter, shape, st.orientation, rect, cell);
+        }
     }
 
     if active_drag.is_some() {
@@ -337,10 +364,20 @@ fn draw_shape(painter: &egui::Painter, shape: Shape, orientation: Color, rect: R
     });
     match shape {
         Shape::Square { square, .. } => {
-            painter.circle_filled(
-                square_rect(square).center(),
-                cell * 0.38,
-                Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 150),
+            let r = square_rect(square);
+            painter.rect_filled(
+                r,
+                0.0,
+                Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 110),
+            );
+            painter.rect_stroke(
+                r.shrink(1.5),
+                0.0,
+                Stroke::new(
+                    2.5,
+                    Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 220),
+                ),
+                StrokeKind::Inside,
             );
         }
         Shape::Arrow { from, to, .. } if from != to => {

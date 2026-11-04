@@ -92,6 +92,21 @@ pub fn build_document(
     selected: &BTreeSet<usize>,
     include_final: bool,
 ) -> PrintDocument {
+    build_document_with_depth(game, meta, selected, include_final, usize::MAX)
+}
+
+/// Build the printable representation with an explicit maximum variation depth.
+///
+/// - `max_variation_depth = 0`: mainline only (no variations).
+/// - `max_variation_depth = 1`: direct variations only (no nested variations).
+/// - `max_variation_depth >= 2`: all variations.
+pub fn build_document_with_depth(
+    game: &Game,
+    meta: PrintMeta,
+    selected: &BTreeSet<usize>,
+    include_final: bool,
+    max_variation_depth: usize,
+) -> PrintDocument {
     let final_node = game.mainline().last().copied().unwrap_or(0);
 
     let mut nodes: Vec<usize> = selected
@@ -155,7 +170,14 @@ pub fn build_document(
         }
     }
 
-    emit_sequence(game, 0, &diagram_at, 0, true, &mut items);
+    let ctx = PrintContext {
+        game,
+        diagram_at: &diagram_at,
+        max_variation_depth,
+        final_node,
+    };
+
+    emit_sequence(&ctx, 0, 0, true, &mut items);
 
     PrintDocument {
         meta,
@@ -170,51 +192,53 @@ pub fn build_document(
     }
 }
 
+struct PrintContext<'a> {
+    game: &'a Game,
+    diagram_at: &'a BTreeMap<usize, usize>,
+    max_variation_depth: usize,
+    final_node: usize,
+}
+
 /// Emit the children of `parent` as one printed line.
 ///
 /// `children[0]` is the continuation; every later child is an alternative to
 /// it and becomes an indented variation after the continuation's move.
 fn emit_sequence(
-    game: &Game,
+    ctx: &PrintContext<'_>,
     parent: usize,
-    diagram_at: &BTreeMap<usize, usize>,
     depth: usize,
     mut line_start: bool,
     items: &mut Vec<PrintItem>,
 ) {
-    let Some(parent_node) = game.nodes.get(parent) else {
+    let Some(parent_node) = ctx.game.nodes.get(parent) else {
         return;
     };
     let Some(&main) = parent_node.children.first() else {
         return;
     };
 
-    emit_move(game, main, depth, &mut line_start, items);
-    emit_extras(game, main, diagram_at, items);
+    emit_move(ctx.game, main, depth, &mut line_start, items);
+    emit_extras(ctx, main, items);
 
-    for &alternative in &parent_node.children[1..] {
-        let mut variation = Vec::new();
-        emit_variation(game, alternative, diagram_at, depth + 1, &mut variation);
-        items.push(PrintItem::Variation(variation));
-        // A black continuation after a variation needs its move number again.
-        line_start = true;
+    if depth < ctx.max_variation_depth {
+        for &alternative in &parent_node.children[1..] {
+            let mut variation = Vec::new();
+            emit_variation(ctx, alternative, depth + 1, &mut variation);
+            items.push(PrintItem::Variation(variation));
+            // A black continuation after a variation needs its move number again.
+            line_start = true;
+        }
     }
 
-    emit_sequence(game, main, diagram_at, depth, line_start, items);
+    emit_sequence(ctx, main, depth, line_start, items);
 }
 
 /// Emit a variation whose first move is `first`.
-fn emit_variation(
-    game: &Game,
-    first: usize,
-    diagram_at: &BTreeMap<usize, usize>,
-    depth: usize,
-    items: &mut Vec<PrintItem>,
-) {
+fn emit_variation(ctx: &PrintContext<'_>, first: usize, depth: usize, items: &mut Vec<PrintItem>) {
     let mut line_start = true;
-    emit_move(game, first, depth, &mut line_start, items);
-    emit_extras(game, first, diagram_at, items);
-    emit_sequence(game, first, diagram_at, depth, line_start, items);
+    emit_move(ctx.game, first, depth, &mut line_start, items);
+    emit_extras(ctx, first, items);
+    emit_sequence(ctx, first, depth, line_start, items);
 }
 
 fn emit_move(
@@ -249,22 +273,19 @@ fn emit_move(
     *line_start = false;
 }
 
-fn emit_extras(
-    game: &Game,
-    node: usize,
-    diagram_at: &BTreeMap<usize, usize>,
-    items: &mut Vec<PrintItem>,
-) {
-    let Some(node_ref) = game.nodes.get(node) else {
+fn emit_extras(ctx: &PrintContext<'_>, node: usize, items: &mut Vec<PrintItem>) {
+    let Some(node_ref) = ctx.game.nodes.get(node) else {
         return;
     };
-    if !node_ref.comment.is_empty() {
+    if node != ctx.final_node && !node_ref.comment.is_empty() {
         items.push(PrintItem::Comment(node_ref.comment.clone()));
     }
     if let Some(annotation) = annotation_text(node_ref) {
         items.push(PrintItem::Annotation(annotation));
     }
-    if let Some(&index) = diagram_at.get(&node) {
+    if node != ctx.final_node
+        && let Some(&index) = ctx.diagram_at.get(&node)
+    {
         items.push(PrintItem::Diagram(index));
     }
 }
