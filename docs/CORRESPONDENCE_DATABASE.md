@@ -40,7 +40,10 @@ A local working copy may also live at:
 
 The native SCID reader opens the triple with zero decode errors:
 
-- **87,927 games**, **6,187,801 mainline moves**;
+- **87,927 games**, **5,421,540 mainline moves** in the bundled 70-ply
+  snapshot (the untruncated ICCF export has **6,187,801**);
+- every branch is capped at **70 plies**; deeper moves and their annotations
+  are dropped when the snapshot is prepared;
 - dates from **2021-01-01** through **2026-09-25**;
 - every game has `Site "ICCF"`;
 - `WhiteElo` and `BlackElo` both range from **2350 to 2724**;
@@ -59,7 +62,8 @@ preparation preferences. `BRETT_CORRESPONDENCE` overrides the saved path. With
 no saved choice, Brett looks for the bundled snapshot in a source checkout and
 then for the conventional local copy. The first open builds a position index in
 the background and caches it under `$XDG_CACHE_HOME/brett/index/`; later opens
-memory-map the cached `.brettpos` file. The source triple is never modified.
+memory-map the cached `.brettpos` file. At runtime the source triple is never
+modified; snapshot maintenance rewrites it only before a release.
 
 The database is optional: Brett and every other format work without it. The
 snapshot is committed so a clone or repository download includes it; release
@@ -136,13 +140,17 @@ download plus one or more earlier correspondence-server collections.
    current export has no zero-move games.
 4. De-duplicate by player names, date, result, and move sequence rather than
    by file position.
-5. Write a new `.si4`/`.sn4`/`.sg4` triple to a new path. Never overwrite the
+5. Cap every branch at 70 plies. In a source checkout:
+   `cargo run --release --example truncate_scid -- path/to/input.si4 70`.
+   The command is idempotent and reports when the database is already within
+   the limit.
+6. Write a new `.si4`/`.sn4`/`.sg4` triple to a new path. Never overwrite the
    source or the historical 2016 database.
-6. Replace all three files under `databases/iccf/` together, then open the new
+7. Replace all three files under `databases/iccf/` together, then open the new
    triple in Brett, verify that it decodes with zero errors, and let the
    position index rebuild. The cache key includes the canonical `.si4` path and
    the combined file metadata, so a replaced triple invalidates the old cache.
-7. Update the snapshot facts in this file, `databases/iccf/README.md`, and the
+8. Update the snapshot facts in this file, `databases/iccf/README.md`, and the
    counts in the README if they are mentioned there.
 
 Do not refresh only one file of the triple, and do not rewrite a snapshot in

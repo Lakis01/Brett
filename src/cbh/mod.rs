@@ -612,7 +612,7 @@ fn round_string(round: u8, subround: u8) -> String {
     }
 }
 
-fn eco_string(field: u16) -> Option<String> {
+pub(crate) fn eco_string(field: u16) -> Option<String> {
     if !(128..=64127).contains(&field) {
         return None;
     }

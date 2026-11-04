@@ -558,7 +558,20 @@ fn headers_entities_tree_variations_comments_and_nags() {
     assert_eq!(game.nodes[2].comment, "[%mdl 32]");
     assert_eq!(game.nodes[3].comment, "Develop.");
     assert_eq!(game.nodes[4].nags, [1, 5]);
-    assert_eq!(game.nodes[5].comment, "[%csl Ge5][%cal Gh8h7] Spanish.");
+    assert_eq!(game.nodes[5].comment, "Spanish.");
+    assert!(
+        game.nodes[5]
+            .shapes
+            .contains(&crate::domain::Shape::Square {
+                color: crate::domain::ShapeColor::Green,
+                square: Square::E5,
+            })
+    );
+    assert!(game.nodes[5].shapes.contains(&crate::domain::Shape::Arrow {
+        color: crate::domain::ShapeColor::Green,
+        from: Square::H8,
+        to: Square::H7,
+    }));
     assert_eq!(game.nodes[9].comment, "Italian.");
     // Position 100 is past the last stored ply; ChessBase's export writes it
     // after the main line's last move.

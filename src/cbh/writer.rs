@@ -762,7 +762,7 @@ fn parse_elo(raw: Option<&str>) -> u16 {
     raw.and_then(|s| s.trim().parse::<u16>().ok()).unwrap_or(0)
 }
 
-fn encode_eco(raw: Option<&str>) -> u16 {
+pub(crate) fn encode_eco(raw: Option<&str>) -> u16 {
     let Some(raw) = raw.map(str::trim) else {
         return 0;
     };
@@ -1210,14 +1210,37 @@ fn encode_game_annotations(
         }
 
         // 3. Coloured squares (`0x04`, `[%csl ...]`).
-        if !extracted.squares.is_empty() {
-            push_annotation_item(&mut items, position, 0x04, &extracted.squares)?;
+        let mut squares = extracted.squares;
+        let mut arrows = extracted.arrows;
+        for shape in &node.shapes {
+            match *shape {
+                crate::domain::Shape::Square { color, square } => {
+                    if let (Some(color), Some(code)) = (
+                        drawing_color_code(color.code() as u8),
+                        drawing_square_code(square.to_string().as_bytes()),
+                    ) {
+                        squares.extend_from_slice(&[color, code]);
+                    }
+                }
+                crate::domain::Shape::Arrow { color, from, to } => {
+                    if let (Some(color), Some(from), Some(to)) = (
+                        drawing_color_code(color.code() as u8),
+                        drawing_square_code(from.to_string().as_bytes()),
+                        drawing_square_code(to.to_string().as_bytes()),
+                    ) {
+                        arrows.extend_from_slice(&[color, from, to]);
+                    }
+                }
+            }
+        }
+        if !squares.is_empty() {
+            push_annotation_item(&mut items, position, 0x04, &squares)?;
             item_count += 1;
         }
 
         // 4. Coloured arrows (`0x05`, `[%cal ...]`).
-        if !extracted.arrows.is_empty() {
-            push_annotation_item(&mut items, position, 0x05, &extracted.arrows)?;
+        if !arrows.is_empty() {
+            push_annotation_item(&mut items, position, 0x05, &arrows)?;
             item_count += 1;
         }
 

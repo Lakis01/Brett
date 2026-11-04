@@ -618,3 +618,35 @@ fn board_helper_is_rank_major() {
         Some(Piece::new(Color::White, Role::King))
     );
 }
+
+#[test]
+fn testing_for_markus_chessbase17_decodes_names_and_metadata() {
+    let path =
+        Path::new("/home/gratis01/Downloads/Brett Resources/Testing/Testing_for_Markus.2cbh");
+    if !path.exists() {
+        return;
+    }
+    let library = TwoCbhLibrary::open(path).expect("open Testing_for_Markus.2cbh");
+    assert!(!library.is_empty());
+    let game0 = library.get(0).expect("first game");
+    assert_eq!(game0.white(), "Sarana, Alexey");
+    assert_eq!(game0.black(), "Postny, Evgeny");
+    assert_eq!(game0.header("WhiteElo"), Some("2682"));
+    assert_eq!(game0.header("BlackElo"), Some("2568"));
+    assert_eq!(game0.header("ECO"), Some("D58"));
+    assert_eq!(game0.event(), "2BLO 2324 SK Göggingen - Münchener Sc");
+    assert_eq!(game0.header("Site"), Some("Augsburg"));
+
+    let game1 = library.get(1).expect("second game");
+    assert_eq!(game1.white(), "Braeuer, Franz");
+    assert_eq!(game1.black(), "Predke, Alexandr");
+    assert_eq!(game1.header("WhiteElo"), Some("2444"));
+    assert_eq!(game1.header("ECO"), Some("B47"));
+
+    let check_count = library.len().min(50);
+    for i in 0..check_count {
+        let g = library.get(i).unwrap();
+        assert_ne!(g.white(), "?", "Game {i} white player must not be ?");
+        assert_ne!(g.black(), "?", "Game {i} black player must not be ?");
+    }
+}

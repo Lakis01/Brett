@@ -11,12 +11,14 @@ The three files form one read-only SCID database:
 | File | Size | Contents |
 | --- | ---: | --- |
 | `Correspondence_2350.si4` | 4.0 MB | SCID index |
-| `Correspondence_2350.sn4` | 72 KB | Player, event, site, and round names |
-| `Correspondence_2350.sg4` | 7.2 MB | Games, comments, and variations |
+| `Correspondence_2350.sn4` | 73 KB | Player, event, site, and round names |
+| `Correspondence_2350.sg4` | 6.4 MB | Games, comments, and variations |
 
 Snapshot facts:
 
-- **87,927 games**, **6,187,801 mainline moves**;
+- **87,927 games**, **5,421,540 mainline moves** in this 70-ply snapshot
+  (the untruncated ICCF export has **6,187,801**);
+- every branch is capped at **70 plies**;
 - dates from **2021-01-01** through **2026-09-25**;
 - every game has `Site "ICCF"`;
 - `WhiteElo` and `BlackElo` both range from **2350 to 2724**;
@@ -57,14 +59,16 @@ databases are a triple, not a single file.
 2. Apply the inclusive filter `WhiteElo >= 2350` and `BlackElo >= 2350` on both
    sides. No upper bound is currently applied.
 3. De-duplicate by player names, date, result, and move sequence.
-4. Write a new `.si4`/`.sn4`/`.sg4` triple with the same base name, then replace
+4. Cap every branch at 70 plies with
+   `cargo run --release --example truncate_scid -- input.si4 70`.
+5. Write a new `.si4`/`.sn4`/`.sg4` triple with the same base name, then replace
    the three files here together. Never leave an index from one snapshot beside
    games from another.
-5. Open the new triple in Brett, verify that it decodes with zero errors, and
+6. Open the new triple in Brett, verify that it decodes with zero errors, and
    let the position index rebuild. The cache key is the canonical `.si4` path
    and the combined file metadata, so replacing the triple invalidates the old
    cache.
-6. Update the snapshot facts above and the counts in
+7. Update the snapshot facts above and the counts in
    [`docs/CORRESPONDENCE_DATABASE.md`](../../docs/CORRESPONDENCE_DATABASE.md).
 
 Do not refresh only one file of the triple, and do not rewrite a snapshot in

@@ -23,7 +23,8 @@
 use anyhow::{Context, Result, bail};
 
 use super::CbgRecord;
-use crate::domain::Game;
+use crate::chess::{File, Rank, Square};
+use crate::domain::{Game, Shape, ShapeColor};
 
 const HEAD_LEN: usize = 14;
 const ITEM_HEAD_LEN: usize = 6;
@@ -72,9 +73,6 @@ impl Note {
         }
         for time in &self.times {
             parts.push((true, time.clone()));
-        }
-        if let Some(graphics) = graphics_token(&self.squares, &self.arrows) {
-            parts.push((false, graphics));
         }
         for medal in &self.medals {
             parts.push((false, medal.clone()));
@@ -257,6 +255,29 @@ pub(super) fn apply(record: &CbgRecord, id: u32, game: &mut Game) -> Result<()> 
         let Some(note) = note else {
             continue;
         };
+        for &(color, square) in &note.squares {
+            if let (Some(color), Some(square)) = (shape_color(color), shape_square(square))
+                && !game.nodes[node]
+                    .shapes
+                    .contains(&Shape::Square { color, square })
+            {
+                game.nodes[node]
+                    .shapes
+                    .push(Shape::Square { color, square });
+            }
+        }
+        for &(color, from, to) in &note.arrows {
+            if let (Some(color), Some(from), Some(to)) =
+                (shape_color(color), shape_square(from), shape_square(to))
+                && !game.nodes[node]
+                    .shapes
+                    .contains(&Shape::Arrow { color, from, to })
+            {
+                game.nodes[node]
+                    .shapes
+                    .push(Shape::Arrow { color, from, to });
+            }
+        }
         let mut text = note.before.join(" ");
         let after = note.after();
         if !after.is_empty() {
@@ -311,57 +332,28 @@ fn clean(text: &str, own_language: bool) -> String {
     text
 }
 
-/// One `[%csl …][%cal …]` token. Colours are ChessBase's: 2 green, 3 yellow,
-/// 4 red, 7 blue. Unknown colours are left out, as are out-of-range squares.
-fn graphics_token(squares: &[(u8, u8)], arrows: &[(u8, u8, u8)]) -> Option<String> {
-    let mut out = String::new();
-
-    let marks: Vec<String> = squares
-        .iter()
-        .filter_map(|&(color, square)| Some(format!("{}{}", colour(color)?, name(square)?)))
-        .collect();
-    if !marks.is_empty() {
-        out.push_str("[%csl ");
-        out.push_str(&marks.join(","));
-        out.push(']');
-    }
-
-    let marks: Vec<String> = arrows
-        .iter()
-        .filter_map(|&(color, from, to)| {
-            Some(format!("{}{}{}", colour(color)?, name(from)?, name(to)?))
-        })
-        .collect();
-    if !marks.is_empty() {
-        out.push_str("[%cal ");
-        out.push_str(&marks.join(","));
-        out.push(']');
-    }
-
-    (!out.is_empty()).then_some(out)
-}
-
-fn colour(color: u8) -> Option<char> {
+/// ChessBase drawing colour: 2 green, 3 yellow, 4 red, 7 blue. Unknown
+/// colours are skipped by the caller.
+fn shape_color(color: u8) -> Option<ShapeColor> {
     match color {
-        2 => Some('G'),
-        3 => Some('Y'),
-        4 => Some('R'),
-        7 => Some('B'),
+        2 => Some(ShapeColor::Green),
+        3 => Some(ShapeColor::Yellow),
+        4 => Some(ShapeColor::Red),
+        7 => Some(ShapeColor::Blue),
         _ => None,
     }
 }
 
 /// The drawing payload numbers squares from 1, file by file: `a1` is 1 and
 /// `b1` is 9.
-fn name(square: u8) -> Option<String> {
+fn shape_square(square: u8) -> Option<Square> {
     if !(1..=64).contains(&square) {
         return None;
     }
     let square = square - 1;
-    Some(format!(
-        "{}{}",
-        char::from(b'a' + square / 8),
-        char::from(b'1' + square % 8)
+    Some(Square::from_coords(
+        File::new(u32::from(square / 8)),
+        Rank::new(u32::from(square % 8)),
     ))
 }
 

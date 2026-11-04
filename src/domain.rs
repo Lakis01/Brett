@@ -9,7 +9,7 @@ use std::num::NonZeroU32;
 use std::ops::ControlFlow;
 
 use crate::chess::{
-    CastlingMode, Chess, Color, EnPassantMode, Fen, File, Move, Position, Role, San, SanPlus,
+    CastlingMode, Chess, Color, EnPassantMode, Fen, File, Move, Position, Rank, Role, San, SanPlus,
     Square, UciMove,
 };
 use crate::pgn::reader::{Reader, Visitor};
@@ -133,6 +133,8 @@ pub struct Node {
     pub clock: Option<Clock>,
     /// Evaluation from a PGN `[%eval ...]` directive, when present.
     pub eval: Option<PgnEval>,
+    /// Coloured squares and arrows attached to this position.
+    pub shapes: Vec<Shape>,
     pub nags: Vec<u8>,
     pub parent: Option<usize>,
     pub children: Vec<usize>,
@@ -145,7 +147,7 @@ impl Node {
         self.mv.as_ref().map(|m| m.san.as_str())
     }
 
-    /// Append a PGN comment, extracting clock and eval directives from it.
+    /// Append a PGN comment, extracting clock, eval, and drawing directives.
     pub fn add_comment(&mut self, text: &str) {
         let directives = parse_comment_directives(text);
         if let Some(clock) = directives.clock {
@@ -153,6 +155,11 @@ impl Node {
         }
         if let Some(eval) = directives.eval {
             self.eval = Some(eval);
+        }
+        for shape in directives.shapes {
+            if !self.shapes.contains(&shape) {
+                self.shapes.push(shape);
+            }
         }
         if !directives.text.is_empty() {
             if !self.comment.is_empty() {
@@ -162,7 +169,8 @@ impl Node {
         }
     }
 
-    /// Replace the human comment while preserving any existing clock and eval.
+    /// Replace the human comment while preserving clocks, evaluations, and
+    /// any shapes that are not explicitly replaced by drawing directives.
     pub fn replace_comment(&mut self, text: &str) {
         let directives = parse_comment_directives(text);
         self.comment = directives.text;
@@ -172,21 +180,122 @@ impl Node {
         if let Some(eval) = directives.eval {
             self.eval = Some(eval);
         }
+        if !directives.shapes.is_empty() {
+            self.shapes = directives.shapes;
+        }
     }
+}
+
+/// Colour of a board drawing. ChessBase stores these as `G`, `Y`, `R`, `B`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ShapeColor {
+    Green,
+    Yellow,
+    Red,
+    Blue,
+}
+
+impl ShapeColor {
+    /// ChessBase/Lichess `%csl`/`%cal` colour letter.
+    pub fn code(self) -> char {
+        match self {
+            Self::Green => 'G',
+            Self::Yellow => 'Y',
+            Self::Red => 'R',
+            Self::Blue => 'B',
+        }
+    }
+
+    /// Decode a ChessBase/Lichess colour letter.
+    pub fn from_code(code: char) -> Option<Self> {
+        match code.to_ascii_uppercase() {
+            'G' => Some(Self::Green),
+            'Y' => Some(Self::Yellow),
+            'R' => Some(Self::Red),
+            'B' => Some(Self::Blue),
+            _ => None,
+        }
+    }
+
+    /// Decode the colour names used by SCID's `%draw` extension.
+    pub fn from_scid_name(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "green" | "darkgreen" => Some(Self::Green),
+            "yellow" | "gold" | "orange" => Some(Self::Yellow),
+            "red" | "darkred" => Some(Self::Red),
+            "blue" | "skyblue" | "cyan" => Some(Self::Blue),
+            _ => None,
+        }
+    }
+}
+
+/// A coloured square or arrow attached to one game-tree position.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Shape {
+    Square {
+        color: ShapeColor,
+        square: Square,
+    },
+    Arrow {
+        color: ShapeColor,
+        from: Square,
+        to: Square,
+    },
+}
+
+impl Shape {
+    /// One entry inside a `%csl` or `%cal` directive, without the brackets.
+    pub fn token(self) -> String {
+        match self {
+            Self::Square { color, square } => {
+                format!("{}{square}", color.code())
+            }
+            Self::Arrow { color, from, to } => {
+                format!("{}{from}{to}", color.code())
+            }
+        }
+    }
+}
+
+/// Render shapes as ChessBase- and Lichess-compatible PGN drawing tokens.
+pub fn shape_tokens(shapes: &[Shape]) -> String {
+    let mut squares = Vec::new();
+    let mut arrows = Vec::new();
+    for &shape in shapes {
+        match shape {
+            Shape::Square { .. } => squares.push(shape.token()),
+            Shape::Arrow { .. } => arrows.push(shape.token()),
+        }
+    }
+    let mut out = String::new();
+    if !squares.is_empty() {
+        out.push_str("[%csl ");
+        out.push_str(&squares.join(","));
+        out.push(']');
+    }
+    if !arrows.is_empty() {
+        out.push_str("[%cal ");
+        out.push_str(&arrows.join(","));
+        out.push(']');
+    }
+    out
 }
 
 struct CommentDirectives {
     text: String,
     clock: Option<Clock>,
     eval: Option<PgnEval>,
+    shapes: Vec<Shape>,
 }
 
-/// Split `[%clk ...]` and `[%eval ...]` out of a PGN comment. Other directives remain text.
+/// Split `[%clk ...]`, `[%eval ...]`, `[%csl ...]`, `[%cal ...]`, and SCID
+/// `[%draw ...]` directives out of a PGN comment. Other directives remain text.
 fn parse_comment_directives(text: &str) -> CommentDirectives {
     let mut out = String::new();
     let mut rest = text;
     let mut clock = None;
     let mut eval = None;
+    let mut shapes = Vec::new();
     loop {
         let Some(start) = rest.find("[%") else {
             out.push_str(rest);
@@ -201,19 +310,39 @@ fn parse_comment_directives(text: &str) -> CommentDirectives {
         let body = &directive[..end];
         let mut fields = body.split_whitespace();
         let name = fields.next().unwrap_or_default();
-        if name.eq_ignore_ascii_case("clk") {
+        let parsed = if name.eq_ignore_ascii_case("clk") {
             if let Some(value) = fields.next()
                 && let Some(parsed) = Clock::parse(value)
             {
                 clock = Some(parsed);
             }
+            true
         } else if name.eq_ignore_ascii_case("eval") {
             if let Some(value) = fields.next()
                 && let Some(parsed) = PgnEval::parse(value)
             {
                 eval = Some(parsed);
             }
+            true
+        } else if name.eq_ignore_ascii_case("csl") {
+            let parsed = parse_csl(fields.next().unwrap_or(""));
+            let kept = !parsed.is_empty();
+            shapes.extend(parsed);
+            kept
+        } else if name.eq_ignore_ascii_case("cal") {
+            let parsed = parse_cal(fields.next().unwrap_or(""));
+            let kept = !parsed.is_empty();
+            shapes.extend(parsed);
+            kept
+        } else if name.eq_ignore_ascii_case("draw") {
+            let parsed = parse_draw(fields.next().unwrap_or(""));
+            let kept = !parsed.is_empty();
+            shapes.extend(parsed);
+            kept
         } else {
+            false
+        };
+        if !parsed {
             out.push_str(&rest[start..start + 2 + end + 1]);
         }
         rest = &directive[end + 1..];
@@ -222,7 +351,92 @@ fn parse_comment_directives(text: &str) -> CommentDirectives {
         text: out.split_whitespace().collect::<Vec<_>>().join(" "),
         clock,
         eval,
+        shapes,
     }
+}
+
+fn parse_csl(arg: &str) -> Vec<Shape> {
+    let mut out = Vec::new();
+    for item in arg
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+    {
+        let bytes = item.as_bytes();
+        if bytes.len() != 3 {
+            continue;
+        }
+        let Some(color) = ShapeColor::from_code(bytes[0] as char) else {
+            continue;
+        };
+        let Some(square) = parse_square(&item[1..]) else {
+            continue;
+        };
+        out.push(Shape::Square { color, square });
+    }
+    out
+}
+
+fn parse_cal(arg: &str) -> Vec<Shape> {
+    let mut out = Vec::new();
+    for item in arg
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+    {
+        let bytes = item.as_bytes();
+        if bytes.len() != 5 {
+            continue;
+        }
+        let Some(color) = ShapeColor::from_code(bytes[0] as char) else {
+            continue;
+        };
+        let (Some(from), Some(to)) = (parse_square(&item[1..3]), parse_square(&item[3..5])) else {
+            continue;
+        };
+        out.push(Shape::Arrow { color, from, to });
+    }
+    out
+}
+
+fn parse_draw(arg: &str) -> Vec<Shape> {
+    let fields: Vec<&str> = arg.split(',').map(str::trim).collect();
+    match fields.as_slice() {
+        [kind, square, color] if kind.eq_ignore_ascii_case("square") => {
+            let (Some(square), Some(color)) =
+                (parse_square(square), ShapeColor::from_scid_name(color))
+            else {
+                return Vec::new();
+            };
+            vec![Shape::Square { color, square }]
+        }
+        [kind, from, to, color] if kind.eq_ignore_ascii_case("arrow") => {
+            let (Some(from), Some(to), Some(color)) = (
+                parse_square(from),
+                parse_square(to),
+                ShapeColor::from_scid_name(color),
+            ) else {
+                return Vec::new();
+            };
+            vec![Shape::Arrow { color, from, to }]
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn parse_square(text: &str) -> Option<Square> {
+    let bytes = text.as_bytes();
+    if bytes.len() != 2 {
+        return None;
+    }
+    let file = bytes[0].to_ascii_lowercase();
+    if !(b'a'..=b'h').contains(&file) || !(b'1'..=b'8').contains(&bytes[1]) {
+        return None;
+    }
+    Some(Square::from_coords(
+        File::new(u32::from(file - b'a')),
+        Rank::new(u32::from(bytes[1] - b'1')),
+    ))
 }
 
 /// A single game: headers plus an arena of nodes rooted at index 0.
@@ -243,6 +457,7 @@ impl Default for Game {
                 comment: String::new(),
                 clock: None,
                 eval: None,
+                shapes: Vec::new(),
                 nags: Vec::new(),
                 parent: None,
                 children: Vec::new(),
@@ -346,6 +561,27 @@ impl Game {
         n
     }
 
+    /// Truncate every branch at `max_plies`, dropping deeper moves and their
+    /// annotations. The root position is depth zero. This rebuilds the arena so
+    /// unreachable nodes do not linger after export.
+    pub fn truncate_mainline(&mut self, max_plies: usize) {
+        if self.nodes.is_empty() || tree_depth(self, 0, 0) <= max_plies {
+            return;
+        }
+        let old = std::mem::take(&mut self.nodes);
+        let mut new = Vec::with_capacity(old.len());
+        copy_subtree(&old, 0, None, 0, max_plies, &mut new);
+        self.nodes = new;
+        let mainline_len = self.mainline_len().to_string();
+        if let Some((_, value)) = self
+            .headers
+            .iter_mut()
+            .find(|(name, _)| name.eq_ignore_ascii_case("PlyCount"))
+        {
+            *value = mainline_len;
+        }
+    }
+
     /// Node ids along the mainline, excluding the root.
     pub fn mainline(&self) -> Vec<usize> {
         let mut out = Vec::new();
@@ -398,6 +634,7 @@ impl Game {
             comment: String::new(),
             clock: None,
             eval: None,
+            shapes: Vec::new(),
             nags: Vec::new(),
             parent: Some(parent),
             children: Vec::new(),
@@ -406,6 +643,39 @@ impl Game {
         self.nodes[parent].children.push(id);
         id
     }
+}
+
+/// Deepest node below `node`, measured in plies from the root.
+fn tree_depth(game: &Game, node: usize, depth: usize) -> usize {
+    game.nodes[node]
+        .children
+        .iter()
+        .map(|&child| tree_depth(game, child, depth + 1))
+        .max()
+        .unwrap_or(depth)
+}
+
+/// Clone a subtree into a fresh arena, stopping at `max_plies`.
+fn copy_subtree(
+    old: &[Node],
+    id: usize,
+    parent: Option<usize>,
+    depth: usize,
+    max_plies: usize,
+    out: &mut Vec<Node>,
+) -> usize {
+    let new_id = out.len();
+    let mut node = old[id].clone();
+    node.parent = parent;
+    node.children.clear();
+    out.push(node);
+    if depth < max_plies {
+        for &child in &old[id].children {
+            let child_id = copy_subtree(old, child, Some(new_id), depth + 1, max_plies, out);
+            out[new_id].children.push(child_id);
+        }
+    }
+    new_id
 }
 
 /// Parse every game in a PGN byte stream.
@@ -532,6 +802,7 @@ impl Builder {
                 comment: String::new(),
                 clock: None,
                 eval: None,
+                shapes: Vec::new(),
                 nags: Vec::new(),
                 parent: None,
                 children: Vec::new(),
@@ -620,6 +891,7 @@ impl Builder {
             comment: String::new(),
             clock: None,
             eval: None,
+            shapes: Vec::new(),
             nags: Vec::new(),
             parent: Some(parent),
             children: Vec::new(),
@@ -1218,6 +1490,119 @@ mod tests {
                 mate: None,
             })
         );
+    }
+
+    #[test]
+    fn parses_coloured_squares_and_arrows_from_comments() {
+        let games = parse_pgn(
+            br#"[Event "Shapes"]
+
+1. e4 {[%csl Ge4,Re5][%cal Gg1f3,Ye2e4] Key squares.} e5 *
+"#,
+        )
+        .unwrap();
+        let node = &games[0].nodes[1];
+        assert_eq!(
+            node.shapes,
+            vec![
+                Shape::Square {
+                    color: ShapeColor::Green,
+                    square: Square::E4,
+                },
+                Shape::Square {
+                    color: ShapeColor::Red,
+                    square: Square::E5,
+                },
+                Shape::Arrow {
+                    color: ShapeColor::Green,
+                    from: Square::G1,
+                    to: Square::F3,
+                },
+                Shape::Arrow {
+                    color: ShapeColor::Yellow,
+                    from: Square::E2,
+                    to: Square::E4,
+                },
+            ]
+        );
+        assert_eq!(node.comment, "Key squares.");
+    }
+
+    #[test]
+    fn parses_scid_draw_annotations() {
+        let games = parse_pgn(
+            br#"[Event "SCID drawing"]
+
+1. e4 {[%draw arrow,e2,h5,skyBlue][%draw square,d4,red] Threat.} e5 *
+"#,
+        )
+        .unwrap();
+        let node = &games[0].nodes[1];
+        assert_eq!(
+            node.shapes,
+            vec![
+                Shape::Arrow {
+                    color: ShapeColor::Blue,
+                    from: Square::E2,
+                    to: Square::H5,
+                },
+                Shape::Square {
+                    color: ShapeColor::Red,
+                    square: Square::D4,
+                },
+            ]
+        );
+        assert_eq!(node.comment, "Threat.");
+    }
+
+    #[test]
+    fn editing_a_comment_keeps_existing_shapes() {
+        let mut game = parse_pgn(
+            br#"[Event "Shapes"]
+
+1. e4 {[%cal Gg1f3]} e5 *
+"#,
+        )
+        .unwrap()
+        .remove(0);
+        assert_eq!(game.nodes[1].shapes.len(), 1);
+
+        game.nodes[1].replace_comment("A human note");
+        assert_eq!(game.nodes[1].comment, "A human note");
+        assert_eq!(game.nodes[1].shapes.len(), 1);
+
+        game.nodes[1].add_comment("[%csl Gd4]");
+        assert_eq!(game.nodes[1].comment, "A human note");
+        assert_eq!(game.nodes[1].shapes.len(), 2);
+    }
+
+    #[test]
+    fn truncates_every_branch_at_the_ply_limit() {
+        let mut game = parse_pgn(
+            br#"[Event "Long"]
+[PlyCount "9"]
+
+1. e4 e5 2. Nf3 Nc6 3. Bb5 a6 4. Ba4 Nf6 (3... Nf6 4. O-O Nxe4 5. d4) 5. O-O *
+"#,
+        )
+        .unwrap()
+        .remove(0);
+        assert!(game.mainline_len() > 5);
+
+        game.truncate_mainline(3);
+        assert_eq!(game.mainline_len(), 3);
+        assert_eq!(game.header("PlyCount"), Some("3"));
+
+        fn max_depth(game: &Game, node: usize, depth: usize) -> usize {
+            game.nodes[node]
+                .children
+                .iter()
+                .map(|&child| max_depth(game, child, depth + 1))
+                .max()
+                .unwrap_or(depth)
+        }
+        assert_eq!(max_depth(&game, 0, 0), 3);
+        assert_eq!(game.mainline().len(), 3);
     }
 
     #[test]

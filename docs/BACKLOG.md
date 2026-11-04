@@ -456,10 +456,12 @@ redistributed in `databases/iccf/Correspondence_2350.si4` (with its `.sn4` and
 implemented, and the file decodes with zero errors. See
 [CORRESPONDENCE_DATABASE.md](CORRESPONDENCE_DATABASE.md).
 
-- Current source: **87,927 games**, **6,187,801 mainline moves**, dated
-  2021-01-01 through 2026-09-25, all `Site "ICCF"`. Both Elo fields range from
-  **2350 to 2724**; every game has both ratings and at least one move. The accompanying note says the
-  ICCF January–March 2026 compilation is still missing.
+- Current source: **87,927 games**, **5,421,540 mainline moves** after the
+  bundled snapshot was capped at **70 plies** (the untruncated export has
+  **6,187,801**), dated 2021-01-01 through 2026-09-25, all `Site "ICCF"`. Both
+  Elo fields range from **2350 to 2724**; every game has both ratings and at
+  least one move. The accompanying note says the ICCF January–March 2026
+  compilation is still missing.
 - The snapshot is optional but encouraged, carries the ICCF non-sale notice,
   and is refreshed between releases. The three files must always be replaced
   together.
@@ -1142,7 +1144,9 @@ the database games list.
 
 ## 31. Engine Cloud Eval Box: Deduplicate Lichess Depth Display
 
-**Status:** queued.
+**Status:** implemented 2026-11-04. The Cloud Engine header now reports the PV
+count only; the Lichess depth is rendered once in the column heading and in
+the per-row tooltip.
 
 **Goal:** avoid showing redundant or duplicated Lichess depth indicators in the
 Engine tab's cloud evaluation candidate box.
@@ -1212,7 +1216,10 @@ and daily master snapshots (`stockfish-ubuntu-x86-64-avx2-git-YYYYMMDD`).
 
 ## 35. File Picker Filter Polish: Hide Companion Files by Default
 
-**Status:** queued.
+**Status:** implemented and verified 2026-11-04. The database picker offers
+`*.pgn`, `*.si4`, `*.si3`, `*.cbh`, and `*.2cbh` as its default filter; the
+opening-book picker offers `*.bin`, `*.ctg`, `*.abk`, and `*.bkt`. Companion
+files are visible only through the explicit **All files** filter.
 
 **Goal:** present only the primary entry point files in the native file selection dialogs
 (Zenity and KDialog), hiding companion files and auxiliary data files by default.

@@ -645,18 +645,74 @@ struct Player {
 /// The inline `.2lid` name blocks.
 struct NameBase {
     bytes: Option<Mmap>,
+    first_offset: usize,
+    stride: usize,
+    event_offset: usize,
+    source_offset: usize,
 }
 
 impl NameBase {
     fn open(path: &Path) -> Result<Self> {
         if !path.is_file() {
-            return Ok(Self { bytes: None });
+            return Ok(Self {
+                bytes: None,
+                first_offset: LID_FIRST,
+                stride: LID_STRIDE,
+                event_offset: LID_EVENT,
+                source_offset: LID_SOURCE,
+            });
         }
         let bytes = map_file(path, "2CBH names")?;
-        if bytes.len() < LID_FIRST {
+        if bytes.len() < 8 {
             bail!("{} is shorter than a 2CBH name header", path.display());
         }
-        Ok(Self { bytes: Some(bytes) })
+
+        let first = be_u32(&bytes[0..4]) as usize;
+        let num_sections = be_u32(&bytes[4..8]) as usize;
+        let (first_offset, stride, event_offset, source_offset) = if first >= 8
+            && (1..=32).contains(&num_sections)
+            && bytes.len() >= 8 + num_sections * 20
+        {
+            let mut running_offset = 0usize;
+            let mut event_off = LID_EVENT;
+            let mut source_off = LID_SOURCE;
+            let mut total_stride = 0usize;
+            for i in 0..num_sections {
+                let sec_desc = 8 + i * 20;
+                let sec_size = be_u32(&bytes[sec_desc..sec_desc + 4]) as usize;
+                if i == 1 {
+                    event_off = running_offset;
+                } else if i == 2 {
+                    source_off = running_offset;
+                }
+                running_offset = running_offset.saturating_add(sec_size);
+                total_stride = total_stride.saturating_add(sec_size);
+            }
+            (
+                if first <= bytes.len() {
+                    first
+                } else {
+                    LID_FIRST
+                },
+                if total_stride > 0 {
+                    total_stride
+                } else {
+                    LID_STRIDE
+                },
+                event_off,
+                source_off,
+            )
+        } else {
+            (LID_FIRST, LID_STRIDE, LID_EVENT, LID_SOURCE)
+        };
+
+        Ok(Self {
+            bytes: Some(bytes),
+            first_offset,
+            stride,
+            event_offset,
+            source_offset,
+        })
     }
 
     fn player(&self, id: u32) -> Player {
@@ -683,7 +739,7 @@ impl NameBase {
     }
 
     fn event(&self, id: u32) -> (String, String) {
-        let Some(block) = self.block(id, LID_EVENT) else {
+        let Some(block) = self.block(id, self.event_offset) else {
             return ("?".to_string(), "?".to_string());
         };
         let Some((texts, _)) = two_strings(block) else {
@@ -695,7 +751,7 @@ impl NameBase {
     }
 
     fn source(&self, id: u32) -> Option<(String, String)> {
-        let block = self.block(id, LID_SOURCE)?;
+        let block = self.block(id, self.source_offset)?;
         let (texts, _) = two_strings(block)?;
         let title = non_empty(decode_text(texts[0]));
         let publisher = non_empty(decode_text(texts[1]));
@@ -704,8 +760,9 @@ impl NameBase {
 
     fn block(&self, id: u32, offset: usize) -> Option<&[u8]> {
         let bytes = self.bytes.as_ref()?;
-        let base = LID_FIRST
-            .checked_add(usize::try_from(id).ok()?.checked_mul(LID_STRIDE)?)?
+        let base = self
+            .first_offset
+            .checked_add(usize::try_from(id).ok()?.checked_mul(self.stride)?)?
             .checked_add(offset)?;
         let length = usize::try_from(le_u32(bytes.get(base..base + 4)?)).ok()?;
         if length < 4 {
@@ -740,8 +797,9 @@ fn base_headers(
     let round = (packed >> 16) as u16;
     let result = (packed & 0xffff) as u16;
     let subround = le_u32(&record[0x5c..0x60]);
-    let white_elo = le_u32(&record[0x60..0x64]);
-    let black_elo = le_u32(&record[0x70..0x74]);
+    let white_elo = le_u16(&record[0x60..0x62]);
+    let black_elo = le_u16(&record[0x70..0x72]);
+    let eco = le_u16(&record[0x80..0x82]);
     let game_id = le_u64(&record[0x98..0xa0]);
     let beauty = le_u64(&record[0xb0..0xb8]);
     let date = le_u32(&record[0xbc..0xc0]);
@@ -762,6 +820,9 @@ fn base_headers(
     }
     if black_elo > 0 {
         push("BlackElo", black_elo.to_string());
+    }
+    if let Some(eco_str) = crate::cbh::eco_string(eco) {
+        push("ECO", eco_str);
     }
     if let Some(fide) = white.fide {
         push("WhiteFideId", fide.to_string());
@@ -884,6 +945,10 @@ fn le_u64(bytes: &[u8]) -> u64 {
     u64::from_le_bytes([
         bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
     ])
+}
+
+fn be_u32(bytes: &[u8]) -> u32 {
+    u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
 }
 
 /// Resolve a companion file case-insensitively, like ChessBase's own file set.

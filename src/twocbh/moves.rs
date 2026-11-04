@@ -220,6 +220,7 @@ fn append_node(game: &mut Game, parent: usize, ply: Ply, after: Chess, variation
         comment: String::new(),
         clock: None,
         eval: None,
+        shapes: Vec::new(),
         nags: Vec::new(),
         parent: Some(parent),
         children: Vec::new(),

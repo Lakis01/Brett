@@ -907,6 +907,7 @@ fn add_null_move(game: &mut Game, parent: usize, parent_pos: &Chess) -> Result<u
         comment: String::new(),
         clock: None,
         eval: None,
+        shapes: Vec::new(),
         nags: Vec::new(),
         parent: Some(parent),
         children: Vec::new(),
@@ -1253,6 +1254,31 @@ mod tests {
         assert_eq!(game.white(), "Paul Morphy");
         assert_eq!(game.black(), "Duke Karl and Count Isouard");
         assert_eq!(game.result(), "1-0");
+    }
+
+    #[test]
+    fn scid_draw_tokens_become_first_class_shapes() {
+        let mut game = Game::default();
+        set_comment(
+            &mut game,
+            0,
+            "[%draw arrow,e2,h5,skyBlue][%draw square,d4,red]",
+        );
+        assert_eq!(
+            game.nodes[0].shapes,
+            vec![
+                crate::domain::Shape::Arrow {
+                    color: crate::domain::ShapeColor::Blue,
+                    from: Square::E2,
+                    to: Square::H5,
+                },
+                crate::domain::Shape::Square {
+                    color: crate::domain::ShapeColor::Red,
+                    square: Square::D4,
+                },
+            ]
+        );
+        assert_eq!(game.nodes[0].comment, "");
     }
 
     #[test]

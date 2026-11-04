@@ -12,7 +12,7 @@ pub use reader::{Reader, Visitor};
 
 use crate::chess::{Chess, Color, EnPassantMode, Fen};
 
-use crate::domain::{Clock, Game, PgnEval};
+use crate::domain::{Clock, Game, PgnEval, shape_tokens};
 
 const WIDTH: usize = 80;
 const SEVEN_TAGS: [&str; 7] = ["Event", "Site", "Date", "Round", "White", "Black", "Result"];
@@ -162,7 +162,7 @@ fn write_root_comment(out: &mut Movetext, game: &Game) {
     let Some(root) = game.nodes.first() else {
         return;
     };
-    if let Some(comment) = format_comment(&root.comment, root.clock, root.eval) {
+    if let Some(comment) = format_comment(&root.comment, root.clock, root.eval, &root.shapes) {
         out.token(&comment);
     }
 }
@@ -205,17 +205,31 @@ fn write_move(game: &Game, node: usize, force_number: bool, out: &mut Movetext) 
         &game.nodes[node].comment,
         game.nodes[node].clock,
         game.nodes[node].eval,
+        &game.nodes[node].shapes,
     ) {
         out.token(&comment);
     }
 }
 
-fn format_comment(comment: &str, clock: Option<Clock>, eval: Option<PgnEval>) -> Option<String> {
-    let text = comment
+fn format_comment(
+    comment: &str,
+    clock: Option<Clock>,
+    eval: Option<PgnEval>,
+    shapes: &[crate::domain::Shape],
+) -> Option<String> {
+    let human = comment
         .replace(['\n', '\r'], " ")
         .replace('{', "(")
         .replace('}', ")");
-    let mut text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut text = human.split_whitespace().collect::<Vec<_>>().join(" ");
+    let drawing = shape_tokens(shapes);
+    if !drawing.is_empty() {
+        if text.is_empty() {
+            text = drawing;
+        } else {
+            text = format!("{drawing} {text}");
+        }
+    }
     if let Some(eval_text) = eval.and_then(PgnEval::pgn_text) {
         if !text.is_empty() {
             text.push(' ');
@@ -427,5 +441,30 @@ mod tests {
             })
         );
         assert_eq!(round.nodes[2].clock.map(|c| c.centis), Some(605_400));
+    }
+
+    #[test]
+    fn round_trips_shapes_as_lichess_and_chessbase_tokens() {
+        let source = r#"[Event "Shapes"]
+[Site "Brett"]
+[Date "2026.11.04"]
+[Round "1"]
+[White "White"]
+[Black "Black"]
+[Result "*"]
+
+1. e4 {[%csl Ge4][%cal Gg1f3] king pawn} e5 *
+"#;
+        let game = parse_one(source);
+        assert_eq!(game.nodes[1].comment, "king pawn");
+        assert_eq!(game.nodes[1].shapes.len(), 2);
+
+        let exported = game_to_pgn(&game);
+        assert!(exported.contains("[%csl Ge4]"), "{exported}");
+        assert!(exported.contains("[%cal Gg1f3]"), "{exported}");
+
+        let round = parse_one(&exported);
+        assert_eq!(round.nodes[1].comment, "king pawn");
+        assert_eq!(round.nodes[1].shapes, game.nodes[1].shapes);
     }
 }

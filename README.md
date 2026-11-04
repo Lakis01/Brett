@@ -3,6 +3,13 @@
 Brett is a Chess Preparation and Database Suite. It is built for fast opening
 preparation, game review, database management, and deep position analysis.
 
+> **Alpha software.** Brett is currently in an early alpha stage, with
+> development focused largely on implementing core functionality, database
+> capabilities, and deep engine analysis rather than a pretty UI. The visual
+> interface and UI polish will be optimized once all functional components and
+> workflows are firmly in place. Expect rough edges and evolving features in
+> this phase. Back up important databases before editing them in place.
+
 ## Quick start (Linux)
 
 ```sh
@@ -208,9 +215,12 @@ ICCF server games under ICCF's terms, and comply with ICCF's terms. See
   Correspondence database** (not in Refs). The bundled snapshot is
   `databases/iccf/Correspondence_2350.si4` in a source checkout; a copy at
   `~/Downloads/Brett Resources/Correspondence Database/Correspondence_2350.si4`
-  is also found, and `BRETT_CORRESPONDENCE` overrides both. The first open
-  builds a cached position index in the background, and later opens reuse the
-  memory-mapped cache. See
+  is also found, and `BRETT_CORRESPONDENCE` overrides both. When no reference
+  is detected at startup, Brett offers a one-click download; **Not now** keeps
+  asking on later launches, while **Don't remind me again** plus **Not now**
+  stops the prompt. The first open builds a cached position index in the
+  background, and later opens reuse the memory-mapped cache. Bundled games are
+  capped at 70 plies. See
   [docs/CORRESPONDENCE_DATABASE.md](docs/CORRESPONDENCE_DATABASE.md).
 - Requests run off the UI thread, are debounced while navigating, and are
   cached in memory per FEN. Hovering a candidate move overlays the resulting
@@ -308,9 +318,16 @@ ICCF server games under ICCF's terms, and comply with ICCF's terms. See
   copies the FEN. The move counter counts full moves, not plies.
 - The Moves header keeps one metadata line: compact `R`/`B` chips, the event
   truncated rather than wrapped or squeezed, and the result right-aligned.
-  When the game has an `Opening` tag, its bare ECO code (for example `A07`)
-  appears as a gold chip beside the opening name; otherwise the ECO code stays
-  in the top bar as before.
+  ECO and Opening are always available as one compact editable row. The `🎯`
+  button classifies only the current game from its mainline. If the game
+  already has ECO/Opening values, Brett shows the current and proposed values
+  and asks before replacing them; untagged games are filled without a prompt.
+- Coloured squares and arrows are first-class board drawings: right-click or
+  Shift-click to mark a square, drag with those buttons to draw an arrow, and
+  click without a modifier to clear the current position's shapes. Ctrl/Shift
+  selects red, Alt/Command blue, and one key from each group yellow, matching
+  Lichess. Drawings round-trip through PGN `%csl`/`%cal`, SCID `%draw` input,
+  and classic CBH `.cba` annotations.
 - The right-side PGN panel has a styled game header, an editable tag table,
   result badge, move cards, selected-move highlighting, variation cards, and
   clickable comment previews. **Settings → Show PGN tags** hides the whole

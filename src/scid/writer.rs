@@ -23,7 +23,7 @@ use crate::chess::{
 };
 use anyhow::{Context, Result, bail};
 
-use crate::domain::{Clock, Game, Node};
+use crate::domain::{Clock, Game, Node, shape_tokens};
 use crate::scid::PieceLists;
 
 const INDEX_MAGIC: &[u8; 8] = b"Scid.si\0";
@@ -1037,11 +1037,18 @@ impl MoveEncoder<'_> {
 }
 
 fn comment_text(node: &Node) -> Option<String> {
-    let mut text = node
+    let mut text = shape_tokens(&node.shapes);
+    let human = node
         .comment
         .replace('\0', " ")
         .replace('{', "(")
         .replace('}', ")");
+    if !human.trim().is_empty() {
+        if !text.is_empty() {
+            text.push(' ');
+        }
+        text.push_str(&human);
+    }
     if let Some(clock) = node.clock {
         if !text.trim().is_empty() {
             text.push(' ');

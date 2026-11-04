@@ -70,6 +70,8 @@ fn first_unsupported_annotation(game: &Game) -> Option<(&'static str, usize)> {
     game.nodes.iter().enumerate().find_map(|(node, value)| {
         if !value.comment.trim().is_empty() {
             Some(("comment", node))
+        } else if !value.shapes.is_empty() {
+            Some(("drawing", node))
         } else if !value.nags.is_empty() {
             Some(("NAG", node))
         } else if value.clock.is_some() {
@@ -976,6 +978,11 @@ impl TwoCbhWriter {
         if let Some(start_id) = start_id {
             record[0x80..0x84]
                 .copy_from_slice(&(START_ID_BASE + u32::from(start_id)).to_le_bytes());
+        } else {
+            let eco = crate::cbh::writer::encode_eco(game.header("ECO"));
+            if eco > 0 {
+                record[0x80..0x82].copy_from_slice(&eco.to_le_bytes());
+            }
         }
         record[0x98..0xa0].copy_from_slice(&parse_u64_header(game.header("GameId")).to_le_bytes());
         record[0xb0..0xb8].copy_from_slice(&parse_u64_header(game.header("Beauty")).to_le_bytes());
@@ -1092,8 +1099,11 @@ fn lid_header(block_count: u32, event_count: u32) -> [u8; LID_FIRST] {
     put_be(&mut header, 0x18, u32::MAX);
     put_be(&mut header, 0x1c, 0x460);
     put_be(&mut header, 0x24, event_count);
+    put_be(&mut header, 0x30, 0xdc);
     put_be(&mut header, 0x38, 2);
     put_be(&mut header, 0x44, 0x400);
+    put_be(&mut header, 0x58, 0x13a);
+    put_be(&mut header, 0x6c, 0x214);
     put_be(&mut header, 0x74, 1);
     put_be(&mut header, 0x80, u32::MAX);
     header

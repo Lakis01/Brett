@@ -19,7 +19,7 @@ use crate::cbh::CbhLibrary;
 use crate::champions;
 use crate::cloud;
 use crate::country::{self, Country};
-use crate::domain::{self, Clock, Game, Token};
+use crate::domain::{self, Clock, Game, Shape, Token};
 use crate::engine::{EngineEvent, EngineHandle, EngineInfo, EngineOptions, Score, SearchLimit};
 use crate::eval::{self, BoardEval};
 use crate::fide;
@@ -97,6 +97,7 @@ struct PlayerBadge {
 struct BoardMeta {
     pos: Chess,
     last_move: Option<(Square, Square)>,
+    shapes: Vec<Shape>,
     top: PlayerBadge,
     bottom: PlayerBadge,
     show_clocks: bool,
@@ -708,6 +709,7 @@ pub struct App {
     selected: Option<Square>,
     targets: Vec<Square>,
     drag_from: Option<Square>,
+    shape_drag_from: Option<Square>,
     status: String,
     open_rx: Option<mpsc::Receiver<OpenMessage>>,
     open_job: Option<PathBuf>,
@@ -800,6 +802,7 @@ pub struct App {
     correspondence_rx: Option<mpsc::Receiver<CorrespondenceMessage>>,
     correspondence_job: Option<PathBuf>,
     correspondence_status: String,
+    correspondence_prompt_open: bool,
     correspondence_download_dismissed: bool,
     correspondence_download_rx: Option<mpsc::Receiver<Result<PathBuf, String>>>,
     correspondence_download_status: String,
@@ -1057,6 +1060,7 @@ impl App {
             selected: None,
             targets: Vec::new(),
             drag_from: None,
+            shape_drag_from: None,
             status: "Open a PGN, SCID, or classic ChessBase database, or drop one onto the window."
                 .to_string(),
             open_rx: None,
@@ -1138,6 +1142,7 @@ impl App {
             correspondence_rx: None,
             correspondence_job: None,
             correspondence_status,
+            correspondence_prompt_open: false,
             correspondence_download_dismissed: preparation_prefs.correspondence_download_dismissed,
             correspondence_download_rx: None,
             correspondence_download_status: String::new(),
@@ -1363,7 +1368,12 @@ impl App {
                 } else {
                     app.correspondence_status =
                         format!("Correspondence database not found: {}", path.display());
+                    if !app.correspondence_download_dismissed {
+                        app.correspondence_prompt_open = true;
+                    }
                 }
+            } else if !app.correspondence_download_dismissed {
+                app.correspondence_prompt_open = true;
             }
         } else {
             app.correspondence_status = "Correspondence database disabled in Settings.".to_string();
@@ -3636,30 +3646,6 @@ impl App {
         if self.correspondence_job.as_ref() == Some(&path) && self.correspondence_rx.is_some() {
             return;
         }
-        let library = match open_library(&path) {
-            Ok(lib) => lib,
-            Err(err) => {
-                self.correspondence_status = format!("Could not open {}: {err:#}", path.display());
-                return;
-            }
-        };
-        match PositionIndex::open_cached_for(library.as_ref()) {
-            Ok(Some(index)) => {
-                self.correspondence_status = format!(
-                    "Correspondence reference ready · {} games · {} positions",
-                    games_label(index.game_count()),
-                    positions_label(index.position_count())
-                );
-                self.correspondence = Some(index);
-                self.correspondence_job = None;
-                return;
-            }
-            Ok(None) => {}
-            Err(err) => {
-                tracing::warn!("could not open cached correspondence index: {err:#}");
-            }
-        }
-
         self.correspondence = None;
         self.correspondence_job = Some(path.clone());
         self.correspondence_status =
@@ -3669,15 +3655,14 @@ impl App {
         std::thread::spawn(move || {
             let progress_tx = tx.clone();
             let progress_ctx = ctx.clone();
-            let result = PositionIndex::build_cached_for(
-                library,
-                BuildOptions::default(),
-                move |progress| {
+            let result = (|| -> Result<PositionIndex, String> {
+                let library = open_library(&path).map_err(|err| format!("{err:#}"))?;
+                PositionIndex::build_cached_for(library, BuildOptions::default(), move |progress| {
                     let _ = progress_tx.send(CorrespondenceMessage::Progress(progress));
                     progress_ctx.request_repaint();
-                },
-            )
-            .map_err(|err| format!("{err:#}"));
+                })
+                .map_err(|err| format!("{err:#}"))
+            })();
             let _ = tx.send(CorrespondenceMessage::Done(result));
             ctx.request_repaint();
         });
@@ -3737,79 +3722,109 @@ impl App {
         }
     }
 
-    fn download_and_unpack_correspondence() -> Result<PathBuf, String> {
-        let target_dir = local_share_correspondence_dir()
-            .ok_or_else(|| "Could not determine local data directory for download".to_string())?;
-        std::fs::create_dir_all(&target_dir)
-            .map_err(|err| format!("Failed to create directory {}: {err}", target_dir.display()))?;
-
-        let response = ureq::AgentBuilder::new()
-            .timeout(Duration::from_secs(180))
-            .build()
-            .get(CORRESPONDENCE_DOWNLOAD_URL)
-            .call()
-            .map_err(|err| format!("Download failed: {err}"))?;
-
-        let reader = response.into_reader();
-        let gz = flate2::read::GzDecoder::new(reader);
-        let mut archive = tar::Archive::new(gz);
-        archive
-            .unpack(&target_dir)
-            .map_err(|err| format!("Extracting correspondence database failed: {err}"))?;
-
-        let direct = target_dir.join("Correspondence_2350.si4");
-        let nested = target_dir.join("databases/iccf/Correspondence_2350.si4");
-        if direct.exists() {
-            Ok(direct)
-        } else if nested.exists() {
-            Ok(nested)
-        } else {
-            Err("Correspondence_2350.si4 not found in extracted archive".to_string())
+    fn poll_correspondence_download(&mut self) {
+        let Some(rx) = &self.correspondence_download_rx else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Ok(path)) => {
+                self.correspondence_download_rx = None;
+                self.correspondence_download_status = "Download complete.".to_string();
+                self.correspondence_prompt_open = false;
+                self.correspondence_path = path.display().to_string();
+                self.settings_correspondence_path = path.display().to_string();
+                self.save_reference_prefs();
+                self.start_correspondence(path);
+            }
+            Ok(Err(err)) => {
+                self.correspondence_download_rx = None;
+                self.correspondence_download_status = format!("Download failed: {err}");
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.correspondence_download_rx = None;
+                self.correspondence_download_status = "Download stopped unexpectedly.".to_string();
+            }
         }
     }
 
-    fn start_correspondence_download(&mut self) {
+    fn start_correspondence_download(&mut self, ctx: &egui::Context) {
         if self.correspondence_download_rx.is_some() {
             return;
         }
         let (tx, rx) = mpsc::channel();
         self.correspondence_download_rx = Some(rx);
         self.correspondence_download_status =
-            "Downloading correspondence reference (26 MB)…".to_string();
-        self.status = self.correspondence_download_status.clone();
-        let ctx = self.ctx.clone();
+            "Downloading Correspondence_2350.tar.gz (26 MB)…".to_string();
+        let target_dir = xdg_data_dir()
+            .map(|d| d.join("brett/databases/iccf"))
+            .unwrap_or_else(|| PathBuf::from("databases/iccf"));
+        let ctx = ctx.clone();
         std::thread::spawn(move || {
-            let result = Self::download_and_unpack_correspondence();
-            let _ = tx.send(result);
+            let res = download_and_unpack_correspondence(&target_dir);
+            let _ = tx.send(res);
             ctx.request_repaint();
         });
     }
 
-    fn poll_correspondence_download(&mut self) {
-        let Some(rx) = self.correspondence_download_rx.take() else {
+    fn correspondence_download_dialog(&mut self, ctx: &egui::Context) {
+        if !self.correspondence_prompt_open {
             return;
-        };
-        match rx.try_recv() {
-            Ok(Ok(path)) => {
-                self.correspondence_download_status =
-                    "Correspondence database downloaded and ready.".to_string();
-                self.status = self.correspondence_download_status.clone();
-                self.correspondence_path = path.display().to_string();
-                self.correspondence_download_dismissed = true;
-                self.save_reference_prefs();
-                self.start_correspondence(path);
-            }
-            Ok(Err(err)) => {
-                self.correspondence_download_status = format!("Download failed: {err}");
-                self.status = self.correspondence_download_status.clone();
-            }
-            Err(mpsc::TryRecvError::Empty) => {
-                self.correspondence_download_rx = Some(rx);
-            }
-            Err(mpsc::TryRecvError::Disconnected) => {
-                self.correspondence_download_status = "Download stopped unexpectedly.".to_string();
-                self.status = self.correspondence_download_status.clone();
-            }
+        }
+        let mut close = false;
+        let mut start_download = false;
+        egui::Window::new("Correspondence Reference Database")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.set_min_width(420.0);
+                ui.label(RichText::new("No correspondence reference database detected.").strong());
+                ui.add_space(4.0);
+                ui.label(
+                    "Brett uses an ICCF correspondence database (ratings 2350+, mainlines truncated \
+                     to 70 plies, with pre-computed position index) to provide reference statistics, \
+                     opening tree insights, and preparation trends.",
+                );
+                ui.add_space(6.0);
+                ui.label(RichText::new("Archive size: ~26 MB  •  Storage used: ~124 MB").weak());
+                ui.add_space(8.0);
+
+                if self.correspondence_download_rx.is_some() {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(&self.correspondence_download_status);
+                    });
+                } else {
+                    if !self.correspondence_download_status.is_empty() {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(220, 80, 80),
+                            &self.correspondence_download_status,
+                        );
+                        ui.add_space(4.0);
+                    }
+                    ui.checkbox(
+                        &mut self.correspondence_download_dismissed,
+                        "Don't remind me again",
+                    );
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button(RichText::new("Download (26 MB)").strong()).clicked() {
+                            start_download = true;
+                        }
+                        if ui.button("Not now").clicked() {
+                            close = true;
+                        }
+                    });
+                }
+            });
+
+        if close {
+            self.correspondence_prompt_open = false;
+            self.save_reference_prefs();
+        }
+        if start_download {
+            self.start_correspondence_download(ctx);
         }
     }
 
@@ -6793,7 +6808,60 @@ impl App {
                 self.selected = None;
                 self.targets.clear();
             }
+            BoardEvent::ShapeDragStart(from) => {
+                self.shape_drag_from = Some(from);
+            }
+            BoardEvent::ShapeSquare { square, color } => {
+                self.shape_drag_from = None;
+                self.toggle_shape(Shape::Square { square, color });
+            }
+            BoardEvent::ShapeArrow { from, to, color } => {
+                self.shape_drag_from = None;
+                self.toggle_shape(Shape::Arrow { from, to, color });
+            }
         }
+    }
+
+    fn toggle_shape(&mut self, shape: Shape) {
+        let Some(game) = self.current.as_mut() else {
+            return;
+        };
+        let Some(node) = game.nodes.get_mut(self.node) else {
+            return;
+        };
+        match shape {
+            Shape::Square { square, color } => {
+                if let Some(pos) = node
+                    .shapes
+                    .iter()
+                    .position(|s| matches!(s, Shape::Square { square: sq, .. } if *sq == square))
+                {
+                    if node.shapes[pos] == (Shape::Square { square, color }) {
+                        node.shapes.remove(pos);
+                    } else {
+                        node.shapes[pos] = Shape::Square { square, color };
+                    }
+                } else {
+                    node.shapes.push(Shape::Square { square, color });
+                }
+            }
+            Shape::Arrow { from, to, color } => {
+                if let Some(pos) = node.shapes.iter().position(
+                    |s| matches!(s, Shape::Arrow { from: f, to: t, .. } if *f == from && *t == to),
+                ) {
+                    if node.shapes[pos] == (Shape::Arrow { from, to, color }) {
+                        node.shapes.remove(pos);
+                    } else {
+                        node.shapes[pos] = Shape::Arrow { from, to, color };
+                    }
+                } else {
+                    node.shapes.push(Shape::Arrow { from, to, color });
+                }
+            }
+        }
+        self.dirty = true;
+        self.persist_current_edit();
+        self.sync_current_slot();
     }
 
     fn handle_branch_keys(&mut self, ctx: &egui::Context) {
@@ -9418,20 +9486,12 @@ impl App {
 
         if self.correspondence_enabled {
             ui.add_space(8.0);
-            let has_default = default_correspondence_path().is_some();
-            let downloading = self.correspondence_download_rx.is_some();
-            let (correspondence_move, correspondence_preview, req_download) =
-                correspondence_section(
-                    ui,
-                    self.correspondence.as_ref(),
-                    &pos,
-                    &self.correspondence_status,
-                    downloading,
-                    has_default,
-                );
-            if req_download {
-                self.start_correspondence_download();
-            }
+            let (correspondence_move, correspondence_preview) = correspondence_section(
+                ui,
+                self.correspondence.as_ref(),
+                &pos,
+                &self.correspondence_status,
+            );
             if correspondence_move.is_some() {
                 clicked_move = correspondence_move;
             }
@@ -12951,7 +13011,6 @@ impl eframe::App for App {
             || self.book_rx.is_some()
             || self.player_book_rx.is_some()
             || self.reference_rx.is_some()
-            || self.correspondence_download_rx.is_some()
             || self.online_rx.is_some()
             || self.online_game_rx.is_some()
             || self.online_ref_rx.is_some()
@@ -12999,50 +13058,6 @@ impl eframe::App for App {
         self.moves_panel(ui);
         self.sync_current_slot();
         self.bottom_bar(ui);
-
-        let mut trigger_download = false;
-        let mut dismiss_download = false;
-        if !self.correspondence_download_dismissed && default_correspondence_path().is_none() {
-            egui::Frame::new()
-                .fill(SURFACE)
-                .stroke(Stroke::new(1.0, GOLD))
-                .inner_margin(egui::Margin::symmetric(10, 6))
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            RichText::new("📦 Master Correspondence Opening Reference")
-                                .strong()
-                                .color(GOLD),
-                        );
-                        ui.label(
-                            RichText::new("87,927 games · 26 MB download, ~124 MB on disk.")
-                                .small()
-                                .weak(),
-                        );
-                        if self.correspondence_download_rx.is_some() {
-                            ui.label(
-                                RichText::new(&self.correspondence_download_status)
-                                    .small()
-                                    .color(GOLD),
-                            );
-                        } else {
-                            if ui.small_button("Download (26 MB)").clicked() {
-                                trigger_download = true;
-                            }
-                            if ui.small_button("Dismiss").clicked() {
-                                dismiss_download = true;
-                            }
-                        }
-                    });
-                });
-        }
-        if trigger_download {
-            self.start_correspondence_download();
-        }
-        if dismiss_download {
-            self.correspondence_download_dismissed = true;
-            self.save_reference_prefs();
-        }
 
         egui::CentralPanel::default_margins().show(ui, |ui| {
             let avail = ui.available_size();
@@ -13102,6 +13117,9 @@ impl eframe::App for App {
                         last_move: hover
                             .map(|preview| preview.last_move)
                             .unwrap_or_else(|| domain::last_move_squares(node)),
+                        shapes: hover
+                            .map(|_| Vec::new())
+                            .unwrap_or_else(|| node.shapes.clone()),
                         top: badge(top_color),
                         bottom: badge(bottom_color),
                         show_clocks,
@@ -13143,7 +13161,9 @@ impl eframe::App for App {
                                         last_move: meta.last_move,
                                         selected: self.selected,
                                         targets: &self.targets,
+                                        shapes: &meta.shapes,
                                         drag_from: self.drag_from,
+                                        shape_drag_from: self.shape_drag_from,
                                     },
                                     side,
                                 );
@@ -13169,7 +13189,9 @@ impl eframe::App for App {
                                 last_move: meta.last_move,
                                 selected: self.selected,
                                 targets: &self.targets,
+                                shapes: &meta.shapes,
                                 drag_from: self.drag_from,
+                                shape_drag_from: self.shape_drag_from,
                             },
                             side,
                         )
@@ -13242,6 +13264,7 @@ impl eframe::App for App {
         self.pending_open_dialog(&ctx);
         self.save_database_dialog(&ctx);
         self.close_confirmation_dialog(&ctx);
+        self.correspondence_download_dialog(&ctx);
         if self.pending_window_close {
             self.pending_window_close = false;
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -16177,12 +16200,9 @@ fn correspondence_section(
     index: Option<&PositionIndex>,
     pos: &Chess,
     status: &str,
-    downloading: bool,
-    has_default: bool,
-) -> (Option<Move>, Option<HoverPreview>, bool) {
+) -> (Option<Move>, Option<HoverPreview>) {
     let mut clicked = None;
     let mut hover_preview = None;
-    let mut download_clicked = false;
 
     egui::Frame::new()
         .fill(SURFACE)
@@ -16204,19 +16224,6 @@ fn correspondence_section(
 
             let Some(index) = index else {
                 ui.label(RichText::new(status).small().weak().italics());
-                if !has_default {
-                    ui.add_space(4.0);
-                    ui.label(
-                        RichText::new("87,927 master correspondence games (26 MB download, ~124 MB on disk) with prebuilt index.")
-                            .small()
-                            .weak(),
-                    );
-                    if downloading {
-                        ui.label(RichText::new("Downloading correspondence reference…").small().color(GOLD));
-                    } else if ui.small_button("Download Correspondence Reference (26 MB)").clicked() {
-                        download_clicked = true;
-                    }
-                }
                 return;
             };
             let key = position::position_key(pos);
@@ -16311,7 +16318,7 @@ fn correspondence_section(
             }
         });
 
-    (clicked, hover_preview, download_clicked)
+    (clicked, hover_preview)
 }
 
 /// Merge remote cloud evaluations (chessdb.cn, Lichess cloud eval) with
@@ -17652,23 +17659,10 @@ fn default_reference_path() -> Option<PathBuf> {
         .find(|path| path.exists())
 }
 
-const CORRESPONDENCE_DOWNLOAD_URL: &str =
-    "https://github.com/Lakis01/Brett/releases/latest/download/correspondence-reference.tar.gz";
-
-fn local_share_correspondence_dir() -> Option<PathBuf> {
-    std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .or_else(|| home_path(".local/share"))
-        .map(|data| data.join("brett/databases/iccf"))
-}
-
-fn local_share_correspondence_path() -> Option<PathBuf> {
-    local_share_correspondence_dir().map(|dir| dir.join("Correspondence_2350.si4"))
-}
-
 /// The correspondence database used automatically in the Engine tab.
-/// `BRETT_CORRESPONDENCE` wins, then local user data, then the snapshot bundled
-/// in a source checkout, then conventional locations.
+/// `BRETT_CORRESPONDENCE` wins, then the snapshot bundled in a source
+/// checkout, then the conventional Brett Resources location. The file remains
+/// read-only; only a position-index cache is built.
 fn default_correspondence_path() -> Option<PathBuf> {
     let env = std::env::var_os("BRETT_CORRESPONDENCE")
         .map(PathBuf::from)
@@ -17680,14 +17674,48 @@ fn default_correspondence_path() -> Option<PathBuf> {
     let candidates = [
         Some(PathBuf::from("databases/iccf/Correspondence_2350.si4")),
         Some(manifest.join("Correspondence_2350.si4")),
-        local_share_correspondence_path(),
         executable.map(|dir| dir.join("databases/iccf/Correspondence_2350.si4")),
+        xdg_data_dir().map(|dir| dir.join("brett/databases/iccf/Correspondence_2350.si4")),
         home_path("Downloads/Brett Resources/Correspondence Database/Correspondence_2350.si4"),
         home_path("Downloads/CBH/Pimped Correspondence Database.cbh"),
     ];
     env.into_iter()
         .chain(candidates.into_iter().flatten())
         .find(|path| path.exists())
+}
+
+fn xdg_data_dir() -> Option<PathBuf> {
+    std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
+}
+
+fn download_and_unpack_correspondence(target_dir: &Path) -> Result<PathBuf, String> {
+    std::fs::create_dir_all(target_dir).map_err(|e| format!("creating directory: {e}"))?;
+    let target_si4 = target_dir.join("Correspondence_2350.si4");
+    if target_si4.exists() {
+        return Ok(target_si4);
+    }
+    let url =
+        "https://github.com/Lakis01/Brett/releases/latest/download/Correspondence_2350.tar.gz";
+    let agent = ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(120))
+        .build();
+    let resp = agent
+        .get(url)
+        .call()
+        .map_err(|e| format!("HTTP request failed: {e}"))?;
+    let reader = resp.into_reader();
+    let gz = flate2::read::GzDecoder::new(reader);
+    let mut archive = tar::Archive::new(gz);
+    archive
+        .unpack(target_dir)
+        .map_err(|e| format!("extracting archive: {e}"))?;
+    if target_si4.exists() {
+        Ok(target_si4)
+    } else {
+        Err("Archive extracted, but Correspondence_2350.si4 was not found inside".to_string())
+    }
 }
 
 fn open_dialog(initial_dir: Option<&Path>) -> Option<std::path::PathBuf> {
@@ -18433,6 +18461,7 @@ mod tests {
             selected: None,
             targets: Vec::new(),
             drag_from: None,
+            shape_drag_from: None,
             status: String::new(),
             open_rx: None,
             open_job: None,
@@ -18505,6 +18534,7 @@ mod tests {
             correspondence_rx: None,
             correspondence_job: None,
             correspondence_status: String::new(),
+            correspondence_prompt_open: false,
             correspondence_download_dismissed: false,
             correspondence_download_rx: None,
             correspondence_download_status: String::new(),

@@ -1,5 +1,6 @@
 use crate::chess::{Chess, Color, File, Position, Rank, Square};
-use egui::{Color32, Pos2, Rect, Sense, Stroke, StrokeKind, Ui, Vec2, pos2};
+use crate::domain::{Shape, ShapeColor};
+use egui::{Color32, PointerButton, Pos2, Rect, Sense, Stroke, StrokeKind, Ui, Vec2, pos2};
 
 use crate::ui::pieces::PieceTextures;
 
@@ -15,8 +16,24 @@ const DROP_TARGET: Color32 = Color32::from_rgba_premultiplied(0xE6, 0xF0, 0xDA, 
 pub enum BoardEvent {
     Click(Square),
     DragStart(Square),
-    Drop { from: Square, to: Square },
+    Drop {
+        from: Square,
+        to: Square,
+    },
     DragCancel,
+    /// Mark one square with a Lichess/ChessBase colour.
+    ShapeSquare {
+        square: Square,
+        color: ShapeColor,
+    },
+    /// A drawing drag began on `square`; the app keeps it until the release.
+    ShapeDragStart(Square),
+    /// Draw an arrow between two squares.
+    ShapeArrow {
+        from: Square,
+        to: Square,
+        color: ShapeColor,
+    },
 }
 
 pub struct BoardState<'a> {
@@ -25,6 +42,10 @@ pub struct BoardState<'a> {
     pub last_move: Option<(Square, Square)>,
     pub selected: Option<Square>,
     pub targets: &'a [Square],
+    /// Coloured squares and arrows stored on the current position.
+    pub shapes: &'a [Shape],
+    /// Square where a secondary-button or Shift drawing drag started.
+    pub shape_drag_from: Option<Square>,
     /// Square currently being dragged, if any. Kept by the app across frames.
     pub drag_from: Option<Square>,
 }
@@ -53,14 +74,23 @@ pub fn draw(ui: &mut Ui, tex: &PieceTextures, st: BoardState<'_>, side: f32) -> 
     let drag_origin = press_origin
         .and_then(|p| square_at_pos(rect, cell, p, st.orientation))
         .or(hovered);
-    let just_started = response
-        .drag_started()
-        .then_some(drag_origin)
+    let modifiers = ui.input(|i| i.modifiers);
+    let drawing_color = shape_color(&modifiers);
+    let shape_with_primary = modifiers.shift;
+    let secondary_drag = response.drag_started_by(PointerButton::Secondary)
+        || response.dragged_by(PointerButton::Secondary)
+        || response.drag_stopped_by(PointerButton::Secondary);
+    let shape_dragging = secondary_drag
+        || (shape_with_primary
+            && (response.dragged() || response.drag_started() || response.drag_stopped()));
+    let just_started = (!shape_dragging)
+        .then(|| response.drag_started().then_some(drag_origin).flatten())
         .flatten()
         .filter(|sq| is_movable(st.pos, *sq));
-    let active_drag = (response.dragged() || response.drag_started() || response.drag_stopped())
-        .then(|| st.drag_from.or(just_started))
-        .flatten();
+    let active_drag = (!shape_with_primary
+        && (response.dragged() || response.drag_started() || response.drag_stopped()))
+    .then(|| st.drag_from.or(just_started))
+    .flatten();
 
     for row in 0..8 {
         for col in 0..8 {
@@ -173,10 +203,76 @@ pub fn draw(ui: &mut Ui, tex: &PieceTextures, st: BoardState<'_>, side: f32) -> 
         );
     }
 
+    for &shape in st.shapes {
+        draw_shape(&painter, shape, st.orientation, rect, cell);
+    }
+
     if active_drag.is_some() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
     } else if hovered.is_some_and(|sq| is_movable(st.pos, sq)) {
         ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+    }
+
+    let shape_drag_id = response.id.with("shape_drag_origin");
+    if (response.drag_started_by(PointerButton::Secondary)
+        || (shape_with_primary && response.drag_started()))
+        && let Some(from) = drag_origin
+    {
+        let idx = (from.file().to_u32() + from.rank().to_u32() * 8) as u8;
+        ui.data_mut(|d| d.insert_temp(shape_drag_id, idx));
+    }
+
+    let dragging_shape_from: Option<Square> = ui
+        .data(|d| d.get_temp::<u8>(shape_drag_id))
+        .map(|idx| Square::new(u32::from(idx)));
+    if let Some(from) = dragging_shape_from.or(st.shape_drag_from)
+        && let Some(to) = hovered
+        && from != to
+    {
+        draw_shape(
+            &painter,
+            Shape::Arrow {
+                from,
+                to,
+                color: drawing_color,
+            },
+            st.orientation,
+            rect,
+            cell,
+        );
+    }
+
+    if response.drag_stopped_by(PointerButton::Secondary)
+        || (shape_with_primary && response.drag_stopped())
+    {
+        let stored_from: Option<Square> = ui
+            .data_mut(|d| d.remove_temp::<u8>(shape_drag_id))
+            .map(|idx| Square::new(u32::from(idx)));
+        if let Some(from) = stored_from.or(st.shape_drag_from).or(drag_origin) {
+            if let Some(to) = hovered
+                && to != from
+            {
+                return Some(BoardEvent::ShapeArrow {
+                    from,
+                    to,
+                    color: drawing_color,
+                });
+            }
+            return Some(BoardEvent::ShapeSquare {
+                square: from,
+                color: drawing_color,
+            });
+        }
+    }
+
+    if (response.secondary_clicked() || (shape_with_primary && response.clicked()))
+        && let Some(sq) = hovered
+    {
+        ui.data_mut(|d| d.remove_temp::<u8>(shape_drag_id));
+        return Some(BoardEvent::ShapeSquare {
+            square: sq,
+            color: drawing_color,
+        });
     }
 
     if response.drag_stopped()
@@ -201,6 +297,78 @@ pub fn draw(ui: &mut Ui, tex: &PieceTextures, st: BoardState<'_>, side: f32) -> 
     }
 
     None
+}
+
+/// Lichess drawing modifiers: green by default, red with Ctrl/Shift, blue with
+/// Alt/Command, and yellow when one key from each group is held.
+fn shape_color(modifiers: &egui::Modifiers) -> ShapeColor {
+    let red = modifiers.ctrl || modifiers.shift;
+    let blue = modifiers.alt || modifiers.mac_cmd;
+    match (red, blue) {
+        (true, true) => ShapeColor::Yellow,
+        (true, false) => ShapeColor::Red,
+        (false, true) => ShapeColor::Blue,
+        (false, false) => ShapeColor::Green,
+    }
+}
+
+fn drawing_color(color: ShapeColor) -> Color32 {
+    match color {
+        ShapeColor::Green => Color32::from_rgba_unmultiplied(0x15, 0x78, 0x1B, 220),
+        ShapeColor::Yellow => Color32::from_rgba_unmultiplied(0xE6, 0x8F, 0x00, 220),
+        ShapeColor::Red => Color32::from_rgba_unmultiplied(0x88, 0x20, 0x20, 220),
+        ShapeColor::Blue => Color32::from_rgba_unmultiplied(0x00, 0x30, 0x88, 220),
+    }
+}
+
+fn draw_shape(painter: &egui::Painter, shape: Shape, orientation: Color, rect: Rect, cell: f32) {
+    let square_rect = |sq: Square| -> Rect {
+        let (col, row) = coords(sq, orientation);
+        Rect::from_min_size(
+            pos2(
+                rect.left() + col as f32 * cell,
+                rect.top() + row as f32 * cell,
+            ),
+            Vec2::splat(cell),
+        )
+    };
+    let color = drawing_color(match shape {
+        Shape::Square { color, .. } | Shape::Arrow { color, .. } => color,
+    });
+    match shape {
+        Shape::Square { square, .. } => {
+            painter.circle_filled(
+                square_rect(square).center(),
+                cell * 0.38,
+                Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 150),
+            );
+        }
+        Shape::Arrow { from, to, .. } if from != to => {
+            let start = square_rect(from).center();
+            let end = square_rect(to).center();
+            let delta = end - start;
+            let length = delta.length();
+            if length < 1.0 {
+                return;
+            }
+            let direction = delta / length;
+            let shaft_end = end - direction * cell * 0.30;
+            let width = cell * 0.12;
+            painter.line_segment([start, shaft_end], Stroke::new(width, color));
+            let perpendicular = Vec2::new(-direction.y, direction.x);
+            let head = vec![
+                end,
+                shaft_end + perpendicular * cell * 0.20,
+                shaft_end - perpendicular * cell * 0.20,
+            ];
+            painter.add(egui::Shape::convex_polygon(
+                head,
+                color,
+                Stroke::new(0.0, Color32::TRANSPARENT),
+            ));
+        }
+        Shape::Arrow { .. } => {}
+    }
 }
 
 fn is_movable(pos: &Chess, sq: Square) -> bool {
@@ -300,5 +468,36 @@ mod tests {
         assert!(!is_dark(Square::H1));
         assert!(!is_dark(Square::A8));
         assert!(is_dark(Square::H8));
+    }
+
+    #[test]
+    fn lichess_shape_modifiers_choose_the_colour() {
+        use crate::domain::ShapeColor;
+        use egui::Modifiers;
+
+        let modifiers = |ctrl: bool, shift: bool, alt: bool| Modifiers {
+            ctrl,
+            shift,
+            alt,
+            ..Modifiers::default()
+        };
+        assert_eq!(
+            shape_color(&modifiers(false, false, false)),
+            ShapeColor::Green
+        );
+        assert_eq!(shape_color(&modifiers(true, false, false)), ShapeColor::Red);
+        assert_eq!(shape_color(&modifiers(false, true, false)), ShapeColor::Red);
+        assert_eq!(
+            shape_color(&modifiers(false, false, true)),
+            ShapeColor::Blue
+        );
+        assert_eq!(
+            shape_color(&modifiers(true, false, true)),
+            ShapeColor::Yellow
+        );
+        assert_eq!(
+            shape_color(&modifiers(false, true, true)),
+            ShapeColor::Yellow
+        );
     }
 }

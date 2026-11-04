@@ -492,6 +492,7 @@ impl Walker<'_> {
             comment: String::new(),
             clock: None,
             eval: None,
+            shapes: Vec::new(),
             nags: Vec::new(),
             parent: Some(self.current),
             children: Vec::new(),
