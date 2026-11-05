@@ -385,6 +385,33 @@ pub trait GameLibrary: Send + Sync {
             (white, black)
         }
     }
+
+    /// Tournament index categories, when the database carries one (the Mega
+    /// Database keeps its HTML tournament index in a text record). The base
+    /// implementation reports none.
+    fn tournament_categories(
+        &self,
+    ) -> Option<Vec<crate::twocbh::tournaments::MegaTournamentCategory>> {
+        None
+    }
+
+    /// One-based source record id backing a game index, when the backend
+    /// numbers its game slots (2CBH `.2cbh` record ids).
+    fn source_record_id(&self, _index: usize) -> Option<u32> {
+        None
+    }
+
+    /// Game index backing a one-based source record id, when the backend
+    /// numbers its game slots.
+    fn source_index_for_record(&self, _record_id: u32) -> Option<usize> {
+        None
+    }
+
+    /// Whether a one-based source record id is a game rather than a text or
+    /// unused slot. Backends without record ids treat every slot as a game.
+    fn is_game_record(&self, _record_id: u32) -> bool {
+        true
+    }
 }
 
 pub(crate) fn filter_games(games: &[IndexedGame], needle: &str) -> Vec<usize> {

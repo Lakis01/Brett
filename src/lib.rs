@@ -12,6 +12,7 @@ pub mod champions;
 pub mod chess;
 pub mod cloud;
 pub mod country;
+pub mod crosstable;
 pub mod domain;
 pub mod eco;
 pub mod engine;

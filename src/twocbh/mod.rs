@@ -24,7 +24,10 @@
 pub mod fast_index;
 mod moves;
 mod tokens;
+pub mod tournaments;
 pub mod writer;
+
+pub use tournaments::{MegaTournamentCategory, MegaTournamentEntry, parse_mega_tournament_index};
 
 #[cfg(test)]
 mod tests;
@@ -193,6 +196,58 @@ impl TwoCbhFile {
     pub fn is_game(&self, id: u32) -> bool {
         self.record(id)
             .is_ok_and(|record| record[0] & 1 != 0 && record[0] & 2 == 0)
+    }
+
+    /// Whether a record slot is a text record (Mega index, reports, …).
+    pub fn is_text(&self, id: u32) -> bool {
+        self.record(id).is_ok_and(|record| record[0] & 2 != 0)
+    }
+
+    /// Decode a text record (such as the Mega tournament index in slot 1) as
+    /// HTML. The `.2cbg` payload starts with the usual magic, a length word
+    /// `a` at header bytes 8..12, and the content at `offset + 24`. The
+    /// English HTML block is located by searching for `<!DOCTYPE` or `<html`
+    /// and decoded with the shared UTF-8/Windows-1252 fallback. All bounds
+    /// are validated; this never panics.
+    pub fn text_html(&self, id: u32) -> Result<String> {
+        let record = self.record(id)?;
+        let offset = le_u64(&record[8..16]) as usize;
+        let header = self
+            .cbg
+            .get(offset..offset.saturating_add(24))
+            .with_context(|| format!("2CBG text record {id} header is truncated at {offset}"))?;
+        if header.len() < 24 || header[..8] != CBG_MAGIC {
+            bail!("2CBG text record {id} at {offset} has the wrong magic");
+        }
+        let a = le_u32(&header[8..12]) as usize;
+        let content_start = offset
+            .checked_add(24)
+            .context("2CBG text offset overflow")?;
+        let content_end = content_start
+            .checked_add(a)
+            .context("2CBG text size overflow")?;
+        let bytes = self.cbg.get(content_start..content_end).with_context(|| {
+            format!(
+                "2CBG text record {id} runs past the end of {}",
+                self.cbg_path.display()
+            )
+        })?;
+        let lower = bytes
+            .iter()
+            .map(|byte| byte.to_ascii_lowercase())
+            .collect::<Vec<u8>>();
+        let mut start = 0usize;
+        let mut found = false;
+        for needle in [b"<!doctype".as_slice(), b"<html".as_slice()] {
+            if let Some(at) = find_subslice(&lower, needle)
+                && (!found || at < start)
+            {
+                start = at;
+                found = true;
+            }
+        }
+        let slice = if found { &bytes[start..] } else { bytes };
+        Ok(decode_text(slice))
     }
 
     /// Read and validate one `.2cbg` record.
@@ -473,6 +528,39 @@ impl TwoCbhLibrary {
         let black = self.names.player(le_u32(&record[0x20..0x24]));
         (white.name, black.name)
     }
+
+    /// Tournament index categories from the slot-1 text record, if present.
+    /// Returns `None` when slot 1 is not a text record or has no entries.
+    pub fn tournament_categories(&self) -> Option<Vec<MegaTournamentCategory>> {
+        if !self.file.is_text(1) {
+            return None;
+        }
+        let html = self.file.text_html(1).ok()?;
+        let categories = parse_mega_tournament_index(&html);
+        if categories.is_empty() {
+            None
+        } else {
+            Some(categories)
+        }
+    }
+
+    /// Whether a one-based `.2cbh` record id holds a game.
+    pub fn is_game_record(&self, record_id: u32) -> bool {
+        self.file.is_game(record_id)
+    }
+
+    /// The one-based `.2cbh` record id backing a game index.
+    pub fn record_id_for_index(&self, index: usize) -> Option<u32> {
+        self.entries.get(index).map(|entry| entry.id)
+    }
+
+    /// The game index backing a one-based `.2cbh` record id, if it is a game.
+    /// `entries` is sorted by record id, so this is a binary search.
+    pub fn game_index_for_record(&self, record_id: u32) -> Option<usize> {
+        self.entries
+            .binary_search_by_key(&record_id, |entry| entry.id)
+            .ok()
+    }
 }
 
 impl GameLibrary for TwoCbhLibrary {
@@ -570,6 +658,22 @@ impl GameLibrary for TwoCbhLibrary {
 
     fn filter(&self, needle: &str) -> Vec<usize> {
         crate::library::filter_games(&self.games, needle)
+    }
+
+    fn tournament_categories(&self) -> Option<Vec<MegaTournamentCategory>> {
+        TwoCbhLibrary::tournament_categories(self)
+    }
+
+    fn source_record_id(&self, index: usize) -> Option<u32> {
+        TwoCbhLibrary::record_id_for_index(self, index)
+    }
+
+    fn source_index_for_record(&self, record_id: u32) -> Option<usize> {
+        TwoCbhLibrary::game_index_for_record(self, record_id)
+    }
+
+    fn is_game_record(&self, record_id: u32) -> bool {
+        TwoCbhLibrary::is_game_record(self, record_id)
     }
 }
 
@@ -933,10 +1037,18 @@ fn map_file(path: &Path, kind: &str) -> Result<Mmap> {
         .with_context(|| format!("mapping 2CBH {kind} file {}", path.display()))
 }
 
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
 fn le_u16(bytes: &[u8]) -> u16 {
     u16::from_le_bytes([bytes[0], bytes[1]])
 }
-
 fn le_u32(bytes: &[u8]) -> u32 {
     u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
 }

@@ -206,6 +206,83 @@ pub struct MoveTrend {
 }
 
 impl MoveTrend {
+    /// Normalized sparkline points `(x, y)` with both axes in `0.0..=1.0`.
+    ///
+    /// Only quarters with dated games (`position_games > 0` and a share) emit
+    /// points; `x` is the chronological bucket index over the full bucket
+    /// slice and `y` is the share linearly normalized into the data range
+    /// (higher share maps to higher `y`). Returns empty when there is no
+    /// badge or fewer than two active quarters.
+    pub fn sparkline_points(&self) -> Vec<(f32, f32)> {
+        let Some((min_s, span)) = self.sparkline_scale() else {
+            return Vec::new();
+        };
+        let denom = self.buckets.len().saturating_sub(1).max(1) as f32;
+        self.buckets
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| b.position_games > 0 && b.share.is_some())
+            .map(|(idx, b)| {
+                let share = b.share.unwrap_or(0.0);
+                let y = ((share - min_s) / span).clamp(0.0, 1.0) as f32;
+                (idx as f32 / denom, y)
+            })
+            .collect()
+    }
+
+    /// Baseline share mapped into the same normalized `0.0..=1.0` scale as
+    /// [`Self::sparkline_points`], or `None` when the sparkline is empty or
+    /// there is no baseline share.
+    pub fn sparkline_baseline_y(&self) -> Option<f32> {
+        let baseline = self.baseline_share?;
+        let (min_s, span) = self.sparkline_scale()?;
+        Some(((baseline - min_s) / span).clamp(0.0, 1.0) as f32)
+    }
+
+    /// Shared `(min, span)` normalization over active shares plus the baseline.
+    /// Enforces a minimum 0.20 span centered on the mid, clamped to `0..=1`.
+    fn sparkline_scale(&self) -> Option<(f64, f64)> {
+        self.badge?;
+        let active: Vec<(usize, f64)> = self
+            .buckets
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| b.position_games > 0 && b.share.is_some())
+            .map(|(idx, b)| (idx, b.share.unwrap_or(0.0)))
+            .collect();
+        if active.len() < 2 {
+            return None;
+        }
+        let mut min_s = active.iter().map(|(_, s)| *s).fold(f64::INFINITY, f64::min);
+        let mut max_s = active
+            .iter()
+            .map(|(_, s)| *s)
+            .fold(f64::NEG_INFINITY, f64::max);
+        if let Some(base) = self.baseline_share {
+            min_s = min_s.min(base);
+            max_s = max_s.max(base);
+        }
+        if max_s - min_s < 0.20 {
+            let mid = (min_s + max_s) / 2.0;
+            let mut lo = mid - 0.10;
+            let mut hi = mid + 0.10;
+            if lo < 0.0 {
+                hi -= lo;
+                lo = 0.0;
+            }
+            if hi > 1.0 {
+                lo -= hi - 1.0;
+                hi = 1.0;
+            }
+            min_s = lo.clamp(0.0, 1.0);
+            max_s = hi.clamp(0.0, 1.0);
+        }
+        min_s = min_s.clamp(0.0, 1.0);
+        max_s = max_s.clamp(0.0, 1.0);
+        let span = (max_s - min_s).max(1e-6);
+        Some((min_s, span))
+    }
+
     /// Compact badge + delta label for the Tree table (for example
     /// `"new +32pp"` or `"rising +14pp"`), or `None` when data is too sparse.
     pub fn compact_label(&self) -> Option<String> {
@@ -1086,5 +1163,132 @@ mod tests {
         assert_eq!(g3_trend.recent_total, 15);
         assert_eq!(g3_trend.baseline_total, 20);
         assert_eq!(g3_trend.badge, Some(TrendBadge::New));
+    }
+
+    #[test]
+    fn sparkline_points_normalize_chronological_quarters_and_handle_sparse_buckets() {
+        // Declining 1. e4 share: dominant in 2023-2024, rare in 2026.
+        let games = build_repeated_pgn(&[
+            ("2023.05.10", "1. e4 e5", 15),
+            ("2024.05.10", "1. e4 e5", 15),
+            ("2024.08.10", "1. d4 d5", 10),
+            ("2026.02.15", "1. e4 e5", 6),
+            ("2026.05.15", "1. d4 d5", 6),
+            ("2026.08.15", "1. c4 c5", 12),
+        ]);
+        let tree = RecentTree::from_games(&games, 20260901, 365);
+        let start = Chess::default();
+        let root = position::position_key(&start);
+        let moves = tree.moves(root);
+        let trend_map = position_trend_map(&moves, TrendConfig::default());
+        let e4_stat = moves
+            .iter()
+            .find(|m| m.san(&start).as_deref() == Some("e4"))
+            .unwrap();
+        let e4_trend = &trend_map[&e4_stat.mv];
+        assert_eq!(e4_trend.badge, Some(TrendBadge::Falling));
+        let pts = e4_trend.sparkline_points();
+        assert!(pts.len() >= 2, "declining trend needs >= 2 points");
+        for (i, (x, y)) in pts.iter().enumerate() {
+            assert!((0.0..=1.0).contains(x), "x in 0..1 (idx {i})");
+            assert!((0.0..=1.0).contains(y), "y in 0..1 (idx {i})");
+            if i > 0 {
+                assert!(pts[i - 1].0 < pts[i].0, "x must increase chronologically");
+            }
+        }
+        assert!(
+            pts.first().unwrap().1 > pts.last().unwrap().1,
+            "declining share: first y ({}) > last y ({})",
+            pts.first().unwrap().1,
+            pts.last().unwrap().1
+        );
+        if let Some(by) = e4_trend.sparkline_baseline_y() {
+            assert!((0.0..=1.0).contains(&by), "baseline y in 0..1");
+        }
+
+        // Flat steady shares stay centered near 0.5.
+        let flat = MoveTrend {
+            mv: 0,
+            recent_games: 10,
+            recent_total: 20,
+            recent_share: Some(0.5),
+            shrunk_recent_share: Some(0.5),
+            baseline_games: 20,
+            baseline_total: 40,
+            baseline_share: Some(0.5),
+            raw_delta_pp: Some(0.0),
+            shrunk_delta_pp: Some(0.0),
+            badge: Some(TrendBadge::Steady),
+            confidence: TrendConfidence::Low,
+            buckets: (0..8)
+                .map(|i| TrendBucket {
+                    quarter: i,
+                    move_games: 5,
+                    position_games: 10,
+                    share: Some(0.5),
+                })
+                .collect(),
+        };
+        let flat_pts = flat.sparkline_points();
+        assert_eq!(flat_pts.len(), 8);
+        for (_, y) in &flat_pts {
+            assert!((y - 0.5).abs() < 0.05, "flat shares map near 0.5, got {y}");
+        }
+
+        // Sparse: badge None or a single active bucket yields empty points.
+        let sparse_none = MoveTrend {
+            mv: 1,
+            recent_games: 2,
+            recent_total: 2,
+            recent_share: Some(1.0),
+            shrunk_recent_share: Some(1.0),
+            baseline_games: 40,
+            baseline_total: 40,
+            baseline_share: Some(0.0),
+            raw_delta_pp: Some(100.0),
+            shrunk_delta_pp: Some(50.0),
+            badge: None,
+            confidence: TrendConfidence::Low,
+            buckets: vec![TrendBucket {
+                quarter: 0,
+                move_games: 2,
+                position_games: 2,
+                share: Some(1.0),
+            }],
+        };
+        assert!(sparse_none.sparkline_points().is_empty());
+        assert_eq!(sparse_none.sparkline_baseline_y(), None);
+        let mut single_buckets = vec![
+            TrendBucket {
+                quarter: 0,
+                move_games: 0,
+                position_games: 0,
+                share: None,
+            };
+            8
+        ];
+        single_buckets[7] = TrendBucket {
+            quarter: 7,
+            move_games: 3,
+            position_games: 5,
+            share: Some(0.6),
+        };
+        let sparse_single = MoveTrend {
+            mv: 2,
+            recent_games: 3,
+            recent_total: 5,
+            recent_share: Some(0.6),
+            shrunk_recent_share: Some(0.6),
+            baseline_games: 10,
+            baseline_total: 20,
+            baseline_share: Some(0.5),
+            raw_delta_pp: Some(10.0),
+            shrunk_delta_pp: Some(10.0),
+            badge: Some(TrendBadge::Steady),
+            confidence: TrendConfidence::Low,
+            buckets: single_buckets,
+        };
+        assert!(sparse_single.sparkline_points().is_empty());
+        assert_eq!(sparse_single.sparkline_baseline_y(), None);
     }
 }

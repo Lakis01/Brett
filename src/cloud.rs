@@ -90,6 +90,58 @@ impl Snapshot {
     pub fn has_any_data(&self) -> bool {
         self.chessdb.is_ok() || self.explorer.is_ok() || self.cloud_eval.is_ok()
     }
+
+    /// True only when every source positively reports "no data here" (as
+    /// opposed to a network error or timeout). Used as the local transposition
+    /// oracle for online tree pruning.
+    pub fn is_verified_empty(&self) -> bool {
+        is_chessdb_empty(&self.chessdb)
+            && is_explorer_empty(&self.explorer)
+            && is_cloud_eval_empty(&self.cloud_eval)
+    }
+
+    /// Placeholder cached for pruned plies: carries the canonical "absent"
+    /// errors so the UI renders "no data" without firing network requests.
+    pub fn pruned(fen: String, explorer_source: ExplorerSource) -> Self {
+        Self {
+            fen,
+            explorer_source,
+            chessdb: Err("chessdb.cn: unknown".to_string()),
+            explorer: Ok(empty_explorer()),
+            cloud_eval: Err("Lichess has no cloud evaluation for this position".to_string()),
+        }
+    }
+}
+
+/// chessdb.cn reports absent positions as `unknown` / `nobestmove` or an
+/// empty move list; anything else (timeouts, HTTP errors) is not verified.
+pub fn is_chessdb_empty(res: &Result<ChessDb, String>) -> bool {
+    match res {
+        Ok(db) => db.moves.is_empty(),
+        Err(err) => {
+            err.starts_with("chessdb.cn: unknown")
+                || err.starts_with("chessdb.cn: nobestmove")
+                || err == "chessdb.cn returned no known moves"
+        }
+    }
+}
+
+/// The explorer is verified empty only when it answered successfully with
+/// zero games and zero moves. Auth errors and timeouts do not count.
+pub fn is_explorer_empty(res: &Result<Explorer, String>) -> bool {
+    match res {
+        Ok(explorer) => explorer.total() == 0 && explorer.moves.is_empty(),
+        Err(_) => false,
+    }
+}
+
+/// Lichess cloud eval is verified empty on HTTP 404 (no cached eval) or an
+/// `Ok` with zero PVs. Query failures do not count.
+pub fn is_cloud_eval_empty(res: &Result<CloudEval, String>) -> bool {
+    match res {
+        Ok(eval) => eval.pvs.is_empty(),
+        Err(err) => err == "Lichess has no cloud evaluation for this position",
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -335,7 +387,7 @@ fn fetch_both_explorers(agent: &ureq::Agent, fen: &str, token: Option<&str>) -> 
     }
 }
 
-fn empty_explorer() -> Explorer {
+pub(crate) fn empty_explorer() -> Explorer {
     Explorer {
         white: 0,
         draws: 0,
@@ -884,5 +936,78 @@ mod tests {
         assert!(!encoded.contains(' '));
         assert!(encoded.contains("%2F"));
         assert!(encoded.contains("%20"));
+    }
+
+    #[test]
+    fn verified_empty_distinguishes_absent_positions_from_network_errors() {
+        let empty = empty_explorer();
+        assert!(is_explorer_empty(&Ok(empty.clone())));
+        assert!(!is_explorer_empty(&Err("boom".to_string())));
+        let with_games = Explorer {
+            moves: vec![ExplorerMove {
+                uci: "e2e4".to_string(),
+                san: "e4".to_string(),
+                white: 1,
+                draws: 0,
+                black: 0,
+                average_rating: None,
+            }],
+            ..empty.clone()
+        };
+        assert!(!is_explorer_empty(&Ok(with_games)));
+
+        assert!(is_chessdb_empty(&Ok(ChessDb { moves: vec![] })));
+        assert!(is_chessdb_empty(&Err("chessdb.cn: unknown".to_string())));
+        assert!(is_chessdb_empty(&Err("chessdb.cn: nobestmove".to_string())));
+        assert!(is_chessdb_empty(&Err(
+            "chessdb.cn returned no known moves".to_string()
+        )));
+        assert!(!is_chessdb_empty(&Err("requesting https://x".to_string())));
+        assert!(!is_chessdb_empty(&Ok(ChessDb {
+            moves: vec![ChessDbMove {
+                uci: "e2e4".to_string(),
+                score: 10,
+                rank: 2,
+                note: String::new(),
+                winrate: 50.0,
+            }],
+        })));
+
+        assert!(is_cloud_eval_empty(&Ok(CloudEval {
+            depth: 0,
+            knodes: 0,
+            pvs: vec![],
+        })));
+        assert!(is_cloud_eval_empty(&Err(
+            "Lichess has no cloud evaluation for this position".to_string()
+        )));
+        assert!(!is_cloud_eval_empty(&Err(
+            "querying the Lichess cloud evaluation".to_string()
+        )));
+        assert!(!is_cloud_eval_empty(&Ok(CloudEval {
+            depth: 70,
+            knodes: 1,
+            pvs: vec![CloudPv {
+                moves: "e2e4".to_string(),
+                cp: Some(20),
+                mate: None,
+            }],
+        })));
+
+        let pruned = Snapshot::pruned("fen".to_string(), ExplorerSource::Masters);
+        assert!(pruned.is_verified_empty());
+        let with_data = Snapshot {
+            cloud_eval: Ok(CloudEval {
+                depth: 70,
+                knodes: 1,
+                pvs: vec![CloudPv {
+                    moves: "e2e4".to_string(),
+                    cp: Some(20),
+                    mate: None,
+                }],
+            }),
+            ..pruned
+        };
+        assert!(!with_data.is_verified_empty());
     }
 }

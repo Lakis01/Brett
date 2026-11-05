@@ -19,6 +19,7 @@ use crate::cbh::CbhLibrary;
 use crate::champions;
 use crate::cloud;
 use crate::country::{self, Country};
+use crate::crosstable::{self, Crosstable};
 use crate::domain::{self, Clock, Game, Shape, Token};
 use crate::engine::{EngineEvent, EngineHandle, EngineInfo, EngineOptions, Score, SearchLimit};
 use crate::eval::{self, BoardEval};
@@ -713,6 +714,9 @@ pub struct App {
     node: usize,
     orientation: Color,
     show_clocks: bool,
+    crosstable_open: bool,
+    active_crosstable: Option<Crosstable>,
+    tournament_browser_open: bool,
     selected: Option<Square>,
     targets: Vec<Square>,
     drag_from: Option<Square>,
@@ -1067,6 +1071,9 @@ impl App {
             node: 0,
             orientation: Color::White,
             show_clocks: display_prefs.show_clocks,
+            crosstable_open: false,
+            active_crosstable: None,
+            tournament_browser_open: false,
             selected: None,
             targets: Vec::new(),
             drag_from: None,
@@ -6432,6 +6439,117 @@ impl App {
         self.explorer_rx = Some(rx);
     }
 
+    /// FEN of an arbitrary game-tree node with legal en passant.
+    fn node_fen(&self, node: usize) -> Option<String> {
+        let game = self.current.as_ref()?;
+        let pos = &game.nodes.get(node)?.pos;
+        Some(Fen::from_position(pos, EnPassantMode::Legal).to_string())
+    }
+
+    /// True when any local source has data for `pos`: the native opening
+    /// book, the current/tree/correspondence indices, the reference index,
+    /// or the on-disk engine-analysis cache. A local hit vetoes online
+    /// tree pruning so genuinely analysed positions are always refreshed.
+    fn has_local_position_hit(&self, pos: &Chess) -> bool {
+        if self
+            .book
+            .as_ref()
+            .is_some_and(|book| book.moves(pos).is_ok_and(|moves| !moves.is_empty()))
+        {
+            return true;
+        }
+        let key = position::position_key(pos);
+        let index_hit = |index: Option<&PositionIndex>| {
+            index.is_some_and(|index| {
+                index.stats(key).is_some_and(|stats| stats.games > 0)
+                    || !index.moves(key).is_empty()
+            })
+        };
+        if index_hit(self.index.as_ref())
+            || index_hit(self.tree_index.as_ref())
+            || index_hit(self.correspondence.as_ref())
+        {
+            return true;
+        }
+        if self.reference.as_ref().is_some_and(|reference| {
+            reference
+                .index
+                .stats(key)
+                .is_some_and(|stats| stats.games > 0)
+                || !reference.index.moves(key).is_empty()
+        }) {
+            return true;
+        }
+        let hash = pos.position_hash();
+        if self.cached_analyses_pos == Some(hash) {
+            return !self.cached_analyses.is_empty();
+        }
+        self.analysis_cache
+            .as_ref()
+            .is_some_and(|cache| !cache.query_position(hash).is_empty())
+    }
+
+    /// Consecutive ancestors (up to 2) of `node` whose cached snapshot is
+    /// verified empty. A streak of 2 means the line has died online and the
+    /// current ply can be pruned unless a local source disagrees.
+    fn ancestor_cloud_empty_streak(&self, node: usize) -> usize {
+        let Some(game) = self.current.as_ref() else {
+            return 0;
+        };
+        let mut streak = 0;
+        let mut cursor = game.nodes.get(node).and_then(|n| n.parent);
+        for _ in 0..2 {
+            let Some(parent) = cursor else {
+                break;
+            };
+            let Some(fen) = self.node_fen(parent) else {
+                break;
+            };
+            let empty = self
+                .cloud_cache
+                .get(&(self.explorer_source, fen))
+                .is_some_and(|snapshot| snapshot.is_verified_empty());
+            if !empty {
+                break;
+            }
+            streak += 1;
+            cursor = game.nodes.get(parent).and_then(|n| n.parent);
+        }
+        streak
+    }
+
+    /// Bar-eval analogue: ancestors with a verified-absent cloud eval, either
+    /// a cached `None` bar result or a full snapshot whose cloud-eval half is
+    /// verified empty.
+    fn ancestor_bar_cloud_empty_streak(&self, node: usize) -> usize {
+        let Some(game) = self.current.as_ref() else {
+            return 0;
+        };
+        let mut streak = 0;
+        let mut cursor = game.nodes.get(node).and_then(|n| n.parent);
+        for _ in 0..2 {
+            let Some(parent) = cursor else {
+                break;
+            };
+            let Some(fen) = self.node_fen(parent) else {
+                break;
+            };
+            let empty = self
+                .bar_cloud_cache
+                .get(&fen)
+                .is_some_and(|cached| cached.is_none())
+                || self.cloud_cache.values().any(|snapshot| {
+                    snapshot.fen == fen && cloud::is_cloud_eval_empty(&snapshot.cloud_eval)
+                });
+            if !empty {
+                break;
+            }
+            streak += 1;
+            cursor = game.nodes.get(parent).and_then(|n| n.parent);
+        }
+        streak
+    }
+
     /// Query the external references for the current position. Queries are
     /// delayed briefly so holding an arrow key does not fire a request for
     /// every intermediate position.
@@ -6470,6 +6588,22 @@ impl App {
         if let Some(snapshot) = self.cloud_cache.get(&cache_key).cloned() {
             self.cloud = Some(snapshot);
             self.cloud_status = "References loaded from cache.".to_string();
+            self.cloud_pending = None;
+            return;
+        }
+        // Online tree pruning: when the two preceding plies are verified
+        // empty online and no local source knows this position, skip the
+        // network query and cache a pruned placeholder instead.
+        if self.ancestor_cloud_empty_streak(self.node) >= 2
+            && let Some(pos) = self.current_position()
+            && !self.has_local_position_hit(&pos)
+        {
+            let pruned = cloud::Snapshot::pruned(fen.clone(), self.explorer_source);
+            self.cloud_cache.insert(cache_key, pruned.clone());
+            self.cloud = Some(pruned);
+            self.cloud_status =
+                "Skipped online query (0 hits on preceding plies · press Refresh to query)."
+                    .to_string();
             self.cloud_pending = None;
             return;
         }
@@ -6531,12 +6665,16 @@ impl App {
         match rx.try_recv() {
             Ok(BarCloudMessage { fen, result }) => {
                 self.bar_cloud_job = None;
-                let cached = result.unwrap_or(None);
-                self.bar_cloud_cache.insert(fen, cached);
-                if self.bar_cloud_cache.len() > 256
-                    && let Some(key) = self.bar_cloud_cache.keys().next().cloned()
-                {
-                    self.bar_cloud_cache.remove(&key);
+                // Only cache successful lookups: an `Err` is a network
+                // failure, not proof the position is absent, and must not
+                // feed the pruning oracle.
+                if let Ok(cached) = result {
+                    self.bar_cloud_cache.insert(fen, cached);
+                    if self.bar_cloud_cache.len() > 256
+                        && let Some(key) = self.bar_cloud_cache.keys().next().cloned()
+                    {
+                        self.bar_cloud_cache.remove(&key);
+                    }
                 }
             }
             Err(TryRecvError::Empty) => {
@@ -6567,6 +6705,16 @@ impl App {
             return;
         }
         if self.bar_cloud_rx.is_some() {
+            return;
+        }
+        // Bar-eval pruning mirrors the references pruning: two verified-absent
+        // ancestors and no local hit means the eval query is skipped.
+        if self.ancestor_bar_cloud_empty_streak(self.node) >= 2
+            && let Some(pos) = self.current_position()
+            && !self.has_local_position_hit(&pos)
+        {
+            self.bar_cloud_cache.insert(fen, None);
+            self.bar_cloud_pending = None;
             return;
         }
         let now = Instant::now();
@@ -6777,6 +6925,334 @@ impl App {
 
     fn has_unsaved_changes(&self) -> bool {
         self.dirty || self.session_dirty
+    }
+
+    /// Collect the session games matching the current game's
+    /// (Event, Site, year) and open them as a crosstable.
+    fn open_crosstable_for_current_game(&mut self) {
+        let Some(game) = self.current.as_ref() else {
+            self.status = "No game is open.".to_string();
+            return;
+        };
+        let event = game.event().trim().to_string();
+        let site = game.header("Site").map(str::trim).unwrap_or("").to_string();
+        let year = year_of_date(game.date());
+        if event.is_empty() || event == "?" {
+            self.status = "The current game has no Event tag.".to_string();
+            return;
+        }
+        let mut games = Vec::new();
+        for slot in self.session.slots() {
+            let slot_event = slot.event().trim();
+            let slot_site = slot.header("Site").unwrap_or("?").trim();
+            if slot_event != event || slot_site != site {
+                continue;
+            }
+            if year_of_date(slot.date()) != year {
+                continue;
+            }
+            games.push(crosstable::TournamentGame {
+                game_index: slot.id,
+                white: slot.white().to_string(),
+                black: slot.black().to_string(),
+                white_title: None,
+                black_title: None,
+                white_elo: elo_of(slot.header("WhiteElo")),
+                black_elo: elo_of(slot.header("BlackElo")),
+                result: slot.result().to_string(),
+                round: slot.header("Round").unwrap_or("?").to_string(),
+                date: slot.date().to_string(),
+            });
+        }
+        if games.is_empty() {
+            self.status = format!("No other games found for event {event}.");
+            return;
+        }
+        games.sort_by(|a, b| {
+            a.date
+                .cmp(&b.date)
+                .then_with(|| a.round.cmp(&b.round))
+                .then_with(|| a.game_index.cmp(&b.game_index))
+        });
+        let table = crosstable::build_crosstable(&event, &site, year, &games);
+        let count = table.games;
+        self.active_crosstable = Some(table);
+        self.crosstable_open = true;
+        self.status = format!("Crosstable for {event}: {count} games.");
+    }
+
+    /// Build one [`crosstable::TournamentGame`] for a source game index,
+    /// resolving the click-through target to the matching session slot id.
+    fn tournament_game_for_source_index(
+        &self,
+        library: &Arc<dyn GameLibrary>,
+        index: usize,
+    ) -> Option<crosstable::TournamentGame> {
+        let slot_id = self.session.source_slot(index)?;
+        let slot = self.session.slot(slot_id)?;
+        let headers = library.game_headers(index);
+        let header = |key: &str| {
+            headers
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(key))
+                .map(|(_, value)| value.to_string())
+        };
+        let (white, black) = library.game_players(index);
+        Some(crosstable::TournamentGame {
+            game_index: slot_id,
+            white,
+            black,
+            white_title: None,
+            black_title: None,
+            white_elo: header("WhiteElo").as_deref().and_then(parse_elo),
+            black_elo: header("BlackElo").as_deref().and_then(parse_elo),
+            result: header("Result").unwrap_or_else(|| slot.result().to_string()),
+            round: header("Round").unwrap_or_else(|| "?".to_string()),
+            date: header("Date").unwrap_or_else(|| slot.date().to_string()),
+        })
+    }
+
+    /// Open the crosstable for one tournament-index entry, resolving its
+    /// one-based game slots (filtered by [`GameLibrary::is_game_record`]) to
+    /// session games.
+    fn open_crosstable_for_entry(
+        &mut self,
+        entry: &crate::twocbh::tournaments::MegaTournamentEntry,
+    ) {
+        let Some(library) = self.library.clone() else {
+            self.status = "No database is open.".to_string();
+            return;
+        };
+        let mut games = Vec::new();
+        for &record_id in &entry.game_slots {
+            if !library.is_game_record(record_id) {
+                continue;
+            }
+            let Some(index) = library.source_index_for_record(record_id) else {
+                continue;
+            };
+            if let Some(game) = self.tournament_game_for_source_index(&library, index) {
+                games.push(game);
+            }
+        }
+        if games.is_empty() {
+            self.status = format!("No games of {} are in the game list.", entry.title);
+            return;
+        }
+        let event = entry.event.clone().unwrap_or_else(|| entry.title.clone());
+        let site = entry.site.clone().unwrap_or_default();
+        let table = crosstable::build_crosstable(&event, &site, entry.year, &games);
+        let count = table.games;
+        self.active_crosstable = Some(table);
+        self.crosstable_open = true;
+        self.status = format!("Crosstable for {}: {count} games.", entry.title);
+    }
+
+    fn crosstable_window(&mut self, ctx: &egui::Context) {
+        if !self.crosstable_open {
+            return;
+        }
+        let mut open = true;
+        let mut select = None;
+        let table = self.active_crosstable.clone();
+        egui::Window::new("Tournament crosstable")
+            .open(&mut open)
+            .collapsible(false)
+            .show(ctx, |ui| {
+                let Some(table) = table else {
+                    ui.label("No crosstable is open.");
+                    return;
+                };
+                ui.label(
+                    RichText::new(crosstable_summary(&table))
+                        .small()
+                        .strong()
+                        .color(GOLD),
+                );
+                ui.add_space(4.0);
+                match &table.kind {
+                    crosstable::CrosstableKind::Match(match_table) => {
+                        for entry in &match_table.entries {
+                            ui.horizontal(|ui| {
+                                ui.label(format!(
+                                    "R{} · {} – {}",
+                                    entry.round, entry.white, entry.black
+                                ));
+                                if ui
+                                    .small_button(&entry.result)
+                                    .on_hover_text(format!("Open game on {}", entry.date))
+                                    .clicked()
+                                {
+                                    select = Some(entry.game_index);
+                                }
+                            });
+                        }
+                    }
+                    crosstable::CrosstableKind::RoundRobin(round_robin) => {
+                        egui::Grid::new("crosstable-grid")
+                            .striped(true)
+                            .spacing([6.0, 4.0])
+                            .show(ui, |ui| {
+                                ui.label("");
+                                for player in &round_robin.players {
+                                    ui.label(RichText::new(player).small().strong());
+                                }
+                                ui.label("Pts");
+                                ui.end_row();
+                                for (row, player) in round_robin.players.iter().enumerate() {
+                                    ui.label(RichText::new(player).small().strong());
+                                    for col in 0..round_robin.players.len() {
+                                        if row == col {
+                                            ui.label("■");
+                                            continue;
+                                        }
+                                        let cells = &round_robin.matrix[row][col];
+                                        if cells.is_empty() {
+                                            ui.label(RichText::new("·").weak());
+                                            continue;
+                                        }
+                                        ui.horizontal(|ui| {
+                                            ui.spacing_mut().item_spacing.x = 2.0;
+                                            for cell in cells {
+                                                let label = match cell.half_points {
+                                                    2 => "1",
+                                                    1 => "½",
+                                                    _ => "0",
+                                                };
+                                                let color = if cell.is_white { "w" } else { "b" };
+                                                if ui
+                                                    .small_button(format!("{label}{color}"))
+                                                    .on_hover_text(format!(
+                                                        "{} vs {} · Round {}",
+                                                        round_robin.players[row],
+                                                        round_robin.players[col],
+                                                        cell.round
+                                                    ))
+                                                    .clicked()
+                                                {
+                                                    select = Some(cell.game_index);
+                                                }
+                                            }
+                                        });
+                                    }
+                                    ui.label(format!("{:.1}", round_robin.points[row]));
+                                    ui.end_row();
+                                }
+                            });
+                    }
+                    crosstable::CrosstableKind::Swiss(swiss) => {
+                        egui::Grid::new("crosstable-swiss")
+                            .striped(true)
+                            .spacing([6.0, 4.0])
+                            .show(ui, |ui| {
+                                ui.label(RichText::new("#").small().strong());
+                                ui.label(RichText::new("Player").small().strong());
+                                ui.label(RichText::new("Elo").small().strong());
+                                ui.label(RichText::new("+=").small().strong());
+                                ui.label(RichText::new("Pts").small().strong());
+                                ui.end_row();
+                                for (rank, row) in swiss.rows.iter().enumerate() {
+                                    ui.label(format!("{}", rank + 1));
+                                    ui.label(row.player.clone());
+                                    ui.label(
+                                        row.elo
+                                            .map(|elo| elo.to_string())
+                                            .unwrap_or_else(|| "—".to_string()),
+                                    );
+                                    ui.label(format!(
+                                        "+{} ={} -{}",
+                                        row.wins, row.draws, row.losses
+                                    ));
+                                    ui.label(format!("{:.1}", row.points));
+                                    ui.end_row();
+                                }
+                            });
+                    }
+                }
+            });
+        self.crosstable_open = open;
+        if let Some(id) = select {
+            self.select_slot(id);
+        }
+    }
+
+    fn tournament_browser_window(&mut self, ctx: &egui::Context) {
+        if !self.tournament_browser_open {
+            return;
+        }
+        let categories = self
+            .library
+            .as_ref()
+            .and_then(|library| library.tournament_categories())
+            .unwrap_or_default();
+        let mut open = true;
+        let mut crosstable_entry = None;
+        let mut filter_event = None;
+        egui::Window::new("🏆 Tournaments")
+            .open(&mut open)
+            .collapsible(false)
+            .show(ctx, |ui| {
+                if categories.is_empty() {
+                    ui.label("This database has no tournament index.");
+                    return;
+                }
+                egui::ScrollArea::vertical()
+                    .id_salt("tournament-browser")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        for category in &categories {
+                            ui.collapsing(
+                                format!("{} ({})", category.name, category.entries.len()),
+                                |ui| {
+                                    for entry in &category.entries {
+                                        ui.horizontal_wrapped(|ui| {
+                                            ui.label(RichText::new(&entry.title).strong());
+                                            if let Some(year) = entry.year {
+                                                ui.label(
+                                                    RichText::new(format!("{year}")).weak().small(),
+                                                );
+                                            }
+                                            ui.label(
+                                                RichText::new(format!(
+                                                    "{} games",
+                                                    entry.game_slots.len()
+                                                ))
+                                                .weak()
+                                                .small(),
+                                            );
+                                        });
+                                        ui.horizontal(|ui| {
+                                            if ui.small_button("Cross table").clicked() {
+                                                crosstable_entry = Some(entry.clone());
+                                            }
+                                            if ui
+                                                .small_button("Games")
+                                                .on_hover_text("Filter the game list to this event")
+                                                .clicked()
+                                            {
+                                                filter_event = Some(
+                                                    entry
+                                                        .event
+                                                        .clone()
+                                                        .unwrap_or_else(|| entry.title.clone()),
+                                                );
+                                            }
+                                        });
+                                        ui.separator();
+                                    }
+                                },
+                            );
+                        }
+                    });
+            });
+        self.tournament_browser_open = open;
+        if let Some(entry) = crosstable_entry {
+            self.open_crosstable_for_entry(&entry);
+        }
+        if let Some(event) = filter_event {
+            self.filter = event;
+            self.left_tab = LeftTab::Games;
+        }
     }
 
     /// Intercept a window-close request. Modified databases ask first; a
@@ -7700,6 +8176,17 @@ impl App {
                             LeftTab::Players => self.players.len().to_string(),
                         };
                         ui.label(RichText::new(count).weak());
+                        if self.library.as_ref().is_some_and(|library| {
+                            library
+                                .tournament_categories()
+                                .is_some_and(|categories| !categories.is_empty())
+                        }) && ui
+                            .small_button("🏆")
+                            .on_hover_text("Browse the tournament index")
+                            .clicked()
+                        {
+                            self.tournament_browser_open = true;
+                        }
                         if ui
                             .small_button("Views")
                             .on_hover_text("Open additional databases side by side")
@@ -10074,6 +10561,7 @@ impl App {
         let mut date_clicked: Option<egui::Pos2> = None;
         let mut hover_preview = None;
         let mut diagram_toggle = None;
+        let mut crosstable_clicked = false;
 
         game_header_card(
             ui,
@@ -10100,6 +10588,7 @@ impl App {
                     &self.forced_tag_visibility,
                     &mut date_clicked,
                     &mut self.classify_openings_open,
+                    &mut crosstable_clicked,
                 );
             });
             tags_ui.response.context_menu(|ui| {
@@ -10134,6 +10623,13 @@ impl App {
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         result_badge(ui, game.result());
+                        if ui
+                            .small_button("📊")
+                            .on_hover_text("Open tournament crosstable for this event")
+                            .clicked()
+                        {
+                            crosstable_clicked = true;
+                        }
                         if ui
                             .small_button("Annotate")
                             .on_hover_text("Edit the selected move")
@@ -10194,6 +10690,10 @@ impl App {
 
         if let Some(node) = diagram_toggle {
             toggle_diagram(&mut self.print_diagrams, node);
+        }
+
+        if crosstable_clicked {
+            self.open_crosstable_for_current_game();
         }
 
         let editing = editor.is_some();
@@ -13468,6 +13968,8 @@ impl eframe::App for App {
 
         self.about(&ctx);
         self.cache_info_dialog(&ctx);
+        self.crosstable_window(&ctx);
+        self.tournament_browser_window(&ctx);
         self.photo_viewer_window(&ctx);
         self.settings_dialog(&ctx);
         self.online_dialog(&ctx);
@@ -14198,6 +14700,7 @@ fn game_tags_card(
     forced_tags: &HashSet<String>,
     date_clicked: &mut Option<egui::Pos2>,
     classify_clicked: &mut bool,
+    crosstable_clicked: &mut bool,
 ) {
     let show_empty_now = *show_empty;
     let board_present = game
@@ -14295,6 +14798,13 @@ fn game_tags_card(
                 ui.columns(2, |columns| {
                     if event_visible {
                         compact_text_tag(&mut columns[0], game, "Event", tag_update, tag_add);
+                        if columns[0]
+                            .small_button("📊 Crosstable")
+                            .on_hover_text("Open tournament crosstable for this event")
+                            .clicked()
+                        {
+                            *crosstable_clicked = true;
+                        }
                     }
                     if site_visible {
                         compact_text_tag(&mut columns[1], game, "Site", tag_update, tag_add);
@@ -15003,6 +15513,49 @@ fn copy_to_clipboard(ctx: &egui::Context, text: &str) {
 
 /// Header card above the PGN move list. Date sits on the left, the tournament
 /// is centered, and the result stays on the right.
+/// Header line for the crosstable window: event, site, year, game count,
+// average Elo and FIDE category.
+fn crosstable_summary(table: &Crosstable) -> String {
+    let year = table
+        .year
+        .map(|year| year.to_string())
+        .unwrap_or_else(|| "????".to_string());
+    let elo = table
+        .average_elo
+        .map(|elo| elo.to_string())
+        .unwrap_or_else(|| "—".to_string());
+    let category = table
+        .category
+        .map(|category| category.to_string())
+        .unwrap_or_else(|| "—".to_string());
+    format!(
+        "{} · {} · {} · {} · Avg Elo {} · Cat. {}",
+        table.event,
+        table.site,
+        year,
+        games_label(table.games),
+        elo,
+        category
+    )
+}
+
+/// Calendar year of a `YYYY.MM.DD` tag, if the year part parses.
+fn year_of_date(date: &str) -> Option<u32> {
+    date.split('.').next()?.trim().parse::<u32>().ok()
+}
+
+fn parse_elo(text: &str) -> Option<u32> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    trimmed.parse::<u32>().ok().filter(|elo| *elo > 0)
+}
+
+fn elo_of(header: Option<&str>) -> Option<u32> {
+    header.and_then(parse_elo)
+}
+
 fn game_header_card(
     ui: &mut Ui,
     game: &Game,
@@ -17687,6 +18240,59 @@ fn wdl_bar(ui: &mut Ui, stats: &PositionStats) {
     ));
 }
 
+/// Badge color for the opening-tree Trend column and its sparkline.
+fn trend_badge_color(badge: crate::recent::TrendBadge) -> Color32 {
+    match badge {
+        crate::recent::TrendBadge::New | crate::recent::TrendBadge::Rising => {
+            Color32::from_rgb(0x7E, 0xD3, 0x8A)
+        }
+        crate::recent::TrendBadge::Revival => GOLD,
+        crate::recent::TrendBadge::Steady => Color32::from_gray(165),
+        crate::recent::TrendBadge::Falling => Color32::from_rgb(0xE0, 0x6C, 0x6C),
+    }
+}
+
+/// 44x14 px miniature popularity curve for one move's quarterly shares.
+/// Normalized points come from [`crate::recent::MoveTrend::sparkline_points`]
+/// (`y` higher means higher share); the baseline level, when known, is drawn
+/// as a faint horizontal line.
+fn draw_trend_sparkline(
+    ui: &mut Ui,
+    trend: &crate::recent::MoveTrend,
+    color: Color32,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(vec2(44.0, 14.0), Sense::hover());
+    let points = trend.sparkline_points();
+    if points.is_empty() {
+        return response;
+    }
+    let painter = ui.painter_at(rect);
+    if let Some(base_y) = trend.sparkline_baseline_y() {
+        let y = rect.max.y - base_y.clamp(0.0, 1.0) * rect.height();
+        painter.line_segment(
+            [pos2(rect.min.x, y), pos2(rect.max.x, y)],
+            Stroke::new(1.0, Color32::from_gray(90)),
+        );
+    }
+    let screen_pts: Vec<egui::Pos2> = points
+        .iter()
+        .map(|(x, y)| {
+            pos2(
+                rect.min.x + x.clamp(0.0, 1.0) * rect.width(),
+                rect.max.y - y.clamp(0.0, 1.0) * rect.height(),
+            )
+        })
+        .collect();
+    painter.add(egui::Shape::line(
+        screen_pts.clone(),
+        Stroke::new(1.4, color),
+    ));
+    if let Some(&last) = screen_pts.last() {
+        painter.circle_filled(last, 2.0, color);
+    }
+    response
+}
+
 /// Normal opening-tree summary and table for one position. Kept free of
 /// scrolling so preparation mode can place it inside its own scroll area.
 fn opening_tree_table(
@@ -17792,8 +18398,15 @@ fn opening_tree_table(
                 {
                     Some(label) => {
                         let trend = trend_by_move.get(&stat.mv).expect("trend map entry");
-                        ui.label(RichText::new(label).small())
-                            .on_hover_text(trend.tooltip(trends));
+                        let color = trend_badge_color(
+                            trend.badge.unwrap_or(crate::recent::TrendBadge::Steady),
+                        );
+                        ui.horizontal(|ui| {
+                            draw_trend_sparkline(ui, trend, color)
+                                .on_hover_text(trend.tooltip(trends));
+                            ui.label(RichText::new(label).small().color(color))
+                                .on_hover_text(trend.tooltip(trends));
+                        });
                     }
                     None => {
                         ui.label(RichText::new("—").weak()).on_hover_text(
@@ -18809,6 +19422,9 @@ mod tests {
             node: 0,
             orientation: Color::White,
             show_clocks: true,
+            crosstable_open: false,
+            active_crosstable: None,
+            tournament_browser_open: false,
             selected: None,
             targets: Vec::new(),
             drag_from: None,
@@ -20134,6 +20750,155 @@ mod tests {
         let missing = cloud_test_row(None, None);
         assert_eq!(cloud_average_cp(&missing), None);
         assert_eq!(cloud_row_score(&missing), None);
+    }
+
+    #[test]
+    fn cloud_pruning_requires_two_verified_empty_ancestors_and_respects_jump_and_local_oracle() {
+        use crate::analysis_cache::{CachedAnalysis, EngineFamily};
+
+        let mut app = test_app();
+        app.right_tab = RightTab::References;
+        let node_count = app.current.as_ref().unwrap().nodes.len();
+        assert!(node_count >= 4);
+        let source = app.explorer_source;
+        let fen0 = app.node_fen(0).unwrap();
+        let fen1 = app.node_fen(1).unwrap();
+        let fen2 = app.node_fen(2).unwrap();
+        let fen3 = app.node_fen(3).unwrap();
+        assert!(app.cloud_cache.is_empty());
+
+        // A single verified-empty ancestor is not enough: the query proceeds
+        // through the normal delayed path without touching the network yet.
+        app.cloud_cache.insert(
+            (source, fen1.clone()),
+            cloud::Snapshot::pruned(fen1.clone(), source),
+        );
+        app.goto(2);
+        assert_eq!(app.ancestor_cloud_empty_streak(2), 1);
+        app.maybe_request_cloud();
+        assert!(app.cloud.is_none(), "one empty ancestor must not prune");
+        assert!(app.cloud_pending.is_some());
+        assert!(!app.cloud_cache.contains_key(&(source, fen2.clone())));
+        assert!(app.cloud_rx.is_none());
+
+        // A network error (not a verified absence) breaks the streak even
+        // when an older ancestor is verified empty.
+        app.cloud_cache.insert(
+            (source, fen0.clone()),
+            cloud::Snapshot::pruned(fen0.clone(), source),
+        );
+        assert_eq!(app.ancestor_cloud_empty_streak(2), 2);
+
+        // A network error (not a verified absence) breaks the streak even
+        // when an older ancestor is verified empty.
+        let error_snapshot = cloud::Snapshot {
+            fen: fen1.clone(),
+            explorer_source: source,
+            chessdb: Err("requesting https://www.chessdb.cn timed out".to_string()),
+            explorer: Err("timed out".to_string()),
+            cloud_eval: Err("timed out".to_string()),
+        };
+        assert!(!error_snapshot.is_verified_empty());
+        app.cloud_cache
+            .insert((source, fen1.clone()), error_snapshot);
+        app.cloud_pending = None;
+        app.maybe_request_cloud();
+        assert_eq!(app.ancestor_cloud_empty_streak(2), 0);
+        assert!(app.cloud.is_none(), "errors must not feed the oracle");
+        assert!(app.cloud_pending.is_some());
+
+        // Two verified-empty ancestors prune the query and cache the placeholder.
+        app.cloud_cache.insert(
+            (source, fen1.clone()),
+            cloud::Snapshot::pruned(fen1.clone(), source),
+        );
+        assert_eq!(app.ancestor_cloud_empty_streak(2), 2);
+        app.cloud_pending = None;
+        app.maybe_request_cloud();
+        assert!(app.cloud_pending.is_none());
+        assert!(app.cloud_rx.is_none());
+        let pruned = app.cloud.as_ref().expect("pruned placeholder shown");
+        assert_eq!(pruned.fen, fen2);
+        assert!(pruned.is_verified_empty());
+        assert!(
+            app.cloud_cache
+                .get(&(source, fen2.clone()))
+                .is_some_and(|snapshot| snapshot.is_verified_empty())
+        );
+        assert_eq!(
+            app.cloud_status,
+            "Skipped online query (0 hits on preceding plies · press Refresh to query)."
+        );
+
+        // Jumping elsewhere recomputes the streak from the new cursor: with
+        // node 2's entry evicted, node 3 has no verified-empty ancestors
+        // nearby, so its query proceeds normally.
+        app.cloud_cache.remove(&(source, fen2.clone()));
+        app.goto(3);
+        assert_eq!(app.ancestor_cloud_empty_streak(3), 0);
+        app.maybe_request_cloud();
+        assert!(app.cloud_pending.is_some(), "jump must reset the streak");
+        assert!(!app.cloud_cache.contains_key(&(source, fen3.clone())));
+        assert!(app.cloud_rx.is_none());
+
+        // A local oracle hit vetoes pruning even with a full empty streak.
+        app.cloud_cache.remove(&(source, fen2.clone()));
+        app.cloud = None;
+        app.cloud_pending = None;
+        app.goto(2);
+        assert_eq!(app.ancestor_cloud_empty_streak(2), 2);
+        let pos2 = app.current_position().unwrap();
+        let hash2 = pos2.position_hash();
+        app.cached_analyses = vec![CachedAnalysis {
+            pos_hash: hash2,
+            fen: fen2.clone(),
+            engine_family: EngineFamily::Stockfish,
+            engine_name: "Stockfish 17".to_string(),
+            multipv: 1,
+            depth: 28,
+            seldepth: None,
+            score_cp: Some(30),
+            score_mate: None,
+            nodes: None,
+            time_ms: None,
+            nps: None,
+            pv: vec!["e2e4".to_string()],
+            quality_score: 1.0,
+            analyzed_at: 0,
+        }];
+        app.cached_analyses_pos = Some(hash2);
+        assert!(app.has_local_position_hit(&pos2));
+        app.maybe_request_cloud();
+        assert!(app.cloud.is_none(), "local hit must veto pruning");
+        assert!(app.cloud_pending.is_some());
+        assert!(!app.cloud_cache.contains_key(&(source, fen2.clone())));
+
+        // The bar-eval oracle prunes on the same two-streak rule.
+        app.cached_analyses.clear();
+        app.cached_analyses_pos = None;
+        app.cloud = None;
+        app.cloud_pending = None;
+        // Keep the full-snapshot path out of the way for this node.
+        app.cloud_cache.remove(&(source, fen2.clone()));
+        app.cloud_cache.remove(&(source, fen3.clone()));
+        app.bar_cloud_cache.insert(fen1.clone(), None);
+        app.bar_cloud_cache.insert(fen2.clone(), None);
+        app.goto(3);
+        assert_eq!(app.ancestor_bar_cloud_empty_streak(3), 2);
+        app.maybe_request_bar_cloud();
+        assert!(app.bar_cloud_pending.is_none());
+        assert!(app.bar_cloud_rx.is_none());
+        assert_eq!(app.bar_cloud_cache.get(&fen3), Some(&None));
+
+        // And a single bar ancestor is not enough.
+        app.bar_cloud_cache.remove(&fen3);
+        app.bar_cloud_cache.remove(&fen2);
+        app.bar_cloud_pending = None;
+        assert_eq!(app.ancestor_bar_cloud_empty_streak(3), 0);
+        app.maybe_request_bar_cloud();
+        assert!(app.bar_cloud_pending.is_some());
+        assert!(!app.bar_cloud_cache.contains_key(&fen3));
+        assert!(app.bar_cloud_rx.is_none());
     }
 
     #[test]
