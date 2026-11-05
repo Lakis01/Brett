@@ -270,6 +270,37 @@ impl EnginePrefs {
     }
 }
 
+/// Which preparation panel is shown in the Player tree.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PrepMode {
+    Classic,
+    #[default]
+    Smart,
+}
+
+impl PrepMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Classic => "Classic Stats",
+            Self::Smart => "Smart Predictor",
+        }
+    }
+
+    pub fn config_value(self) -> &'static str {
+        match self {
+            Self::Classic => "classic",
+            Self::Smart => "smart",
+        }
+    }
+
+    pub fn from_config(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "classic" => Self::Classic,
+            _ => Self::Smart,
+        }
+    }
+}
+
 /// Reference-database settings for preparation. These live in a separate file
 /// so a player database never needs to know about the reference corpus.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -300,6 +331,14 @@ pub struct PreparationPrefs {
     pub exclude_chesscom: bool,
     /// Whether the prompt to download the correspondence reference has been dismissed.
     pub correspondence_download_dismissed: bool,
+    /// Whether online games are included in Smart preparation by default.
+    /// The toggle is instant (no refetch); this only stores the default.
+    pub prep_include_online: bool,
+    /// Default preparation panel mode.
+    pub prep_mode: PrepMode,
+    /// Online accounts per prepared player, keyed by canonical player key.
+    pub prep_online_accounts:
+        std::collections::HashMap<String, Vec<crate::players::PrepOnlineAccount>>,
 }
 
 impl Default for PreparationPrefs {
@@ -314,6 +353,9 @@ impl Default for PreparationPrefs {
             prep_player_names: Vec::new(),
             exclude_chesscom: false,
             correspondence_download_dismissed: false,
+            prep_include_online: true,
+            prep_mode: PrepMode::default(),
+            prep_online_accounts: std::collections::HashMap::new(),
         }
     }
 }
@@ -373,6 +415,36 @@ impl PreparationPrefs {
             .get("correspondence_download_dismissed")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        let prep_include_online = value
+            .get("prep_include_online")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        let prep_mode = value
+            .get("prep_mode")
+            .and_then(Value::as_str)
+            .map(PrepMode::from_config)
+            .unwrap_or_default();
+        let prep_online_accounts = value
+            .get("prep_online_accounts")
+            .and_then(Value::as_object)
+            .map(|map| {
+                map.iter()
+                    .map(|(key, accounts)| {
+                        let accounts = accounts
+                            .as_array()
+                            .map(|items| {
+                                items
+                                    .iter()
+                                    .filter_map(crate::players::PrepOnlineAccount::from_value)
+                                    .take(20)
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        (key.clone(), accounts)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         Self {
             reference_path,
             correspondence_path,
@@ -383,10 +455,24 @@ impl PreparationPrefs {
             prep_player_names,
             exclude_chesscom,
             correspondence_download_dismissed,
+            prep_include_online,
+            prep_mode,
+            prep_online_accounts,
         }
     }
 
     pub fn to_json(&self) -> String {
+        let accounts: Value = self
+            .prep_online_accounts
+            .iter()
+            .map(|(key, accounts)| {
+                (
+                    key.clone(),
+                    Value::Array(accounts.iter().map(|account| account.to_value()).collect()),
+                )
+            })
+            .collect::<serde_json::Map<String, Value>>()
+            .into();
         serde_json::to_string_pretty(&json!({
             "reference_path": self.reference_path.as_ref().map(|path| path.display().to_string()),
             "correspondence_path": self.correspondence_path.as_ref().map(|path| path.display().to_string()),
@@ -397,6 +483,9 @@ impl PreparationPrefs {
             "prep_player_names": self.prep_player_names,
             "exclude_chesscom": self.exclude_chesscom,
             "correspondence_download_dismissed": self.correspondence_download_dismissed,
+            "prep_include_online": self.prep_include_online,
+            "prep_mode": self.prep_mode.config_value(),
+            "prep_online_accounts": accounts,
         }))
         .unwrap_or_default()
     }
@@ -658,6 +747,9 @@ pub struct DisplayPrefs {
     pub engine_depth: u32,
     /// Target milliseconds when limit mode is `time`.
     pub engine_time_ms: u64,
+    /// When preparation is active, restrict the left game list to games where
+    /// the opponent plays the facing colour. The chip offers Show all.
+    pub prep_filter_facing_color: bool,
 }
 
 impl Default for DisplayPrefs {
@@ -683,6 +775,7 @@ impl Default for DisplayPrefs {
             show_annotations: true,
             show_clocks: true,
             engine_bar: true,
+            prep_filter_facing_color: true,
             review_skip_book: true,
             review_book_min_games: 3,
             review_book_max_plies: 30,
@@ -861,6 +954,10 @@ impl DisplayPrefs {
             .and_then(Value::as_u64)
             .unwrap_or(1_500)
             .clamp(100, 60_000);
+        let prep_filter_facing_color = value
+            .get("prep_filter_facing_color")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
         Self {
             rating_priority,
             show_all_ratings,
@@ -891,6 +988,7 @@ impl DisplayPrefs {
             engine_limit_mode,
             engine_depth,
             engine_time_ms,
+            prep_filter_facing_color,
         }
     }
 
@@ -925,6 +1023,7 @@ impl DisplayPrefs {
             "engine_limit_mode": self.engine_limit_mode,
             "engine_depth": self.engine_depth,
             "engine_time_ms": self.engine_time_ms,
+            "prep_filter_facing_color": self.prep_filter_facing_color,
         }))
         .unwrap_or_default()
     }
@@ -1317,6 +1416,9 @@ mod tests {
             prep_player_names: vec!["Carlsen, Magnus".to_string()],
             exclude_chesscom: false,
             correspondence_download_dismissed: false,
+            prep_include_online: true,
+            prep_mode: PrepMode::Smart,
+            prep_online_accounts: std::collections::HashMap::new(),
         };
         assert_eq!(PreparationPrefs::from_json(&prefs.to_json()), prefs);
 
@@ -1396,6 +1498,7 @@ mod tests {
             engine_limit_mode: "depth".to_string(),
             engine_depth: 30,
             engine_time_ms: 2_500,
+            prep_filter_facing_color: true,
         };
         assert_eq!(DisplayPrefs::from_json(&prefs.to_json()), prefs);
         assert_eq!(DisplayPrefs::from_json("not json"), DisplayPrefs::default());

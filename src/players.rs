@@ -14,7 +14,9 @@
 //! not been observed. A 2/2 move is therefore never displayed as certain, and
 //! every estimate carries an approximate 90% credible interval.
 
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::chess::{Color, UciMove};
@@ -26,7 +28,8 @@ use crate::fide;
 use crate::library::GameLibrary;
 #[cfg(test)]
 use crate::library::PgnLibrary;
-use crate::position::{self, MoveStat};
+use crate::online::OnlineSource;
+use crate::position::{self, MoveStat, TREND_BUCKETS};
 use crate::titles::{self, PlayerTitle};
 
 /// One player's aggregate record in the loaded database.
@@ -536,12 +539,51 @@ fn result_for(color: Color, tag: &str) -> GameResult {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum GameResult {
-    Win,
-    Draw,
-    Loss,
-    Unknown,
+/// Merge one colour's stat into a combined stat (for colour-blind views).
+fn merge_stat(into: &mut PlayerMoveStat, from: &PlayerMoveStat) {
+    into.games += from.games;
+    into.wins += from.wins;
+    into.draws += from.draws;
+    into.losses += from.losses;
+    into.recent_games += from.recent_games;
+    into.weighted += from.weighted;
+    into.recent_weighted += from.recent_weighted;
+    into.otb_weighted += from.otb_weighted;
+    into.online_weighted += from.online_weighted;
+    for i in 0..4 {
+        into.tc_weighted[i] += from.tc_weighted[i];
+    }
+    if from.first_date != 0 && (into.first_date == 0 || from.first_date < into.first_date) {
+        into.first_date = from.first_date;
+    }
+    into.last_date = into.last_date.max(from.last_date);
+}
+
+fn accumulate_stats<'a>(
+    stats: &mut PlayerPositionStats,
+    moves: impl Iterator<Item = &'a PlayerMoveStat>,
+) {
+    for mv in moves {
+        stats.games += mv.games;
+        stats.wins += mv.wins;
+        stats.draws += mv.draws;
+        stats.losses += mv.losses;
+        stats.recent_games += mv.recent_games;
+        if mv.first_date != 0 && (stats.first_date == 0 || mv.first_date < stats.first_date) {
+            stats.first_date = mv.first_date;
+        }
+        stats.last_date = stats.last_date.max(mv.last_date);
+    }
+}
+
+fn is_recent_date(date: u32, as_of: u32, config: PredictionConfig) -> bool {
+    if date == 0 {
+        return false;
+    }
+    let (Some(d), Some(a)) = (date_to_days(date), date_to_days(as_of)) else {
+        return false;
+    };
+    (a - d).max(0) <= config.recent_days
 }
 
 /// Canonical player identity. Word order and punctuation are ignored so
@@ -609,6 +651,503 @@ pub fn is_chesscom_event(event: &str, site: &str) -> bool {
     false
 }
 
+/// Broad time-control bucket for preparation filtering.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum TimeControlClass {
+    Classical,
+    #[default]
+    Rapid,
+    Blitz,
+    Bullet,
+}
+
+impl TimeControlClass {
+    fn index(self) -> usize {
+        match self {
+            Self::Classical => 0,
+            Self::Rapid => 1,
+            Self::Blitz => 2,
+            Self::Bullet => 3,
+        }
+    }
+}
+
+/// Parse a `TimeControl` tag into estimated seconds (`base + 40 * increment`).
+fn parse_time_control_seconds(tag: &str) -> Option<f64> {
+    let tag = tag.trim();
+    if tag.is_empty() || tag == "?" || tag == "-" {
+        return None;
+    }
+    // Common forms: `600+5`, `180+2`, `40/7200`, `300`.
+    let main = tag.split_whitespace().next().unwrap_or(tag);
+    if let Some(slash) = main.find('/') {
+        // `moves/seconds`, e.g. `40/7200`: use the sudden-death portion.
+        let tail = &main[slash + 1..];
+        let secs: f64 = tail.parse().ok()?;
+        if secs.is_finite() && secs > 0.0 {
+            return Some(secs);
+        }
+        return None;
+    }
+    let (base_s, inc_s) = match main.split_once('+') {
+        Some((b, i)) => (b, Some(i)),
+        None => (main, None),
+    };
+    let base: f64 = base_s.parse().ok()?;
+    if !base.is_finite() || base <= 0.0 {
+        return None;
+    }
+    let inc: f64 = match inc_s {
+        Some(i) => {
+            let head: String = i
+                .chars()
+                .take_while(|c| c.is_ascii_digit() || *c == '.')
+                .collect();
+            if head.is_empty() {
+                0.0
+            } else {
+                head.parse().unwrap_or(0.0)
+            }
+        }
+        None => 0.0,
+    };
+    if !inc.is_finite() || inc < 0.0 {
+        return None;
+    }
+    Some(base + 40.0 * inc)
+}
+
+fn tc_from_seconds(secs: f64) -> TimeControlClass {
+    if secs < 180.0 {
+        TimeControlClass::Bullet
+    } else if secs < 600.0 {
+        TimeControlClass::Blitz
+    } else if secs < 3600.0 {
+        TimeControlClass::Rapid
+    } else {
+        TimeControlClass::Classical
+    }
+}
+
+fn tc_from_event_keywords(event: &str) -> Option<TimeControlClass> {
+    let lower = event.to_ascii_lowercase();
+    if lower.contains("bullet") {
+        Some(TimeControlClass::Bullet)
+    } else if lower.contains("blitz") {
+        Some(TimeControlClass::Blitz)
+    } else if lower.contains("rapid") {
+        Some(TimeControlClass::Rapid)
+    } else if lower.contains("titled tuesday") {
+        // Titled Tuesday is an 11-round blitz event.
+        Some(TimeControlClass::Blitz)
+    } else {
+        None
+    }
+}
+
+fn looks_online(event: &str, site: &str) -> bool {
+    let hay = format!("{event} {site}").to_ascii_lowercase();
+    // Covers Lichess / Chess.com servers plus named online series and the
+    // generic markers used by online PGN exports.
+    for needle in [
+        "lichess",
+        "chess.com",
+        "chesscom",
+        "chessabc",
+        "titled tuesday",
+        "arena kings",
+        "speed chess",
+        "pro chess league",
+        "bullet chess championship",
+        "tornelo",
+        "internet",
+        "online",
+        " chess.com int",
+    ] {
+        if hay.contains(needle) {
+            return true;
+        }
+    }
+    let site_t = site.trim().to_ascii_lowercase();
+    if site_t == "?" || site_t == "int" || site_t == "internet" || site_t == "online" {
+        // Bare online marker with no physical venue. A named OTB event with a
+        // real venue (e.g. `Wijk aan Zee`) does not match here because the
+        // combined haystack check above already ran; this catches exports that
+        // only carry the marker.
+        if event.trim().is_empty() || event.trim() == "?" {
+            return true;
+        }
+    }
+    // Chess.com online events per the existing detector also count.
+    is_chesscom_event(event, site)
+}
+
+fn is_rated_game(game: &Game) -> bool {
+    let event = game.event().to_ascii_lowercase();
+    !(event.contains("casual") || event.contains("unrated") || event.contains("friendly"))
+}
+
+/// Classify a game for preparation filtering.
+///
+/// Returns `(time-control class, is_online, is_rated)`.
+pub fn classify_game_metadata(game: &Game) -> (TimeControlClass, bool, bool) {
+    let event = game.event();
+    let site = game.site();
+    let is_online = looks_online(event, site);
+    let is_rated = is_rated_game(game);
+    let tc = game
+        .header("TimeControl")
+        .and_then(parse_time_control_seconds)
+        .map(tc_from_seconds)
+        .or_else(|| tc_from_event_keywords(event))
+        .unwrap_or(TimeControlClass::Rapid);
+    (tc, is_online, is_rated)
+}
+
+/// Which time controls pass a preparation filter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TimeControlMask {
+    pub classical: bool,
+    pub rapid: bool,
+    pub blitz: bool,
+    pub bullet: bool,
+}
+
+impl Default for TimeControlMask {
+    fn default() -> Self {
+        Self {
+            classical: true,
+            rapid: true,
+            blitz: true,
+            bullet: false,
+        }
+    }
+}
+
+impl TimeControlMask {
+    pub fn matches(self, tc: TimeControlClass) -> bool {
+        match tc {
+            TimeControlClass::Classical => self.classical,
+            TimeControlClass::Rapid => self.rapid,
+            TimeControlClass::Blitz => self.blitz,
+            TimeControlClass::Bullet => self.bullet,
+        }
+    }
+}
+
+/// Date cutoff for one preparation source (OTB or online).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DateCutoff {
+    #[default]
+    AllTime,
+    Months(u32),
+    SinceDate(u32),
+}
+
+impl DateCutoff {
+    pub fn matches(self, date: u32, as_of: u32) -> bool {
+        match self {
+            Self::AllTime => true,
+            Self::SinceDate(since) => date == 0 || date >= since,
+            Self::Months(months) => {
+                if date == 0 {
+                    return true;
+                }
+                let (Some(d), Some(a)) = (date_to_days(date), date_to_days(as_of)) else {
+                    return true;
+                };
+                let age = (a - d).max(0);
+                // Average Gregorian month length.
+                let limit = (f64::from(months) * 365.25 / 12.0).ceil() as i64;
+                age <= limit
+            }
+        }
+    }
+}
+
+/// Preparation source filter. OTB and online games are filtered independently
+/// so toggling `include_online` never requires rebuilding the book.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PrepFilterConfig {
+    pub otb_time_controls: TimeControlMask,
+    pub otb_date_cutoff: DateCutoff,
+    pub include_online: bool,
+    pub online_time_controls: TimeControlMask,
+    pub online_date_cutoff: DateCutoff,
+    pub online_rated_only: bool,
+}
+
+impl Default for PrepFilterConfig {
+    fn default() -> Self {
+        Self {
+            otb_time_controls: TimeControlMask::default(),
+            otb_date_cutoff: DateCutoff::AllTime,
+            include_online: true,
+            online_time_controls: TimeControlMask::default(),
+            online_date_cutoff: DateCutoff::Months(24),
+            online_rated_only: true,
+        }
+    }
+}
+
+impl PrepFilterConfig {
+    /// Check one pre-classified observation against this filter.
+    pub fn matches_obs(
+        self,
+        is_online: bool,
+        tc: TimeControlClass,
+        date: u32,
+        is_rated: bool,
+        as_of: u32,
+    ) -> bool {
+        if is_online {
+            if !self.include_online {
+                return false;
+            }
+            if self.online_rated_only && !is_rated {
+                return false;
+            }
+            if !self.online_time_controls.matches(tc) {
+                return false;
+            }
+            if !self.online_date_cutoff.matches(date, as_of) {
+                return false;
+            }
+            true
+        } else {
+            if !self.otb_time_controls.matches(tc) {
+                return false;
+            }
+            if !self.otb_date_cutoff.matches(date, as_of) {
+                return false;
+            }
+            true
+        }
+    }
+
+    pub fn matches_game(self, game: &Game, as_of: u32) -> bool {
+        let (tc, is_online, is_rated) = classify_game_metadata(game);
+        let date = parse_date(game.date()).unwrap_or(0);
+        self.matches_obs(is_online, tc, date, is_rated, as_of)
+    }
+}
+
+/// One linked online account used for preparation imports.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrepOnlineAccount {
+    pub source: OnlineSource,
+    pub username: String,
+    pub enabled: bool,
+}
+
+impl PrepOnlineAccount {
+    pub fn service_slug(source: OnlineSource) -> &'static str {
+        match source {
+            OnlineSource::Lichess => "lichess",
+            OnlineSource::ChessCom => "chesscom",
+            OnlineSource::ChessAbc => "chessabc",
+        }
+    }
+
+    pub fn service_from_slug(slug: &str) -> Option<OnlineSource> {
+        match slug.trim().to_ascii_lowercase().as_str() {
+            "lichess" => Some(OnlineSource::Lichess),
+            "chesscom" | "chess.com" | "chess_com" => Some(OnlineSource::ChessCom),
+            "chessabc" | "chess_abc" | "abc" => Some(OnlineSource::ChessAbc),
+            _ => None,
+        }
+    }
+
+    pub fn to_value(&self) -> serde_json::Value {
+        serde_json::json!({
+            "service": Self::service_slug(self.source),
+            "username": self.username,
+            "enabled": self.enabled,
+        })
+    }
+
+    pub fn from_value(value: &serde_json::Value) -> Option<Self> {
+        let username = value
+            .get("username")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|name| !name.is_empty())?
+            .to_string();
+        let source = value
+            .get("service")
+            .and_then(serde_json::Value::as_str)
+            .and_then(Self::service_from_slug)
+            .unwrap_or(OnlineSource::Lichess);
+        Some(Self {
+            source,
+            username,
+            enabled: value
+                .get("enabled")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(true),
+        })
+    }
+}
+
+/// Where a deduplicated game originally came from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SourceTag {
+    Owoju,
+    Online(OnlineSource),
+    Other(String),
+}
+
+/// Content fingerprint used to spot the same game arriving from two sources
+/// (for example Mega Database and a ChessABC export).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GameFingerprint {
+    pub white_key: String,
+    pub black_key: String,
+    pub result: String,
+    pub spine_hash: u64,
+    pub ply_count: usize,
+    pub date: u32,
+}
+
+/// Hash the first `min(mainline, 30)` plies of UCI moves.
+fn spine_hash(game: &Game) -> (u64, usize) {
+    let mut hasher = DefaultHasher::new();
+    let mut count = 0usize;
+    let mut node = 0usize;
+    while let Some(&child) = game.nodes[node].children.first() {
+        if count >= 30 {
+            break;
+        }
+        let Some(ply) = &game.nodes[child].mv else {
+            break;
+        };
+        if ply.uci == "0000" {
+            break;
+        }
+        ply.uci.hash(&mut hasher);
+        count += 1;
+        node = child;
+    }
+    (hasher.finish(), count)
+}
+
+pub fn fingerprint_game(game: &Game) -> GameFingerprint {
+    let (spine_hash, ply_count) = spine_hash(game);
+    GameFingerprint {
+        white_key: player_key(game.white()).unwrap_or_default(),
+        black_key: player_key(game.black()).unwrap_or_default(),
+        result: game.result().trim().to_string(),
+        spine_hash,
+        ply_count,
+        date: parse_date(game.date()).unwrap_or(0),
+    }
+}
+
+fn day_unknown(date: u32) -> bool {
+    date == 0 || date.is_multiple_of(100) || date % 100 > 31
+}
+
+fn dates_compatible(a: u32, b: u32) -> bool {
+    if day_unknown(a) || day_unknown(b) {
+        if a == 0 || b == 0 {
+            return true;
+        }
+        // Same YYYYMM when the day is unknown.
+        return a / 100 == b / 100;
+    }
+    let (Some(da), Some(db)) = (date_to_days(a), date_to_days(b)) else {
+        return a / 100 == b / 100;
+    };
+    (da - db).abs() <= 3
+}
+
+fn richer_header_value(current: &str, candidate: &str) -> bool {
+    if candidate.trim().is_empty() || candidate.trim() == "?" {
+        return false;
+    }
+    if current.trim().is_empty() || current.trim() == "?" {
+        return true;
+    }
+    candidate.len() > current.len()
+}
+
+/// Merge headers from `incoming` into `base`, keeping the richest value per
+/// tag (never dropping clocks, Elo, FideId or TimeControl data).
+fn merge_headers(base: &mut Game, incoming: &Game) {
+    for (key, value) in &incoming.headers {
+        if let Some((_, current)) = base
+            .headers
+            .iter_mut()
+            .find(|(name, _)| name.eq_ignore_ascii_case(key))
+        {
+            if richer_header_value(current, value) {
+                *current = value.clone();
+            }
+        } else {
+            base.headers.push((key.clone(), value.clone()));
+        }
+    }
+    // Keep the longer mainline and any clock/eval annotations the other copy
+    // carried.
+    let base_clocks = base.nodes.iter().filter(|n| n.clock.is_some()).count();
+    let inc_clocks = incoming.nodes.iter().filter(|n| n.clock.is_some()).count();
+    if incoming.nodes.len() > base.nodes.len() && inc_clocks >= base_clocks {
+        let headers = std::mem::take(&mut base.headers);
+        let errors = std::mem::take(&mut base.errors);
+        *base = incoming.clone();
+        // `incoming` headers were already merged above only into the old base;
+        // re-merge so nothing is lost in either direction.
+        let mut merged_headers = base.headers.clone();
+        for (key, value) in &headers {
+            if !merged_headers
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case(key))
+            {
+                merged_headers.push((key.clone(), value.clone()));
+            }
+        }
+        base.headers = merged_headers;
+        base.errors.extend(errors);
+    }
+}
+
+/// Deduplicate games arriving from several sources.
+///
+/// Two games are duplicates when the canonical player keys and result match,
+/// the opening spine (first 30 plies) matches, and the dates are within ±3
+/// days (or share YYYYMM when the day is unknown). The richest headers win;
+/// the first occurrence keeps its [`SourceTag`].
+pub fn deduplicate_and_merge_games(sources: Vec<(SourceTag, Vec<Game>)>) -> Vec<(SourceTag, Game)> {
+    let mut out: Vec<(SourceTag, Game, GameFingerprint)> = Vec::new();
+    for (tag, games) in sources {
+        for game in games {
+            let fp = fingerprint_game(&game);
+            let mut merged = false;
+            for (_, existing, efp) in out.iter_mut() {
+                if efp.white_key == fp.white_key
+                    && efp.black_key == fp.black_key
+                    && efp.result == fp.result
+                    && efp.spine_hash == fp.spine_hash
+                    && efp.ply_count == fp.ply_count
+                    && dates_compatible(efp.date, fp.date)
+                {
+                    merge_headers(existing, &game);
+                    // Prefer the most informative date.
+                    if efp.date == 0 && fp.date != 0 {
+                        efp.date = fp.date;
+                    }
+                    merged = true;
+                    break;
+                }
+            }
+            if !merged {
+                out.push((tag.clone(), game, fp));
+            }
+        }
+    }
+    out.into_iter().map(|(tag, game, _)| (tag, game)).collect()
+}
+
 /// One move played by the selected player from one position.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct PlayerMoveStat {
@@ -623,6 +1162,39 @@ pub struct PlayerMoveStat {
     pub recent_games: u32,
     pub weighted: f64,
     pub recent_weighted: f64,
+    /// Time-decayed weight from OTB games (kept for instant refiltering).
+    pub otb_weighted: f64,
+    /// Time-decayed weight from online games.
+    pub online_weighted: f64,
+    /// Time-decayed weight per [`TimeControlClass`] index (Classical=0,
+    /// Rapid=1, Blitz=2, Bullet=3).
+    pub tc_weighted: [f64; 4],
+    /// Quarterly game counts for the player's sparkline, aligned to
+    /// `anchor_quarter` like [`MoveStat`].
+    pub anchor_quarter: u32,
+    pub older_dated: u32,
+    pub buckets: [u32; TREND_BUCKETS],
+}
+
+/// One stored observation backing a [`PlayerMoveStat`]. Kept per move so
+/// [`PrepFilterConfig`] can be applied instantly without rebuilding the book.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PlayerObs {
+    pub weight: f64,
+    pub is_online: bool,
+    pub is_rated: bool,
+    pub tc: TimeControlClass,
+    pub date: u32,
+    pub result: GameResult,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum GameResult {
+    Win,
+    Draw,
+    Loss,
+    #[default]
+    Unknown,
 }
 
 impl PlayerMoveStat {
@@ -705,7 +1277,7 @@ impl Default for PredictionConfig {
 }
 
 /// A game that reached one position in the player's book.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PlayerGameRef {
     /// Index in the database that produced the book.
     pub index: usize,
@@ -713,13 +1285,36 @@ pub struct PlayerGameRef {
     pub date: u32,
     /// The prepared player's colour in that game.
     pub color: Color,
+    /// Pre-classified preparation metadata so filters apply without reparsing.
+    pub is_online: bool,
+    pub is_rated: bool,
+    pub tc: TimeControlClass,
+}
+
+impl Eq for PlayerGameRef {}
+
+fn color_idx(color: Color) -> usize {
+    match color {
+        Color::White => 0,
+        Color::Black => 1,
+    }
 }
 
 /// A player's position book. Built off the UI thread.
+///
+/// Move statistics are stored per player colour (`White = 0`, `Black = 1`) so
+/// preparation can look at one side without mixing the other. Every
+/// observation is also stored individually, so [`PrepFilterConfig`] filtering
+/// is a cheap in-memory pass with no rebuild.
 pub struct PlayerBook {
     player_key: String,
     player_name: String,
-    positions: HashMap<u64, BTreeMap<u32, PlayerMoveStat>>,
+    positions: [HashMap<u64, BTreeMap<u32, PlayerMoveStat>>; 2],
+    /// Exact per-observation data for instant refiltering, keyed by
+    /// `(color_idx, position_key, move_code)`.
+    obs: HashMap<(u8, u64, u32), Vec<PlayerObs>>,
+    /// Mainline depth (plies from the start) of each recorded position.
+    depths: HashMap<u64, u32>,
     /// Games that reached each position, used by the recent-games panel.
     game_refs: HashMap<u64, Vec<PlayerGameRef>>,
     games: usize,
@@ -761,7 +1356,9 @@ impl PlayerBook {
         let mut book = Self {
             player_key: summary.key.clone(),
             player_name: summary.name.clone(),
-            positions: HashMap::new(),
+            positions: [HashMap::new(), HashMap::new()],
+            obs: HashMap::new(),
+            depths: HashMap::new(),
             game_refs: HashMap::new(),
             games: 0,
             as_of,
@@ -794,7 +1391,9 @@ impl PlayerBook {
         let mut book = Self {
             player_key: player_key.into(),
             player_name: player_name.into(),
-            positions: HashMap::new(),
+            positions: [HashMap::new(), HashMap::new()],
+            obs: HashMap::new(),
+            depths: HashMap::new(),
             game_refs: HashMap::new(),
             games: 0,
             as_of,
@@ -802,6 +1401,36 @@ impl PlayerBook {
         };
         for game in games {
             book.add_game(game, None);
+        }
+        book.sort_game_refs();
+        book
+    }
+
+    /// Build from already-parsed games merged across several sources.
+    ///
+    /// Game-ref indices address `games` positionally, so the caller must keep
+    /// that slice alive next to the book (the UI stores it as
+    /// `prep_merged_games`) before resolving recent rows.
+    pub fn from_merged_games(
+        player_key: impl Into<String>,
+        player_name: impl Into<String>,
+        games: &[Game],
+        config: PredictionConfig,
+        as_of: u32,
+    ) -> Self {
+        let mut book = Self {
+            player_key: player_key.into(),
+            player_name: player_name.into(),
+            positions: [HashMap::new(), HashMap::new()],
+            obs: HashMap::new(),
+            depths: HashMap::new(),
+            game_refs: HashMap::new(),
+            games: 0,
+            as_of,
+            config,
+        };
+        for (position, game) in games.iter().enumerate() {
+            book.add_game(game, Some(position));
         }
         book.sort_game_refs();
         book
@@ -826,11 +1455,14 @@ impl PlayerBook {
         } else {
             return;
         };
+        let cidx = color_idx(color);
 
         let date = parse_date(game.date()).unwrap_or(0);
         let result = result_for(color, game.result());
+        let (tc, is_online, is_rated) = classify_game_metadata(game);
         let mut seen = HashSet::new();
         let mut node = 0;
+        let mut depth: u32 = 0;
 
         loop {
             let parent_pos = &game.nodes[node].pos;
@@ -838,13 +1470,18 @@ impl PlayerBook {
             if !seen.insert(key) {
                 break;
             }
+            self.depths.entry(key).or_insert(depth);
             // Record every position the game reached, including the final
             // position where no reply was played.
             if let Some(index) = game_index {
-                self.game_refs
-                    .entry(key)
-                    .or_default()
-                    .push(PlayerGameRef { index, date, color });
+                self.game_refs.entry(key).or_default().push(PlayerGameRef {
+                    index,
+                    date,
+                    color,
+                    is_online,
+                    is_rated,
+                    tc,
+                });
             }
             let Some(&child) = game.nodes[node].children.first() else {
                 break;
@@ -866,8 +1503,7 @@ impl PlayerBook {
             };
             if ply.color == color {
                 let (weight, recent) = recency(date, self.as_of, self.config);
-                let entry = self
-                    .positions
+                let entry = self.positions[cidx]
                     .entry(key)
                     .or_default()
                     .entry(code)
@@ -878,6 +1514,12 @@ impl PlayerBook {
                     });
                 entry.games += 1;
                 entry.weighted += weight;
+                if is_online {
+                    entry.online_weighted += weight;
+                } else {
+                    entry.otb_weighted += weight;
+                }
+                entry.tc_weighted[tc.index()] += weight;
                 match result {
                     GameResult::Win => entry.wins += 1,
                     GameResult::Draw => entry.draws += 1,
@@ -893,16 +1535,82 @@ impl PlayerBook {
                         entry.first_date = date;
                     }
                     entry.last_date = entry.last_date.max(date);
+                    if let Some(q) = position::date_to_quarter(date) {
+                        if entry.anchor_quarter == 0 {
+                            entry.anchor_quarter = q;
+                            entry.buckets[TREND_BUCKETS - 1] += 1;
+                        } else if q > entry.anchor_quarter {
+                            let shift = (q - entry.anchor_quarter) as usize;
+                            if shift >= TREND_BUCKETS {
+                                let moved: u32 = entry.buckets.iter().sum();
+                                entry.older_dated = entry.older_dated.saturating_add(moved);
+                                entry.buckets = [0; TREND_BUCKETS];
+                            } else {
+                                let moved: u32 = entry.buckets[..shift].iter().sum();
+                                entry.older_dated = entry.older_dated.saturating_add(moved);
+                                entry.buckets.copy_within(shift.., 0);
+                                entry.buckets[TREND_BUCKETS - shift..].fill(0);
+                            }
+                            entry.anchor_quarter = q;
+                            entry.buckets[TREND_BUCKETS - 1] =
+                                entry.buckets[TREND_BUCKETS - 1].saturating_add(1);
+                        } else {
+                            let age = (entry.anchor_quarter - q) as usize;
+                            if age < TREND_BUCKETS {
+                                let idx = TREND_BUCKETS - 1 - age;
+                                entry.buckets[idx] = entry.buckets[idx].saturating_add(1);
+                            } else {
+                                entry.older_dated = entry.older_dated.saturating_add(1);
+                            }
+                        }
+                    }
                 }
+                self.obs
+                    .entry((cidx as u8, key, code))
+                    .or_default()
+                    .push(PlayerObs {
+                        weight,
+                        is_online,
+                        is_rated,
+                        tc,
+                        date,
+                        result,
+                    });
             }
             node = child;
+            depth = depth.saturating_add(1);
         }
         self.games += 1;
     }
 
+    /// Combined moves from both colours (backwards compatible).
     pub fn moves(&self, key: u64) -> Vec<PlayerMoveStat> {
-        let mut moves: Vec<_> = self
-            .positions
+        let mut combined: BTreeMap<u32, PlayerMoveStat> = BTreeMap::new();
+        for map in &self.positions {
+            if let Some(moves) = map.get(&key) {
+                for (&code, stat) in moves {
+                    let entry = combined.entry(code).or_insert(PlayerMoveStat {
+                        key,
+                        mv: code,
+                        ..PlayerMoveStat::default()
+                    });
+                    merge_stat(entry, stat);
+                }
+            }
+        }
+        let mut moves: Vec<_> = combined.into_values().collect();
+        moves.sort_by(|a, b| {
+            b.weighted
+                .total_cmp(&a.weighted)
+                .then(b.games.cmp(&a.games))
+                .then(a.mv.cmp(&b.mv))
+        });
+        moves
+    }
+
+    /// Moves from one player colour only.
+    pub fn moves_for_color(&self, key: u64, color: Color) -> Vec<PlayerMoveStat> {
+        let mut moves: Vec<_> = self.positions[color_idx(color)]
             .get(&key)
             .map(|moves| moves.values().copied().collect())
             .unwrap_or_default();
@@ -915,21 +1623,272 @@ impl PlayerBook {
         moves
     }
 
-    pub fn stats(&self, key: u64) -> Option<PlayerPositionStats> {
-        let moves = self.positions.get(&key)?;
-        let mut stats = PlayerPositionStats::default();
-        for mv in moves.values() {
-            stats.games += mv.games;
-            stats.wins += mv.wins;
-            stats.draws += mv.draws;
-            stats.losses += mv.losses;
-            stats.recent_games += mv.recent_games;
-            if mv.first_date != 0 && (stats.first_date == 0 || mv.first_date < stats.first_date) {
-                stats.first_date = mv.first_date;
+    /// Filtered moves for one colour: only observations passing `filter`
+    /// contribute. Cheap in-memory pass over the stored observations.
+    pub fn filtered_moves(
+        &self,
+        key: u64,
+        color: Color,
+        filter: &PrepFilterConfig,
+    ) -> Vec<PlayerMoveStat> {
+        let cidx = color_idx(color) as u8;
+        let Some(moves) = self.positions[color_idx(color)].get(&key) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for (&code, base) in moves {
+            let Some(obs) = self.obs.get(&(cidx, key, code)) else {
+                continue;
+            };
+            let mut stat = PlayerMoveStat {
+                key,
+                mv: code,
+                anchor_quarter: base.anchor_quarter,
+                ..PlayerMoveStat::default()
+            };
+            let mut weighted = 0.0;
+            let mut recent_weighted = 0.0;
+            for ob in obs {
+                if !filter.matches_obs(ob.is_online, ob.tc, ob.date, ob.is_rated, self.as_of) {
+                    continue;
+                }
+                stat.games += 1;
+                match ob.result {
+                    GameResult::Win => stat.wins += 1,
+                    GameResult::Draw => stat.draws += 1,
+                    GameResult::Loss => stat.losses += 1,
+                    GameResult::Unknown => {}
+                }
+                weighted += ob.weight;
+                if is_recent_date(ob.date, self.as_of, self.config) {
+                    stat.recent_games += 1;
+                    recent_weighted += ob.weight;
+                }
+                if ob.date != 0 {
+                    if stat.first_date == 0 || ob.date < stat.first_date {
+                        stat.first_date = ob.date;
+                    }
+                    stat.last_date = stat.last_date.max(ob.date);
+                }
+                if ob.is_online {
+                    stat.online_weighted += ob.weight;
+                } else {
+                    stat.otb_weighted += ob.weight;
+                }
+                stat.tc_weighted[ob.tc.index()] += ob.weight;
             }
-            stats.last_date = stats.last_date.max(mv.last_date);
+            if stat.games == 0 {
+                continue;
+            }
+            stat.weighted = weighted;
+            stat.recent_weighted = recent_weighted;
+            out.push(stat);
         }
+        out.sort_by(|a, b| {
+            b.weighted
+                .total_cmp(&a.weighted)
+                .then(b.games.cmp(&a.games))
+                .then(a.mv.cmp(&b.mv))
+        });
+        out
+    }
+
+    pub fn stats(&self, key: u64) -> Option<PlayerPositionStats> {
+        let mut stats = PlayerPositionStats::default();
+        let mut any = false;
+        for map in &self.positions {
+            if let Some(moves) = map.get(&key) {
+                any = true;
+                accumulate_stats(&mut stats, moves.values());
+            }
+        }
+        any.then_some(stats)
+    }
+
+    /// Aggregated filtered stats for one colour.
+    pub fn filtered_stats(
+        &self,
+        key: u64,
+        color: Color,
+        filter: &PrepFilterConfig,
+    ) -> Option<PlayerPositionStats> {
+        let moves = self.filtered_moves(key, color, filter);
+        if moves.is_empty() {
+            return None;
+        }
+        let mut stats = PlayerPositionStats::default();
+        accumulate_stats(&mut stats, moves.iter());
         Some(stats)
+    }
+
+    /// Total filtered games at `key` for `color` (cheap count for swap checks).
+    pub fn filtered_game_count(
+        &self,
+        key: u64,
+        color: Color,
+        filter: &PrepFilterConfig,
+    ) -> (u32, f64) {
+        let moves = self.filtered_moves(key, color, filter);
+        let n: u32 = moves.iter().map(|m| m.games).sum();
+        let w: f64 = moves.iter().map(|m| m.weighted).sum();
+        (n, w)
+    }
+
+    /// Does the player have meaningful experience on the *opposite* side of
+    /// the board from where preparation expects them?
+    ///
+    /// `our_color` is the colour the opponent (us) will play; the book is the
+    /// prepared player's. `ply` is the current mainline depth.
+    pub fn has_swapped_color_experience(
+        &self,
+        key: u64,
+        our_color: Color,
+        filter: &PrepFilterConfig,
+        ply: u32,
+    ) -> bool {
+        let (n, w) = self.filtered_game_count(key, our_color, filter);
+        if n >= 3 {
+            return true;
+        }
+        if n >= 2 && (ply >= 8 || w >= 1.2) {
+            return true;
+        }
+        if ply >= 14 && n >= 1 {
+            // At least one recent (<= 12 months) game this deep is meaningful.
+            let cidx = color_idx(our_color) as u8;
+            if let Some(moves) = self.positions[color_idx(our_color)].get(&key) {
+                for &code in moves.keys() {
+                    if let Some(obs) = self.obs.get(&(cidx, key, code)) {
+                        for ob in obs {
+                            if !filter.matches_obs(
+                                ob.is_online,
+                                ob.tc,
+                                ob.date,
+                                ob.is_rated,
+                                self.as_of,
+                            ) {
+                                continue;
+                            }
+                            if ob.date != 0
+                                && let (Some(d), Some(a)) =
+                                    (date_to_days(ob.date), date_to_days(self.as_of))
+                                && (a - d).max(0) <= 365
+                            {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Repertoire profile for one colour under `filter`.
+    pub fn profile(
+        &self,
+        color: Color,
+        filter: &PrepFilterConfig,
+        reference: Option<&crate::position::PositionIndex>,
+    ) -> RepertoireProfile {
+        let cidx = color_idx(color);
+        let mut inv_perplexities: Vec<(f64, f64)> = Vec::new();
+        let mut sample_games = 0u32;
+        let mut exit_plies: Vec<u32> = Vec::new();
+        let mut booked_moves = 0u32;
+        let mut total_moves = 0u32;
+        for (key, moves) in &self.positions[cidx] {
+            let depth = self.depths.get(key).copied().unwrap_or(0);
+            if depth == 0 || depth > 20 {
+                continue;
+            }
+            // Rebuild filtered weights for this node.
+            let mut weights: Vec<(u32, f64, u32)> = Vec::new();
+            let mut node_games = 0u32;
+            for &code in moves.keys() {
+                let mut w = 0.0;
+                let mut g = 0u32;
+                if let Some(obs) = self.obs.get(&(cidx as u8, *key, code)) {
+                    for ob in obs {
+                        if filter.matches_obs(ob.is_online, ob.tc, ob.date, ob.is_rated, self.as_of)
+                        {
+                            w += ob.weight;
+                            g += 1;
+                        }
+                    }
+                }
+                if g > 0 {
+                    weights.push((code, w, g));
+                    node_games += g;
+                }
+            }
+            if node_games < 3 || weights.is_empty() {
+                continue;
+            }
+            sample_games += node_games;
+            let total_w: f64 = weights.iter().map(|(_, w, _)| *w).sum();
+            if total_w <= 0.0 {
+                continue;
+            }
+            let mut h = 0.0;
+            for (_, w, _) in &weights {
+                let p = *w / total_w;
+                if p > 0.0 {
+                    h -= p * p.ln();
+                }
+            }
+            inv_perplexities.push(((-h).exp(), f64::from(node_games)));
+            if let Some(index) = reference {
+                total_moves += 1;
+                let ref_moves = index.moves(*key);
+                if !ref_moves.is_empty() {
+                    exit_plies.push(depth);
+                    // Booked-up if the player's top move appears in the
+                    // reference's top three.
+                    weights.sort_by(|a, b| b.1.total_cmp(&a.1));
+                    let mut ref_sorted = ref_moves;
+                    ref_sorted.sort_by_key(|m| std::cmp::Reverse(m.games));
+                    let top3: HashSet<u32> = ref_sorted.into_iter().take(3).map(|m| m.mv).collect();
+                    if top3.contains(&weights[0].0) {
+                        booked_moves += 1;
+                    }
+                }
+            }
+        }
+        let consistency_score = if inv_perplexities.is_empty() {
+            0.0
+        } else {
+            let (num, den) = inv_perplexities
+                .iter()
+                .fold((0.0, 0.0), |(n, d), (inv, w)| (n + inv * w, d + w));
+            (num / den).clamp(0.0, 1.0) as f32
+        };
+        let consistency_label = if consistency_score >= 0.8 {
+            "specialist"
+        } else if consistency_score >= 0.55 {
+            "focused"
+        } else if consistency_score >= 0.35 {
+            "varied"
+        } else {
+            "exploratory"
+        };
+        let mean_book_exit_ply = if exit_plies.is_empty() {
+            0.0
+        } else {
+            exit_plies.iter().sum::<u32>() as f32 / exit_plies.len() as f32
+        };
+        let booked_up_score = if total_moves == 0 {
+            0.0
+        } else {
+            booked_moves as f32 / total_moves as f32
+        };
+        RepertoireProfile {
+            consistency_score,
+            consistency_label: consistency_label.to_string(),
+            mean_book_exit_ply,
+            booked_up_score,
+            sample_games,
+        }
     }
 
     /// Most recent games in this book that reached `key`, newest first.
@@ -957,10 +1916,90 @@ impl PlayerBook {
             .copied()
             .collect()
     }
+
+    /// Filtered recent games: only games passing `filter` are returned.
+    pub fn recent_games_filtered(
+        &self,
+        key: u64,
+        filter: &PrepFilterConfig,
+        limit: usize,
+    ) -> Vec<PlayerGameRef> {
+        let Some(games) = self.game_refs.get(&key) else {
+            return Vec::new();
+        };
+        games
+            .iter()
+            .filter(|game| {
+                filter.matches_obs(
+                    game.is_online,
+                    game.tc,
+                    game.date,
+                    game.is_rated,
+                    self.as_of,
+                )
+            })
+            .take(limit)
+            .copied()
+            .collect()
+    }
+
+    /// Filtered recent games for one colour.
+    pub fn recent_games_for_filtered(
+        &self,
+        key: u64,
+        color: Color,
+        filter: &PrepFilterConfig,
+        limit: usize,
+    ) -> Vec<PlayerGameRef> {
+        let Some(games) = self.game_refs.get(&key) else {
+            return Vec::new();
+        };
+        games
+            .iter()
+            .filter(|game| {
+                game.color == color
+                    && filter.matches_obs(
+                        game.is_online,
+                        game.tc,
+                        game.date,
+                        game.is_rated,
+                        self.as_of,
+                    )
+            })
+            .take(limit)
+            .copied()
+            .collect()
+    }
+}
+
+/// Repertoire fingerprint for one colour under a preparation filter.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RepertoireProfile {
+    /// Time-decayed inverse perplexity averaged over qualifying nodes
+    /// (`0 = unpredictable`, `1 = always the same move`).
+    pub consistency_score: f32,
+    /// Human label for [`Self::consistency_score`].
+    pub consistency_label: String,
+    /// Mean mainline depth where the reference tree runs out.
+    pub mean_book_exit_ply: f32,
+    /// Share of the player's top moves that appear in the reference top 3.
+    pub booked_up_score: f32,
+    pub sample_games: u32,
+}
+
+/// Free-function wrapper for swapped-colour experience checks.
+pub fn has_meaningful_swapped_color_experience(
+    book: &PlayerBook,
+    key: u64,
+    our_color: Color,
+    filter: &PrepFilterConfig,
+    ply: u32,
+) -> bool {
+    book.has_swapped_color_experience(key, our_color, filter, ply)
 }
 
 /// A predicted move in the next game.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct MovePrediction {
     pub mv: u32,
     /// Posterior mean of the move's probability.
@@ -978,6 +2017,14 @@ pub struct MovePrediction {
     /// Change in share between the old and recent windows, in percentage
     /// points. Positive means the player is moving toward this move.
     pub trend_pp: Option<f64>,
+    /// True when the move was never played by the player and comes purely
+    /// from the background prior.
+    pub is_inferred_only: bool,
+    /// Player probability minus field (background) share, in percentage
+    /// points. Positive means the player favours this move vs the field.
+    pub vs_field_pp: Option<f64>,
+    /// Normalized sparkline points `(x, y)` for the move's popularity trend.
+    pub sparkline: Vec<(f32, f32)>,
 }
 
 /// What supplies the background distribution for one prediction.
@@ -1044,11 +2091,19 @@ pub fn predict(
     prior_source: PriorSource,
     legal_moves: usize,
 ) -> Prediction {
-    let player_moves: BTreeMap<u32, PlayerMoveStat> = book
-        .positions
-        .get(&key)
-        .map(|moves| moves.iter().map(|(&code, stat)| (code, *stat)).collect())
-        .unwrap_or_default();
+    let mut player_moves: BTreeMap<u32, PlayerMoveStat> = BTreeMap::new();
+    for map in &book.positions {
+        if let Some(moves) = map.get(&key) {
+            for (&code, stat) in moves {
+                let entry = player_moves.entry(code).or_insert(PlayerMoveStat {
+                    key,
+                    mv: code,
+                    ..PlayerMoveStat::default()
+                });
+                merge_stat(entry, stat);
+            }
+        }
+    }
 
     let mut candidates: BTreeMap<u32, Candidate> = BTreeMap::new();
     for stat in global {
@@ -1149,6 +2204,11 @@ pub fn predict(
 
         player_games += player.games;
         recent_games += player.recent_games;
+        let field_share = if database_total > 0 {
+            f64::from(candidate.database_games) / database_total as f64
+        } else {
+            1.0 / candidate_count
+        };
         moves.push(MovePrediction {
             mv: code,
             probability,
@@ -1159,6 +2219,9 @@ pub fn predict(
             last_date: player.last_date,
             prior_games: candidate.database_games,
             trend_pp,
+            is_inferred_only: player.games == 0,
+            vs_field_pp: Some((probability - field_share) * 100.0),
+            sparkline: Vec::new(),
         });
     }
 
@@ -1187,6 +2250,317 @@ pub fn predict(
         recent_games,
         recent_mix,
         has_player_data: total_weight > 0.0,
+        unseen_probability,
+        unseen_moves,
+        legal_moves,
+        prior_games: database_total.min(u64::from(u32::MAX)) as u32,
+        prior_source,
+    }
+}
+
+/// Trend-boosted prediction (`v2`).
+///
+/// On top of [`predict`] this adds:
+/// - a trend-boosted prior `pi ~ p_base + gamma * max(0, shrunk_recent - base)`
+///   computed from `reference` quarterly buckets via
+///   [`crate::recent::position_trends`],
+/// - an adaptive prior strength `alpha0 = alpha_base * (1.4 - 0.8 * C) *
+///   (1 + 0.75 * staleness)` where `C` is the local inverse perplexity and
+///   `staleness` the share of decayed weight outside the recent window,
+/// - inference caps: moves the player never played (`player_games == 0`) keep
+///   `probability >= 0.08` for at most three moves; the rest are capped below.
+/// - `is_inferred_only`, `vs_field_pp` and `sparkline` on every move.
+///
+/// `filter`/`color` select the filtered player view; pass `None`/`None` for
+/// the unfiltered colour-blind book. `reference` supplies the background
+/// quarterly buckets for the trend boost (typically the same `global` moves).
+#[allow(clippy::too_many_arguments)]
+pub fn predict_v2(
+    book: &PlayerBook,
+    key: u64,
+    global: &[MoveStat],
+    prior_source: PriorSource,
+    legal_moves: usize,
+    filter: Option<&PrepFilterConfig>,
+    color: Option<Color>,
+    reference: Option<&[MoveStat]>,
+) -> Prediction {
+    let player_moves: BTreeMap<u32, PlayerMoveStat> = match (filter, color) {
+        (Some(f), Some(c)) => book
+            .filtered_moves(key, c, f)
+            .into_iter()
+            .map(|m| (m.mv, m))
+            .collect(),
+        _ => {
+            let mut combined: BTreeMap<u32, PlayerMoveStat> = BTreeMap::new();
+            for map in &book.positions {
+                if let Some(moves) = map.get(&key) {
+                    for (&code, stat) in moves {
+                        let entry = combined.entry(code).or_insert(PlayerMoveStat {
+                            key,
+                            mv: code,
+                            ..PlayerMoveStat::default()
+                        });
+                        merge_stat(entry, stat);
+                    }
+                }
+            }
+            combined
+        }
+    };
+
+    // Trend boost from the reference background, if supplied.
+    let mut boost: HashMap<u32, f64> = HashMap::new();
+    let mut sparklines: HashMap<u32, Vec<(f32, f32)>> = HashMap::new();
+    if let Some(ref_moves) = reference {
+        let trends =
+            crate::recent::position_trends(ref_moves, crate::recent::TrendConfig::default());
+        for trend in trends {
+            if let (Some(shrunk), Some(base)) = (trend.shrunk_recent_share, trend.baseline_share) {
+                let delta = (shrunk - base).max(0.0);
+                if delta > 0.0 {
+                    // gamma = 0.5 on the shrunk share delta.
+                    boost.insert(trend.mv, 0.5 * delta);
+                }
+            }
+            sparklines.insert(trend.mv, trend.sparkline_points());
+        }
+    }
+
+    // Local consistency C: inverse perplexity of the player's distribution.
+    let total_w: f64 = player_moves.values().map(|m| m.weighted).sum();
+    let recent_w: f64 = player_moves.values().map(|m| m.recent_weighted).sum();
+    let consistency = if total_w > 0.0 {
+        let mut h = 0.0;
+        for m in player_moves.values() {
+            let p = m.weighted / total_w;
+            if p > 0.0 {
+                h -= p * p.ln();
+            }
+        }
+        (-h).exp().clamp(0.0, 1.0)
+    } else {
+        0.5
+    };
+    let staleness = if total_w > 0.0 {
+        ((total_w - recent_w).max(0.0) / total_w).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+
+    let mut candidates: BTreeMap<u32, Candidate> = BTreeMap::new();
+    for stat in global {
+        let player_games = if prior_source == PriorSource::CurrentDatabase {
+            player_moves.get(&stat.mv).map_or(0, |mv| mv.games)
+        } else {
+            0
+        };
+        let database_games = stat.games.saturating_sub(player_games);
+        let entry = candidates.entry(stat.mv).or_default();
+        entry.database_games = entry.database_games.saturating_add(database_games);
+    }
+    for &code in player_moves.keys() {
+        candidates.entry(code).or_default();
+    }
+    if candidates.is_empty() {
+        return Prediction {
+            unseen_probability: if legal_moves > 0 { 1.0 } else { 0.0 },
+            unseen_moves: legal_moves,
+            legal_moves,
+            prior_source,
+            ..Prediction::default()
+        };
+    }
+
+    let database_total: u64 = candidates
+        .values()
+        .map(|candidate| u64::from(candidate.database_games))
+        .sum();
+    let candidate_count = candidates.len() as f64;
+    let unseen_moves = legal_moves.saturating_sub(candidates.len());
+    let unseen_alpha = if unseen_moves > 0 {
+        book.config.unseen_prior_games.max(0.0)
+    } else {
+        0.0
+    };
+    let alpha_base = book.config.prior_games + (database_total as f64).sqrt().min(12.0);
+    let adaptive = alpha_base * (1.4 - 0.8 * consistency) * (1.0 + 0.75 * staleness);
+    let mut prior_total = 0.0;
+    for (mv, candidate) in candidates.iter_mut() {
+        let mut share = if database_total > 0 {
+            f64::from(candidate.database_games) / database_total as f64
+        } else {
+            1.0 / candidate_count
+        };
+        if let Some(b) = boost.get(mv) {
+            share += *b;
+        }
+        candidate.alpha = adaptive * share + book.config.smoothing;
+        prior_total += candidate.alpha;
+    }
+
+    let decay_total = prior_total + unseen_alpha + total_w;
+    let recent_total = prior_total + unseen_alpha + recent_w;
+    let recent_mix = if recent_w > 0.0 {
+        recent_w / (recent_w + book.config.recent_mix_games)
+    } else {
+        0.0
+    };
+
+    let mut moves = Vec::with_capacity(candidates.len());
+    let mut player_games = 0;
+    let mut recent_games = 0;
+    for (code, candidate) in candidates {
+        let player = player_moves.get(&code).copied().unwrap_or_default();
+        let decay_probability = (candidate.alpha + player.weighted) / decay_total;
+        let recent_probability = if recent_w > 0.0 {
+            (candidate.alpha + player.recent_weighted) / recent_total
+        } else {
+            decay_probability
+        };
+        let probability = (1.0 - recent_mix) * decay_probability + recent_mix * recent_probability;
+        let decay_variance = beta_variance(decay_probability, prior_total + unseen_alpha + total_w);
+        let recent_variance =
+            beta_variance(recent_probability, prior_total + unseen_alpha + recent_w);
+        let variance =
+            (1.0 - recent_mix).powi(2) * decay_variance + recent_mix.powi(2) * recent_variance;
+        let margin = CREDIBLE_Z_90 * variance.sqrt();
+        let trend_pp = if recent_w > 0.0 && total_w > recent_w {
+            let recent_share = player.recent_weighted / recent_w;
+            let historical_weight = (player.weighted - player.recent_weighted).max(0.0);
+            let historical_total = total_w - recent_w;
+            Some((recent_share - historical_weight / historical_total) * 100.0)
+        } else {
+            None
+        };
+        let field_share = if database_total > 0 {
+            f64::from(candidate.database_games) / database_total as f64
+        } else {
+            1.0 / candidate_count
+        };
+        player_games += player.games;
+        recent_games += player.recent_games;
+        moves.push(MovePrediction {
+            mv: code,
+            probability,
+            probability_low: (probability - margin).clamp(0.0, 1.0),
+            probability_high: (probability + margin).clamp(0.0, 1.0),
+            player_games: player.games,
+            recent_games: player.recent_games,
+            last_date: player.last_date,
+            prior_games: candidate.database_games,
+            trend_pp,
+            is_inferred_only: player.games == 0,
+            vs_field_pp: Some((probability - field_share) * 100.0),
+            sparkline: sparklines.get(&code).cloned().unwrap_or_default(),
+        });
+    }
+
+    moves.sort_by(|a, b| {
+        b.probability
+            .total_cmp(&a.probability)
+            .then(b.player_games.cmp(&a.player_games))
+            .then(a.mv.cmp(&b.mv))
+    });
+
+    let mut unseen_probability = if unseen_alpha > 0.0 {
+        let decay_unseen = unseen_alpha / decay_total;
+        let recent_unseen = if recent_w > 0.0 {
+            unseen_alpha / recent_total
+        } else {
+            decay_unseen
+        };
+        (1.0 - recent_mix) * decay_unseen + recent_mix * recent_unseen
+    } else {
+        0.0
+    };
+    // Renormalize the listed moves plus unseen mass back to 1.
+    let listed: f64 = moves.iter().map(|m| m.probability).sum();
+    let total = listed + unseen_probability;
+    if total > 0.0 && (total - 1.0).abs() > 1e-9 {
+        let scale = 1.0 / total;
+        for mv in moves.iter_mut() {
+            mv.probability *= scale;
+            mv.probability_low = (mv.probability_low * scale).clamp(0.0, 1.0);
+            mv.probability_high = (mv.probability_high * scale).clamp(0.0, 1.0);
+        }
+        unseen_probability *= scale;
+    }
+    // Cap inferred moves: at most three keep probability >= 0.08. Capped
+    // moves are pinned just below the threshold and the remaining mass is
+    // redistributed over the uncapped moves (and unseen mass) so the total
+    // stays exactly 1 without pushing the capped moves back over. Repeat
+    // until stable: rescaling can lift a sub-threshold move over the line.
+    let mut capped = vec![false; moves.len()];
+    loop {
+        let mut inferred_rank: Vec<usize> = moves
+            .iter()
+            .enumerate()
+            .filter(|(_, mv)| mv.player_games == 0)
+            .map(|(i, _)| i)
+            .collect();
+        inferred_rank.sort_by(|&a, &b| {
+            moves[b]
+                .probability
+                .total_cmp(&moves[a].probability)
+                .then(a.cmp(&b))
+        });
+        let mut newly_capped = false;
+        for (rank, &i) in inferred_rank.iter().enumerate() {
+            if rank >= 3 && !capped[i] && moves[i].probability >= 0.08 {
+                moves[i].probability = 0.08_f64.next_down();
+                moves[i].probability_low = moves[i].probability_low.min(moves[i].probability);
+                moves[i].probability_high = moves[i]
+                    .probability_high
+                    .min(moves[i].probability + 0.02)
+                    .max(moves[i].probability);
+                capped[i] = true;
+                newly_capped = true;
+            }
+        }
+        if !newly_capped {
+            break;
+        }
+        let fixed: f64 = moves
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| capped[*i])
+            .map(|(_, mv)| mv.probability)
+            .sum();
+        let flex: f64 = moves
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !capped[*i])
+            .map(|(_, mv)| mv.probability)
+            .sum::<f64>()
+            + unseen_probability;
+        if flex <= 0.0 {
+            // Degenerate (no player data, no unseen mass): scale to 1.
+            let all: f64 = moves.iter().map(|mv| mv.probability).sum();
+            if all > 0.0 {
+                for mv in moves.iter_mut() {
+                    mv.probability /= all;
+                }
+            }
+            break;
+        }
+        let scale = (1.0 - fixed) / flex;
+        for (i, mv) in moves.iter_mut().enumerate() {
+            if !capped[i] {
+                mv.probability = (mv.probability * scale).clamp(0.0, 1.0);
+                mv.probability_low = (mv.probability_low * scale).clamp(0.0, 1.0);
+                mv.probability_high = (mv.probability_high * scale).clamp(0.0, 1.0);
+            }
+        }
+        unseen_probability = (unseen_probability * scale).clamp(0.0, 1.0);
+    }
+
+    Prediction {
+        moves,
+        player_games,
+        recent_games,
+        recent_mix,
+        has_player_data: total_w > 0.0,
         unseen_probability,
         unseen_moves,
         legal_moves,
@@ -1838,7 +3212,7 @@ mod tests {
         );
         assert_eq!(prediction.player_games, 2);
         assert_eq!(prediction.moves.len(), 1);
-        let move_prediction = prediction.moves[0];
+        let move_prediction = &prediction.moves[0];
         assert!(move_prediction.probability < 1.0);
         assert!(move_prediction.probability > 0.8);
         assert!(move_prediction.probability_low < move_prediction.probability);
@@ -1942,5 +3316,358 @@ mod tests {
             2025_0101,
         );
         assert_eq!(book_filtered.games(), 1);
+    }
+
+    fn game_with_headers(movetext: &str, headers: &[(&str, &str)]) -> Game {
+        let mut game = domain::parse_pgn(
+            format!(
+                "{}\n\n{movetext}\n",
+                headers
+                    .iter()
+                    .map(|(k, v)| format!("[{k} \"{v}\"]"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
+            .as_bytes(),
+        )
+        .unwrap()
+        .remove(0);
+        // parse_pgn requires a Result tag for complete games; tolerate `*`.
+        let _ = &mut game;
+        game
+    }
+
+    fn otb_game(white: &str, black: &str, date: &str, movetext: &str) -> Game {
+        game_with_headers(
+            movetext,
+            &[
+                ("Event", "Masters"),
+                ("Site", "Wijk aan Zee"),
+                ("Date", date),
+                ("White", white),
+                ("Black", black),
+                ("Result", "1-0"),
+            ],
+        )
+    }
+
+    fn online_game(white: &str, black: &str, date: &str, movetext: &str) -> Game {
+        game_with_headers(
+            movetext,
+            &[
+                ("Event", "Titled Tuesday"),
+                ("Site", "Chess.com INT"),
+                ("Date", date),
+                ("White", white),
+                ("Black", black),
+                ("Result", "1-0"),
+                ("TimeControl", "180+1"),
+            ],
+        )
+    }
+
+    #[test]
+    fn deduplicates_across_mega_and_chessabc() {
+        let moves = "1. e4 e5 2. Nf3 Nc6 3. Bb5 a6 1-0";
+        let mut mega = otb_game(
+            "Carlsen, Magnus",
+            "Nepomniachtchi, Ian",
+            "2024.01.01",
+            moves,
+        );
+        mega.set_header("Event", "Masters".to_string());
+        let mut abc = otb_game(
+            "Carlsen, Magnus",
+            "Nepomniachtchi, Ian",
+            "2024.01.02",
+            moves,
+        );
+        abc.set_header("TimeControl", "3600+30".to_string());
+        abc.set_header("WhiteElo", "2830".to_string());
+        abc.set_header("Event", "Masters".to_string());
+
+        let merged = deduplicate_and_merge_games(vec![
+            (SourceTag::Owoju, vec![mega]),
+            (SourceTag::Online(OnlineSource::Lichess), vec![abc.clone()]),
+        ]);
+        assert_eq!(merged.len(), 1, "same game from two sources merges");
+        assert_eq!(merged[0].0, SourceTag::Owoju, "first source tag is kept");
+        assert_eq!(
+            merged[0].1.header("TimeControl"),
+            Some("3600+30"),
+            "richest headers win"
+        );
+        assert_eq!(merged[0].1.header("WhiteElo"), Some("2830"));
+
+        // A different result is a different game.
+        let mut other = abc.clone();
+        other.set_header("Result", "0-1".to_string());
+        let merged = deduplicate_and_merge_games(vec![
+            (SourceTag::Owoju, vec![abc.clone()]),
+            (SourceTag::Owoju, vec![other]),
+        ]);
+        assert_eq!(merged.len(), 2);
+
+        // Unknown day shares YYYYMM with a dated duplicate.
+        let undated = otb_game(
+            "Carlsen, Magnus",
+            "Nepomniachtchi, Ian",
+            "2024.01.??",
+            moves,
+        );
+        let mut dated = undated.clone();
+        dated.set_header("Date", "2024.01.15".to_string());
+        let merged = deduplicate_and_merge_games(vec![
+            (SourceTag::Owoju, vec![undated]),
+            (SourceTag::Owoju, vec![dated]),
+        ]);
+        assert_eq!(merged.len(), 1);
+    }
+
+    #[test]
+    fn recency_trumps_tc() {
+        // Same online blitz move, one old and one recent. The TC mask allows
+        // blitz, but the 24-month online cutoff still drops the old game.
+        let old = online_game("Opponent", "Trendy", "2020.03.01", "1. e4 c5 2. Nf3 d6 1-0");
+        let new = online_game("Opponent", "Trendy", "2026.02.01", "1. e4 c5 2. Nf3 d6 1-0");
+        let book = PlayerBook::from_games(
+            "trendy",
+            "Trendy",
+            &[old, new],
+            PredictionConfig::default(),
+            2026_1001,
+        );
+        let after_e4 = Chess::default()
+            .play(
+                SanPlus::from_ascii(b"e4")
+                    .unwrap()
+                    .san
+                    .to_move(&Chess::default())
+                    .unwrap(),
+            )
+            .unwrap();
+        let key = position::position_key(&after_e4);
+        let filter = PrepFilterConfig::default();
+        assert!(filter.online_time_controls.blitz);
+        let moves = book.filtered_moves(key, Color::Black, &filter);
+        assert_eq!(moves.len(), 1);
+        assert_eq!(
+            moves[0].games, 1,
+            "only the recent game survives the date cutoff"
+        );
+        assert_eq!(moves[0].last_date, 2026_0201);
+    }
+
+    #[test]
+    fn toggling_include_online_filters_instantly() {
+        let otb = otb_game("Opponent", "Trendy", "2025.05.01", "1. e4 c5 2. Nf3 d6 1-0");
+        let online = online_game("Opponent", "Trendy", "2025.06.01", "1. e4 c5 2. Nf3 d6 0-1");
+        let book = PlayerBook::from_games(
+            "trendy",
+            "Trendy",
+            &[otb, online],
+            PredictionConfig::default(),
+            2026_1001,
+        );
+        let after_e4 = Chess::default()
+            .play(
+                SanPlus::from_ascii(b"e4")
+                    .unwrap()
+                    .san
+                    .to_move(&Chess::default())
+                    .unwrap(),
+            )
+            .unwrap();
+        let key = position::position_key(&after_e4);
+        let with_online = PrepFilterConfig::default();
+        let without_online = PrepFilterConfig {
+            include_online: false,
+            ..PrepFilterConfig::default()
+        };
+        let on = book.filtered_moves(key, Color::Black, &with_online);
+        let off = book.filtered_moves(key, Color::Black, &without_online);
+        assert_eq!(on.iter().map(|m| m.games).sum::<u32>(), 2);
+        assert_eq!(off.iter().map(|m| m.games).sum::<u32>(), 1);
+        // Same book, no rebuild: toggling back restores the online game.
+        let on_again = book.filtered_moves(key, Color::Black, &with_online);
+        assert_eq!(on_again.iter().map(|m| m.games).sum::<u32>(), 2);
+        assert_eq!(
+            book.filtered_stats(key, Color::Black, &without_online)
+                .map(|s| s.games),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn detects_swapped_color() {
+        let games = [
+            otb_game(
+                "Swappy",
+                "Opponent",
+                "2025.01.01",
+                "1. e4 e5 2. Nf3 Nc6 1-0",
+            ),
+            otb_game(
+                "Swappy",
+                "Opponent",
+                "2025.06.01",
+                "1. e4 e5 2. Nf3 Nc6 1-0",
+            ),
+            otb_game(
+                "Swappy",
+                "Opponent",
+                "2026.01.01",
+                "1. e4 e5 2. Nf3 Nc6 1-0",
+            ),
+        ];
+        let book = PlayerBook::from_games(
+            "swappy",
+            "Swappy",
+            &games,
+            PredictionConfig::default(),
+            2026_1001,
+        );
+        let filter = PrepFilterConfig::default();
+        let start = position::position_key(&Chess::default());
+        assert!(
+            book.has_swapped_color_experience(start, Color::White, &filter, 2),
+            "three games with our colour is meaningful"
+        );
+        assert!(
+            has_meaningful_swapped_color_experience(&book, start, Color::White, &filter, 2),
+            "free-function wrapper agrees"
+        );
+        assert!(
+            !book.has_swapped_color_experience(start, Color::Black, &filter, 2),
+            "no Black games exist in this fixture"
+        );
+        // Two games are meaningful once the line is deep.
+        let pair = PlayerBook::from_games(
+            "swappy",
+            "Swappy",
+            &games[..2],
+            PredictionConfig::default(),
+            2026_1001,
+        );
+        assert!(!pair.has_swapped_color_experience(start, Color::White, &filter, 2));
+        assert!(pair.has_swapped_color_experience(start, Color::White, &filter, 8));
+    }
+
+    #[test]
+    fn specialist_vs_exploratory() {
+        let specialist_games: Vec<Game> = (1..=6)
+            .map(|m| {
+                otb_game(
+                    "Specialist",
+                    "Opponent",
+                    &format!("2025.{m:02}.01"),
+                    "1. e4 e5 2. Nf3 Nc6 3. Bb5 a6 1-0",
+                )
+            })
+            .collect();
+        let specialist = PlayerBook::from_games(
+            "specialist",
+            "Specialist",
+            &specialist_games,
+            PredictionConfig::default(),
+            2026_1001,
+        );
+        let exploratory_sans = ["Nf3", "Bc4", "Nc3", "d4", "f4", "c3", "Qh5", "g3"];
+        let exploratory_games: Vec<Game> = exploratory_sans
+            .iter()
+            .enumerate()
+            .map(|(i, san)| {
+                otb_game(
+                    "Explorer",
+                    "Opponent",
+                    &format!("2025.{:02}.01", i + 1),
+                    &format!("1. e4 e5 2. {san} 1-0"),
+                )
+            })
+            .collect();
+        let exploratory = PlayerBook::from_games(
+            "explorer",
+            "Explorer",
+            &exploratory_games,
+            PredictionConfig::default(),
+            2026_1001,
+        );
+        let filter = PrepFilterConfig::default();
+        let spec = specialist.profile(Color::White, &filter, None);
+        let expl = exploratory.profile(Color::White, &filter, None);
+        assert!(spec.sample_games >= 6, "profile sees qualifying nodes");
+        assert!(expl.sample_games >= 8);
+        assert!(
+            spec.consistency_score > expl.consistency_score,
+            "specialist {spec:?} vs exploratory {expl:?}"
+        );
+        assert_eq!(spec.consistency_label, "specialist");
+        assert_eq!(expl.consistency_label, "exploratory");
+    }
+
+    #[test]
+    fn unplayed_capped() {
+        let solo = otb_game("Solo", "Opponent", "2025.06.01", "1. e4 e5 1-0");
+        let book = PlayerBook::from_games(
+            "solo",
+            "Solo",
+            std::slice::from_ref(&solo),
+            PredictionConfig::default(),
+            2026_1001,
+        );
+        let start = Chess::default();
+        let key = position::position_key(&start);
+        let legal = start.legal_moves();
+        let mut heavy = std::collections::HashSet::new();
+        for san in ["e4", "d4", "c4", "Nf3", "g3"] {
+            let mv = SanPlus::from_ascii(san.as_bytes())
+                .unwrap()
+                .san
+                .to_move(&start)
+                .unwrap();
+            heavy.insert(position::encode_move(mv).unwrap());
+        }
+        let global: Vec<MoveStat> = legal
+            .iter()
+            .map(|&mv| {
+                let code = position::encode_move(mv).unwrap();
+                MoveStat {
+                    key,
+                    mv: code,
+                    games: if heavy.contains(&code) { 60 } else { 1 },
+                    ..MoveStat::default()
+                }
+            })
+            .collect();
+        let prediction = predict_v2(
+            &book,
+            key,
+            &global,
+            PriorSource::Reference,
+            legal.len(),
+            None,
+            None,
+            None,
+        );
+        assert!(prediction.has_player_data);
+        let inferred: Vec<_> = prediction
+            .moves
+            .iter()
+            .filter(|m| m.player_games == 0 && m.is_inferred_only)
+            .collect();
+        let above: Vec<_> = inferred.iter().filter(|m| m.probability >= 0.08).collect();
+        assert!(
+            above.len() <= 3,
+            "at most 3 unplayed moves keep >= 8%: got {}",
+            above.len()
+        );
+        assert!(
+            inferred.len() >= 4,
+            "fixture needs enough inferred moves to test the cap"
+        );
+        assert!(
+            prediction.moves.iter().any(|m| m.player_games == 1),
+            "the played move stays listed"
+        );
     }
 }

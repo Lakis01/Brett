@@ -420,11 +420,40 @@ struct PrepSession {
     our_color: Color,
     previous_game: Option<usize>,
     previous_orientation: Color,
+    /// Dual-mode panel selection.
+    mode: crate::settings::PrepMode,
+    /// OTB + online filters chosen in the setup dialog.
+    filter: players::PrepFilterConfig,
+    /// Enabled online accounts used for this session.
+    accounts: Vec<players::PrepOnlineAccount>,
+    /// Human-readable list of the loaded sources.
+    sources_label: String,
 }
 
 impl PrepSession {
     fn opponent_color(&self) -> Color {
         self.our_color.other()
+    }
+}
+
+/// Result of the background multi-source preparation load.
+///
+/// `games` are the deduplicated, player-only games from every selected
+/// source; ref indices in `book` address this vector positionally.
+struct PrepLoadResult {
+    book: PlayerBook,
+    games: Vec<Game>,
+    sources_label: String,
+}
+
+/// Which side of the board the left game list is restricted to while
+/// preparation is active: the opponent's facing colour, or — in the swapped
+/// view — our own colour. `None` means no restriction.
+fn prep_list_shows_game(prep: &PrepSession, white: &str, black: &str, wanted: Color) -> bool {
+    let key = players::player_key;
+    match wanted {
+        Color::White => key(white).as_deref() == Some(prep.player_key.as_str()),
+        Color::Black => key(black).as_deref() == Some(prep.player_key.as_str()),
     }
 }
 
@@ -453,6 +482,10 @@ struct PrepPredictionRow {
     trend_pp: Option<f64>,
     #[allow(dead_code)]
     tree: Option<position::MoveStat>,
+    /// True when the move was never played by the prepared player and comes
+    /// purely from the background prior (Smart predictor only).
+    inferred: bool,
+    vs_field_pp: Option<f64>,
 }
 
 struct PrepPredictionData {
@@ -479,6 +512,9 @@ struct PrepLineRow {
 #[derive(Clone, Debug)]
 struct PrepRecentRow {
     index: usize,
+    /// Position in `prep_merged_games` when the row comes from the unified
+    /// multi-source book; `None` for rows resolved through the open library.
+    merged_index: Option<usize>,
     white: String,
     black: String,
     white_title: Option<&'static str>,
@@ -802,6 +838,36 @@ pub struct App {
     /// Ordered aliases for the user. The first match sets board orientation on
     /// open; the first alias replaces `You` in preparation tags.
     prep_player_names: Vec<String>,
+    /// Smart preparation panel mode (persisted default, per-session override).
+    prep_mode: crate::settings::PrepMode,
+    /// Include cached online games in the unified recent list. The toggle is
+    /// instant: online games stay cached, only the display filter changes.
+    prep_include_online: bool,
+    /// Restrict the left game list to the opponent's facing colour.
+    prep_filter_facing_color: bool,
+    /// Chip override: show every game even while the facing filter is on.
+    prep_show_all_games: bool,
+    /// Show the swapped-colour games instead of the facing-colour ones.
+    prep_swapped_view: bool,
+    /// Start Preparation setup modal.
+    prep_setup_open: bool,
+    prep_setup_use_current: bool,
+    prep_setup_use_reference: bool,
+    prep_setup_use_chessabc: bool,
+    prep_setup_extra_path: String,
+    prep_setup_filter: players::PrepFilterConfig,
+    prep_setup_accounts: Vec<players::PrepOnlineAccount>,
+    prep_setup_account_service: OnlineSource,
+    prep_setup_account_name: String,
+    /// Colour we will play, chosen by the Prepare as White/Black button that
+    /// opened the setup dialog.
+    prep_setup_as_white: bool,
+    /// Unified deduplicated games from every selected source.
+    prep_merged_games: Vec<Game>,
+    prep_load_rx: Option<mpsc::Receiver<Result<PrepLoadResult, String>>>,
+    prep_load_job: Option<String>,
+    /// Online accounts per prepared player, persisted in preparation prefs.
+    prep_saved_accounts: std::collections::HashMap<String, Vec<players::PrepOnlineAccount>>,
     recent_preview: Option<RecentPreview>,
     reference_path: String,
     reference_enabled: bool,
@@ -1156,6 +1222,25 @@ impl App {
             prep_recent_limit: display_prefs.prep_recent_limit,
             prep_exclude_chesscom: preparation_prefs.exclude_chesscom,
             prep_player_names: preparation_prefs.prep_player_names.clone(),
+            prep_mode: preparation_prefs.prep_mode,
+            prep_include_online: preparation_prefs.prep_include_online,
+            prep_filter_facing_color: display_prefs.prep_filter_facing_color,
+            prep_show_all_games: false,
+            prep_swapped_view: false,
+            prep_setup_open: false,
+            prep_setup_use_current: true,
+            prep_setup_use_reference: true,
+            prep_setup_use_chessabc: true,
+            prep_setup_extra_path: String::new(),
+            prep_setup_filter: players::PrepFilterConfig::default(),
+            prep_setup_accounts: Vec::new(),
+            prep_setup_account_service: OnlineSource::Lichess,
+            prep_setup_account_name: String::new(),
+            prep_setup_as_white: true,
+            prep_merged_games: Vec::new(),
+            prep_load_rx: None,
+            prep_load_job: None,
+            prep_saved_accounts: preparation_prefs.prep_online_accounts.clone(),
             recent_preview: None,
             reference_path,
             reference_enabled: preparation_prefs.reference_enabled,
@@ -4126,6 +4211,7 @@ impl App {
             engine_limit_mode: self.engine_limit_mode.config_value().to_string(),
             engine_depth: self.engine_depth,
             engine_time_ms: self.engine_time_ms,
+            prep_filter_facing_color: self.prep_filter_facing_color,
         };
         if let Err(err) = prefs.save() {
             self.status = format!("Could not save display settings: {err:#}");
@@ -4205,6 +4291,9 @@ impl App {
             prep_player_names: self.prep_player_names.clone(),
             exclude_chesscom: self.prep_exclude_chesscom,
             correspondence_download_dismissed: self.correspondence_download_dismissed,
+            prep_include_online: self.prep_include_online,
+            prep_mode: self.prep_mode,
+            prep_online_accounts: self.prep_saved_accounts.clone(),
         };
         if let Err(err) = prefs.save() {
             self.reference_status = format!("Could not save reference settings: {err:#}");
@@ -4646,6 +4735,13 @@ impl App {
         }
     }
 
+    /// Background distribution for the prediction model.
+    ///
+    /// Hierarchy: reference database → opening-tree index → cached Lichess
+    /// Masters explorer → current-database index (with the prepared player's
+    /// own games subtracted by the caller). The correspondence database is
+    /// deliberately never consulted here: correspondence opening choices would
+    /// pollute an over-the-board repertoire prior.
     fn prior_for_position(&self, key: u64) -> (Vec<position::MoveStat>, players::PriorSource) {
         if self.reference_wanted()
             && let Some(reference) = &self.reference
@@ -4655,12 +4751,95 @@ impl App {
                 return (moves, players::PriorSource::Reference);
             }
         }
+        if let Some(tree) = &self.tree_index {
+            let moves = tree.moves(key);
+            if !moves.is_empty() {
+                return (moves, players::PriorSource::Reference);
+            }
+        }
+        if let Some(moves) = self.cached_masters_prior(key) {
+            return (moves, players::PriorSource::Reference);
+        }
         let moves = self
             .index
             .as_ref()
             .map(|index| index.moves(key))
             .unwrap_or_default();
         (moves, players::PriorSource::CurrentDatabase)
+    }
+
+    /// Lichess Masters explorer moves for the current position, converted to
+    /// background [`position::MoveStat`] rows. Only the in-memory cache is
+    /// consulted, so calling this never triggers network traffic.
+    fn cached_masters_prior(&self, key: u64) -> Option<Vec<position::MoveStat>> {
+        let game = self.current.as_ref()?;
+        let node = game.nodes.get(self.node)?;
+        let pos = &node.pos;
+        if position::position_key(pos) != key {
+            return None;
+        }
+        let fen = Fen::from_position(pos, EnPassantMode::Legal).to_string();
+        let snapshot = self
+            .cloud_cache
+            .get(&(cloud::ExplorerSource::Masters, fen))?;
+        let explorer = snapshot.explorer.as_ref().ok()?;
+        if explorer.moves.is_empty() {
+            return None;
+        }
+        let mut stats = Vec::new();
+        for explorer_move in &explorer.moves {
+            let Ok(uci) = explorer_move.uci.parse::<UciMove>() else {
+                continue;
+            };
+            let Ok(mv) = uci.to_move(pos) else {
+                continue;
+            };
+            let Some(code) = position::encode_move(mv) else {
+                continue;
+            };
+            let games = explorer_move.total().min(u64::from(u32::MAX)) as u32;
+            if games == 0 {
+                continue;
+            }
+            stats.push(position::MoveStat {
+                key,
+                mv: code,
+                games,
+                white: explorer_move.white.min(u64::from(u32::MAX)) as u32,
+                draw: explorer_move.draws.min(u64::from(u32::MAX)) as u32,
+                black: explorer_move.black.min(u64::from(u32::MAX)) as u32,
+                elo_sum: 0,
+                elo_count: 0,
+                first_date: 0,
+                last_date: 0,
+                anchor_quarter: 0,
+                older_dated: 0,
+                buckets: [0; position::TREND_BUCKETS],
+            });
+        }
+        (!stats.is_empty()).then_some(stats)
+    }
+
+    /// True when no OTB background source (reference database or opening-tree
+    /// file) is configured, so the UI can suggest setting one up.
+    fn prior_has_otb_background(&self) -> bool {
+        let reference_configured = self.reference_enabled && !self.reference_path.trim().is_empty();
+        let tree_configured = !self.tree_path.trim().is_empty();
+        reference_configured || tree_configured
+    }
+
+    /// Colour the left game list is restricted to while preparation is
+    /// active, or `None` when every game is shown.
+    fn prep_list_color_filter(&self) -> Option<Color> {
+        let prep = self.prep.as_ref()?;
+        if !self.prep_filter_facing_color || self.prep_show_all_games {
+            return None;
+        }
+        Some(if self.prep_swapped_view {
+            prep.our_color
+        } else {
+            prep.opponent_color()
+        })
     }
 
     fn prior_warning(&self, source: players::PriorSource) -> Option<String> {
@@ -5999,6 +6178,438 @@ impl App {
         }
     }
 
+    /// Maximum games fetched per online source during preparation.
+    const PREP_ONLINE_MAX: usize = 300;
+
+    // Temporary minimal stub for the in-progress preparation-setup task.
+    fn open_prep_setup(&mut self, as_white: bool) {
+        let Some(index) = self.selected_player else {
+            return;
+        };
+        let Some(player) = self.players.get(index).cloned() else {
+            return;
+        };
+        self.prep_setup_as_white = as_white;
+        self.prep_setup_accounts = self
+            .prep_saved_accounts
+            .get(&player.key)
+            .cloned()
+            .unwrap_or_default();
+        self.prep_setup_filter = self
+            .prep
+            .as_ref()
+            .filter(|prep| prep.player_key == player.key)
+            .map(|prep| prep.filter)
+            .unwrap_or_default();
+        self.prep_setup_open = true;
+    }
+
+    /// Load the prepared player's games from every selected source in the
+    /// background: the current database, an extra PGN file, recent ChessABC
+    /// OTB games, and one fetch per enabled online account. The merged games
+    /// are deduplicated and indexed into a unified [`PlayerBook`] covering
+    /// both colours; the reference database contributes its prior through
+    /// [`Self::prior_for_position`] rather than raw games.
+    fn start_smart_prep_load(&mut self, index: usize) {
+        let Some(player) = self.players.get(index).cloned() else {
+            return;
+        };
+        if self.prep_load_rx.is_some() {
+            return;
+        }
+        let Some(library) = self.library.clone() else {
+            // Without a current database, fall back to the classic single-source book.
+            self.start_player_book(index);
+            return;
+        };
+        let use_current = self.prep_setup_use_current;
+        let use_reference_file = self.prep_setup_use_reference;
+        let reference_path = self.reference_path.clone();
+        let use_chessabc = self.prep_setup_use_chessabc;
+        let extra_path = self.prep_setup_extra_path.trim().to_string();
+        let accounts: Vec<players::PrepOnlineAccount> = self
+            .prep
+            .as_ref()
+            .filter(|prep| prep.player_key == player.key)
+            .map(|prep| prep.accounts.clone())
+            .unwrap_or_default();
+        self.prep_load_job = Some(player.key.clone());
+        self.player_book_status = format!("Loading {} games from all sources…", player.name);
+        let (tx, rx) = mpsc::channel();
+        let ctx = self.ctx.clone();
+        let config = players::PredictionConfig {
+            exclude_chesscom: self.prep_exclude_chesscom,
+            ..Default::default()
+        };
+        let max_games = Self::PREP_ONLINE_MAX;
+        std::thread::spawn(move || {
+            let as_of = players::today();
+            let mut sources: Vec<(players::SourceTag, Vec<Game>)> = Vec::new();
+            let mut notes: Vec<String> = Vec::new();
+            if use_current {
+                let mut games = Vec::new();
+                for &game_index in &player.game_indices {
+                    match library.load(game_index) {
+                        Ok(game) => games.push(game),
+                        Err(err) => {
+                            tracing::warn!("prep load skipped game {game_index}: {err:#}");
+                        }
+                    }
+                }
+                notes.push(format!("Current DB {}", games.len()));
+                sources.push((
+                    players::SourceTag::Other("Current database".to_string()),
+                    games,
+                ));
+            }
+            if use_reference_file {
+                let trimmed = reference_path.trim();
+                if !trimmed.is_empty() {
+                    let path = PathBuf::from(trimmed);
+                    let is_pgn = path
+                        .extension()
+                        .and_then(|extension| extension.to_str())
+                        .is_some_and(|extension| extension.eq_ignore_ascii_case("pgn"));
+                    if is_pgn && path.exists() {
+                        match std::fs::read(&path) {
+                            Ok(bytes) => match domain::parse_pgn(&bytes) {
+                                Ok(games) => {
+                                    notes.push(format!("Reference file {}", games.len()));
+                                    sources.push((
+                                        players::SourceTag::Other("Reference file".to_string()),
+                                        games,
+                                    ));
+                                }
+                                Err(err) => {
+                                    notes.push(format!("Reference file unreadable: {err:#}"));
+                                }
+                            },
+                            Err(err) => {
+                                notes.push(format!("Reference file unreadable: {err:#}"));
+                            }
+                        }
+                    } else {
+                        notes.push("Reference prior".to_string());
+                    }
+                }
+            }
+            if use_chessabc {
+                match online::fetch_player_games(OnlineSource::ChessAbc, &player.name, max_games) {
+                    Ok(games) => {
+                        notes.push(format!("ChessABC {}", games.len()));
+                        sources.push((players::SourceTag::Online(OnlineSource::ChessAbc), games));
+                    }
+                    Err(err) => {
+                        notes.push(format!("ChessABC unavailable ({err:#})"));
+                    }
+                }
+            }
+            for account in &accounts {
+                if !account.enabled {
+                    continue;
+                }
+                match online::fetch_player_games(account.source, &account.username, max_games) {
+                    Ok(games) => {
+                        notes.push(format!("{} {}", account.source.label(), games.len()));
+                        sources.push((players::SourceTag::Online(account.source), games));
+                    }
+                    Err(err) => {
+                        notes.push(format!("{} unavailable ({err:#})", account.source.label()));
+                    }
+                }
+            }
+            if !extra_path.is_empty() {
+                let path = PathBuf::from(&extra_path);
+                if path.exists() {
+                    match std::fs::read(&path)
+                        .map_err(anyhow::Error::from)
+                        .and_then(|bytes| domain::parse_pgn(&bytes))
+                    {
+                        Ok(games) => {
+                            notes.push(format!("Extra file {}", games.len()));
+                            sources
+                                .push((players::SourceTag::Other("Extra file".to_string()), games));
+                        }
+                        Err(err) => {
+                            notes.push(format!("Extra file unreadable: {err:#}"));
+                        }
+                    }
+                } else {
+                    notes.push("Extra file not found".to_string());
+                }
+            }
+            let mut merged = players::deduplicate_and_merge_games(sources);
+            merged.retain(|(_, game)| {
+                players::player_key(game.white()).as_deref() == Some(player.key.as_str())
+                    || players::player_key(game.black()).as_deref() == Some(player.key.as_str())
+            });
+            let games: Vec<Game> = merged.into_iter().map(|(_, game)| game).collect();
+            let book = PlayerBook::from_merged_games(
+                player.key.clone(),
+                player.name.clone(),
+                &games,
+                config,
+                as_of,
+            );
+            let result: Result<PrepLoadResult, String> = Ok(PrepLoadResult {
+                sources_label: format!("{} · {} games", notes.join(" + "), book.games()),
+                book,
+                games,
+            });
+            let _ = tx.send(result);
+            ctx.request_repaint();
+        });
+        self.prep_load_rx = Some(rx);
+    }
+
+    fn poll_prep_load(&mut self) {
+        let Some(rx) = self.prep_load_rx.take() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Ok(result)) => {
+                let key = result.book.player_key().to_string();
+                let name = result.book.player_name().to_string();
+                let games = result.book.games();
+                let label = result.sources_label.clone();
+                if self
+                    .prep
+                    .as_ref()
+                    .is_some_and(|prep| prep.player_key == key)
+                {
+                    self.prep_merged_games = result.games;
+                    self.player_book = Some(result.book);
+                    self.player_book_job = None;
+                    if let Some(prep) = self.prep.as_mut() {
+                        prep.sources_label = label.clone();
+                    }
+                    self.player_book_status = format!("{games} games merged for {name} · {label}");
+                }
+                self.prep_load_job = None;
+            }
+            Ok(Err(err)) => {
+                self.prep_load_job = None;
+                self.player_book_status = format!("Preparation load failed: {err}");
+            }
+            Err(TryRecvError::Empty) => {
+                self.prep_load_rx = Some(rx);
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.prep_load_job = None;
+                self.player_book_status = "Preparation load stopped unexpectedly.".to_string();
+            }
+        }
+    }
+
+    /// Start Preparation setup modal: sources, per-player online accounts,
+    /// separate OTB/online filters, and the panel mode.
+    fn prep_setup_dialog(&mut self, ctx: &egui::Context) {
+        if !self.prep_setup_open {
+            return;
+        }
+        let player_name = self
+            .selected_player
+            .and_then(|index| self.players.get(index))
+            .map(|player| player.name.clone())
+            .unwrap_or_default();
+        let player_key = self
+            .selected_player
+            .and_then(|index| self.players.get(index))
+            .map(|player| player.key.clone())
+            .unwrap_or_default();
+        let mut open = true;
+        let mut start = false;
+        let mut cancelled = false;
+        let mut choose_extra = false;
+        let mut add_account = false;
+        let mut remove_account = None;
+        egui::Window::new(format!("Start preparation vs {player_name}"))
+            .open(&mut open)
+            .default_size([520.0, 640.0])
+            .min_width(440.0)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("You play:");
+                    ui.radio_value(&mut self.prep_setup_as_white, true, "White");
+                    ui.radio_value(&mut self.prep_setup_as_white, false, "Black");
+                });
+                ui.separator();
+                ui.label(RichText::new("Sources").strong());
+                ui.checkbox(&mut self.prep_setup_use_current, "Current database");
+                ui.checkbox(
+                    &mut self.prep_setup_use_reference,
+                    "Reference database (Mega + prior)",
+                )
+                .on_hover_text(
+                    "The reference database supplies the background prior; PGN reference files also contribute their games.",
+                );
+                ui.checkbox(
+                    &mut self.prep_setup_use_chessabc,
+                    "ChessABC recent OTB games",
+                );
+                ui.horizontal(|ui| {
+                    ui.label("Extra DB file:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.prep_setup_extra_path)
+                            .hint_text("/path/to/extra.pgn")
+                            .desired_width(280.0),
+                    );
+                    if ui.small_button("Browse…").clicked() {
+                        choose_extra = true;
+                    }
+                });
+                ui.separator();
+                ui.label(RichText::new("Online accounts").strong());
+                let mut accounts_changed = false;
+                for (position, account) in self.prep_setup_accounts.iter_mut().enumerate() {
+                    ui.horizontal(|ui| {
+                        if ui.checkbox(&mut account.enabled, "").changed() {
+                            accounts_changed = true;
+                        }
+                        ui.label(format!("{} · {}", account.source.label(), account.username));
+                        if ui.small_button("×").on_hover_text("Remove account").clicked() {
+                            remove_account = Some(position);
+                        }
+                    });
+                }
+                if accounts_changed {
+                    self.prep_saved_accounts
+                        .insert(player_key.clone(), self.prep_setup_accounts.clone());
+                    self.save_reference_prefs();
+                }
+                ui.horizontal(|ui| {
+                    egui::ComboBox::from_id_salt("prep-setup-service")
+                        .selected_text(self.prep_setup_account_service.label())
+                        .show_ui(ui, |ui| {
+                            for service in
+                                [OnlineSource::Lichess, OnlineSource::ChessCom, OnlineSource::ChessAbc]
+                            {
+                                ui.selectable_value(
+                                    &mut self.prep_setup_account_service,
+                                    service,
+                                    service.label(),
+                                );
+                            }
+                        });
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.prep_setup_account_name)
+                            .hint_text(self.prep_setup_account_service.input_hint())
+                            .desired_width(180.0),
+                    );
+                    if ui.small_button("Add account").clicked() {
+                        add_account = true;
+                    }
+                });
+                ui.separator();
+                ui.label(RichText::new("OTB filter").strong());
+                let otb = &mut self.prep_setup_filter.otb_time_controls;
+                ui.horizontal_wrapped(|ui| {
+                    ui.checkbox(&mut otb.classical, "Classical");
+                    ui.checkbox(&mut otb.rapid, "Rapid");
+                    ui.checkbox(&mut otb.blitz, "Blitz");
+                    ui.checkbox(&mut otb.bullet, "Bullet");
+                });
+                ui.horizontal(|ui| {
+                    ui.label("OTB games from:");
+                    cutoff_picker(ui, "prep-cutoff-otb", &mut self.prep_setup_filter.otb_date_cutoff);
+                });
+                ui.separator();
+                ui.label(RichText::new("Online filter").strong());
+                ui.checkbox(
+                    &mut self.prep_setup_filter.include_online,
+                    "Include online games (instant toggle, no refetch)",
+                );
+                let online_tc = &mut self.prep_setup_filter.online_time_controls;
+                ui.horizontal_wrapped(|ui| {
+                    ui.checkbox(&mut online_tc.classical, "Classical");
+                    ui.checkbox(&mut online_tc.rapid, "Rapid");
+                    ui.checkbox(&mut online_tc.blitz, "Blitz");
+                    ui.checkbox(&mut online_tc.bullet, "Bullet");
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Online games from:");
+                    cutoff_picker(
+                        ui,
+                        "prep-cutoff-online",
+                        &mut self.prep_setup_filter.online_date_cutoff,
+                    );
+                });
+                ui.checkbox(
+                    &mut self.prep_setup_filter.online_rated_only,
+                    "Rated games only",
+                );
+                ui.separator();
+                ui.label(RichText::new("Panel mode").strong());
+                ui.horizontal(|ui| {
+                    let classic = ui.selectable_label(
+                        self.prep_mode == crate::settings::PrepMode::Classic,
+                        "📊 Classic Stats",
+                    );
+                    if classic.clicked() {
+                        self.prep_mode = crate::settings::PrepMode::Classic;
+                        self.save_reference_prefs();
+                    }
+                    let smart = ui.selectable_label(
+                        self.prep_mode == crate::settings::PrepMode::Smart,
+                        "🎯 Smart Predictor",
+                    );
+                    if smart.clicked() {
+                        self.prep_mode = crate::settings::PrepMode::Smart;
+                        self.save_reference_prefs();
+                    }
+                });
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("Start preparation").clicked() {
+                        start = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancelled = true;
+                    }
+                });
+            });
+        if choose_extra && let Some(path) = open_dialog(None) {
+            self.prep_setup_extra_path = path.display().to_string();
+        }
+        if add_account {
+            let name = self.prep_setup_account_name.trim().to_string();
+            if !name.is_empty()
+                && !self.prep_setup_accounts.iter().any(|account| {
+                    account.source == self.prep_setup_account_service
+                        && account.username.eq_ignore_ascii_case(&name)
+                })
+            {
+                self.prep_setup_accounts.push(players::PrepOnlineAccount {
+                    source: self.prep_setup_account_service,
+                    username: name,
+                    enabled: true,
+                });
+                self.prep_saved_accounts
+                    .insert(player_key.clone(), self.prep_setup_accounts.clone());
+                self.save_reference_prefs();
+            }
+            self.prep_setup_account_name.clear();
+        }
+        if let Some(position) = remove_account
+            && position < self.prep_setup_accounts.len()
+        {
+            self.prep_setup_accounts.remove(position);
+            self.prep_saved_accounts
+                .insert(player_key.clone(), self.prep_setup_accounts.clone());
+            self.save_reference_prefs();
+        }
+        if cancelled {
+            open = false;
+        }
+        if start {
+            open = false;
+            self.prep_setup_open = false;
+            let as_white = self.prep_setup_as_white;
+            self.start_prep(as_white);
+        }
+        self.prep_setup_open = open;
+    }
+
     fn start_prep(&mut self, as_white: bool) {
         let Some(index) = self.selected_player else {
             return;
@@ -6065,6 +6676,11 @@ impl App {
         self.prep_online_status.clear();
         self.prep_online_rx = None;
         self.prep_online_job = None;
+        self.prep_merged_games.clear();
+        self.prep_load_rx = None;
+        self.prep_load_job = None;
+        self.prep_show_all_games = false;
+        self.prep_swapped_view = false;
         self.prep = Some(PrepSession {
             player_key: player.key.clone(),
             player_name: display_name.clone(),
@@ -6073,6 +6689,15 @@ impl App {
             our_color,
             previous_game,
             previous_orientation,
+            mode: self.prep_mode,
+            filter: self.prep_setup_filter,
+            accounts: self
+                .prep_setup_accounts
+                .iter()
+                .filter(|account| account.enabled)
+                .cloned()
+                .collect(),
+            sources_label: String::new(),
         });
         self.annotation_editor = None;
         self.annotation_focus = false;
@@ -6089,7 +6714,7 @@ impl App {
             color_name(our_color),
             color_name(self.orientation),
         );
-        self.start_player_book(index);
+        self.start_smart_prep_load(index);
     }
 
     fn exit_prep(&mut self) {
@@ -6101,6 +6726,11 @@ impl App {
         self.prep_online_status.clear();
         self.prep_online_rx = None;
         self.prep_online_job = None;
+        self.prep_merged_games.clear();
+        self.prep_load_rx = None;
+        self.prep_load_job = None;
+        self.prep_show_all_games = false;
+        self.prep_swapped_view = false;
         self.dirty = false;
         self.current = None;
         self.current_slot = None;
@@ -8855,12 +9485,12 @@ impl App {
         );
         ui.add_space(4.0);
 
-        let filter_trimmed = self.filter.trim();
+        let filter_trimmed = self.filter.trim().to_string();
         let is_filtered = !filter_trimmed.is_empty();
 
         let mut open_player_name = None;
         if filter_trimmed.len() >= 2 {
-            let player_matches = self.players.filter(filter_trimmed);
+            let player_matches = self.players.filter(filter_trimmed.as_str());
             if !player_matches.is_empty() {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(RichText::new("👤 Players:").weak().size(11.0));
@@ -8888,19 +9518,78 @@ impl App {
             self.open_player_profile(&name);
             return;
         }
+        // Facing-colour filter: while preparation is active, the left list
+        // shows only games where the opponent plays the facing colour, with a
+        // chip to reveal the rest. The swapped view instead shows the games
+        // where the opponent played our colour.
+        let facing_filter = self.prep_list_color_filter();
+        if self.prep.is_some() && self.prep_filter_facing_color {
+            let label = if let Some(prep) = &self.prep {
+                if self.prep_show_all_games {
+                    format!("Showing all games · prep vs {}", prep.player_name)
+                } else if self.prep_swapped_view {
+                    format!(
+                        "🔄 Prep: {} as {} (swapped)",
+                        prep.player_name,
+                        color_name(prep.our_color)
+                    )
+                } else {
+                    format!(
+                        "🎯 Prep: {} as {}",
+                        prep.player_name,
+                        color_name(prep.opponent_color())
+                    )
+                }
+            } else {
+                String::new()
+            };
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new(label).small().strong());
+                if self.prep_show_all_games {
+                    if ui.small_button("Filter to opponent").clicked() {
+                        self.prep_show_all_games = false;
+                        self.save_display_prefs();
+                    }
+                } else if ui.small_button("Show all").clicked() {
+                    self.prep_show_all_games = true;
+                    self.save_display_prefs();
+                }
+            });
+            ui.add_space(2.0);
+        }
+        let facing_ids: Option<Vec<usize>> = facing_filter.and_then(|_| {
+            let prep = self.prep.as_ref()?;
+            let wanted = self.prep_list_color_filter()?;
+            let mut ids = Vec::new();
+            for pos in 0..self.session.len() {
+                let Some(id) = self.session.id_at(pos) else {
+                    continue;
+                };
+                let Some(slot) = self.session.slot(id) else {
+                    continue;
+                };
+                if prep_list_shows_game(prep, slot.white(), slot.black(), wanted) {
+                    ids.push(id);
+                }
+            }
+            Some(ids)
+        });
         let rows = if is_filtered {
-            self.session.filter(filter_trimmed)
+            self.session.filter(filter_trimmed.as_str())
         } else {
-            Vec::new()
+            facing_ids.unwrap_or_default()
         };
-        let total_count = if is_filtered {
+        let total_count = if is_filtered || facing_filter.is_some() {
             rows.len()
         } else {
             self.session.len()
         };
+        let use_prefiltered = is_filtered || facing_filter.is_some();
 
         if total_count == 0 {
-            let message = if !is_filtered {
+            let message = if !is_filtered && facing_filter.is_some() {
+                "No games with the opponent on the facing colour."
+            } else if !is_filtered {
                 "No games loaded."
             } else {
                 "No matching games."
@@ -8919,7 +9608,7 @@ impl App {
             .auto_shrink([false, false])
             .show_rows(ui, row_h, total_count, |ui, range| {
                 for pos in range {
-                    let Some(id) = (if is_filtered {
+                    let Some(id) = (if use_prefiltered {
                         rows.get(pos).copied()
                     } else {
                         self.session.id_at(pos)
@@ -9502,10 +10191,10 @@ impl App {
             self.exit_prep();
         }
         if start_white {
-            self.start_prep(true);
+            self.open_prep_setup(true);
         }
         if start_black {
-            self.start_prep(false);
+            self.open_prep_setup(false);
         }
         if let Some(index) = select_game {
             self.select_source(index);
@@ -11872,9 +12561,13 @@ impl App {
                 .into_iter()
                 .find(|predicted| predicted.mv == code)
             });
-            let likelihood = predicted.map(|predicted| predicted.probability);
-            let likelihood_low = predicted.map(|predicted| predicted.probability_low);
-            let likelihood_high = predicted.map(|predicted| predicted.probability_high);
+            let likelihood = predicted.as_ref().map(|predicted| predicted.probability);
+            let likelihood_low = predicted
+                .as_ref()
+                .map(|predicted| predicted.probability_low);
+            let likelihood_high = predicted
+                .as_ref()
+                .map(|predicted| predicted.probability_high);
             let date = player_move
                 .map(|stat| stat.last_date)
                 .filter(|&date| date != 0)
@@ -11912,17 +12605,35 @@ impl App {
             .player_book
             .as_ref()
             .filter(|book| book.player_key() == prep.player_key)?;
+        let facing = if self.prep_swapped_view {
+            prep.our_color
+        } else {
+            prep.opponent_color()
+        };
         let (prior, prior_source) = self.prior_for_position(key);
         let warning = self.prior_warning(prior_source);
-        let prediction = players::predict(book, key, &prior, prior_source, pos.legal_moves().len());
-        let stats = book.stats(key);
+        let reference_moves = self
+            .reference
+            .as_ref()
+            .map(|reference| reference.index.moves(key));
+        let prediction = players::predict_v2(
+            book,
+            key,
+            &prior,
+            prior_source,
+            pos.legal_moves().len(),
+            Some(&prep.filter),
+            Some(facing),
+            reference_moves.as_deref(),
+        );
+        let stats = book.filtered_stats(key, facing, &prep.filter);
         let tree_moves = self
             .index
             .as_ref()
             .map(|index| index.moves(key))
             .unwrap_or_default();
         let player_move_stats: HashMap<u32, players::PlayerMoveStat> = book
-            .moves(key)
+            .filtered_moves(key, facing, &prep.filter)
             .into_iter()
             .map(|stat| (stat.mv, stat))
             .collect();
@@ -11956,6 +12667,8 @@ impl App {
                     last_date: predicted.last_date,
                     trend_pp: predicted.trend_pp,
                     tree,
+                    inferred: predicted.is_inferred_only,
+                    vs_field_pp: predicted.vs_field_pp,
                 })
             })
             .collect();
@@ -12066,6 +12779,7 @@ impl App {
                 };
                 Some(PrepRecentRow {
                     index: game.index,
+                    merged_index: None,
                     white,
                     black,
                     white_title,
@@ -12080,6 +12794,51 @@ impl App {
                         color_name(game.color),
                         outcome_label(&result, game.color),
                         event
+                    ),
+                })
+            })
+            .collect()
+    }
+
+    /// Unified recent games from every merged source (`prep_merged_games`),
+    /// newest first, for the viewed colour. Falls back to an empty list when
+    /// no merged book has been loaded yet.
+    fn prep_unified_recent_rows(
+        &self,
+        prep: &PrepSession,
+        facing: Color,
+        key: u64,
+        limit: usize,
+    ) -> Vec<PrepRecentRow> {
+        let Some(book) = self
+            .player_book
+            .as_ref()
+            .filter(|book| book.player_key() == prep.player_key)
+        else {
+            return Vec::new();
+        };
+        book.recent_games_for_filtered(key, facing, &prep.filter, limit)
+            .into_iter()
+            .filter_map(|game_ref| {
+                let position = game_ref.index;
+                let game = self.prep_merged_games.get(position)?;
+                Some(PrepRecentRow {
+                    index: position,
+                    merged_index: Some(position),
+                    white: game.white().to_string(),
+                    black: game.black().to_string(),
+                    white_title: player_title(game, Color::White),
+                    black_title: player_title(game, Color::Black),
+                    white_country: player_country(game, Color::White).map(|c| c.badge),
+                    black_country: player_country(game, Color::Black).map(|c| c.badge),
+                    white_fide_id: player_fide_id(game, Color::White).map(str::to_string),
+                    black_fide_id: player_fide_id(game, Color::Black).map(str::to_string),
+                    subtitle: format!(
+                        "{} · as {} · {} · {}",
+                        game.date(),
+                        color_name(game_ref.color),
+                        outcome_label(game.result(), game_ref.color),
+                        game.event()
                     ),
                 })
             })
@@ -12132,7 +12891,10 @@ impl App {
             self.player_book = None;
             self.player_book_rx = None;
             self.player_book_job = None;
-            self.start_player_book(player_idx);
+            self.prep_merged_games.clear();
+            self.prep_load_rx = None;
+            self.prep_load_job = None;
+            self.start_smart_prep_load(player_idx);
         }
         ui.separator();
         if exit {
@@ -12140,6 +12902,11 @@ impl App {
             return;
         }
 
+        let facing = if self.prep_swapped_view {
+            prep.our_color
+        } else {
+            prep.opponent_color()
+        };
         let our_turn = pos.turn() != prep.opponent_color();
         let prediction_data = if our_turn {
             None
@@ -12151,7 +12918,55 @@ impl App {
         } else {
             Vec::new()
         };
-        let recent_rows = self.prep_recent_rows(prep, key, 500);
+        let legacy_rows = self.prep_recent_rows(prep, key, 500);
+        let unified_rows = self.prep_unified_recent_rows(prep, facing, key, 500);
+        let use_unified = !self.prep_merged_games.is_empty() || self.prep_load_job.is_some();
+        let recent_rows = if use_unified {
+            &unified_rows
+        } else {
+            &legacy_rows
+        };
+        let sources_label = prep.sources_label.clone();
+        let ply_depth = {
+            let mut depth = 0u32;
+            if let Some(game) = self.current.as_ref() {
+                let mut node = self.node.min(game.nodes.len().saturating_sub(1));
+                while let Some(parent) = game.nodes.get(node).and_then(|node| node.parent) {
+                    depth += 1;
+                    node = parent;
+                }
+            }
+            depth
+        };
+        let profile_data = self
+            .player_book
+            .as_ref()
+            .filter(|book| book.player_key() == prep.player_key)
+            .map(|book| {
+                book.profile(
+                    facing,
+                    &prep.filter,
+                    self.reference.as_ref().map(|reference| &reference.index),
+                )
+            });
+        let (swapped_count, swapped_meaningful) = self
+            .player_book
+            .as_ref()
+            .filter(|book| book.player_key() == prep.player_key)
+            .map(|book| {
+                (
+                    book.filtered_game_count(key, prep.our_color, &prep.filter)
+                        .0 as usize,
+                    players::has_meaningful_swapped_color_experience(
+                        book,
+                        key,
+                        prep.our_color,
+                        &prep.filter,
+                        ply_depth,
+                    ),
+                )
+            })
+            .unwrap_or((0, false));
         let book_loaded = self
             .player_book
             .as_ref()
@@ -12195,12 +13010,83 @@ impl App {
         let mut online_preview = None;
         let mut clicked = None;
         let mut preview = None;
+        let mut merged_preview: Option<usize> = None;
         let mut hover_preview = None;
+        let mut mode = prep.mode;
+        let mut include_online = prep.filter.include_online;
+        let mut toggle_online = false;
+        let mut show_swapped = false;
+        let mut back_to_facing = false;
 
         egui::ScrollArea::vertical()
             .id_salt("prep-tree-scroll")
             .auto_shrink([false, false])
             .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .selectable_label(
+                            mode == crate::settings::PrepMode::Classic,
+                            "📊 Classic Stats",
+                        )
+                        .on_hover_text("Per-move game counts and scores from the player's book")
+                        .clicked()
+                    {
+                        mode = crate::settings::PrepMode::Classic;
+                    }
+                    if ui
+                        .selectable_label(
+                            mode == crate::settings::PrepMode::Smart,
+                            "🎯 Smart Predictor",
+                        )
+                        .on_hover_text("Time-decayed likelihoods with inferred repertoire additions")
+                        .clicked()
+                    {
+                        mode = crate::settings::PrepMode::Smart;
+                    }
+                    if ui
+                        .checkbox(&mut include_online, "Include online")
+                        .on_hover_text(
+                            "Instant in-memory toggle: online games stay cached, no refetch.",
+                        )
+                        .changed()
+                    {
+                        toggle_online = true;
+                    }
+                });
+                if self.prep_swapped_view {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(
+                            RichText::new(format!(
+                                "🔄 Swapped view · {} {} as {}",
+                                swapped_count,
+                                prep.player_name,
+                                color_name(prep.our_color),
+                            ))
+                            .small()
+                            .strong(),
+                        );
+                        if ui.small_button("Back").clicked() {
+                            back_to_facing = true;
+                        }
+                    });
+                } else if swapped_meaningful {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(
+                            RichText::new(format!(
+                                "🔄 {} has meaningful experience with swapped colors here.",
+                                prep.player_name
+                            ))
+                            .small()
+                            .weak(),
+                        );
+                        if ui
+                            .small_button(format!("Show {swapped_count} swapped-color games"))
+                            .clicked()
+                        {
+                            show_swapped = true;
+                        }
+                    });
+                }
                 if our_turn {
                     ui.add_space(2.0);
                     ui.label(RichText::new("It is your move").strong());
@@ -12273,6 +13159,31 @@ impl App {
                 } else if let Some(data) = &prediction_data {
                     let rows = &data.rows;
                     let stats = &data.stats;
+                    if mode == crate::settings::PrepMode::Smart
+                        && let Some(profile) = &profile_data
+                    {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(
+                                RichText::new(format!(
+                                    "Consistency {:.0}% ({})",
+                                    profile.consistency_score * 100.0,
+                                    profile.consistency_label
+                                ))
+                                .strong(),
+                            );
+                            ui.label(
+                                RichText::new(format!(
+                                    "· Booked depth {:.1} · {} games",
+                                    profile.mean_book_exit_ply, profile.sample_games
+                                ))
+                                .weak()
+                                .small(),
+                            )
+                            .on_hover_text(
+                                "Mean mainline depth where the reference tree runs out, over the filtered sample.",
+                            );
+                        });
+                    }
                     if let Some(stats) = stats {
                         ui.horizontal_wrapped(|ui| {
                             let games_here = if stats.games == 1 {
@@ -12309,6 +13220,11 @@ impl App {
                         );
                     }
                     let player_moves: Vec<_> = rows.iter().filter(|r| r.player_games > 0).collect();
+                    let inferred_moves: Vec<_> = rows
+                        .iter()
+                        .filter(|r| r.inferred && r.probability >= 0.08)
+                        .take(3)
+                        .collect();
 
                     if player_moves.is_empty() {
                         ui.add_space(6.0);
@@ -12372,6 +13288,53 @@ impl App {
                                     ui.end_row();
                                 }
                             });
+                        if mode == crate::settings::PrepMode::Smart && !inferred_moves.is_empty() {
+                            ui.add_space(4.0);
+                            ui.label(RichText::new("Inferred additions").strong());
+                            ui.label(
+                                RichText::new(
+                                    "Never played here, but the background prior expects them.",
+                                )
+                                .weak()
+                                .small(),
+                            );
+                            egui::Grid::new("prep-inferred-grid")
+                                .num_columns(3)
+                                .striped(true)
+                                .spacing([12.0, 4.0])
+                                .show(ui, |ui| {
+                                    ui.label(RichText::new("Move").strong().small());
+                                    ui.label(RichText::new("Likelihood").strong().small());
+                                    ui.label(RichText::new("vs field").strong().small());
+                                    ui.end_row();
+                                    for row in &inferred_moves {
+                                        ui.horizontal(|ui| {
+                                            let text = RichText::new(domain::figurine_san(&row.san))
+                                                .monospace()
+                                                .italics();
+                                            let response = ui
+                                                .selectable_label(false, text)
+                                                .on_hover_text("Hover to preview · click to play");
+                                            if response.hovered() {
+                                                hover_preview = preview_after_move(pos, row.mv);
+                                            }
+                                            if response.clicked() {
+                                                clicked = Some(row.mv);
+                                            }
+                                            ui.label(
+                                                RichText::new("[Inferred]").small().weak(),
+                                            );
+                                        });
+                                        ui.label(format!("{:.0}%", row.probability * 100.0));
+                                        ui.label(
+                                            row.vs_field_pp
+                                                .map(|pp| format!("{pp:+.0}pp"))
+                                                .unwrap_or_else(|| "—".to_string()),
+                                        );
+                                        ui.end_row();
+                                    }
+                                });
+                        }
                     }
                 } else {
                     ui.add_space(4.0);
@@ -12383,6 +13346,15 @@ impl App {
 
                 ui.add_space(8.0);
                 ui.label(RichText::new(&reference_status).small().weak());
+                if !self.prior_has_otb_background() {
+                    ui.label(
+                        RichText::new(
+                            "Tip: set a Mega reference database or opening-tree file (Players → Reference database prior) for a stronger OTB background prior.",
+                        )
+                        .small()
+                        .weak(),
+                    );
+                }
                 egui::CollapsingHeader::new(RichText::new("Opening tree").strong())
                     .default_open(true)
                     .show(ui, |ui| {
@@ -12435,10 +13407,14 @@ impl App {
                             ui.label("games");
                         });
                         ui.label(
-                            RichText::new(format!(
-                                "Newest first · from {}'s games in this database",
-                                prep.player_name
-                            ))
+                            RichText::new(if use_unified {
+                                format!("Newest first · {} · {}", prep.player_name, sources_label)
+                            } else {
+                                format!(
+                                    "Newest first · from {}'s games in this database",
+                                    prep.player_name
+                                )
+                            })
                             .weak()
                             .small(),
                         );
@@ -12479,7 +13455,11 @@ impl App {
                                 )
                                 .clicked()
                                 {
-                                    preview = Some(row.index);
+                                    if let Some(merged) = row.merged_index {
+                                        merged_preview = Some(merged);
+                                    } else {
+                                        preview = Some(row.index);
+                                    }
                                 }
                             }
                             if recent_rows.len() > recent_limit {
@@ -12583,6 +13563,27 @@ impl App {
         if build_index {
             self.request_index_build();
         }
+        if mode != prep.mode {
+            self.prep_mode = mode;
+            self.save_reference_prefs();
+            if let Some(session) = self.prep.as_mut() {
+                session.mode = mode;
+            }
+        }
+        if toggle_online {
+            self.prep_include_online = include_online;
+            self.prep_setup_filter.include_online = include_online;
+            self.save_reference_prefs();
+            if let Some(session) = self.prep.as_mut() {
+                session.filter.include_online = include_online;
+            }
+        }
+        if show_swapped {
+            self.prep_swapped_view = true;
+        }
+        if back_to_facing {
+            self.prep_swapped_view = false;
+        }
         self.prep_recent_limit = recent_limit;
         if recent_limit_changed {
             self.save_display_prefs();
@@ -12594,7 +13595,12 @@ impl App {
         if load_online {
             self.start_prep_online();
         }
-        if let Some(game) = online_preview {
+        if let Some(position) = merged_preview {
+            if let Some(game) = self.prep_merged_games.get(position).cloned() {
+                let label = format!("Preparation game {} · read only", position + 1);
+                self.open_game_preview(game, label);
+            }
+        } else if let Some(game) = online_preview {
             self.open_game_preview(game, "ChessABC · latest game");
         } else if let Some(mv) = clicked {
             self.play_move(mv);
@@ -14114,6 +15120,7 @@ impl eframe::App for App {
         self.poll_player_directory();
         self.poll_book();
         self.poll_player_book();
+        self.poll_prep_load();
         self.poll_wiki();
         self.poll_reference();
         self.poll_correspondence();
@@ -14136,6 +15143,7 @@ impl eframe::App for App {
             || self.players_rx.is_some()
             || self.book_rx.is_some()
             || self.player_book_rx.is_some()
+            || self.prep_load_rx.is_some()
             || self.reference_rx.is_some()
             || self.online_rx.is_some()
             || self.online_game_rx.is_some()
@@ -14383,6 +15391,7 @@ impl eframe::App for App {
         self.two_cbh_export_dialog(&ctx);
         self.print_export_dialog(&ctx);
         self.setup_dialog(&ctx);
+        self.prep_setup_dialog(&ctx);
         self.classify_openings_dialog(&ctx);
         self.index_confirmation_dialog(&ctx);
         self.branch_choice_dialog(&ctx);
@@ -18513,6 +19522,36 @@ fn prep_matches(app: &App, player_key: &str) -> bool {
         .is_some_and(|prep| prep.player_key == player_key)
 }
 
+/// Date-cutoff picker shared by the OTB and online preparation filters.
+fn cutoff_picker(ui: &mut Ui, salt: &str, cutoff: &mut players::DateCutoff) {
+    let current = match *cutoff {
+        players::DateCutoff::AllTime => 0,
+        players::DateCutoff::Months(months) => months,
+        players::DateCutoff::SinceDate(_) => 0,
+    };
+    egui::ComboBox::from_id_salt(salt)
+        .selected_text(if current == 0 {
+            "All time".to_string()
+        } else {
+            format!("{current}mo")
+        })
+        .show_ui(ui, |ui| {
+            for (label, months) in [
+                ("All time", None),
+                ("6 months", Some(6)),
+                ("12 months", Some(12)),
+                ("24 months", Some(24)),
+                ("60 months", Some(60)),
+            ] {
+                let selected = current == months.unwrap_or(0);
+                if ui.selectable_label(selected, label).clicked() {
+                    *cutoff =
+                        months.map_or(players::DateCutoff::AllTime, players::DateCutoff::Months);
+                }
+            }
+        });
+}
+
 fn pgn_date(date: u32) -> String {
     format!(
         "{:04}.{:02}.{:02}",
@@ -19896,6 +20935,25 @@ mod tests {
             prep_recent_limit: 10,
             prep_exclude_chesscom: false,
             prep_player_names: Vec::new(),
+            prep_mode: crate::settings::PrepMode::default(),
+            prep_include_online: true,
+            prep_filter_facing_color: true,
+            prep_show_all_games: false,
+            prep_swapped_view: false,
+            prep_setup_open: false,
+            prep_setup_use_current: true,
+            prep_setup_use_reference: true,
+            prep_setup_use_chessabc: true,
+            prep_setup_extra_path: String::new(),
+            prep_setup_filter: players::PrepFilterConfig::default(),
+            prep_setup_accounts: Vec::new(),
+            prep_setup_account_service: OnlineSource::Lichess,
+            prep_setup_account_name: String::new(),
+            prep_setup_as_white: true,
+            prep_merged_games: Vec::new(),
+            prep_load_rx: None,
+            prep_load_job: None,
+            prep_saved_accounts: std::collections::HashMap::new(),
             recent_preview: None,
             reference_path: String::new(),
             reference_enabled: false,
@@ -21470,6 +22528,73 @@ mod tests {
     }
 
     #[test]
+    fn prior_for_position_never_uses_correspondence_database() {
+        let dir = std::env::temp_dir().join(format!(
+            "brett-correspondence-prior-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pgn_path = dir.join("correspondence.pgn");
+        let index_path = dir.join("correspondence.brettpos");
+        std::fs::write(&pgn_path, crate::test_data::OPERA_PGN).unwrap();
+        PositionIndex::build_to(&pgn_path, &index_path, BuildOptions::default(), |_| {}).unwrap();
+        let index = PositionIndex::open(&index_path).unwrap();
+        // Sanity: the correspondence index really does cover the start position.
+        let key = position::position_key(&Chess::default());
+        assert!(!index.moves(key).is_empty());
+
+        let mut app = test_app();
+        app.correspondence_enabled = true;
+        app.correspondence_path = pgn_path.display().to_string();
+        app.correspondence = Some(index);
+        // No reference, tree, or current-database index is configured.
+        let (moves, source) = app.prior_for_position(key);
+        assert!(
+            moves.is_empty(),
+            "correspondence games must never supply the preparation prior"
+        );
+        assert_eq!(source, players::PriorSource::CurrentDatabase);
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn prep_facing_color_filter_shows_only_opponent_games() {
+        let prep = PrepSession {
+            player_key: "opponent".to_string(),
+            player_name: "Opponent".to_string(),
+            player_title: None,
+            player_fide_id: None,
+            our_color: Color::White,
+            previous_game: None,
+            previous_orientation: Color::White,
+            mode: crate::settings::PrepMode::default(),
+            filter: players::PrepFilterConfig::default(),
+            accounts: Vec::new(),
+            sources_label: String::new(),
+        };
+        // We play White, so the opponent faces Black.
+        assert_eq!(prep.opponent_color(), Color::Black);
+        assert!(prep_list_shows_game(&prep, "Us", "Opponent", Color::Black));
+        assert!(!prep_list_shows_game(&prep, "Us", "Opponent", Color::White));
+        assert!(!prep_list_shows_game(&prep, "Opponent", "Us", Color::Black));
+        assert!(prep_list_shows_game(&prep, "Opponent", "Us", Color::White));
+
+        let mut app = test_app();
+        app.prep = Some(prep);
+        assert_eq!(app.prep_list_color_filter(), Some(Color::Black));
+        app.prep_show_all_games = true;
+        assert_eq!(app.prep_list_color_filter(), None);
+        app.prep_show_all_games = false;
+        app.prep_filter_facing_color = false;
+        assert_eq!(app.prep_list_color_filter(), None);
+    }
+
+    #[test]
     fn prep_line_lists_opponent_moves_with_likelihoods() {
         let pgn = b"[Event \"Prep\"]\n[White \"You\"]\n[Black \"Opponent\"]\n[Date \"2024.01.01\"]\n[Result \"*\"]\n\n1. e4 e5 2. Nf3 Nc6 *\n";
         let mut games = domain::parse_pgn(&pgn[..]).unwrap();
@@ -21494,6 +22619,10 @@ mod tests {
             our_color: Color::White,
             previous_game: None,
             previous_orientation: Color::White,
+            mode: crate::settings::PrepMode::default(),
+            filter: players::PrepFilterConfig::default(),
+            accounts: Vec::new(),
+            sources_label: String::new(),
         });
 
         let prep = app.prep.clone().unwrap();
@@ -21541,6 +22670,10 @@ mod tests {
             our_color: Color::White,
             previous_game: None,
             previous_orientation: Color::White,
+            mode: crate::settings::PrepMode::default(),
+            filter: players::PrepFilterConfig::default(),
+            accounts: Vec::new(),
+            sources_label: String::new(),
         });
 
         app.open_recent_preview(0);

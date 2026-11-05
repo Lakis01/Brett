@@ -244,7 +244,7 @@ whose rows open a read-only preview without losing preparation state.
 
 ## 6. Predictor v2 and a static reference distribution
 
-**Status:** implemented. Predictions now report posterior means and approximate
+**Status:** implemented (baseline v2). Predictions now report posterior means and approximate
 90% credible intervals, reserve probability for unobserved legal moves, scale
 background strength with sample size, and use an optional separately cached
 rating-filtered reference index with a visible fallback. `predictor_eval`
@@ -254,6 +254,8 @@ transpositions are handled through the player book and position keys, and move
 popularity through the background counts. Time-control, event/era,
 opponent-rating, local-engine, and fully incremental reference-refresh features
 remain deferred; a changed reference source rebuilds the cached window.
+
+**Next-gen evolution (queued, design pass done; scheduled for implementation — do not mark done):** *Smart Preparation v2 & Move Predictor v2* (Hierarchical Empirical-Bayes / Dirichlet-Multinomial). Multi-source merge (Current DB + Reference Mega via `.2lgd`/`.cbp`/`.brettacc` + ChessABC one-shot + multiple Lichess/Chess.com accounts per site persisted per `player_key`), cross-source dedup (spine hash first 30 plies + ±3 days/`YYYYMM`), dual Classic Stats vs Smart Predictor modes, separate OTB vs Online pre-filters (TC Classical/Rapid/Blitz/Bullet, date cutoff All/6/12/24/60mo, rated-only, `include_online` default ON, instant `<1ms` refilter), recency `2^(-dt/365)*w_tc` (`1.0`/`0.85`/`0.65`), facing-color left-list filter + Last X games, swapped-color smart threshold (`N>=3` OR `(N>=2 AND (ply>=8 OR W>=1.2))` OR `(ply>=14 AND recent<=12mo)`) with Show N games selection view, Consistency (inverse perplexity) + Booked-up (mean theory exit ply) badges, strict OTB prior (correspondence never; hierarchy Reference->Tree->Masters->CurrentDB+tip; ChessABC games one-shot not per-ply), threshold-capped inferred moves (`>=8%`, max 3, separate section). Requires dedicated design pass done.
 
 **Goal:** make preparation probabilities honest, calibrated, and less dependent
 on the loaded player database.
@@ -508,13 +510,15 @@ position-index book marking.
 
 ## 12. Preparation mode refinements
 
-**Status:** implemented. Preparation starts with the board oriented to the
+**Status:** implemented (baseline). Preparation starts with the board oriented to the
 prepared player's side, with the name-priority list taking precedence. The
 left-hand game list filters to the prepared player's relevant color, the
 right-hand recent-games panel follows the current position and persists a
 1–50 limit, and ChessABC's latest games can be loaded on demand. Recent-game
 rows remain read-only previews and preserve the preparation node, tab, and
 orientation.
+
+**Queued evolution:** Smart Preparation v2 extends this with multi-source merge/dedup, dual Classic Stats vs Smart Predictor modes, OTB vs Online pre-filters (instant `<1ms` refilter), facing-color/Last X filters, swapped-color smart threshold + Show N games view, and profile badges. See item 6 (next-gen evolution) for the full spec. Design pass done; scheduled for implementation — do not mark done.
 
 - **Board orientation:** when preparation starts, flip the board to the side the
   prepared player will play (or the user’s side, per the explicit setting). Do
