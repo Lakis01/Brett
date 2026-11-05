@@ -21,12 +21,14 @@
 //! adds the game list used by the application and refuses to index databases
 //! above [`MAX_INDEXED_GAMES`].
 
+pub mod accelerator;
 pub mod fast_index;
 mod moves;
 mod tokens;
 pub mod tournaments;
 pub mod writer;
 
+pub use accelerator::TwoCbhAccelerator;
 pub use tournaments::{MegaTournamentCategory, MegaTournamentEntry, parse_mega_tournament_index};
 
 #[cfg(test)]
@@ -203,6 +205,42 @@ impl TwoCbhFile {
         self.record(id).is_ok_and(|record| record[0] & 2 != 0)
     }
 
+    /// Event/title ids of a text record: `event_id` at `0x10` and `title_id`
+    /// at `0x28`, per the verified 2CBH layout.
+    pub fn text_ids(&self, id: u32) -> Result<(u32, u32)> {
+        let record = self.record(id)?;
+        if record[0] & 2 == 0 {
+            anyhow::bail!("2CBH record {id} is not a text record");
+        }
+        Ok((le_u32(&record[0x10..0x14]), le_u32(&record[0x28..0x2c])))
+    }
+
+    /// Event (place, title) names for a text record.
+    pub fn text_event(&self, id: u32) -> Result<(String, String)> {
+        let (event_id, _) = self.text_ids(id)?;
+        let names = NameBase::open(&self.lid_path)?;
+        Ok(names.event(event_id))
+    }
+
+    /// Title string for a text record (`.2lid` single-string block at
+    /// `0xE82`: `le_u32` length then bytes, shared UTF-8/CP1252 fallback).
+    pub fn text_title(&self, id: u32) -> Result<String> {
+        let (_, title_id) = self.text_ids(id)?;
+        let names = NameBase::open(&self.lid_path)?;
+        Ok(names.text_title(title_id))
+    }
+
+    /// Parsed guiding-text document for a text record.
+    pub fn guiding_document(&self, id: u32) -> Result<crate::guiding::GuidingTextDocument> {
+        let html = self.text_html(id)?;
+        Ok(crate::guiding::parse_guiding_html(&html))
+    }
+
+    /// All one-based text record ids.
+    pub fn text_record_ids(&self) -> Vec<u32> {
+        (1..self.count).filter(|&id| self.is_text(id)).collect()
+    }
+
     /// Decode a text record (such as the Mega tournament index in slot 1) as
     /// HTML. The `.2cbg` payload starts with the usual magic, a length word
     /// `a` at header bytes 8..12, and the content at `offset + 24`. The
@@ -360,6 +398,7 @@ pub struct TwoCbhLibrary {
     games: Vec<IndexedGame>,
     file_len: u64,
     indexed_in: Duration,
+    accelerator: Option<TwoCbhAccelerator>,
 }
 
 impl TwoCbhLibrary {
@@ -415,6 +454,14 @@ impl TwoCbhLibrary {
             file_len += fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
         }
 
+        // Best-effort `.2lgd` accelerator: load it when present, otherwise
+        // build it with one scan so event/player lookups are O(1).
+        let lgd_path = TwoCbhAccelerator::path_for(&file.cbh_path);
+        let accelerator = TwoCbhAccelerator::open(&lgd_path).ok().or_else(|| {
+            TwoCbhAccelerator::build_to(&file, &lgd_path).ok()?;
+            TwoCbhAccelerator::open(&lgd_path).ok()
+        });
+
         Ok(Self {
             path: file.cbh_path.clone(),
             file,
@@ -423,6 +470,7 @@ impl TwoCbhLibrary {
             games,
             file_len,
             indexed_in: started.elapsed(),
+            accelerator,
         })
     }
 
@@ -544,6 +592,45 @@ impl TwoCbhLibrary {
         }
     }
 
+    /// All one-based text record ids in this database.
+    pub fn text_record_ids(&self) -> Vec<u32> {
+        self.file.text_record_ids()
+    }
+
+    /// Title of a text record, if present.
+    pub fn text_title(&self, id: u32) -> Option<String> {
+        self.file.text_title(id).ok()
+    }
+
+    /// Raw HTML of a text record, if present.
+    pub fn text_html(&self, id: u32) -> Option<String> {
+        self.file.text_html(id).ok()
+    }
+
+    /// Text record whose event matches `(event, site)`, if any. Compares
+    /// against the record's `.2lid` event names.
+    pub fn find_text_for_event(&self, event: &str, site: &str) -> Option<u32> {
+        let want_event = event.trim().to_lowercase();
+        let want_site = site.trim().to_lowercase();
+        if want_event.is_empty() || want_event == "?" {
+            return None;
+        }
+        for id in self.text_record_ids() {
+            if id == 1 {
+                continue;
+            }
+            let Ok((place, title)) = self.file.text_event(id) else {
+                continue;
+            };
+            if title.trim().to_lowercase() == want_event
+                && (want_site.is_empty() || place.trim().to_lowercase() == want_site)
+            {
+                return Some(id);
+            }
+        }
+        None
+    }
+
     /// Whether a one-based `.2cbh` record id holds a game.
     pub fn is_game_record(&self, record_id: u32) -> bool {
         self.file.is_game(record_id)
@@ -560,6 +647,116 @@ impl TwoCbhLibrary {
         self.entries
             .binary_search_by_key(&record_id, |entry| entry.id)
             .ok()
+    }
+
+    /// The loaded `.2lgd` accelerator, if one could be read or built.
+    pub fn accelerator(&self) -> Option<&TwoCbhAccelerator> {
+        self.accelerator.as_ref()
+    }
+
+    /// One-based `.2cbh` record ids for one `(Event, Site)` pair, resolved
+    /// through the `.2lgd` accelerator when present (O(1) posting-list reads
+    /// after the entity-id match) and by header scan otherwise.
+    pub fn event_record_ids(&self, event: &str, site: &str) -> Vec<u32> {
+        let want_event = event.trim().to_lowercase();
+        let want_site = site.trim().to_lowercase();
+        if want_event.is_empty() || want_event == "?" {
+            return Vec::new();
+        }
+        if let Some(acc) = &self.accelerator {
+            let mut out = Vec::new();
+            for entity in 0..acc.block_count() as u32 {
+                let (place, title) = self.names.event(entity);
+                if title.trim().to_lowercase() != want_event {
+                    continue;
+                }
+                if !want_site.is_empty() && place.trim().to_lowercase() != want_site {
+                    continue;
+                }
+                if let Ok(ids) = acc.event_games(entity) {
+                    out.extend(ids);
+                }
+            }
+            if !out.is_empty() {
+                out.sort_unstable();
+                out.dedup();
+                return out;
+            }
+        }
+        // Fallback: scan headers.
+        let mut out = Vec::new();
+        for index in 0..self.len() {
+            let headers = self.game_headers(index);
+            let header = |key: &str| {
+                headers
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case(key))
+                    .map(|(_, value)| value.to_string())
+                    .unwrap_or_default()
+            };
+            if header("Event").trim().to_lowercase() == want_event
+                && (want_site.is_empty() || header("Site").trim().to_lowercase() == want_site)
+                && let Some(id) = self.record_id_for_index(index)
+            {
+                out.push(id);
+            }
+        }
+        out
+    }
+
+    /// Per-player game lists resolved through the `.2lgd` accelerator.
+    /// Each entity id with a non-empty player posting list contributes one
+    /// entry named from the `.2lid`; record ids map to game indices.
+    pub fn accelerated_players(&self) -> Option<Vec<crate::library::AcceleratedPlayer>> {
+        let acc = self.accelerator.as_ref()?;
+        let mut out = Vec::new();
+        for entity in 0..acc.block_count() as u32 {
+            let Ok(ids) = acc.player_games(entity) else {
+                continue;
+            };
+            if ids.is_empty() {
+                continue;
+            }
+            let player = self.names.player(entity);
+            if player.name == "?" {
+                continue;
+            }
+            let mut indices = Vec::with_capacity(ids.len());
+            let mut white_games = 0u32;
+            let mut black_games = 0u32;
+            for record_id in ids {
+                let Some(index) = self.game_index_for_record(record_id) else {
+                    continue;
+                };
+                indices.push(index);
+                let Ok(record) = self.file.record(record_id) else {
+                    continue;
+                };
+                if record.len() >= 0x24 {
+                    let white = le_u32(&record[0x18..0x1c]);
+                    let black = le_u32(&record[0x20..0x24]);
+                    if white == entity {
+                        white_games += 1;
+                    }
+                    if black == entity {
+                        black_games += 1;
+                    }
+                }
+            }
+            if indices.is_empty() {
+                continue;
+            }
+            indices.sort_unstable();
+            indices.dedup();
+            out.push(crate::library::AcceleratedPlayer {
+                name: player.name,
+                indices,
+                white_games,
+                black_games,
+                ..crate::library::AcceleratedPlayer::default()
+            });
+        }
+        if out.is_empty() { None } else { Some(out) }
     }
 }
 
@@ -675,6 +872,50 @@ impl GameLibrary for TwoCbhLibrary {
     fn is_game_record(&self, record_id: u32) -> bool {
         TwoCbhLibrary::is_game_record(self, record_id)
     }
+
+    fn guiding_text_ids(&self) -> Vec<u32> {
+        TwoCbhLibrary::text_record_ids(self)
+    }
+
+    fn guiding_text_title(&self, id: u32) -> Option<String> {
+        TwoCbhLibrary::text_title(self, id)
+    }
+
+    fn guiding_text_html(&self, id: u32) -> Option<Vec<String>> {
+        TwoCbhLibrary::text_html(self, id).map(|html| vec![html])
+    }
+
+    fn find_guiding_text(&self, event: &str, site: &str) -> Option<u32> {
+        TwoCbhLibrary::find_text_for_event(self, event, site)
+    }
+
+    fn event_game_indices(
+        &self,
+        event: &str,
+        site: &str,
+        _year: Option<u32>,
+    ) -> Option<Vec<usize>> {
+        let accelerator = self.accelerator.as_ref()?;
+        let mut indices = Vec::new();
+        for record_id in self.event_record_ids(event, site) {
+            if let Some(index) = self.game_index_for_record(record_id) {
+                indices.push(index);
+            }
+        }
+        if indices.is_empty() {
+            return None;
+        }
+        // Touch the accelerator so a present-but-unusable sidecar still
+        // counts as wired rather than silently scanned.
+        let _ = accelerator.block_count();
+        indices.sort_unstable();
+        indices.dedup();
+        Some(indices)
+    }
+
+    fn accelerated_player_games(&self) -> Option<Vec<crate::library::AcceleratedPlayer>> {
+        TwoCbhLibrary::accelerated_players(self)
+    }
 }
 
 fn load_game(
@@ -747,7 +988,7 @@ struct Player {
 }
 
 /// The inline `.2lid` name blocks.
-struct NameBase {
+pub(crate) struct NameBase {
     bytes: Option<Mmap>,
     first_offset: usize,
     stride: usize,
@@ -756,7 +997,7 @@ struct NameBase {
 }
 
 impl NameBase {
-    fn open(path: &Path) -> Result<Self> {
+    pub(crate) fn open(path: &Path) -> Result<Self> {
         if !path.is_file() {
             return Ok(Self {
                 bytes: None,
@@ -860,6 +1101,29 @@ impl NameBase {
         let title = non_empty(decode_text(texts[0]));
         let publisher = non_empty(decode_text(texts[1]));
         (title != "?" || publisher != "?").then_some((title, publisher))
+    }
+
+    /// Single-string title block used by text records (offset `0xE82`):
+    /// `le_u32` length followed by bytes.
+    pub(crate) fn text_title(&self, id: u32) -> String {
+        const TEXT_TITLE_OFFSET: usize = 0xE82;
+        const MAX_TITLE: usize = 1 << 20;
+        let Some(bytes) = self.bytes.as_ref() else {
+            return "?".to_string();
+        };
+        let Ok(id_usize) = usize::try_from(id) else {
+            return "?".to_string();
+        };
+        let base = self
+            .first_offset
+            .saturating_add(id_usize.saturating_mul(self.stride))
+            .saturating_add(TEXT_TITLE_OFFSET);
+        let len = bytes.get(base..base + 4).map(le_u32).unwrap_or(0) as usize;
+        if len == 0 || len > MAX_TITLE {
+            return "?".to_string();
+        }
+        let text = bytes.get(base + 4..base + 4 + len).unwrap_or(&[]);
+        non_empty(decode_text(text))
     }
 
     fn block(&self, id: u32, offset: usize) -> Option<&[u8]> {
@@ -1090,7 +1354,7 @@ const CP1252_HIGH: [char; 32] = [
     '\u{90}', '‘', '’', '“', '”', '•', '–', '—', '˜', '™', 'š', '›', 'œ', '\u{9d}', 'ž', 'Ÿ',
 ];
 
-fn decode_text(bytes: &[u8]) -> String {
+pub(crate) fn decode_text(bytes: &[u8]) -> String {
     match std::str::from_utf8(bytes) {
         Ok(text) => text.to_owned(),
         Err(_) => bytes

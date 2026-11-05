@@ -331,4 +331,131 @@ mod tests {
         assert_eq!(entry.site.as_deref(), Some("Toronto"));
         assert_eq!(entry.year, Some(2024));
     }
+
+    #[test]
+    fn guiding_document_keeps_embedded_table_prose_and_images() {
+        let html = r#"
+<h2>Ostend 1907</h2>
+<p>Final report with <a href="javascript:CBLink('tag_game_set',42)">Goetz - Janowski</a>.</p>
+<table>
+<tr><th></th><th>GOETZ</th><th>JANOWSKI</th></tr>
+<tr><td>1</td><td>1</td><td>0</td></tr>
+<tr><td>2</td><td>0</td><td>1</td></tr>
+</table>
+<p><img src="Mega Database 2026.html\8255890.jpg" alt="rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"></p>
+<p><a href="javascript:CBLink('tag_table','Ostend','Ostend',1907)">Table</a>
+<a href="javascript:CBLink('tag_text','Report','Ostend','Ostend',1907)">Report</a>
+<a href="javascript:CBLink('tag_game','Goetz','Janowski','Ostend',3)">G3</a></p>
+"#;
+        let doc = crate::guiding::parse_guiding_html(html);
+        assert!(
+            doc.blocks.iter().any(|block| matches!(
+                block,
+                crate::guiding::GuidingBlock::Heading(heading) if heading.contains("Ostend")
+            )),
+            "expected a heading, got {:?}",
+            doc.blocks
+        );
+        let rows: Vec<Vec<String>> = doc
+            .blocks
+            .iter()
+            .find_map(|block| match block {
+                crate::guiding::GuidingBlock::Table(rows) => Some(rows.clone()),
+                _ => None,
+            })
+            .expect("expected an embedded table");
+        let flat = rows.concat().join(" ");
+        assert!(flat.contains("GOETZ"), "table must keep GOETZ row: {flat}");
+        assert!(
+            flat.contains("JANOWSKI"),
+            "table must keep JANOWSKI row: {flat}"
+        );
+        let image = doc
+            .blocks
+            .iter()
+            .find_map(|block| match block {
+                crate::guiding::GuidingBlock::Image { src, alt_fen } => {
+                    Some((src.clone(), alt_fen.clone()))
+                }
+                _ => None,
+            })
+            .expect("expected an inline image");
+        assert_eq!(crate::guiding::image_basename(&image.0), "8255890.jpg");
+        assert_eq!(
+            image.1.as_deref(),
+            Some("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1")
+        );
+        let mut saw_set = false;
+        let mut saw_table = false;
+        let mut saw_text = false;
+        let mut saw_game = false;
+        for block in &doc.blocks {
+            let crate::guiding::GuidingBlock::Paragraph(spans) = block else {
+                continue;
+            };
+            for span in spans {
+                match span {
+                    crate::guiding::GuidingSpan::Link { target, .. } => match target {
+                        crate::guiding::CbLinkTarget::GameSet(slots) => {
+                            assert_eq!(*slots, vec![42]);
+                            saw_set = true;
+                        }
+                        crate::guiding::CbLinkTarget::Table { event, site, year } => {
+                            assert_eq!(event, "Ostend");
+                            assert_eq!(site, "Ostend");
+                            assert_eq!(*year, Some(1907));
+                            saw_table = true;
+                        }
+                        crate::guiding::CbLinkTarget::Text { title, .. } => {
+                            assert_eq!(title, "Report");
+                            saw_text = true;
+                        }
+                        crate::guiding::CbLinkTarget::Game {
+                            white_last, round, ..
+                        } => {
+                            assert_eq!(white_last, "Goetz");
+                            assert_eq!(*round, Some(3));
+                            saw_game = true;
+                        }
+                    },
+                    crate::guiding::GuidingSpan::Text(_) => {}
+                }
+            }
+        }
+        assert!(
+            saw_set && saw_table && saw_text && saw_game,
+            "all CBLink kinds must parse"
+        );
+    }
+
+    #[test]
+    fn two_lid_text_title_decodes_single_string_block() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!(
+            "brett-2cbh-title-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("titles.2lid");
+        let mut bytes = vec![0u8; 0xB8 + 7 * 0x108A + 0xE82 + 64];
+        // Minimal name header so NameBase uses default offsets.
+        bytes[0..4].copy_from_slice(&0u32.to_be_bytes());
+        bytes[4..8].copy_from_slice(&0u32.to_be_bytes());
+        let id = 7u32;
+        let base = 0xB8 + id as usize * 0x108A + 0xE82;
+        let title = "Ostend 1907 Report";
+        bytes[base..base + 4].copy_from_slice(&(title.len() as u32).to_le_bytes());
+        bytes[base + 4..base + 4 + title.len()].copy_from_slice(title.as_bytes());
+        {
+            let mut file = std::fs::File::create(&path).unwrap();
+            file.write_all(&bytes).unwrap();
+        }
+        let lid = crate::twocbh::NameBase::open(&path).unwrap();
+        assert_eq!(lid.text_title(id), title);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

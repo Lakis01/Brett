@@ -20,8 +20,10 @@ use anyhow::{Context, Result, bail};
 use crate::domain::{Game, Node, Ply};
 use crate::library::{GameLibrary, IndexedGame, SourceMeta, StringPool, intern_headers};
 
+mod accelerator;
 mod writer;
 
+pub use accelerator::{PlayerStats, ScidAccelerator};
 pub use writer::{ScidWriteReport, write_database};
 
 const INDEX_MAGIC: &[u8; 8] = b"Scid.si\0";
@@ -72,6 +74,8 @@ pub struct ScidLibrary {
     file_len: u64,
     entries: Vec<Entry>,
     games: Vec<IndexedGame>,
+    names: Names,
+    accelerator: Option<ScidAccelerator>,
     indexed_in: Duration,
     #[allow(dead_code)]
     version: u16,
@@ -167,6 +171,27 @@ impl ScidLibrary {
             games.push(IndexedGame::scid(headers, entry.offset, entry.length));
         }
 
+        // Best-effort `.brettacc` CSR sidecar for O(1) event/player lookups.
+        let accelerator = ScidAccelerator::load(path).ok().flatten().or_else(|| {
+            let sidecar = ScidAccelerator::path_for(path);
+            let library = ScidLibrary {
+                path: path.to_path_buf(),
+                name_path: name_path.clone(),
+                game_path: game_path.clone(),
+                game_len,
+                file_len: index_len + name_len + game_len,
+                entries: entries.clone(),
+                games: Vec::new(),
+                names: Names::default(),
+                accelerator: None,
+                indexed_in: Duration::ZERO,
+                version,
+                description: description.clone(),
+            };
+            ScidAccelerator::build_to(&library, &sidecar).ok()?;
+            ScidAccelerator::load(path).ok().flatten()
+        });
+
         Ok(Self {
             path: path.to_path_buf(),
             name_path,
@@ -175,10 +200,37 @@ impl ScidLibrary {
             file_len: index_len + name_len + game_len,
             entries,
             games,
+            names,
+            accelerator,
             indexed_in: started.elapsed(),
             version,
             description,
         })
+    }
+
+    /// The loaded `.brettacc` accelerator, if one could be read or built.
+    pub fn accelerator(&self) -> Option<&ScidAccelerator> {
+        self.accelerator.as_ref()
+    }
+
+    /// Numeric player id for a display name, if the namebase holds it.
+    pub fn player_id_for_name(&self, name: &str) -> Option<u32> {
+        let want = name.trim().to_lowercase();
+        self.names
+            .players
+            .iter()
+            .position(|candidate| candidate.to_lowercase() == want)
+            .map(|position| position as u32)
+    }
+
+    /// Numeric event id for a display title, if the namebase holds it.
+    pub fn event_id_for_title(&self, title: &str) -> Option<u32> {
+        let want = title.trim().to_lowercase();
+        self.names
+            .events
+            .iter()
+            .position(|candidate| candidate.to_lowercase() == want)
+            .map(|position| position as u32)
     }
 
     pub fn path(&self) -> &Path {
@@ -293,6 +345,63 @@ impl GameLibrary for ScidLibrary {
 
     fn filter(&self, needle: &str) -> Vec<usize> {
         crate::library::filter_games(&self.games, needle)
+    }
+
+    fn event_game_indices(&self, event: &str, site: &str, year: Option<u32>) -> Option<Vec<usize>> {
+        let accelerator = self.accelerator.as_ref()?;
+        let event_id = self.event_id_for_title(event)?;
+        let want_site = site.trim().to_lowercase();
+        let mut out: Vec<usize> = accelerator
+            .event_games(event_id)
+            .iter()
+            .map(|&index| index as usize)
+            .filter(|&index| {
+                self.games.get(index).is_some_and(|game| {
+                    (want_site.is_empty()
+                        || game
+                            .header("Site")
+                            .unwrap_or("?")
+                            .eq_ignore_ascii_case(site.trim()))
+                        && year.is_none_or(|year| game.date().starts_with(&year.to_string()))
+                })
+            })
+            .collect();
+        if out.is_empty() {
+            return None;
+        }
+        out.sort_unstable();
+        Some(out)
+    }
+
+    fn accelerated_player_games(&self) -> Option<Vec<crate::library::AcceleratedPlayer>> {
+        let accelerator = self.accelerator.as_ref()?;
+        let mut out = Vec::new();
+        for (id, name) in self.names.players.iter().enumerate() {
+            if name.is_empty() || name == "?" {
+                continue;
+            }
+            let slice = accelerator.player_games(id as u32);
+            if slice.is_empty() {
+                continue;
+            }
+            let stats = accelerator
+                .player_stats(id as u32)
+                .copied()
+                .unwrap_or_default();
+            out.push(crate::library::AcceleratedPlayer {
+                name: name.clone(),
+                indices: slice.iter().map(|&index| index as usize).collect(),
+                white_games: stats.white_games,
+                black_games: stats.black_games,
+                wins: stats.wins,
+                draws: stats.draws,
+                losses: stats.losses,
+                elo_max: u32::from(stats.max_elo),
+                first_year: stats.first_year,
+                last_year: stats.last_year,
+            });
+        }
+        if out.is_empty() { None } else { Some(out) }
     }
 }
 

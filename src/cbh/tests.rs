@@ -896,6 +896,37 @@ fn non_ascii_entity_text_is_preserved() {
 }
 
 #[test]
+fn classic_guiding_text_header_parses_titles_and_html_blocks() {
+    // total_len | [3,0] | title_count le_u16 | titles | 0x01 | block_count le_u32 | blocks
+    let title = "Ostend 1907";
+    let html = "<p>GOETZ drew with JANOWSKI.</p>";
+    let mut body = Vec::new();
+    body.extend_from_slice(&[3, 0]);
+    body.extend_from_slice(&1u16.to_le_bytes());
+    body.extend_from_slice(&0u16.to_le_bytes()); // lang
+    body.extend_from_slice(&(title.len() as u16).to_le_bytes());
+    body.extend_from_slice(title.as_bytes());
+    body.push(0x01);
+    body.extend_from_slice(&1u32.to_le_bytes());
+    body.push(0); // lang
+    body.extend_from_slice(&(html.len() as u32).to_le_bytes());
+    body.extend_from_slice(html.as_bytes());
+    let total_len = body.len() as u32;
+    let mut record = Vec::new();
+    record.extend_from_slice(&total_len.to_be_bytes());
+    record.extend_from_slice(&body);
+    let (titles, blocks) = super::parse_classic_guiding_record(&record, 0).unwrap();
+    assert_eq!(titles, vec![title.to_string()]);
+    assert_eq!(blocks, vec![html.to_string()]);
+    let doc = crate::guiding::parse_guiding_html(&blocks[0]);
+    assert!(
+        doc.blocks
+            .iter()
+            .any(|block| matches!(block, crate::guiding::GuidingBlock::Paragraph(_)))
+    );
+}
+
+#[test]
 fn rejects_a_header_file_that_is_not_classic_cbh() {
     let dir = TempDir::new();
     let stem = dir.path().join("bad");
@@ -956,4 +987,109 @@ fn chess960_start_keeps_outer_rook_castling_rights() {
         crate::chess::Color::White,
         crate::chess::CastlingSide::QueenSide
     ));
+}
+
+fn entity_file_with(data_size: usize, rows: &[(i32, i32, Vec<u8>)], root: i32) -> EntityFile {
+    let dir = TempDir::new();
+    let path = dir.path().join("synthetic.cbp");
+    let mut bytes = vec![0u8; 28];
+    bytes[8..12].copy_from_slice(&ENTITY_MAGIC.to_le_bytes());
+    bytes[12..16].copy_from_slice(&(data_size as i32).to_le_bytes());
+    bytes[16..20].copy_from_slice(&root.to_le_bytes());
+    bytes[24..28].copy_from_slice(&0i32.to_le_bytes());
+    for (left, right, data) in rows {
+        assert_eq!(data.len(), data_size);
+        bytes.extend_from_slice(&left.to_le_bytes());
+        bytes.extend_from_slice(&right.to_le_bytes());
+        bytes.push(0);
+        bytes.extend_from_slice(data);
+    }
+    fs::write(&path, &bytes).unwrap();
+    EntityFile::open(&path, data_size as i32)
+        .unwrap()
+        .expect("entity file opens")
+}
+
+fn player_data(last: &str, first: &str, game_count: u32, first_game: u32) -> Vec<u8> {
+    let mut data = vec![0u8; 50];
+    data[..last.len()].copy_from_slice(last.as_bytes());
+    data[30..30 + first.len()].copy_from_slice(first.as_bytes());
+    data[42..46].copy_from_slice(&game_count.to_le_bytes());
+    data[46..50].copy_from_slice(&first_game.to_le_bytes());
+    data
+}
+
+#[test]
+fn entity_game_counts_and_first_game_come_from_the_record_tail() {
+    let file = entity_file_with(
+        50,
+        &[
+            (-1, -1, player_data("Doe", "Jane", 7, 3)),
+            (-1, -1, player_data("Roe", "Richard", 0, 0)),
+        ],
+        0,
+    );
+    assert_eq!(file.game_count(0), 7);
+    assert_eq!(file.first_game_id(0), 3);
+    assert_eq!(file.game_count(1), 0);
+    assert_eq!(file.first_game_id(1), 0);
+    assert_eq!(file.game_count(99), 0, "unknown ids read as zero");
+}
+
+#[test]
+fn avl_search_walks_left_and_right_from_the_root() {
+    // BST over the last-name field: root "M" (id 1), left "A" (id 0),
+    // right "Z" (id 2).
+    let file = entity_file_with(
+        50,
+        &[
+            (-1, -1, player_data("A", "", 1, 10)),
+            (0, 2, player_data("M", "", 2, 20)),
+            (-1, -1, player_data("Z", "", 3, 30)),
+        ],
+        1,
+    );
+    assert_eq!(file.root(), 1);
+    assert_eq!(file.left(1), Some(0));
+    assert_eq!(file.right(1), Some(2));
+    let by_last = |want: &str| {
+        file.avl_search(|data| {
+            let name = decode_text(data.get(0..30).unwrap_or(&[]))
+                .trim_end_matches('\0')
+                .to_lowercase();
+            name.cmp(&want.to_string())
+        })
+    };
+    assert_eq!(by_last("m"), Some(1));
+    assert_eq!(by_last("a"), Some(0));
+    assert_eq!(by_last("z"), Some(2));
+    assert_eq!(by_last("q"), None, "a missing key misses");
+}
+
+#[test]
+fn player_entity_lookup_uses_avl_with_linear_fallback() {
+    let mut db = Database::new();
+    db.add(GameSpec {
+        cbh_flags: 1,
+        ..GameSpec::default()
+    });
+    let path = db.finish();
+    let library = CbhLibrary::open(&path).unwrap();
+    // The fixture writes flat left/right links, so "Roe, Richard" can only
+    // resolve through the linear fallback while "Doe, Jane" hits the root.
+    assert_eq!(
+        library.player_entity_stats("Doe, Jane").map(|stat| stat.0),
+        Some(0)
+    );
+    assert_eq!(
+        library
+            .player_entity_stats("Roe, Richard")
+            .map(|stat| stat.0),
+        Some(1)
+    );
+    assert_eq!(library.player_entity_stats("Nobody, N"), None);
+    assert_eq!(
+        library.event_entity_stats("Test Open").map(|stat| stat.0),
+        Some(0)
+    );
 }

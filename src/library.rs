@@ -168,6 +168,22 @@ pub(crate) fn intern_headers(
         .collect()
 }
 
+/// One player's game list resolved through a backend accelerator
+/// (`.2lgd`, `.brettacc`, or classic entity counts) instead of a full scan.
+#[derive(Clone, Debug, Default)]
+pub struct AcceleratedPlayer {
+    pub name: String,
+    pub indices: Vec<usize>,
+    pub white_games: u32,
+    pub black_games: u32,
+    pub wins: u32,
+    pub draws: u32,
+    pub losses: u32,
+    pub elo_max: u32,
+    pub first_year: u16,
+    pub last_year: u16,
+}
+
 /// One indexed game: its headers and where its data lives in the source.
 #[derive(Clone, Debug)]
 pub struct IndexedGame {
@@ -395,6 +411,26 @@ pub trait GameLibrary: Send + Sync {
         None
     }
 
+    /// Guiding-text record ids carried by ChessBase databases (flag bit 1).
+    fn guiding_text_ids(&self) -> Vec<u32> {
+        Vec::new()
+    }
+
+    /// Title of one guiding-text record, if the backend can read it.
+    fn guiding_text_title(&self, _id: u32) -> Option<String> {
+        None
+    }
+
+    /// Raw HTML blocks of one guiding-text record, if readable.
+    fn guiding_text_html(&self, _id: u32) -> Option<Vec<String>> {
+        None
+    }
+
+    /// Guiding-text record matching an event, if any.
+    fn find_guiding_text(&self, _event: &str, _site: &str) -> Option<u32> {
+        None
+    }
+
     /// One-based source record id backing a game index, when the backend
     /// numbers its game slots (2CBH `.2cbh` record ids).
     fn source_record_id(&self, _index: usize) -> Option<u32> {
@@ -411,6 +447,24 @@ pub trait GameLibrary: Send + Sync {
     /// unused slot. Backends without record ids treat every slot as a game.
     fn is_game_record(&self, _record_id: u32) -> bool {
         true
+    }
+
+    /// Game indices for one `(Event, Site, year)` tournament, resolved through
+    /// a backend accelerator when one is available. `None` means "no
+    /// accelerator; the caller falls back to scanning headers".
+    fn event_game_indices(
+        &self,
+        _event: &str,
+        _site: &str,
+        _year: Option<u32>,
+    ) -> Option<Vec<usize>> {
+        None
+    }
+
+    /// Per-player game lists resolved through a backend accelerator.
+    /// `None` means "no accelerator; the caller falls back to scanning".
+    fn accelerated_player_games(&self) -> Option<Vec<AcceleratedPlayer>> {
+        None
     }
 }
 

@@ -714,10 +714,11 @@ See `THIRD_PARTY_NOTICES.md` and [`GPL_OPTIONS.md`](GPL_OPTIONS.md).
 
 ## 18. Recently trending move popularity
 
-**Status:** backend implemented 2026-10-29; the Tree shows a compact
-trend badge with a detailed tooltip and **Settings → Move trends** exposes the
-window, baseline, and minimum sample. The sparkline and moves-panel rendering
-remain planned.
+**Status:** backend implemented 2026-10-29; the Tree shows a compact trend
+badge, tooltip, and egui sparkline (`src/recent.rs::sparkline_points`/
+`baseline_y`, `src/app.rs::draw_trend_sparkline`), and **Settings → Move trends**
+exposes the window, baseline, and minimum sample. Moves-panel sparkline/trend
+rendering remains planned.
 
 **Goal:** surface opening ideas whose popularity has recently picked up, rather
 than only showing all-time frequency, and make the trend visible at a glance.

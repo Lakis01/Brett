@@ -160,6 +160,86 @@ pub struct PlayerDirectory {
 
 impl PlayerDirectory {
     pub fn build(library: &dyn GameLibrary) -> Self {
+        Self::from_library(library)
+    }
+
+    /// Build the directory from a game library, using a backend accelerator
+    /// (`.2lgd`, `.brettacc`) for O(1) event game IDs and player lists when
+    /// the backend provides one, and falling back to a full scan otherwise.
+    pub fn from_library(library: &dyn GameLibrary) -> Self {
+        if let Some(accelerated) = library.accelerated_player_games() {
+            return Self::from_accelerated(library, &accelerated);
+        }
+        Self::from_scan(library)
+    }
+
+    /// Group pre-resolved accelerator player lists into summaries. When the
+    /// library keeps headers in memory the colour split, titles, Elos and
+    /// years are exact; for lazy backends the per-colour game counts,
+    /// Elo peak and years are exact and the combined WDL totals are kept
+    /// on the majority colour's record (only the colour split is approximate).
+    fn from_accelerated(
+        library: &dyn GameLibrary,
+        accelerated: &[crate::library::AcceleratedPlayer],
+    ) -> Self {
+        let eager = !library.games().is_empty();
+        let mut players: Vec<PlayerSummary> = Vec::with_capacity(accelerated.len());
+        for accelerated in accelerated {
+            let key = player_key(&accelerated.name)
+                .unwrap_or_else(|| accelerated.name.trim().to_lowercase());
+            let mut summary = PlayerSummary {
+                name: accelerated.name.clone(),
+                key,
+                title: None,
+                fide_id: None,
+                country: None,
+                white: PlayerRecord::default(),
+                black: PlayerRecord::default(),
+                elo_sum: 0,
+                elo_count: 0,
+                elo_max: accelerated.elo_max,
+                opponent_elo_sum: 0,
+                opponent_elo_count: 0,
+                first_year: accelerated.first_year,
+                last_year: accelerated.last_year,
+                game_indices: Vec::new(),
+            };
+            if eager {
+                for &index in &accelerated.indices {
+                    let Some(game) = library.games().get(index) else {
+                        continue;
+                    };
+                    let white_match =
+                        player_key(game.white()).as_deref() == Some(summary.key.as_str());
+                    let black_match =
+                        player_key(game.black()).as_deref() == Some(summary.key.as_str());
+                    if white_match && !black_match {
+                        add_game(&mut summary, game, Color::White, index, None);
+                    } else if black_match && !white_match {
+                        add_game(&mut summary, game, Color::Black, index, None);
+                    } else if white_match && black_match {
+                        add_game(&mut summary, game, Color::White, index, Some(Color::Black));
+                    }
+                }
+                // Accelerators that resolve to no loadable game keep their
+                // pre-aggregated counts instead of vanishing.
+                if summary.game_indices.is_empty() {
+                    apply_accelerated_counts(&mut summary, accelerated);
+                }
+            } else {
+                apply_accelerated_counts(&mut summary, accelerated);
+            }
+            players.push(summary);
+        }
+        players.sort_by(|a, b| {
+            b.games()
+                .cmp(&a.games())
+                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        });
+        Self { players }
+    }
+
+    fn from_scan(library: &dyn GameLibrary) -> Self {
         let mut by_key: HashMap<String, PlayerSummary> = HashMap::new();
 
         if !library.games().is_empty() {
@@ -337,6 +417,29 @@ impl PlayerDirectory {
             .filter(|(_, player)| player.name.to_lowercase().contains(&needle))
             .map(|(index, _)| index)
             .collect()
+    }
+}
+
+/// Fill a summary from pre-aggregated accelerator counts when headers are
+/// not in memory. Colour game counts, Elo peak and years are exact; the
+/// combined WDL totals sit on the majority colour's record so
+/// [`PlayerSummary::wins`] and friends stay exact and only the colour split
+/// is approximate.
+fn apply_accelerated_counts(
+    summary: &mut PlayerSummary,
+    accelerated: &crate::library::AcceleratedPlayer,
+) {
+    summary.white.games = accelerated.white_games;
+    summary.black.games = accelerated.black_games;
+    summary.game_indices = accelerated.indices.clone();
+    if accelerated.white_games >= accelerated.black_games {
+        summary.white.wins = accelerated.wins;
+        summary.white.draws = accelerated.draws;
+        summary.white.losses = accelerated.losses;
+    } else {
+        summary.black.wins = accelerated.wins;
+        summary.black.draws = accelerated.draws;
+        summary.black.losses = accelerated.losses;
     }
 }
 
