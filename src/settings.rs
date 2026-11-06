@@ -331,6 +331,9 @@ pub struct PreparationPrefs {
     pub exclude_chesscom: bool,
     /// Whether the prompt to download the correspondence reference has been dismissed.
     pub correspondence_download_dismissed: bool,
+    /// Whether the startup prompt to pick a default opening book and reference
+    /// database has been dismissed ("No & don't ask again").
+    pub reference_setup_dismissed: bool,
     /// Whether online games are included in Smart preparation by default.
     /// The toggle is instant (no refetch); this only stores the default.
     pub prep_include_online: bool,
@@ -353,6 +356,7 @@ impl Default for PreparationPrefs {
             prep_player_names: Vec::new(),
             exclude_chesscom: false,
             correspondence_download_dismissed: false,
+            reference_setup_dismissed: false,
             prep_include_online: true,
             prep_mode: PrepMode::default(),
             prep_online_accounts: std::collections::HashMap::new(),
@@ -415,6 +419,10 @@ impl PreparationPrefs {
             .get("correspondence_download_dismissed")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        let reference_setup_dismissed = value
+            .get("reference_setup_dismissed")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let prep_include_online = value
             .get("prep_include_online")
             .and_then(Value::as_bool)
@@ -455,6 +463,7 @@ impl PreparationPrefs {
             prep_player_names,
             exclude_chesscom,
             correspondence_download_dismissed,
+            reference_setup_dismissed,
             prep_include_online,
             prep_mode,
             prep_online_accounts,
@@ -483,6 +492,7 @@ impl PreparationPrefs {
             "prep_player_names": self.prep_player_names,
             "exclude_chesscom": self.exclude_chesscom,
             "correspondence_download_dismissed": self.correspondence_download_dismissed,
+            "reference_setup_dismissed": self.reference_setup_dismissed,
             "prep_include_online": self.prep_include_online,
             "prep_mode": self.prep_mode.config_value(),
             "prep_online_accounts": accounts,
@@ -1416,6 +1426,7 @@ mod tests {
             prep_player_names: vec!["Carlsen, Magnus".to_string()],
             exclude_chesscom: false,
             correspondence_download_dismissed: false,
+            reference_setup_dismissed: true,
             prep_include_online: true,
             prep_mode: PrepMode::Smart,
             prep_online_accounts: std::collections::HashMap::new(),
@@ -1625,6 +1636,11 @@ mod tests {
             r#"{"correspondence_enabled":false,"prep_player_names":[" Carlsen, Magnus ","","Nakamura, Hikaru"]}"#,
         );
         assert!(!parsed.correspondence_enabled);
+        assert!(!parsed.reference_setup_dismissed);
+        assert!(
+            PreparationPrefs::from_json(r#"{"reference_setup_dismissed":true}"#)
+                .reference_setup_dismissed
+        );
         assert_eq!(
             parsed.prep_player_names,
             vec![

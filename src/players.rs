@@ -19,7 +19,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::chess::{Color, UciMove};
+use crate::chess::{Color, Position, UciMove};
 use anyhow::Result;
 
 use crate::country::{self, Country};
@@ -668,6 +668,38 @@ pub fn matches_truncated_or_enumerated_name(full: &str, cand: &str) -> bool {
     }
 }
 
+/// Normalize the `White`/`Black` tags of a game to the canonical account
+/// name. The tag is rewritten when it names the same player as `username`
+/// (compared with [`player_key`], so spelling and word order do not matter)
+/// or matches `canonical_name` through the truncated/enumerated spelling
+/// rules in [`canonicalize_player_tags`]. Online exports
+/// (Lichess/Chess.com/ChessABC) truncate or enumerate player names; without
+/// this the merged book drops those games on its canonical-key colour match.
+pub fn canonicalize_account_tags(game: &mut Game, username: &str, canonical_name: &str) {
+    let user_key = player_key(username);
+    if user_key.is_some() {
+        for side in ["White", "Black"] {
+            let Some(current) = game.header(side) else {
+                continue;
+            };
+            if current == canonical_name {
+                continue;
+            }
+            if player_key(current).as_deref() == user_key.as_deref() {
+                game.set_header(side, canonical_name.to_string());
+            }
+        }
+    }
+    canonicalize_player_tags(game, canonical_name);
+}
+
+/// Batch version of [`canonicalize_account_tags`] for imported game lists.
+pub fn canonicalize_account_games(games: &mut [Game], username: &str, canonical_name: &str) {
+    for game in games {
+        canonicalize_account_tags(game, username, canonical_name);
+    }
+}
+
 /// Normalize the `White`/`Black` tags of a game to the canonical opponent
 /// name when they name the same player through a truncated or enumerated
 /// ChessABC spelling (e.g. `Hinterreiter,M 1` vs `Hinterreiter, Martin`).
@@ -896,7 +928,14 @@ pub fn classify_game_metadata(game: &Game) -> (TimeControlClass, bool, bool) {
         .and_then(parse_time_control_seconds)
         .map(tc_from_seconds)
         .or_else(|| tc_from_event_keywords(event))
-        .unwrap_or(TimeControlClass::Rapid);
+        .unwrap_or(if is_online {
+            TimeControlClass::Rapid
+        } else {
+            // Untagged non-online games are classical by default. Faster
+            // classes only come from an explicit TimeControl tag or event
+            // keywords.
+            TimeControlClass::Classical
+        });
     (tc, is_online, is_rated)
 }
 
@@ -1448,6 +1487,12 @@ pub struct PlayerObs {
     pub tc: TimeControlClass,
     pub date: u32,
     pub result: GameResult,
+    /// True when the mover was the opponent rather than the prepared player,
+    /// i.e. this observation is a reply the player faced, not one of their
+    /// own moves. Replies share the player's colour index so preparation can
+    /// show what the player faced, but they must never count as the player's
+    /// own repertoire in predictions or own-move statistics.
+    pub reply: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1565,7 +1610,10 @@ fn color_idx(color: Color) -> usize {
 /// A player's position book. Built off the UI thread.
 ///
 /// Move statistics are stored per player colour (`White = 0`, `Black = 1`) so
-/// preparation can look at one side without mixing the other. Every
+/// preparation can look at one side without mixing the other. Both the
+/// player's own moves and the replies played against them are recorded under
+/// the player's colour index, so preparation sees the responses the player
+/// actually faced. Every
 /// observation is also stored individually, so [`PrepFilterConfig`] filtering
 /// is a cheap in-memory pass with no rebuild.
 pub struct PlayerBook {
@@ -1763,7 +1811,12 @@ impl PlayerBook {
             let Some(code) = position::encode_move(mv) else {
                 break;
             };
-            if ply.color == color {
+            // Record both the player's own moves and the replies played against
+            // them, all under the player's colour index. The result stays from
+            // the prepared player's perspective. Each observation remembers
+            // which side moved so own-move readers can exclude replies.
+            let reply = parent_pos.turn() != color;
+            {
                 let (weight, recent) = recency(date, self.as_of, self.config);
                 let entry = self.positions[cidx]
                     .entry(key)
@@ -1837,6 +1890,7 @@ impl PlayerBook {
                         tc,
                         date,
                         result,
+                        reply,
                     });
             }
             node = child;
@@ -1845,106 +1899,89 @@ impl PlayerBook {
         self.games += 1;
     }
 
-    /// Combined moves from both colours (backwards compatible).
-    pub fn moves(&self, key: u64) -> Vec<PlayerMoveStat> {
-        let mut combined: BTreeMap<u32, PlayerMoveStat> = BTreeMap::new();
-        for map in &self.positions {
-            if let Some(moves) = map.get(&key) {
-                for (&code, stat) in moves {
-                    let entry = combined.entry(code).or_insert(PlayerMoveStat {
-                        key,
-                        mv: code,
-                        ..PlayerMoveStat::default()
-                    });
-                    merge_stat(entry, stat);
-                }
-            }
-        }
-        let mut moves: Vec<_> = combined.into_values().collect();
-        moves.sort_by(|a, b| {
-            b.weighted
-                .total_cmp(&a.weighted)
-                .then(b.games.cmp(&a.games))
-                .then(a.mv.cmp(&b.mv))
-        });
-        moves
-    }
-
-    /// Moves from one player colour only.
-    pub fn moves_for_color(&self, key: u64, color: Color) -> Vec<PlayerMoveStat> {
-        let mut moves: Vec<_> = self.positions[color_idx(color)]
-            .get(&key)
-            .map(|moves| moves.values().copied().collect())
-            .unwrap_or_default();
-        moves.sort_by(|a, b| {
-            b.weighted
-                .total_cmp(&a.weighted)
-                .then(b.games.cmp(&a.games))
-                .then(a.mv.cmp(&b.mv))
-        });
-        moves
-    }
-
-    /// Filtered moves for one colour: only observations passing `filter`
-    /// contribute. Cheap in-memory pass over the stored observations.
-    pub fn filtered_moves(
+    /// Rebuild one move's aggregate from the stored observations, keeping only
+    /// observations on the wanted side of the reply flag (and passing `filter`
+    /// when given). Returns `None` when nothing matches, so own-move readers
+    /// never mistake a faced reply for one of the player's moves (and reply
+    /// readers never pick up own moves).
+    fn rebuild_stat(
         &self,
+        cidx: usize,
         key: u64,
-        color: Color,
-        filter: &PrepFilterConfig,
-    ) -> Vec<PlayerMoveStat> {
-        let cidx = color_idx(color) as u8;
-        let Some(moves) = self.positions[color_idx(color)].get(&key) else {
-            return Vec::new();
+        code: u32,
+        reply: bool,
+        filter: Option<&PrepFilterConfig>,
+    ) -> Option<PlayerMoveStat> {
+        let obs = self.obs.get(&(cidx as u8, key, code))?;
+        let base = self.positions[cidx].get(&key)?.get(&code)?;
+        let mut stat = PlayerMoveStat {
+            key,
+            mv: code,
+            anchor_quarter: base.anchor_quarter,
+            ..PlayerMoveStat::default()
         };
+        let mut weighted = 0.0;
+        let mut recent_weighted = 0.0;
+        for ob in obs {
+            if ob.reply != reply {
+                continue;
+            }
+            if let Some(f) = filter
+                && !f.matches_obs(ob.is_online, ob.tc, ob.date, ob.is_rated, self.as_of)
+            {
+                continue;
+            }
+            stat.games += 1;
+            match ob.result {
+                GameResult::Win => stat.wins += 1,
+                GameResult::Draw => stat.draws += 1,
+                GameResult::Loss => stat.losses += 1,
+                GameResult::Unknown => {}
+            }
+            weighted += ob.weight;
+            if is_recent_date(ob.date, self.as_of, self.config) {
+                stat.recent_games += 1;
+                recent_weighted += ob.weight;
+            }
+            if ob.date != 0 {
+                if stat.first_date == 0 || ob.date < stat.first_date {
+                    stat.first_date = ob.date;
+                }
+                stat.last_date = stat.last_date.max(ob.date);
+            }
+            if ob.is_online {
+                stat.online_weighted += ob.weight;
+            } else {
+                stat.otb_weighted += ob.weight;
+            }
+            stat.tc_weighted[ob.tc.index()] += ob.weight;
+        }
+        if stat.games == 0 {
+            return None;
+        }
+        stat.weighted = weighted;
+        stat.recent_weighted = recent_weighted;
+        Some(stat)
+    }
+
+    /// Stats for one player colour, rebuilt from observations on the wanted
+    /// side of the reply flag. `reply == false` selects the player's own
+    /// moves; `reply == true` selects the replies they faced.
+    fn stats_for_map(
+        &self,
+        cidx: usize,
+        key: u64,
+        reply: bool,
+        filter: Option<&PrepFilterConfig>,
+    ) -> Vec<PlayerMoveStat> {
         let mut out = Vec::new();
-        for (&code, base) in moves {
-            let Some(obs) = self.obs.get(&(cidx, key, code)) else {
-                continue;
-            };
-            let mut stat = PlayerMoveStat {
-                key,
-                mv: code,
-                anchor_quarter: base.anchor_quarter,
-                ..PlayerMoveStat::default()
-            };
-            let mut weighted = 0.0;
-            let mut recent_weighted = 0.0;
-            for ob in obs {
-                if !filter.matches_obs(ob.is_online, ob.tc, ob.date, ob.is_rated, self.as_of) {
-                    continue;
-                }
-                stat.games += 1;
-                match ob.result {
-                    GameResult::Win => stat.wins += 1,
-                    GameResult::Draw => stat.draws += 1,
-                    GameResult::Loss => stat.losses += 1,
-                    GameResult::Unknown => {}
-                }
-                weighted += ob.weight;
-                if is_recent_date(ob.date, self.as_of, self.config) {
-                    stat.recent_games += 1;
-                    recent_weighted += ob.weight;
-                }
-                if ob.date != 0 {
-                    if stat.first_date == 0 || ob.date < stat.first_date {
-                        stat.first_date = ob.date;
-                    }
-                    stat.last_date = stat.last_date.max(ob.date);
-                }
-                if ob.is_online {
-                    stat.online_weighted += ob.weight;
-                } else {
-                    stat.otb_weighted += ob.weight;
-                }
-                stat.tc_weighted[ob.tc.index()] += ob.weight;
+        let Some(moves) = self.positions[cidx].get(&key) else {
+            return out;
+        };
+        for &code in moves.keys() {
+            if let Some(stat) = self.rebuild_stat(cidx, key, code, reply, filter) {
+                out.push(stat);
             }
-            if stat.games == 0 {
-                continue;
-            }
-            stat.weighted = weighted;
-            stat.recent_weighted = recent_weighted;
-            out.push(stat);
         }
         out.sort_by(|a, b| {
             b.weighted
@@ -1955,19 +1992,84 @@ impl PlayerBook {
         out
     }
 
-    pub fn stats(&self, key: u64) -> Option<PlayerPositionStats> {
-        let mut stats = PlayerPositionStats::default();
-        let mut any = false;
-        for map in &self.positions {
-            if let Some(moves) = map.get(&key) {
-                any = true;
-                accumulate_stats(&mut stats, moves.values());
+    /// Combined own-move stats across both colours (backwards compatible),
+    /// rebuilt from observations so faced replies never leak in. At any
+    /// position only the side to move can own moves, so merging stays exact.
+    fn own_moves_combined(&self, key: u64) -> BTreeMap<u32, PlayerMoveStat> {
+        let mut combined: BTreeMap<u32, PlayerMoveStat> = BTreeMap::new();
+        for (cidx, map) in self.positions.iter().enumerate() {
+            let Some(moves) = map.get(&key) else {
+                continue;
+            };
+            for &code in moves.keys() {
+                if let Some(stat) = self.rebuild_stat(cidx, key, code, false, None) {
+                    let entry = combined.entry(code).or_insert(PlayerMoveStat {
+                        key,
+                        mv: code,
+                        ..PlayerMoveStat::default()
+                    });
+                    merge_stat(entry, &stat);
+                }
             }
         }
-        any.then_some(stats)
+        combined
     }
 
-    /// Aggregated filtered stats for one colour.
+    /// Combined own moves from both colours (backwards compatible). Faced
+    /// replies are excluded: they are not the player's moves.
+    pub fn moves(&self, key: u64) -> Vec<PlayerMoveStat> {
+        let mut moves: Vec<_> = self.own_moves_combined(key).into_values().collect();
+        moves.sort_by(|a, b| {
+            b.weighted
+                .total_cmp(&a.weighted)
+                .then(b.games.cmp(&a.games))
+                .then(a.mv.cmp(&b.mv))
+        });
+        moves
+    }
+
+    /// Own moves from one player colour only. Faced replies are excluded.
+    pub fn moves_for_color(&self, key: u64, color: Color) -> Vec<PlayerMoveStat> {
+        self.stats_for_map(color_idx(color), key, false, None)
+    }
+
+    /// Filtered own moves for one colour: only observations passing `filter`
+    /// contribute. Cheap in-memory pass over the stored observations. Faced
+    /// replies are excluded; see [`Self::filtered_replies`] for those.
+    pub fn filtered_moves(
+        &self,
+        key: u64,
+        color: Color,
+        filter: &PrepFilterConfig,
+    ) -> Vec<PlayerMoveStat> {
+        self.stats_for_map(color_idx(color), key, false, Some(filter))
+    }
+
+    /// Filtered replies faced by the player for one colour: only reply
+    /// observations passing `filter` contribute. Replies live under the
+    /// player's game-colour index at positions where the opponent was to
+    /// move, so query them with the player's colour (e.g. the opponent's
+    /// colour in preparation) at our-turn keys.
+    pub fn filtered_replies(
+        &self,
+        key: u64,
+        color: Color,
+        filter: &PrepFilterConfig,
+    ) -> Vec<PlayerMoveStat> {
+        self.stats_for_map(color_idx(color), key, true, Some(filter))
+    }
+
+    pub fn stats(&self, key: u64) -> Option<PlayerPositionStats> {
+        let combined = self.own_moves_combined(key);
+        if combined.is_empty() {
+            return None;
+        }
+        let mut stats = PlayerPositionStats::default();
+        accumulate_stats(&mut stats, combined.values());
+        Some(stats)
+    }
+
+    /// Aggregated filtered own-move stats for one colour.
     pub fn filtered_stats(
         &self,
         key: u64,
@@ -1975,6 +2077,23 @@ impl PlayerBook {
         filter: &PrepFilterConfig,
     ) -> Option<PlayerPositionStats> {
         let moves = self.filtered_moves(key, color, filter);
+        if moves.is_empty() {
+            return None;
+        }
+        let mut stats = PlayerPositionStats::default();
+        accumulate_stats(&mut stats, moves.iter());
+        Some(stats)
+    }
+
+    /// Aggregated filtered reply stats for one colour: the replies the player
+    /// faced at `key`, from the player's perspective.
+    pub fn replies_stats(
+        &self,
+        key: u64,
+        color: Color,
+        filter: &PrepFilterConfig,
+    ) -> Option<PlayerPositionStats> {
+        let moves = self.filtered_replies(key, color, filter);
         if moves.is_empty() {
             return None;
         }
@@ -2027,6 +2146,9 @@ impl PlayerBook {
                 for &code in moves.keys() {
                     if let Some(obs) = self.obs.get(&(cidx, key, code)) {
                         for ob in obs {
+                            if ob.reply {
+                                continue;
+                            }
                             if !filter.matches_obs(
                                 ob.is_online,
                                 ob.tc,
@@ -2051,7 +2173,8 @@ impl PlayerBook {
         false
     }
 
-    /// Repertoire profile for one colour under `filter`.
+    /// Repertoire profile for one colour under `filter`. Only the player's own
+    /// moves contribute; faced replies are not repertoire.
     pub fn profile(
         &self,
         color: Color,
@@ -2077,6 +2200,9 @@ impl PlayerBook {
                 let mut g = 0u32;
                 if let Some(obs) = self.obs.get(&(cidx as u8, *key, code)) {
                     for ob in obs {
+                        if ob.reply {
+                            continue;
+                        }
                         if filter.matches_obs(ob.is_online, ob.tc, ob.date, ob.is_rated, self.as_of)
                         {
                             w += ob.weight;
@@ -2358,19 +2484,9 @@ pub fn predict(
     prior_source: PriorSource,
     legal_moves: usize,
 ) -> Prediction {
-    let mut player_moves: BTreeMap<u32, PlayerMoveStat> = BTreeMap::new();
-    for map in &book.positions {
-        if let Some(moves) = map.get(&key) {
-            for (&code, stat) in moves {
-                let entry = player_moves.entry(code).or_insert(PlayerMoveStat {
-                    key,
-                    mv: code,
-                    ..PlayerMoveStat::default()
-                });
-                merge_stat(entry, stat);
-            }
-        }
-    }
+    // Own moves only: faced replies share the colour maps but are not the
+    // player's repertoire and must not count as player data.
+    let player_moves = book.own_moves_combined(key);
 
     let mut candidates: BTreeMap<u32, Candidate> = BTreeMap::new();
     for stat in global {
@@ -2531,9 +2647,12 @@ pub fn predict(
 /// - a trend-boosted prior `pi ~ p_base + gamma * max(0, shrunk_recent - base)`
 ///   computed from `reference` quarterly buckets via
 ///   [`crate::recent::position_trends`],
-/// - an adaptive prior strength `alpha0 = alpha_base * (1.4 - 0.8 * C) *
-///   (1 + 0.75 * staleness)` where `C` is the local inverse perplexity and
-///   `staleness` the share of decayed weight outside the recent window,
+/// - a sample-size-adaptive prior strength `alpha0 = 2.5 * (1.25 - 0.85 * C)
+///   / (1 + 0.25 * N)` where `C` is the local inverse perplexity from the
+///   player's weights and `N` the player's game count at the position, with
+///   unseen mass `0.35 / (1 + 0.5 * N)`,
+/// - player evidence `E(m) = w_all(m) + w_recent(m)` combining the decayed
+///   and recent-window weights,
 /// - inference caps: moves the player never played (`player_games == 0`) keep
 ///   `probability >= 0.08` for at most three moves; the rest are capped below.
 /// - `is_inferred_only`, `vs_field_pp` and `sparkline` on every move.
@@ -2559,20 +2678,9 @@ pub fn predict_v2(
             .map(|m| (m.mv, m))
             .collect(),
         _ => {
-            let mut combined: BTreeMap<u32, PlayerMoveStat> = BTreeMap::new();
-            for map in &book.positions {
-                if let Some(moves) = map.get(&key) {
-                    for (&code, stat) in moves {
-                        let entry = combined.entry(code).or_insert(PlayerMoveStat {
-                            key,
-                            mv: code,
-                            ..PlayerMoveStat::default()
-                        });
-                        merge_stat(entry, stat);
-                    }
-                }
-            }
-            combined
+            // Unfiltered colour-blind book: own moves only, merged across both
+            // maps. Faced replies must not count as player data.
+            book.own_moves_combined(key)
         }
     };
 
@@ -2594,10 +2702,13 @@ pub fn predict_v2(
         }
     }
 
-    // Local consistency C: inverse perplexity of the player's distribution.
+    // Local consistency C: inverse perplexity of the player's weighted
+    // distribution at this position.
     let total_w: f64 = player_moves.values().map(|m| m.weighted).sum();
     let recent_w: f64 = player_moves.values().map(|m| m.recent_weighted).sum();
-    let consistency = if total_w > 0.0 {
+    // Player sample size at this position (raw game count).
+    let n_player: f64 = player_moves.values().map(|m| f64::from(m.games)).sum();
+    let c_local = if total_w > 0.0 {
         let mut h = 0.0;
         for m in player_moves.values() {
             let p = m.weighted / total_w;
@@ -2608,11 +2719,6 @@ pub fn predict_v2(
         (-h).exp().clamp(0.0, 1.0)
     } else {
         0.5
-    };
-    let staleness = if total_w > 0.0 {
-        ((total_w - recent_w).max(0.0) / total_w).clamp(0.0, 1.0)
-    } else {
-        0.0
     };
 
     let mut candidates: BTreeMap<u32, Candidate> = BTreeMap::new();
@@ -2645,13 +2751,14 @@ pub fn predict_v2(
         .sum();
     let candidate_count = candidates.len() as f64;
     let unseen_moves = legal_moves.saturating_sub(candidates.len());
+    // Sample-size-adaptive background strength: a large exclusive player
+    // sample earns a tiny prior, while unseen positions keep the floor.
+    let alpha0 = 2.5 * (1.25 - 0.85 * c_local) / (1.0 + 0.25 * n_player);
     let unseen_alpha = if unseen_moves > 0 {
-        book.config.unseen_prior_games.max(0.0)
+        0.35 / (1.0 + 0.5 * n_player)
     } else {
         0.0
     };
-    let alpha_base = book.config.prior_games + (database_total as f64).sqrt().min(12.0);
-    let adaptive = alpha_base * (1.4 - 0.8 * consistency) * (1.0 + 0.75 * staleness);
     let mut prior_total = 0.0;
     for (mv, candidate) in candidates.iter_mut() {
         let mut share = if database_total > 0 {
@@ -2662,11 +2769,13 @@ pub fn predict_v2(
         if let Some(b) = boost.get(mv) {
             share += *b;
         }
-        candidate.alpha = adaptive * share + book.config.smoothing;
+        candidate.alpha = alpha0 * share + book.config.smoothing;
         prior_total += candidate.alpha;
     }
 
-    let decay_total = prior_total + unseen_alpha + total_w;
+    // Player evidence combines the decayed and recent-window weights.
+    let evidence_total = total_w + recent_w;
+    let decay_total = prior_total + unseen_alpha + evidence_total;
     let recent_total = prior_total + unseen_alpha + recent_w;
     let recent_mix = if recent_w > 0.0 {
         recent_w / (recent_w + book.config.recent_mix_games)
@@ -2679,14 +2788,18 @@ pub fn predict_v2(
     let mut recent_games = 0;
     for (code, candidate) in candidates {
         let player = player_moves.get(&code).copied().unwrap_or_default();
-        let decay_probability = (candidate.alpha + player.weighted) / decay_total;
+        let evidence = player.weighted + player.recent_weighted;
+        let decay_probability = (candidate.alpha + evidence) / decay_total;
         let recent_probability = if recent_w > 0.0 {
             (candidate.alpha + player.recent_weighted) / recent_total
         } else {
             decay_probability
         };
         let probability = (1.0 - recent_mix) * decay_probability + recent_mix * recent_probability;
-        let decay_variance = beta_variance(decay_probability, prior_total + unseen_alpha + total_w);
+        let decay_variance = beta_variance(
+            decay_probability,
+            prior_total + unseen_alpha + evidence_total,
+        );
         let recent_variance =
             beta_variance(recent_probability, prior_total + unseen_alpha + recent_w);
         let variance =
@@ -3385,7 +3498,19 @@ mod tests {
     fn database_prior_is_used_when_player_has_no_games_here() {
         let book = trend_book();
         let start = Chess::default();
-        let key = position::position_key(&start);
+        // 1. d4 is never reached in the fixture (every game opens 1. e4), so
+        // the player has no data here — neither own moves nor faced replies.
+        let after_d4 = start
+            .clone()
+            .play(
+                SanPlus::from_ascii(b"d4")
+                    .unwrap()
+                    .san
+                    .to_move(&start)
+                    .unwrap(),
+            )
+            .unwrap();
+        let key = position::position_key(&after_d4);
         let global = vec![
             MoveStat {
                 key,
@@ -3419,7 +3544,7 @@ mod tests {
             key,
             &global,
             PriorSource::CurrentDatabase,
-            start.legal_moves().len(),
+            after_d4.legal_moves().len(),
         );
         assert!(!prediction.has_player_data);
         assert_eq!(prediction.moves[0].mv, global[0].mv);
@@ -3427,6 +3552,84 @@ mod tests {
         assert!(prediction.moves[0].probability < 1.0);
         assert!(prediction.moves[0].probability_high > prediction.moves[0].probability);
         assert!(prediction.unseen_probability > 0.0);
+    }
+
+    #[test]
+    fn replies_excluded_from_own_prediction() {
+        // Trendy is Black in every fixture game, so at the root (White to
+        // move) the book holds only White replies — never Trendy's own moves.
+        let book = trend_book();
+        let start = Chess::default();
+        let key = position::position_key(&start);
+        let filter = PrepFilterConfig::default();
+        let e4 = position::encode_move(
+            SanPlus::from_ascii(b"e4")
+                .unwrap()
+                .san
+                .to_move(&start)
+                .unwrap(),
+        )
+        .unwrap();
+        let replies = book.filtered_replies(key, Color::Black, &filter);
+        assert_eq!(
+            replies.iter().map(|m| m.games).sum::<u32>(),
+            8,
+            "all eight faced e4 replies stay indexed"
+        );
+        assert!(replies.iter().any(|m| m.mv == e4), "the faced reply is e4");
+        assert!(
+            book.filtered_moves(key, Color::Black, &filter).is_empty(),
+            "replies are not the player's own moves"
+        );
+        assert!(book.moves(key).is_empty());
+        assert!(book.stats(key).is_none());
+        let global = vec![
+            MoveStat {
+                key,
+                mv: e4,
+                games: 90,
+                ..MoveStat::default()
+            },
+            MoveStat {
+                key,
+                mv: position::encode_move(
+                    SanPlus::from_ascii(b"d4")
+                        .unwrap()
+                        .san
+                        .to_move(&start)
+                        .unwrap(),
+                )
+                .unwrap(),
+                games: 10,
+                ..MoveStat::default()
+            },
+        ];
+        let prediction = predict(
+            &book,
+            key,
+            &global,
+            PriorSource::CurrentDatabase,
+            start.legal_moves().len(),
+        );
+        assert!(!prediction.has_player_data);
+        assert_eq!(prediction.player_games, 0);
+        assert_eq!(prediction.moves[0].mv, global[0].mv);
+        // The filtered and unfiltered v2 paths agree: no own moves at a
+        // reply-only position.
+        for (f, c) in [(Some(&filter), Some(Color::Black)), (None, None)] {
+            let prediction_v2 = predict_v2(
+                &book,
+                key,
+                &global,
+                PriorSource::CurrentDatabase,
+                start.legal_moves().len(),
+                f,
+                c,
+                None,
+            );
+            assert!(!prediction_v2.has_player_data);
+            assert_eq!(prediction_v2.player_games, 0);
+        }
     }
 
     #[test]
@@ -4115,6 +4318,9 @@ mod tests {
             2026_1001,
         );
         let exploratory_sans = ["Nf3", "Bc4", "Nc3", "d4", "f4", "c3", "Qh5", "g3"];
+        // Replies are filtered out of the profile (they are faced, not played),
+        // so the fixture keeps a constant reply and varies only the player's
+        // own second moves.
         let exploratory_games: Vec<Game> = exploratory_sans
             .iter()
             .enumerate()
@@ -4211,5 +4417,209 @@ mod tests {
             prediction.moves.iter().any(|m| m.player_games == 1),
             "the played move stays listed"
         );
+    }
+
+    #[test]
+    fn book_records_opponent_replies() {
+        let game = otb_game(
+            "Preppie",
+            "Opponent",
+            "2025.05.01",
+            "1. e4 e5 2. Nf3 Nc6 1-0",
+        );
+        let book = PlayerBook::from_games(
+            "preppie",
+            "Preppie",
+            std::slice::from_ref(&game),
+            PredictionConfig::default(),
+            2026_1001,
+        );
+        let start = Chess::default();
+        let start_key = position::position_key(&start);
+        let own = book.moves_for_color(start_key, Color::White);
+        assert_eq!(own.len(), 1, "the player's own move is recorded");
+
+        // After 1. e4 Black replies 1...e5. The reply is recorded under the
+        // player's (White) colour index.
+        let after_e4 = start
+            .clone()
+            .play(
+                SanPlus::from_ascii(b"e4")
+                    .unwrap()
+                    .san
+                    .to_move(&start)
+                    .unwrap(),
+            )
+            .unwrap();
+        let reply_key = position::position_key(&after_e4);
+        // Replies are not the player's moves: every own-move reader excludes
+        // them, even though they share the player's colour index.
+        assert!(
+            book.moves_for_color(reply_key, Color::White).is_empty(),
+            "the opponent reply is not an own move"
+        );
+        assert!(
+            book.filtered_moves(reply_key, Color::White, &PrepFilterConfig::default())
+                .is_empty()
+        );
+        assert!(book.moves(reply_key).is_empty());
+        assert!(book.stats(reply_key).is_none());
+        // The reply is still indexed, on the reply side of the book.
+        let filter = PrepFilterConfig::default();
+        let replies = book.filtered_replies(reply_key, Color::White, &filter);
+        assert_eq!(replies.len(), 1, "the opponent reply is indexed");
+        let san = SanPlus::from_move(
+            after_e4.clone(),
+            position::decode_move(&after_e4, replies[0].mv).unwrap(),
+        )
+        .to_string();
+        assert_eq!(san, "e5");
+        // The result stays from the prepared player's perspective.
+        assert_eq!((replies[0].wins, replies[0].losses), (1, 0));
+        // The aggregated reply stats agree without a rebuild.
+        let reply_stats = book
+            .replies_stats(reply_key, Color::White, &filter)
+            .expect("reply stats exist");
+        assert_eq!(reply_stats.games, 1);
+        assert!(
+            book.filtered_stats(reply_key, Color::White, &filter)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn untagged_otb_games_default_to_classical() {
+        let otb = otb_game("A", "B", "2025.05.01", "1. e4 e5 1-0");
+        let (tc, is_online, _) = classify_game_metadata(&otb);
+        assert!(!is_online);
+        assert_eq!(tc, TimeControlClass::Classical);
+        // An explicit TimeControl tag still wins.
+        let mut blitz = otb.clone();
+        blitz.set_header("TimeControl", "180+2".to_string());
+        assert_eq!(classify_game_metadata(&blitz).0, TimeControlClass::Blitz);
+        // Event keywords still win.
+        let mut keyworded = otb.clone();
+        keyworded.set_header("Event", "World Blitz Championship".to_string());
+        assert_eq!(
+            classify_game_metadata(&keyworded).0,
+            TimeControlClass::Blitz
+        );
+        // Untagged online games keep the Rapid default.
+        let online_untagged = game_with_headers(
+            "1. e4 e5 1-0",
+            &[
+                ("Event", "Casual game"),
+                ("Site", "lichess.org"),
+                ("Date", "2025.05.01"),
+                ("White", "A"),
+                ("Black", "B"),
+                ("Result", "1-0"),
+            ],
+        );
+        let (tc, is_online, _) = classify_game_metadata(&online_untagged);
+        assert!(is_online);
+        assert_eq!(tc, TimeControlClass::Rapid);
+    }
+
+    #[test]
+    fn account_tags_canonicalize_by_username_key() {
+        let mut game = otb_game("Magnus Carlsen", "Opponent", "2025.05.01", "1. e4 e5 1-0");
+        canonicalize_account_tags(&mut game, "Carlsen, Magnus", "Carlsen, Magnus");
+        assert_eq!(game.white(), "Carlsen, Magnus");
+        assert_eq!(game.black(), "Opponent");
+        // The other side matches too.
+        let mut black_game = otb_game("Opponent", "Carlsen Magnus", "2025.05.01", "1. e4 e5 1-0");
+        canonicalize_account_tags(&mut black_game, "Carlsen, Magnus", "Carlsen, Magnus");
+        assert_eq!(black_game.black(), "Carlsen, Magnus");
+        // Garbage usernames leave tags alone.
+        let mut other = otb_game("Someone", "Else", "2025.05.01", "1. e4 e5 1-0");
+        canonicalize_account_tags(&mut other, "?", "Carlsen, Magnus");
+        assert_eq!(other.white(), "Someone");
+        assert_eq!(other.black(), "Else");
+    }
+
+    #[test]
+    fn exclusive_repertoire_overrides_large_background() {
+        // 18/18 exclusive (7 recent) against a 1000-game background where the
+        // player's move is rare: the calibrated prior must stay small.
+        let as_of = 2026_1001;
+        let mut games = Vec::new();
+        for i in 0..18 {
+            let date = if i < 7 {
+                format!("2025.{:02}.01", i + 1)
+            } else {
+                format!("2020.{:02}.01", i - 7 + 1)
+            };
+            games.push(otb_game(
+                "Exclusive",
+                "Opponent",
+                &date,
+                "1. e4 e5 2. Nf3 Nc6 1-0",
+            ));
+        }
+        let book = PlayerBook::from_games(
+            "exclusive",
+            "Exclusive",
+            &games,
+            PredictionConfig::default(),
+            as_of,
+        );
+        let start = Chess::default();
+        let key = position::position_key(&start);
+        let code = |san: &[u8]| {
+            position::encode_move(
+                SanPlus::from_ascii(san)
+                    .unwrap()
+                    .san
+                    .to_move(&start)
+                    .unwrap(),
+            )
+            .unwrap()
+        };
+        let global = vec![
+            MoveStat {
+                key,
+                mv: code(b"d4"),
+                games: 950,
+                ..MoveStat::default()
+            },
+            MoveStat {
+                key,
+                mv: code(b"e4"),
+                games: 10,
+                ..MoveStat::default()
+            },
+            MoveStat {
+                key,
+                mv: code(b"c4"),
+                games: 40,
+                ..MoveStat::default()
+            },
+        ];
+        let prediction = predict_v2(
+            &book,
+            key,
+            &global,
+            PriorSource::Reference,
+            start.legal_moves().len(),
+            None,
+            None,
+            None,
+        );
+        assert!(prediction.has_player_data);
+        assert_eq!(prediction.player_games, 18);
+        assert_eq!(prediction.recent_games, 7);
+        let exclusive = prediction
+            .moves
+            .iter()
+            .find(|mv| mv.mv == code(b"e4"))
+            .expect("exclusive move is listed");
+        assert!(
+            exclusive.probability >= 0.90,
+            "exclusive e4 should dominate, got {:.3}",
+            exclusive.probability
+        );
+        assert!(exclusive.probability_low <= exclusive.probability);
+        assert!(exclusive.probability_high >= exclusive.probability);
     }
 }
