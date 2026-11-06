@@ -43,7 +43,7 @@ pub use writer::{
 use std::ffi::OsString;
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -399,13 +399,22 @@ pub struct TwoCbhLibrary {
     file_len: u64,
     indexed_in: Duration,
     accelerator: Option<TwoCbhAccelerator>,
+    tournament_cache: OnceLock<Option<Vec<MegaTournamentCategory>>>,
 }
 
 impl TwoCbhLibrary {
-    /// Open a 2CBH database and index its game headers.
+    /// Open a 2CBH database and index its game headers. The `.2lgd`
+    /// sidecar is memory-mapped best-effort only; it is never built here so
+    /// a 2.2 GB build cannot block the UI thread. Callers build it in the
+    /// background via [`TwoCbhAccelerator::build_to`] + [`Self::attach_accelerator`].
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let started = Instant::now();
+        let t_file = Instant::now();
         let file = TwoCbhFile::open(path)?;
+        tracing::info!(
+            "2CBH container open took {:.2}s",
+            t_file.elapsed().as_secs_f64()
+        );
         let slots = file.slot_count().saturating_sub(1);
         if slots > MAX_INDEXED_GAMES {
             bail!(
@@ -413,7 +422,12 @@ impl TwoCbhLibrary {
                 file.path().display()
             );
         }
+        let t_names = Instant::now();
         let names = Arc::new(NameBase::open(&file.lid_path)?);
+        tracing::info!(
+            "2CBH names (.2lid) open took {:.2}s",
+            t_names.elapsed().as_secs_f64()
+        );
         let total = file.slot_count().saturating_sub(1);
         // Databases up to 250k games pre-build eager AST/strings; larger collections
         // (such as Mega Database with 11.75M+ games) use lazy headers on demand.
@@ -426,6 +440,7 @@ impl TwoCbhLibrary {
             Vec::new()
         };
         let mut strings = StringPool::default();
+        let t_entries = Instant::now();
         for id in 1..file.count {
             let record = file.record(id)?;
             let kind = record[0];
@@ -449,18 +464,48 @@ impl TwoCbhLibrary {
             }
         }
 
+        let entries_elapsed = t_entries.elapsed();
+        tracing::info!(
+            "2CBH entries scan ({} entries) took {:.2}s",
+            entries.len(),
+            entries_elapsed.as_secs_f64()
+        );
+        if entries_elapsed.as_millis() > 100 {
+            tracing::warn!(
+                "slow 2CBH entries scan took {:.2}s",
+                entries_elapsed.as_secs_f64()
+            );
+        }
+
         let mut file_len = file.cbh.len() as u64 + file.cbg.len() as u64;
         for path in file.cba_path.iter().chain(std::iter::once(&file.lid_path)) {
             file_len += fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
         }
 
-        // Best-effort `.2lgd` accelerator: load it when present, otherwise
-        // build it with one scan so event/player lookups are O(1).
+        // Best-effort `.2lgd` accelerator: memory-map when present. Never
+        // build here — the caller builds in the background.
+        let t_lgd = Instant::now();
         let lgd_path = TwoCbhAccelerator::path_for(&file.cbh_path);
-        let accelerator = TwoCbhAccelerator::open(&lgd_path).ok().or_else(|| {
-            TwoCbhAccelerator::build_to(&file, &lgd_path).ok()?;
-            TwoCbhAccelerator::open(&lgd_path).ok()
-        });
+        let accelerator = TwoCbhAccelerator::open(&lgd_path).ok();
+        let lgd_elapsed = t_lgd.elapsed();
+        if lgd_elapsed.as_millis() > 100 {
+            tracing::warn!("slow 2LGD attach took {:.2}s", lgd_elapsed.as_secs_f64());
+        } else {
+            tracing::info!(
+                "2LGD attach took {:.2}s (present={})",
+                lgd_elapsed.as_secs_f64(),
+                accelerator.is_some()
+            );
+        }
+        let total_open = started.elapsed();
+        if total_open.as_millis() > 100 {
+            tracing::warn!(
+                "slow TwoCbhLibrary::open took {:.2}s",
+                total_open.as_secs_f64()
+            );
+        } else {
+            tracing::info!("TwoCbhLibrary::open took {:.2}s", total_open.as_secs_f64());
+        }
 
         Ok(Self {
             path: file.cbh_path.clone(),
@@ -471,7 +516,26 @@ impl TwoCbhLibrary {
             file_len,
             indexed_in: started.elapsed(),
             accelerator,
+            tournament_cache: OnceLock::new(),
         })
+    }
+
+    /// Companion `.2lgd` path for this database.
+    pub fn lgd_path(&self) -> PathBuf {
+        TwoCbhAccelerator::path_for(&self.file.cbh_path)
+    }
+
+    /// Attach a background-built accelerator.
+    pub fn attach_accelerator(&mut self, acc: TwoCbhAccelerator) {
+        self.accelerator = Some(acc);
+    }
+
+    /// Entity count bound from the `.2lid` (avoids scanning 4.3M overflow blocks).
+    fn entity_bound(&self) -> usize {
+        match &self.accelerator {
+            Some(acc) => self.names.entity_count().min(acc.block_count()),
+            None => 0,
+        }
     }
 
     pub fn path(&self) -> &Path {
@@ -579,17 +643,22 @@ impl TwoCbhLibrary {
 
     /// Tournament index categories from the slot-1 text record, if present.
     /// Returns `None` when slot 1 is not a text record or has no entries.
+    /// Parsed once and cached (the 1.07 MB Slot-1 HTML is not re-parsed).
     pub fn tournament_categories(&self) -> Option<Vec<MegaTournamentCategory>> {
-        if !self.file.is_text(1) {
-            return None;
-        }
-        let html = self.file.text_html(1).ok()?;
-        let categories = parse_mega_tournament_index(&html);
-        if categories.is_empty() {
-            None
-        } else {
-            Some(categories)
-        }
+        self.tournament_cache
+            .get_or_init(|| {
+                if !self.file.is_text(1) {
+                    return None;
+                }
+                let html = self.file.text_html(1).ok()?;
+                let categories = parse_mega_tournament_index(&html);
+                if categories.is_empty() {
+                    None
+                } else {
+                    Some(categories)
+                }
+            })
+            .clone()
     }
 
     /// All one-based text record ids in this database.
@@ -664,8 +733,9 @@ impl TwoCbhLibrary {
             return Vec::new();
         }
         if let Some(acc) = &self.accelerator {
+            let bound = self.entity_bound();
             let mut out = Vec::new();
-            for entity in 0..acc.block_count() as u32 {
+            for entity in 0..bound as u32 {
                 let (place, title) = self.names.event(entity);
                 if title.trim().to_lowercase() != want_event {
                     continue;
@@ -709,8 +779,9 @@ impl TwoCbhLibrary {
     /// entry named from the `.2lid`; record ids map to game indices.
     pub fn accelerated_players(&self) -> Option<Vec<crate::library::AcceleratedPlayer>> {
         let acc = self.accelerator.as_ref()?;
+        let bound = self.entity_bound();
         let mut out = Vec::new();
-        for entity in 0..acc.block_count() as u32 {
+        for entity in 0..bound as u32 {
             let Ok(ids) = acc.player_games(entity) else {
                 continue;
             };
@@ -805,33 +876,29 @@ impl GameLibrary for TwoCbhLibrary {
             .with_context(|| format!("2CBH game index {index} is out of range"))?;
         let content = self.file.content(entry.id)?;
         let words = content.words();
-        let record_start = start_id_from_record(self.file.record(entry.id)?);
         let (start_pos, chess960, move_tokens) = match content.kind {
             1 => {
+                // Custom-start records (e.g. game 503255 with words
+                // [0x1, 0xfffb, …]) and any non-standard marker are not
+                // indexable from the default start: skip cleanly.
                 if words.first() != Some(&0xfffc) {
-                    bail!("2CBH game {} has no standard start marker", entry.id);
+                    tracing::debug!(
+                        "2CBH game {} has non-standard start marker {:?}; skipping position index",
+                        entry.id,
+                        words.first().copied()
+                    );
+                    return Ok(false);
                 }
                 (crate::chess::Chess::default(), false, &words[1..])
             }
             2 => {
-                if words.first() != Some(&0xfffb) || words.get(2) != Some(&0xfffc) {
-                    bail!(
-                        "2CBH game {} has a malformed Chess960 start marker",
-                        entry.id
-                    );
-                }
-                let start_id = *words.get(1).context("Chess960 start id is missing")?;
-                if let Some(record_start) = record_start
-                    && record_start != start_id
-                {
-                    bail!(
-                        "2CBH game {} says Chess960 start {start_id} in its move record but {record_start} in its header",
-                        entry.id
-                    );
-                }
-                let pos = moves::start_position_960(start_id)
-                    .with_context(|| format!("2CBH game {} Chess960 start {start_id}", entry.id))?;
-                (pos, true, &words[3..])
+                // Chess960 games are skipped by the position index (standard
+                // start key space only); not an error.
+                tracing::debug!(
+                    "2CBH game {} is Chess960; skipping position index",
+                    entry.id
+                );
+                return Ok(false);
             }
             kind => bail!("2CBH game {} uses unknown encoding kind {kind}", entry.id),
         };
@@ -1101,6 +1168,18 @@ impl NameBase {
         let title = non_empty(decode_text(texts[0]));
         let publisher = non_empty(decode_text(texts[1]));
         (title != "?" || publisher != "?").then_some((title, publisher))
+    }
+
+    /// Number of `.2lid` entity slots (bounds directory scans; overflow
+    /// `.2lgd` blocks beyond this are never entity ids).
+    pub(crate) fn entity_count(&self) -> usize {
+        let Some(bytes) = self.bytes.as_ref() else {
+            return 0;
+        };
+        if self.stride == 0 || bytes.len() <= self.first_offset {
+            return 0;
+        }
+        (bytes.len() - self.first_offset) / self.stride
     }
 
     /// Single-string title block used by text records (offset `0xE82`):

@@ -112,7 +112,7 @@ where
                 }
 
                 let mut game_keys = HashSet::new();
-                let streamed = library.stream_mainline(
+                let streamed = match library.stream_mainline(
                     game_idx,
                     options.build_options.max_plies,
                     &mut |key, mv| {
@@ -124,10 +124,22 @@ where
                         record.mv = mv;
                         game_meta.add_to(record);
                     },
-                )?;
+                ) {
+                    Ok(streamed) => streamed,
+                    Err(err) => {
+                        tracing::debug!("position index skipped game {game_idx}: {err:#}");
+                        continue;
+                    }
+                };
 
                 if !streamed {
-                    let game = library.load(game_idx)?;
+                    let game = match library.load(game_idx) {
+                        Ok(game) => game,
+                        Err(err) => {
+                            tracing::debug!("position index skipped game {game_idx}: {err:#}");
+                            continue;
+                        }
+                    };
                     let mut node = 0usize;
                     let mut plies = 0u32;
                     while let Some(&child) = game.nodes[node].children.first() {
@@ -223,6 +235,22 @@ where
     let total_indexed_games: usize = segments.iter().map(|s| s.games).sum();
     let total_indexed_edges: usize = segments.iter().map(|s| s.edges).sum();
     let total_positions: usize = segments.iter().map(|s| s.unique_positions).sum();
+    let elapsed = started.elapsed();
+    let rate = if elapsed.as_secs_f64() > 0.0 {
+        total_indexed_games as f64 / elapsed.as_secs_f64()
+    } else {
+        0.0
+    };
+    tracing::info!(
+        "position index built: {total_indexed_games} games, {total_indexed_edges} edges in {:.2}s ({rate:.0} games/s)",
+        elapsed.as_secs_f64()
+    );
+    if elapsed.as_millis() > 100 {
+        tracing::warn!(
+            "slow position index build took {:.2}s",
+            elapsed.as_secs_f64()
+        );
+    }
 
     Ok(BuildReport {
         games: total_indexed_games,

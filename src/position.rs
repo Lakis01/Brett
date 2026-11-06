@@ -455,6 +455,17 @@ impl PositionIndex {
 
         let report =
             accumulator.finish_to_index(index_path, meta, options.max_plies, games, started)?;
+        let rate = if report.elapsed.as_secs_f64() > 0.0 {
+            report.games as f64 / report.elapsed.as_secs_f64()
+        } else {
+            0.0
+        };
+        tracing::info!(
+            "position index (library) built: {} games, {} edges in {:.2}s ({rate:.0} games/s)",
+            report.games,
+            report.edges,
+            report.elapsed.as_secs_f64()
+        );
         progress(BuildProgress {
             games: report.games,
             edges: report.edges,

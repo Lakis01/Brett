@@ -426,6 +426,8 @@ struct PrepSession {
     filter: players::PrepFilterConfig,
     /// Enabled online accounts used for this session.
     accounts: Vec<players::PrepOnlineAccount>,
+    /// ChessABC FIDE ids resolved in the setup dialog (empty = search by name).
+    chessabc_fide_ids: Vec<String>,
     /// Human-readable list of the loaded sources.
     sources_label: String,
 }
@@ -435,6 +437,14 @@ impl PrepSession {
         self.our_color.other()
     }
 }
+
+/// Result of a background ChessABC profile search for the setup dialog:
+/// the queried name, the player's Elo estimate, and the matching profiles.
+type ChessAbcSearchResult = (
+    String,
+    Option<u32>,
+    Result<Vec<online::ChessAbcPlayer>, String>,
+);
 
 /// Result of the background multi-source preparation load.
 ///
@@ -486,6 +496,8 @@ struct PrepPredictionRow {
     /// purely from the background prior (Smart predictor only).
     inferred: bool,
     vs_field_pp: Option<f64>,
+    /// Normalized sparkline points for the move's popularity trend.
+    sparkline: Vec<(f32, f32)>,
 }
 
 struct PrepPredictionData {
@@ -508,6 +520,20 @@ struct PrepLineRow {
     likelihood_high: Option<f64>,
 }
 
+/// One reply the prepared player has previously faced in the current
+/// position: a move chosen against them when they played our colour.
+#[derive(Clone, Debug)]
+struct YourTurnRow {
+    mv: Move,
+    san: String,
+    /// Times this reply was faced (📖 N).
+    games: u32,
+    wins: u32,
+    draws: u32,
+    losses: u32,
+    last_date: u32,
+}
+
 /// One clickable recent-game row.
 #[derive(Clone, Debug)]
 struct PrepRecentRow {
@@ -524,6 +550,9 @@ struct PrepRecentRow {
     white_fide_id: Option<String>,
     black_fide_id: Option<String>,
     subtitle: String,
+    /// Game-type pill colour + label from `classify_game_metadata`.
+    type_color: Color32,
+    type_label: &'static str,
 }
 
 /// Read-only game preview. The previous game, row, and cursor are kept intact
@@ -859,6 +888,17 @@ pub struct App {
     prep_setup_accounts: Vec<players::PrepOnlineAccount>,
     prep_setup_account_service: OnlineSource,
     prep_setup_account_name: String,
+    /// ChessABC profile candidates for the prepared player, highest rated first.
+    prep_setup_chessabc_candidates: Vec<online::ChessAbcPlayer>,
+    /// Selected ChessABC FIDE ids used for the ChessABC fetch.
+    prep_setup_chessabc_selected: Vec<String>,
+    prep_setup_chessabc_status: String,
+    prep_setup_chessabc_rx: Option<mpsc::Receiver<ChessAbcSearchResult>>,
+    /// Search text for the opponent selector at the top of the setup dialog.
+    prep_setup_search: String,
+    /// Directory index of the opponent chosen in the setup dialog. This lets
+    /// File → Prepare work with no prior player selection.
+    prep_setup_player: Option<usize>,
     /// Colour we will play, chosen by the Prepare as White/Black button that
     /// opened the setup dialog.
     prep_setup_as_white: bool,
@@ -1236,6 +1276,12 @@ impl App {
             prep_setup_accounts: Vec::new(),
             prep_setup_account_service: OnlineSource::Lichess,
             prep_setup_account_name: String::new(),
+            prep_setup_chessabc_candidates: Vec::new(),
+            prep_setup_chessabc_selected: Vec::new(),
+            prep_setup_chessabc_status: String::new(),
+            prep_setup_chessabc_rx: None,
+            prep_setup_search: String::new(),
+            prep_setup_player: None,
             prep_setup_as_white: true,
             prep_merged_games: Vec::new(),
             prep_load_rx: None,
@@ -1525,6 +1571,11 @@ impl App {
         self.drag_from = None;
         if changed {
             self.clear_engine_results();
+        }
+        // While preparation is active the board stays locked to our colour
+        // (or the opponent's in the swapped view).
+        if let Some(locked) = self.prep_locked_orientation() {
+            self.orientation = locked;
         }
     }
 
@@ -1873,15 +1924,60 @@ impl App {
             self.open_rx = Some(rx);
             return;
         }
-        match open_library(path) {
-            Ok(library) => self.install_library(library, path),
-            Err(err) => self.status = format!("Could not read {}: {err}", path.display()),
-        }
+        // All other formats open on the background `open_rx` thread (same
+        // OpenMessage::Progress/Done protocol as CBV) so a 11.7M-slot Mega
+        // database cannot freeze the UI thread.
+        self.open_rx = None;
+        self.open_job = Some(path.to_path_buf());
+        self.status = format!("Opening {}…", path.display());
+        tracing::info!("open_library start {}", path.display());
+        let started = std::time::Instant::now();
+        let (tx, rx) = mpsc::channel();
+        let ctx = self.ctx.clone();
+        let target = path.to_path_buf();
+        std::thread::spawn(move || {
+            let _ = tx.send(OpenMessage::Progress(format!(
+                "Opening {}…",
+                target.display()
+            )));
+            let result = open_library(&target).map_err(|err| format!("{err:#}"));
+            if let Ok(library) = result.as_ref() {
+                tracing::info!(
+                    "open_library done {} ({} games) in {:.2}s",
+                    target.display(),
+                    library.len(),
+                    started.elapsed().as_secs_f64()
+                );
+                if started.elapsed().as_millis() > 100 {
+                    tracing::warn!(
+                        "slow open_library {} took {:.2}s",
+                        target.display(),
+                        started.elapsed().as_secs_f64()
+                    );
+                }
+            } else if started.elapsed().as_millis() > 100 {
+                tracing::warn!(
+                    "slow failed open_library {} took {:.2}s",
+                    target.display(),
+                    started.elapsed().as_secs_f64()
+                );
+            }
+            let _ = tx.send(OpenMessage::Done(result));
+            ctx.request_repaint();
+        });
+        self.open_rx = Some(rx);
     }
 
     fn install_library(&mut self, library: Arc<dyn GameLibrary>, path: &std::path::Path) {
+        let install_started = std::time::Instant::now();
         let count = library.len();
         let indexed_in = library.indexed_in();
+        tracing::info!(
+            "install_library {} ({} games, indexed in {:.2}s)",
+            path.display(),
+            count,
+            indexed_in.as_secs_f64()
+        );
         self.players = PlayerDirectory::default();
         self.players_rx = None;
         self.players_job = None;
@@ -1955,6 +2051,62 @@ impl App {
             );
         }
         self.remember_database_dir(path);
+        // Background `.2lgd` sidecar build for 2CBH: never on the UI thread.
+        // `TwoCbhLibrary::open` only memory-maps when present; build here.
+        {
+            let ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            if matches!(ext.as_str(), "2cbh" | "2cbg" | "2cba" | "2lid") {
+                let base = path.to_path_buf();
+                std::thread::spawn(move || {
+                    let build_started = std::time::Instant::now();
+                    let lgd = crate::twocbh::TwoCbhAccelerator::path_for(&base);
+                    if lgd.is_file() {
+                        return;
+                    }
+                    match crate::twocbh::TwoCbhFile::open(&base) {
+                        Ok(file) => {
+                            match crate::twocbh::TwoCbhAccelerator::build_to(&file, &lgd) {
+                                Ok(()) => tracing::info!(
+                                    ".2lgd background build for {} took {:.2}s",
+                                    base.display(),
+                                    build_started.elapsed().as_secs_f64()
+                                ),
+                                Err(err) => tracing::debug!(
+                                    ".2lgd background build skipped for {}: {err:#}",
+                                    base.display()
+                                ),
+                            }
+                            if build_started.elapsed().as_millis() > 100 {
+                                tracing::warn!(
+                                    "slow .2lgd background build for {} took {:.2}s",
+                                    base.display(),
+                                    build_started.elapsed().as_secs_f64()
+                                );
+                            }
+                        }
+                        Err(err) => tracing::debug!(
+                            ".2lgd background build could not open {}: {err:#}",
+                            base.display()
+                        ),
+                    }
+                });
+            }
+        }
+        let install_elapsed = install_started.elapsed();
+        tracing::info!(
+            "install_library done in {:.2}s",
+            install_elapsed.as_secs_f64()
+        );
+        if install_elapsed.as_millis() > 100 {
+            tracing::warn!(
+                "slow install_library took {:.2}s",
+                install_elapsed.as_secs_f64()
+            );
+        }
     }
 
     /// Build the player directory in the background for a very large database.
@@ -1970,7 +2122,20 @@ impl App {
         let (tx, rx) = mpsc::channel();
         let ctx = self.ctx.clone();
         std::thread::spawn(move || {
+            let build_started = std::time::Instant::now();
             let directory = PlayerDirectory::build(library.as_ref());
+            let elapsed = build_started.elapsed();
+            tracing::info!(
+                "PlayerDirectory built: {} players in {:.2}s",
+                directory.len(),
+                elapsed.as_secs_f64()
+            );
+            if elapsed.as_millis() > 100 {
+                tracing::warn!(
+                    "slow PlayerDirectory build took {:.2}s",
+                    elapsed.as_secs_f64()
+                );
+            }
             let _ = tx.send(PlayerDirectoryMessage::Done(directory));
             ctx.request_repaint();
         });
@@ -6180,15 +6345,23 @@ impl App {
 
     /// Maximum games fetched per online source during preparation.
     const PREP_ONLINE_MAX: usize = 300;
+    /// Maximum ChessABC OTB games fetched during preparation.
+    const PREP_CHESSABC_MAX: usize = 2000;
 
     // Temporary minimal stub for the in-progress preparation-setup task.
     fn open_prep_setup(&mut self, as_white: bool) {
-        let Some(index) = self.selected_player else {
+        let index = self.selected_player.or(self.prep_setup_player);
+        let Some(index) = index else {
+            // No opponent chosen yet: open the dialog so one can be picked.
+            self.open_prep_setup_any();
+            self.prep_setup_as_white = as_white;
             return;
         };
         let Some(player) = self.players.get(index).cloned() else {
             return;
         };
+        self.prep_setup_player = Some(index);
+        self.prep_setup_search.clear();
         self.prep_setup_as_white = as_white;
         self.prep_setup_accounts = self
             .prep_saved_accounts
@@ -6201,7 +6374,133 @@ impl App {
             .filter(|prep| prep.player_key == player.key)
             .map(|prep| prep.filter)
             .unwrap_or_default();
+        self.prep_setup_chessabc_candidates.clear();
+        self.prep_setup_chessabc_selected.clear();
+        self.prep_setup_chessabc_status.clear();
+        self.prep_setup_chessabc_rx = None;
+        // ChessABC matching is on by default: resolve the opponent's profile
+        // in the background so the dialog can confirm ambiguous names.
+        let elo = player
+            .elo_avg()
+            .map(|elo| elo as u32)
+            .filter(|elo| *elo > 0)
+            .or_else(|| (player.elo_max > 0).then_some(player.elo_max));
+        self.refresh_chessabc_candidates(player.name.clone(), elo);
         self.prep_setup_open = true;
+    }
+
+    /// Search ChessABC for profiles matching `query` in the background; the
+    /// setup dialog polls the result and either auto-selects the unambiguous
+    /// profile or shows the candidate checklist.
+    fn refresh_chessabc_candidates(&mut self, query: String, elo: Option<u32>) {
+        self.prep_setup_chessabc_rx = None;
+        self.prep_setup_chessabc_candidates.clear();
+        self.prep_setup_chessabc_selected.clear();
+        let trimmed = query.trim().to_string();
+        if trimmed.is_empty() {
+            self.prep_setup_chessabc_status =
+                "Enter a prepared player to search ChessABC profiles.".to_string();
+            return;
+        }
+        self.prep_setup_chessabc_status = format!("Searching ChessABC for {trimmed}…");
+        let (tx, rx) = mpsc::channel();
+        self.prep_setup_chessabc_rx = Some(rx);
+        let ctx = self.ctx.clone();
+        std::thread::spawn(move || {
+            let resolve_started = std::time::Instant::now();
+            let result =
+                online::search_chessabc_candidates(&trimmed).map_err(|err| format!("{err:#}"));
+            if let Ok(candidates) = result.as_ref() {
+                tracing::info!(
+                    "ChessABC resolve '{trimmed}' -> {} candidates in {:.2}s",
+                    candidates.len(),
+                    resolve_started.elapsed().as_secs_f64()
+                );
+            }
+            if resolve_started.elapsed().as_millis() > 100 {
+                tracing::warn!(
+                    "slow ChessABC resolve took {:.2}s",
+                    resolve_started.elapsed().as_secs_f64()
+                );
+            }
+            let _ = tx.send((trimmed, elo, result));
+            ctx.request_repaint();
+        });
+    }
+
+    fn poll_chessabc_candidates(&mut self) {
+        let Some(rx) = self.prep_setup_chessabc_rx.take() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok((query, elo, Ok(candidates))) => {
+                if let Some(single) =
+                    online::auto_select_chessabc_candidate(&candidates, &query, elo)
+                {
+                    self.prep_setup_chessabc_selected = vec![single.fide_id.clone()];
+                    self.prep_setup_chessabc_status =
+                        format!("Auto-selected {} · FIDE {}.", single.name, single.fide_id);
+                } else if candidates.is_empty() {
+                    self.prep_setup_chessabc_status =
+                        format!("No ChessABC profiles found for {query}.");
+                } else {
+                    self.prep_setup_chessabc_selected = candidates
+                        .iter()
+                        .map(|candidate| candidate.fide_id.clone())
+                        .collect();
+                    self.prep_setup_chessabc_status =
+                        format!("Select matching profile(s) for {query}:");
+                }
+                self.prep_setup_chessabc_candidates = candidates;
+            }
+            Ok((_, _, Err(err))) => {
+                self.prep_setup_chessabc_status = format!("ChessABC search failed: {err}");
+            }
+            Err(TryRecvError::Empty) => {
+                self.prep_setup_chessabc_rx = Some(rx);
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.prep_setup_chessabc_status = "ChessABC search stopped.".to_string();
+            }
+        }
+    }
+
+    /// Open the preparation-setup dialog without requiring a prior player
+    /// selection. The dialog's opponent selector picks the player instead.
+    fn open_prep_setup_any(&mut self) {
+        let index = self
+            .selected_player
+            .or(self.prep_setup_player)
+            .filter(|&index| self.players.get(index).is_some());
+        self.prep_setup_player = index.or(self.prep_setup_player);
+        self.prep_setup_search.clear();
+        if let Some(index) = self.prep_setup_player
+            && let Some(player) = self.players.get(index).cloned()
+        {
+            self.prep_setup_accounts = self
+                .prep_saved_accounts
+                .get(&player.key)
+                .cloned()
+                .unwrap_or_default();
+            self.prep_setup_filter = self
+                .prep
+                .as_ref()
+                .filter(|prep| prep.player_key == player.key)
+                .map(|prep| prep.filter)
+                .unwrap_or_default();
+        }
+        self.prep_setup_open = true;
+    }
+
+    /// Board orientation locked while preparation is active: our colour, or
+    /// the opponent's colour in the swapped view.
+    fn prep_locked_orientation(&self) -> Option<Color> {
+        let prep = self.prep.as_ref()?;
+        Some(if self.prep_swapped_view {
+            prep.opponent_color()
+        } else {
+            prep.our_color
+        })
     }
 
     /// Load the prepared player's games from every selected source in the
@@ -6226,6 +6525,13 @@ impl App {
         let use_reference_file = self.prep_setup_use_reference;
         let reference_path = self.reference_path.clone();
         let use_chessabc = self.prep_setup_use_chessabc;
+        let chessabc_ids: Vec<String> = self
+            .prep
+            .as_ref()
+            .filter(|prep| prep.player_key == player.key)
+            .map(|prep| prep.chessabc_fide_ids.clone())
+            .unwrap_or_default();
+        let canonical_name = player.name.clone();
         let extra_path = self.prep_setup_extra_path.trim().to_string();
         let accounts: Vec<players::PrepOnlineAccount> = self
             .prep
@@ -6243,6 +6549,7 @@ impl App {
         };
         let max_games = Self::PREP_ONLINE_MAX;
         std::thread::spawn(move || {
+            let prep_started = std::time::Instant::now();
             let as_of = players::today();
             let mut sources: Vec<(players::SourceTag, Vec<Game>)> = Vec::new();
             let mut notes: Vec<String> = Vec::new();
@@ -6294,24 +6601,69 @@ impl App {
                 }
             }
             if use_chessabc {
-                match online::fetch_player_games(OnlineSource::ChessAbc, &player.name, max_games) {
-                    Ok(games) => {
-                        notes.push(format!("ChessABC {}", games.len()));
-                        sources.push((players::SourceTag::Online(OnlineSource::ChessAbc), games));
+                let max_chessabc = Self::PREP_CHESSABC_MAX;
+                let mut chessabc_games = Vec::new();
+                if chessabc_ids.is_empty() {
+                    // No resolved profiles: search by name and normalize the
+                    // matched White/Black tag to the canonical opponent name so
+                    // truncated-first-name games are never dropped from the book.
+                    match online::fetch_player_games(
+                        OnlineSource::ChessAbc,
+                        &player.name,
+                        max_chessabc,
+                    ) {
+                        Ok(games) => {
+                            notes.push(format!("ChessABC {}", games.len()));
+                            chessabc_games.extend(games);
+                        }
+                        Err(err) => {
+                            notes.push(format!("ChessABC unavailable ({err:#})"));
+                        }
                     }
-                    Err(err) => {
-                        notes.push(format!("ChessABC unavailable ({err:#})"));
+                } else {
+                    let mut fetched = 0usize;
+                    for fide_id in &chessabc_ids {
+                        match online::fetch_chessabc_games_by_fide_id(fide_id, max_chessabc) {
+                            Ok(games) => {
+                                fetched += games.len();
+                                chessabc_games.extend(games);
+                            }
+                            Err(err) => {
+                                notes.push(format!("ChessABC {fide_id} unavailable ({err:#})"));
+                            }
+                        }
                     }
+                    notes.push(format!("ChessABC {fetched}"));
+                }
+                for game in &mut chessabc_games {
+                    players::canonicalize_player_tags(game, &canonical_name);
+                }
+                if !chessabc_games.is_empty() {
+                    sources.push((
+                        players::SourceTag::Online(OnlineSource::ChessAbc),
+                        chessabc_games,
+                    ));
                 }
             }
             for account in &accounts {
                 if !account.enabled {
                     continue;
                 }
+                let as_of_account = as_of;
                 match online::fetch_player_games(account.source, &account.username, max_games) {
                     Ok(games) => {
-                        notes.push(format!("{} {}", account.source.label(), games.len()));
-                        sources.push((players::SourceTag::Online(account.source), games));
+                        let total = games.len();
+                        let kept: Vec<Game> = games
+                            .into_iter()
+                            .filter(|game| account.filter.matches_game(game, as_of_account))
+                            .collect();
+                        notes.push(format!(
+                            "{} {}/{}",
+                            account.source.label(),
+                            kept.len(),
+                            total
+                        ));
+                        sources.push((players::SourceTag::Online(account.source), kept));
                     }
                     Err(err) => {
                         notes.push(format!("{} unavailable ({err:#})", account.source.label()));
@@ -6338,6 +6690,7 @@ impl App {
                     notes.push("Extra file not found".to_string());
                 }
             }
+            let source_count = sources.len();
             let mut merged = players::deduplicate_and_merge_games(sources);
             merged.retain(|(_, game)| {
                 players::player_key(game.white()).as_deref() == Some(player.key.as_str())
@@ -6356,6 +6709,19 @@ impl App {
                 book,
                 games,
             });
+            let fetch_counts: Vec<String> = notes.clone();
+            tracing::info!(
+                "smart prep load: {} ({} sources) in {:.2}s",
+                fetch_counts.join(" + "),
+                source_count,
+                prep_started.elapsed().as_secs_f64()
+            );
+            if prep_started.elapsed().as_millis() > 100 {
+                tracing::warn!(
+                    "slow smart prep load took {:.2}s",
+                    prep_started.elapsed().as_secs_f64()
+                );
+            }
             let _ = tx.send(result);
             ctx.request_repaint();
         });
@@ -6407,13 +6773,16 @@ impl App {
         if !self.prep_setup_open {
             return;
         }
-        let player_name = self
-            .selected_player
+        self.poll_chessabc_candidates();
+        let chosen = self
+            .prep_setup_player
+            .or(self.selected_player)
+            .filter(|&index| self.players.get(index).is_some());
+        let player_name = chosen
             .and_then(|index| self.players.get(index))
             .map(|player| player.name.clone())
             .unwrap_or_default();
-        let player_key = self
-            .selected_player
+        let player_key = chosen
             .and_then(|index| self.players.get(index))
             .map(|player| player.key.clone())
             .unwrap_or_default();
@@ -6422,12 +6791,64 @@ impl App {
         let mut cancelled = false;
         let mut choose_extra = false;
         let mut add_account = false;
+        let mut find_profiles = false;
         let mut remove_account = None;
-        egui::Window::new(format!("Start preparation vs {player_name}"))
+        let mut choose_player = None;
+        let title = if player_name.is_empty() {
+            "Start preparation".to_string()
+        } else {
+            format!("Start preparation vs {player_name}")
+        };
+        egui::Window::new(title)
             .open(&mut open)
             .default_size([520.0, 640.0])
             .min_width(440.0)
             .show(ctx, |ui| {
+                ui.label(RichText::new("Opponent").strong());
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.prep_setup_search)
+                        .hint_text("Search opponent… (min 2 chars)")
+                        .desired_width(f32::INFINITY),
+                );
+                let query = self.prep_setup_search.trim().to_string();
+                if query.len() >= 2 {
+                    let matches = self.players.filter(&query);
+                    if matches.is_empty() {
+                        ui.label(RichText::new("No matching players.").weak().small());
+                    } else {
+                        ui.horizontal_wrapped(|ui| {
+                            for &index in matches.iter().take(5) {
+                                if let Some(player) = self.players.get(index) {
+                                    let name = player.name.clone();
+                                    let selected = Some(index) == chosen;
+                                    if ui
+                                        .selectable_label(selected, &name)
+                                        .on_hover_text(format!(
+                                            "Prepare against {name}"
+                                        ))
+                                        .clicked()
+                                    {
+                                        choose_player = Some(index);
+                                    }
+                                }
+                            }
+                        });
+                    }
+                }
+                if player_name.is_empty() {
+                    ui.label(
+                        RichText::new("Pick an opponent above to start.")
+                            .weak()
+                            .small(),
+                    );
+                } else {
+                    ui.label(
+                        RichText::new(format!("Selected: {player_name}"))
+                            .strong()
+                            .small(),
+                    );
+                }
+                ui.separator();
                 ui.horizontal(|ui| {
                     ui.label("You play:");
                     ui.radio_value(&mut self.prep_setup_as_white, true, "White");
@@ -6447,6 +6868,43 @@ impl App {
                     &mut self.prep_setup_use_chessabc,
                     "ChessABC recent OTB games",
                 );
+                if self.prep_setup_use_chessabc {
+                    ui.horizontal(|ui| {
+                        let status = if self.prep_setup_chessabc_status.is_empty() {
+                            "Resolve ChessABC profiles to fetch up to 2000 games.".to_string()
+                        } else {
+                            self.prep_setup_chessabc_status.clone()
+                        };
+                        ui.label(RichText::new(status).small());
+                        if ui.small_button("Find profiles").clicked() {
+                            find_profiles = true;
+                        }
+                    });
+                    let candidates = self.prep_setup_chessabc_candidates.clone();
+                    for candidate in &candidates {
+                        let mut selected = self
+                            .prep_setup_chessabc_selected
+                            .contains(&candidate.fide_id);
+                        let label = format!(
+                            "{} · Elo {} · FIDE {}",
+                            candidate.name, candidate.rating, candidate.fide_id
+                        );
+                        if ui.checkbox(&mut selected, label).changed() {
+                            if selected {
+                                if !self
+                                    .prep_setup_chessabc_selected
+                                    .contains(&candidate.fide_id)
+                                {
+                                    self.prep_setup_chessabc_selected
+                                        .push(candidate.fide_id.clone());
+                                }
+                            } else {
+                                self.prep_setup_chessabc_selected
+                                    .retain(|id| id != &candidate.fide_id);
+                            }
+                        }
+                    }
+                }
                 ui.horizontal(|ui| {
                     ui.label("Extra DB file:");
                     ui.add(
@@ -6462,15 +6920,74 @@ impl App {
                 ui.label(RichText::new("Online accounts").strong());
                 let mut accounts_changed = false;
                 for (position, account) in self.prep_setup_accounts.iter_mut().enumerate() {
+                    let warning = account.filter.has_zero_overlap().map(str::to_string);
                     ui.horizontal(|ui| {
                         if ui.checkbox(&mut account.enabled, "").changed() {
                             accounts_changed = true;
                         }
                         ui.label(format!("{} · {}", account.source.label(), account.username));
+                        if let Some(reason) = warning {
+                            ui.label(
+                                RichText::new("⚠")
+                                    .color(Color32::from_rgb(0xFF, 0x7F, 0x50)),
+                            )
+                            .on_hover_text(reason);
+                        }
                         if ui.small_button("×").on_hover_text("Remove account").clicked() {
                             remove_account = Some(position);
                         }
                     });
+                    let before = account.filter;
+                    egui::CollapsingHeader::new(format!("Filters##prep-account-{position}"))
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            let filter = &mut account.filter;
+                            ui.horizontal_wrapped(|ui| {
+                                ui.checkbox(&mut filter.include_rated, "Rated");
+                                ui.checkbox(&mut filter.include_casual, "Casual");
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Elo:");
+                                let mut min_on = filter.min_elo.is_some();
+                                let mut min_value =
+                                    u32::from(filter.min_elo.unwrap_or(1200));
+                                let mut max_on = filter.max_elo.is_some();
+                                let mut max_value =
+                                    u32::from(filter.max_elo.unwrap_or(2700));
+                                ui.checkbox(&mut min_on, "Min");
+                                ui.add_enabled(
+                                    min_on,
+                                    egui::DragValue::new(&mut min_value).range(0..=4000),
+                                );
+                                ui.checkbox(&mut max_on, "Max");
+                                ui.add_enabled(
+                                    max_on,
+                                    egui::DragValue::new(&mut max_value).range(0..=4000),
+                                );
+                                filter.min_elo =
+                                    min_on.then(|| min_value.min(4000) as u16);
+                                filter.max_elo =
+                                    max_on.then(|| max_value.min(4000) as u16);
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Games from:");
+                                cutoff_picker(
+                                    ui,
+                                    &format!("prep-acct-cutoff-{position}"),
+                                    &mut filter.date_cutoff,
+                                );
+                            });
+                            let account_tc = &mut filter.time_controls;
+                            ui.horizontal_wrapped(|ui| {
+                                ui.checkbox(&mut account_tc.classical, "Classical");
+                                ui.checkbox(&mut account_tc.rapid, "Rapid");
+                                ui.checkbox(&mut account_tc.blitz, "Blitz");
+                                ui.checkbox(&mut account_tc.bullet, "Bullet");
+                            });
+                        });
+                    if account.filter != before {
+                        accounts_changed = true;
+                    }
                 }
                 if accounts_changed {
                     self.prep_saved_accounts
@@ -6482,7 +6999,7 @@ impl App {
                         .selected_text(self.prep_setup_account_service.label())
                         .show_ui(ui, |ui| {
                             for service in
-                                [OnlineSource::Lichess, OnlineSource::ChessCom, OnlineSource::ChessAbc]
+                                [OnlineSource::Lichess, OnlineSource::ChessCom]
                             {
                                 ui.selectable_value(
                                     &mut self.prep_setup_account_service,
@@ -6534,10 +7051,10 @@ impl App {
                         &mut self.prep_setup_filter.online_date_cutoff,
                     );
                 });
-                ui.checkbox(
-                    &mut self.prep_setup_filter.online_rated_only,
-                    "Rated games only",
-                );
+                ui.horizontal_wrapped(|ui| {
+                    ui.checkbox(&mut self.prep_setup_filter.include_rated, "Rated");
+                    ui.checkbox(&mut self.prep_setup_filter.include_casual, "Casual");
+                });
                 ui.separator();
                 ui.label(RichText::new("Panel mode").strong());
                 ui.horizontal(|ui| {
@@ -6571,6 +7088,16 @@ impl App {
         if choose_extra && let Some(path) = open_dialog(None) {
             self.prep_setup_extra_path = path.display().to_string();
         }
+        if find_profiles
+            && let Some(player) = chosen.and_then(|index| self.players.get(index)).cloned()
+        {
+            let elo = player
+                .elo_avg()
+                .map(|elo| elo as u32)
+                .filter(|elo| *elo > 0)
+                .or_else(|| (player.elo_max > 0).then_some(player.elo_max));
+            self.refresh_chessabc_candidates(player.name.clone(), elo);
+        }
         if add_account {
             let name = self.prep_setup_account_name.trim().to_string();
             if !name.is_empty()
@@ -6583,6 +7110,7 @@ impl App {
                     source: self.prep_setup_account_service,
                     username: name,
                     enabled: true,
+                    filter: players::AccountFilter::default(),
                 });
                 self.prep_saved_accounts
                     .insert(player_key.clone(), self.prep_setup_accounts.clone());
@@ -6598,12 +7126,46 @@ impl App {
                 .insert(player_key.clone(), self.prep_setup_accounts.clone());
             self.save_reference_prefs();
         }
+        if let Some(index) = choose_player
+            && self.players.get(index).is_some()
+        {
+            self.prep_setup_player = Some(index);
+            if let Some(player) = self.players.get(index).cloned() {
+                self.prep_setup_accounts = self
+                    .prep_saved_accounts
+                    .get(&player.key)
+                    .cloned()
+                    .unwrap_or_default();
+                self.prep_setup_filter = self
+                    .prep
+                    .as_ref()
+                    .filter(|prep| prep.player_key == player.key)
+                    .map(|prep| prep.filter)
+                    .unwrap_or_default();
+                let elo = player
+                    .elo_avg()
+                    .map(|elo| elo as u32)
+                    .filter(|elo| *elo > 0)
+                    .or_else(|| (player.elo_max > 0).then_some(player.elo_max));
+                self.refresh_chessabc_candidates(player.name.clone(), elo);
+            }
+        }
         if cancelled {
             open = false;
         }
         if start {
             open = false;
             self.prep_setup_open = false;
+            // The dialog's opponent selector wins; fall back to the Players
+            // tab selection. Starting requires a chosen player.
+            if let Some(index) = self
+                .prep_setup_player
+                .or(self.selected_player)
+                .filter(|&index| self.players.get(index).is_some())
+            {
+                self.selected_player = Some(index);
+                self.prep_setup_player = Some(index);
+            }
             let as_white = self.prep_setup_as_white;
             self.start_prep(as_white);
         }
@@ -6611,12 +7173,19 @@ impl App {
     }
 
     fn start_prep(&mut self, as_white: bool) {
-        let Some(index) = self.selected_player else {
+        let Some(index) = self
+            .selected_player
+            .or(self.prep_setup_player)
+            .filter(|&index| self.players.get(index).is_some())
+        else {
+            self.status = "Pick an opponent first.".to_string();
             return;
         };
         let Some(player) = self.players.get(index).cloned() else {
             return;
         };
+        self.selected_player = Some(index);
+        self.prep_setup_player = Some(index);
 
         self.ensure_reference_for_player(&player);
         let our_color = if as_white { Color::White } else { Color::Black };
@@ -6668,7 +7237,10 @@ impl App {
             ..Game::default()
         };
         let previous_orientation = self.orientation;
-        self.orientation = my_player_color(&self.prep_player_names, &game).unwrap_or(our_color);
+        // Preparation always orients the board to our colour; the locked
+        // orientation is re-pinned by `prep_locked_orientation` while prep
+        // is active.
+        self.orientation = our_color;
 
         self.clear_review();
         self.recent_preview = None;
@@ -6697,6 +7269,7 @@ impl App {
                 .filter(|account| account.enabled)
                 .cloned()
                 .collect(),
+            chessabc_fide_ids: self.prep_setup_chessabc_selected.clone(),
             sources_label: String::new(),
         });
         self.annotation_editor = None;
@@ -7557,8 +8130,12 @@ impl App {
                     .current
                     .as_ref()
                     .and_then(|game| my_player_color(&self.prep_player_names, game));
-                if let Some(color) = orientation {
-                    self.orientation = color;
+                if self.prep.is_none() {
+                    if let Some(color) = orientation {
+                        self.orientation = color;
+                    }
+                } else if let Some(locked) = self.prep_locked_orientation() {
+                    self.orientation = locked;
                 }
             }
             Err(err) => {
@@ -7613,26 +8190,44 @@ impl App {
             }
         }
         let mut games = Vec::new();
-        for slot in self.session.slots() {
-            let slot_event = slot.event().trim();
-            let slot_site = slot.header("Site").unwrap_or("?").trim();
-            if slot_event != event || slot_site != site {
+        let slot_ids: Vec<usize> = self.session.slots().iter().map(|slot| slot.id).collect();
+        for id in slot_ids {
+            let slot_event = self.session.slot_event(id);
+            let slot_event_trimmed = slot_event.trim().to_string();
+            let slot_site = self
+                .session
+                .slot_headers(id)
+                .and_then(|headers| {
+                    headers
+                        .iter()
+                        .find(|(name, _)| name.eq_ignore_ascii_case("Site"))
+                })
+                .map(|(_, value)| value.to_string())
+                .unwrap_or_else(|| "?".to_string());
+            if slot_event_trimmed != event || slot_site.trim() != site {
                 continue;
             }
-            if year_of_date(slot.date()) != year {
+            let slot_date = self.session.slot_date(id);
+            if year_of_date(&slot_date) != year {
                 continue;
             }
+            let headers = self.session.slot_headers(id);
+            let header = |key: &str| {
+                headers
+                    .and_then(|list| list.iter().find(|(name, _)| name.eq_ignore_ascii_case(key)))
+                    .map(|(_, value)| value.as_str())
+            };
             games.push(crosstable::TournamentGame {
-                game_index: slot.id,
-                white: slot.white().to_string(),
-                black: slot.black().to_string(),
+                game_index: id,
+                white: self.session.slot_white(id),
+                black: self.session.slot_black(id),
                 white_title: None,
                 black_title: None,
-                white_elo: elo_of(slot.header("WhiteElo")),
-                black_elo: elo_of(slot.header("BlackElo")),
-                result: slot.result().to_string(),
-                round: slot.header("Round").unwrap_or("?").to_string(),
-                date: slot.date().to_string(),
+                white_elo: elo_of(header("WhiteElo")),
+                black_elo: elo_of(header("BlackElo")),
+                result: self.session.slot_result(id),
+                round: header("Round").unwrap_or("?").to_string(),
+                date: slot_date,
             });
         }
         if games.is_empty() {
@@ -7660,7 +8255,7 @@ impl App {
         index: usize,
     ) -> Option<crosstable::TournamentGame> {
         let slot_id = self.session.source_slot(index)?;
-        let slot = self.session.slot(slot_id)?;
+        self.session.slot(slot_id)?;
         let headers = library.game_headers(index);
         let header = |key: &str| {
             headers
@@ -7677,9 +8272,9 @@ impl App {
             black_title: None,
             white_elo: header("WhiteElo").as_deref().and_then(parse_elo),
             black_elo: header("BlackElo").as_deref().and_then(parse_elo),
-            result: header("Result").unwrap_or_else(|| slot.result().to_string()),
+            result: header("Result").unwrap_or_else(|| self.session.slot_result(slot_id)),
             round: header("Round").unwrap_or_else(|| "?".to_string()),
-            date: header("Date").unwrap_or_else(|| slot.date().to_string()),
+            date: header("Date").unwrap_or_else(|| self.session.slot_date(slot_id)),
         })
     }
 
@@ -8725,7 +9320,10 @@ impl App {
             }
         }
         if flip {
-            self.orientation = self.orientation.other();
+            // Board orientation is locked while preparation is active.
+            if self.prep.is_none() {
+                self.orientation = self.orientation.other();
+            }
         }
         if tree {
             self.focus_right_tab(RightTab::Tree);
@@ -8888,6 +9486,10 @@ impl App {
                         self.set_current_database_as_reference();
                         ui.close();
                     }
+                    if ui.button("Prepare…").clicked() {
+                        self.open_prep_setup_any();
+                        ui.close();
+                    }
                     ui.separator();
                     if ui.button("Import from Lichess…").clicked() {
                         self.online_source = OnlineSource::Lichess;
@@ -8910,7 +9512,10 @@ impl App {
 
                 ui.menu_button("Board", |ui| {
                     if ui.button("Flip board (F)").clicked() {
-                        self.orientation = self.orientation.other();
+                        // Locked to our colour while preparation is active.
+                        if self.prep.is_none() {
+                            self.orientation = self.orientation.other();
+                        }
                         ui.close();
                     }
                     if ui.button("Copy FEN").clicked() {
@@ -9565,10 +10170,15 @@ impl App {
                 let Some(id) = self.session.id_at(pos) else {
                     continue;
                 };
-                let Some(slot) = self.session.slot(id) else {
+                if self.session.slot(id).is_none() {
                     continue;
                 };
-                if prep_list_shows_game(prep, slot.white(), slot.black(), wanted) {
+                if prep_list_shows_game(
+                    prep,
+                    &self.session.slot_white(id),
+                    &self.session.slot_black(id),
+                    wanted,
+                ) {
                     ids.push(id);
                 }
             }
@@ -9615,30 +10225,45 @@ impl App {
                     }) else {
                         continue;
                     };
-                    let Some(slot) = self.session.slot(id) else {
+                    let Some(_) = self.session.slot(id) else {
                         continue;
                     };
-                    let white_title = title_from_tag(slot.header("WhiteTitle"));
-                    let black_title = title_from_tag(slot.header("BlackTitle"));
+                    let headers = self.session.slot_headers(id);
+                    let header = |key: &str| {
+                        headers
+                            .and_then(|list| {
+                                list.iter().find(|(name, _)| name.eq_ignore_ascii_case(key))
+                            })
+                            .map(|(_, value)| value.as_str())
+                    };
+                    let white_title = title_from_tag(header("WhiteTitle"));
+                    let black_title = title_from_tag(header("BlackTitle"));
                     let white_country = player_country_from_header(
-                        slot.header("WhiteCountry")
-                            .or_else(|| slot.header("WhiteFed")),
+                        header("WhiteCountry").or_else(|| header("WhiteFed")),
                     );
                     let black_country = player_country_from_header(
-                        slot.header("BlackCountry")
-                            .or_else(|| slot.header("BlackFed")),
+                        header("BlackCountry").or_else(|| header("BlackFed")),
                     );
-                    let subtitle = format!("{} · {}", slot.event(), slot.date());
+                    let (type_color, type_label) =
+                        slot_game_type_by_headers(header("Event"), header("Result"));
+                    let subtitle = format!(
+                        "{} · {} · {}",
+                        type_label,
+                        header("Event").unwrap_or("?"),
+                        header("Date").unwrap_or("????.??.??")
+                    );
                     let selected = self.current_slot == Some(id) && self.prep.is_none();
                     let width = ui.available_width();
+                    let white_name = self.session.slot_white(id);
+                    let black_name = self.session.slot_black(id);
                     let response = game_row(
                         ui,
                         selected,
                         "",
-                        RowName::new(slot.white(), white_title)
+                        RowName::new(&white_name, white_title)
                             .with_country(white_country.map(|c| c.badge)),
                         Some(
-                            RowName::new(slot.black(), black_title)
+                            RowName::new(&black_name, black_title)
                                 .with_country(black_country.map(|c| c.badge)),
                         ),
                         "",
@@ -9646,6 +10271,7 @@ impl App {
                         width,
                         row_h - 2.0,
                     );
+                    paint_game_type_dot(ui, response.rect, type_color);
                     if response.sense.senses_drag() {
                         response.dnd_set_drag_payload(GameRowDrag { id });
                     }
@@ -12143,6 +12769,7 @@ impl App {
                         "No indexed game reached this position.",
                         self.trend_config(),
                         &mut hover_preview,
+                        None,
                     );
                 } else {
                     ui.label(RichText::new(&self.index_status).weak().small());
@@ -12669,6 +13296,7 @@ impl App {
                     tree,
                     inferred: predicted.is_inferred_only,
                     vs_field_pp: predicted.vs_field_pp,
+                    sparkline: predicted.sparkline.clone(),
                 })
             })
             .collect();
@@ -12705,7 +13333,10 @@ impl App {
                     black_fide_id,
                     result,
                     event,
+                    type_color,
+                    type_label,
                 ) = if let Some(indexed) = library.get(game.index) {
+                    let (type_color, type_label) = indexed_game_type_style(indexed);
                     (
                         indexed.white().to_string(),
                         indexed.black().to_string(),
@@ -12727,6 +13358,8 @@ impl App {
                         player_fide_id_from_header(indexed.header("BlackFideId")),
                         indexed.result().to_string(),
                         indexed.event().to_string(),
+                        type_color,
+                        type_label,
                     )
                 } else {
                     let headers = library.game_headers(game.index);
@@ -12764,6 +13397,11 @@ impl App {
                     let black_fide_id = player_fide_id_from_header(find_h("BlackFideId"));
                     let result = find_h("Result").unwrap_or("*").to_string();
                     let event = find_h("Event").unwrap_or("?").to_string();
+                    let probe = Game {
+                        headers: vec![("Event".to_string(), event.clone())],
+                        ..Game::default()
+                    };
+                    let (type_color, type_label) = game_type_style(&probe);
                     (
                         white,
                         black,
@@ -12775,6 +13413,8 @@ impl App {
                         black_fide_id,
                         result,
                         event,
+                        type_color,
+                        type_label,
                     )
                 };
                 Some(PrepRecentRow {
@@ -12789,12 +13429,15 @@ impl App {
                     white_fide_id,
                     black_fide_id,
                     subtitle: format!(
-                        "{} · as {} · {} · {}",
+                        "{} · {} · as {} · {} · {}",
+                        type_label,
                         short_date(game.date),
                         color_name(game.color),
                         outcome_label(&result, game.color),
                         event
                     ),
+                    type_color,
+                    type_label,
                 })
             })
             .collect()
@@ -12822,6 +13465,7 @@ impl App {
             .filter_map(|game_ref| {
                 let position = game_ref.index;
                 let game = self.prep_merged_games.get(position)?;
+                let (type_color, type_label) = game_type_style(game);
                 Some(PrepRecentRow {
                     index: position,
                     merged_index: Some(position),
@@ -12834,12 +13478,15 @@ impl App {
                     white_fide_id: player_fide_id(game, Color::White).map(str::to_string),
                     black_fide_id: player_fide_id(game, Color::Black).map(str::to_string),
                     subtitle: format!(
-                        "{} · as {} · {} · {}",
+                        "{} · {} · as {} · {} · {}",
+                        type_label,
                         game.date(),
                         color_name(game_ref.color),
                         outcome_label(game.result(), game_ref.color),
                         game.event()
                     ),
+                    type_color,
+                    type_label,
                 })
             })
             .collect()
@@ -12878,8 +13525,8 @@ impl App {
         ui.horizontal(|ui| {
             let mut exclude = self.prep_exclude_chesscom;
             if ui
-                .checkbox(&mut exclude, "Exclude Chess.com games")
-                .on_hover_text("Filter out online Titled Tuesday, Arena Kings, and blitz/bullet server games from this preparation")
+                .checkbox(&mut exclude, "Exclude Chess.com tournament games")
+                .on_hover_text("Filter out Chess.com tournament games (Titled Tuesday, Arena Kings, Speed Chess, Pro Chess League) from this preparation")
                 .changed()
             {
                 self.prep_exclude_chesscom = exclude;
@@ -13017,6 +13664,51 @@ impl App {
         let mut toggle_online = false;
         let mut show_swapped = false;
         let mut back_to_facing = false;
+        // Replies previously faced in this position: book moves the prepared
+        // player chose when playing our colour (swapped-colour experience).
+        let your_turn_rows: Vec<YourTurnRow> = self
+            .player_book
+            .as_ref()
+            .filter(|book| book.player_key() == prep.player_key)
+            .map(|book| {
+                book.filtered_moves(key, prep.our_color, &prep.filter)
+                    .into_iter()
+                    .filter_map(|stat| {
+                        let mv = position::decode_move(pos, stat.mv)?;
+                        let san = SanPlus::from_move(pos.clone(), mv).to_string();
+                        Some(YourTurnRow {
+                            mv,
+                            san,
+                            games: stat.games,
+                            wins: stat.wins,
+                            draws: stat.draws,
+                            losses: stat.losses,
+                            last_date: stat.last_date,
+                        })
+                    })
+                    .take(24)
+                    .collect()
+            })
+            .unwrap_or_default();
+        // Player-book game counts per move for the reference-tree badge.
+        let book_games_map: HashMap<u32, u32> = self
+            .player_book
+            .as_ref()
+            .filter(|book| book.player_key() == prep.player_key)
+            .map(|book| {
+                book.filtered_moves(key, facing, &prep.filter)
+                    .into_iter()
+                    .map(|stat| (stat.mv, stat.games))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let reference_source_label: &'static str = prediction_data
+            .as_ref()
+            .map(|data| match data.prediction.prior_source {
+                players::PriorSource::Reference => "Reference database",
+                players::PriorSource::CurrentDatabase => "Current database",
+            })
+            .unwrap_or("Current database");
 
         egui::ScrollArea::vertical()
             .id_salt("prep-tree-scroll")
@@ -13089,26 +13781,93 @@ impl App {
                 }
                 if our_turn {
                     ui.add_space(2.0);
-                    ui.label(RichText::new("It is your move").strong());
                     ui.label(
                         RichText::new(format!(
-                            "{}'s moves from earlier in this line stay visible below.",
+                            "🧭 Your Move ({}) — Moves Previously Played Against {}",
+                            color_name(prep.our_color),
                             prep.player_name
                         ))
+                        .strong(),
+                    );
+                    ui.label(
+                        RichText::new(
+                            "Replies faced in this position, from the opponent's book. Click to play.",
+                        )
                         .weak()
                         .small(),
                     );
                     ui.add_space(4.0);
-                    if line_rows.is_empty() {
+                    if your_turn_rows.is_empty() {
                         ui.label(
                             RichText::new(format!(
-                                "No moves by {} yet in this line.",
+                                "No moves previously played against {} here yet.",
                                 prep.player_name
                             ))
                             .weak()
                             .italics(),
                         );
                     } else {
+                        egui::Grid::new("prep-your-move-grid")
+                            .num_columns(5)
+                            .striped(true)
+                            .spacing([10.0, 5.0])
+                            .show(ui, |ui| {
+                                ui.label(RichText::new("Move").strong());
+                                ui.label(RichText::new("Times Faced").strong())
+                                    .on_hover_text("Games in the opponent's book reaching this reply.");
+                                ui.label(RichText::new("Your Side Score").strong())
+                                    .on_hover_text("Your score vs the opponent here (green when they struggled).");
+                                ui.label(RichText::new("Result").strong());
+                                ui.label(RichText::new("Last Faced").strong());
+                                ui.end_row();
+
+                                for row in &your_turn_rows {
+                                    let text = RichText::new(domain::figurine_san(&row.san))
+                                        .monospace()
+                                        .strong();
+                                    let response = ui
+                                        .selectable_label(false, text)
+                                        .on_hover_text("Hover to preview · click to play");
+                                    if response.hovered() {
+                                        hover_preview = preview_after_move(pos, row.mv);
+                                    }
+                                    if response.clicked() {
+                                        clicked = Some(row.mv);
+                                    }
+                                    ui.label(format!("📖 {}", row.games));
+                                    // Our score = 1 - opponent's score; green
+                                    // when the opponent struggled here.
+                                    let decided = row.wins + row.draws + row.losses;
+                                    let our_score = if decided > 0 {
+                                        (row.losses as f32 + row.draws as f32 * 0.5)
+                                            / decided as f32
+                                    } else {
+                                        0.0
+                                    };
+                                    let score_color = if our_score >= 0.55 {
+                                        Color32::from_rgb(0x7E, 0xD3, 0x8A)
+                                    } else {
+                                        ui.visuals().text_color()
+                                    };
+                                    ui.label(
+                                        RichText::new(format!("{:.0}%", our_score * 100.0))
+                                            .color(score_color)
+                                            .strong(),
+                                    );
+                                    ui.label(format!(
+                                        "+{} ={} -{}",
+                                        row.losses, row.draws, row.wins
+                                    ));
+                                    ui.label(if row.last_date == 0 {
+                                        "—".to_string()
+                                    } else {
+                                        short_date(row.last_date)
+                                    });
+                                    ui.end_row();
+                                }
+                            });
+                    }
+                    if !line_rows.is_empty() {
                         egui::Grid::new("prep-line-grid")
                             .num_columns(4)
                             .striped(true)
@@ -13159,6 +13918,15 @@ impl App {
                 } else if let Some(data) = &prediction_data {
                     let rows = &data.rows;
                     let stats = &data.stats;
+                    ui.add_space(2.0);
+                    ui.label(
+                        RichText::new(format!(
+                            "🎯 {}'s Move ({}) — Predicted & Historical Choices",
+                            prep.player_name,
+                            color_name(facing)
+                        ))
+                        .strong(),
+                    );
                     if mode == crate::settings::PrepMode::Smart
                         && let Some(profile) = &profile_data
                     {
@@ -13233,6 +14001,162 @@ impl App {
                                 .weak()
                                 .italics(),
                         );
+                    } else if mode == crate::settings::PrepMode::Smart {
+                        ui.add_space(4.0);
+                        // Explicit probability order: highest predicted likelihood first.
+                        let mut smart_rows: Vec<_> = player_moves.iter().collect();
+                        smart_rows.sort_by(|a, b| {
+                            b.probability
+                                .total_cmp(&a.probability)
+                                .then(b.player_games.cmp(&a.player_games))
+                                .then(a.san.cmp(&b.san))
+                        });
+                        egui::Grid::new("prep-smart-grid")
+                            .num_columns(7)
+                            .striped(true)
+                            .spacing([10.0, 4.0])
+                            .show(ui, |ui| {
+                                for heading in PREP_SMART_COLUMNS {
+                                    ui.label(RichText::new(heading).strong().small());
+                                }
+                                ui.end_row();
+
+                                for row in &smart_rows {
+                                    let prob_color = predicted_prob_color(row.probability);
+                                    let text = RichText::new(domain::figurine_san(&row.san))
+                                        .monospace()
+                                        .strong()
+                                        .color(prob_color);
+                                    let response = ui
+                                        .selectable_label(false, text)
+                                        .on_hover_text("Hover to preview · click to play");
+                                    if response.hovered() {
+                                        hover_preview = preview_after_move(pos, row.mv);
+                                    }
+                                    if response.clicked() {
+                                        clicked = Some(row.mv);
+                                    }
+
+                                    let prob_text = match (
+                                        row.probability_low,
+                                        row.probability_high,
+                                    ) {
+                                        (low, high)
+                                            if (low - row.probability).abs() > 0.0005
+                                                || (high - row.probability).abs() > 0.0005 =>
+                                        {
+                                            format!(
+                                                "{:.0}% [{:.0}-{:.0}]",
+                                                row.probability * 100.0,
+                                                low * 100.0,
+                                                high * 100.0
+                                            )
+                                        }
+                                        _ => format!("{:.0}%", row.probability * 100.0),
+                                    };
+                                    ui.label(
+                                        RichText::new(prob_text).strong().color(prob_color),
+                                    )
+                                    .on_hover_text("Posterior mean with an approximate 90% credible interval.");
+
+                                    let games_text = if row.recent_games > 0 {
+                                        format!("{} ({})", row.player_games, row.recent_games)
+                                    } else {
+                                        row.player_games.to_string()
+                                    };
+                                    ui.label(games_text);
+
+                                    ui.label(format!(
+                                        "+{} ={} -{}",
+                                        row.player_wins, row.player_draws, row.player_losses
+                                    ));
+
+                                    ui.label(
+                                        row.vs_field_pp
+                                            .map(|pp| format!("{pp:+.0}pp"))
+                                            .unwrap_or_else(|| "—".to_string()),
+                                    );
+
+                                    ui.label(if row.last_date > 0 {
+                                        short_date(row.last_date)
+                                    } else {
+                                        "—".to_string()
+                                    });
+
+                                    draw_points_sparkline(ui, &row.sparkline, prob_color);
+                                    ui.end_row();
+                                }
+                            });
+                        if !inferred_moves.is_empty() {
+                            ui.add_space(4.0);
+                            egui::Frame::new()
+                                .fill(SURFACE)
+                                .corner_radius(8.0)
+                                .stroke(Stroke::new(1.0, BORDER))
+                                .inner_margin(8.0)
+                                .show(ui, |ui| {
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "💡 Inferred from OTB Reference Theory (0 games by {})",
+                                            prep.player_name
+                                        ))
+                                        .strong()
+                                        .italics(),
+                                    );
+                                    egui::Grid::new("prep-inferred-grid")
+                                        .num_columns(3)
+                                        .striped(true)
+                                        .spacing([12.0, 4.0])
+                                        .show(ui, |ui| {
+                                            ui.label(
+                                                RichText::new("Move").strong().small(),
+                                            );
+                                            ui.label(
+                                                RichText::new("Predicted").strong().small(),
+                                            );
+                                            ui.label(
+                                                RichText::new("vs field").strong().small(),
+                                            );
+                                            ui.end_row();
+                                            for row in &inferred_moves {
+                                                ui.horizontal(|ui| {
+                                                    let text = RichText::new(domain::figurine_san(
+                                                        &row.san,
+                                                    ))
+                                                    .monospace()
+                                                    .italics();
+                                                    let response = ui
+                                                        .selectable_label(false, text)
+                                                        .on_hover_text(
+                                                            "Hover to preview · click to play",
+                                                        );
+                                                    if response.hovered() {
+                                                        hover_preview =
+                                                            preview_after_move(pos, row.mv);
+                                                    }
+                                                    if response.clicked() {
+                                                        clicked = Some(row.mv);
+                                                    }
+                                                    ui.label(
+                                                        RichText::new("[Inferred]")
+                                                            .small()
+                                                            .weak(),
+                                                    );
+                                                });
+                                                ui.label(format!(
+                                                    "{:.0}%",
+                                                    row.probability * 100.0
+                                                ));
+                                                ui.label(
+                                                    row.vs_field_pp
+                                                        .map(|pp| format!("{pp:+.0}pp"))
+                                                        .unwrap_or_else(|| "—".to_string()),
+                                                );
+                                                ui.end_row();
+                                            }
+                                        });
+                                });
+                        }
                     } else {
                         ui.add_space(4.0);
                         egui::Grid::new("prep-player-moves-grid")
@@ -13288,53 +14212,6 @@ impl App {
                                     ui.end_row();
                                 }
                             });
-                        if mode == crate::settings::PrepMode::Smart && !inferred_moves.is_empty() {
-                            ui.add_space(4.0);
-                            ui.label(RichText::new("Inferred additions").strong());
-                            ui.label(
-                                RichText::new(
-                                    "Never played here, but the background prior expects them.",
-                                )
-                                .weak()
-                                .small(),
-                            );
-                            egui::Grid::new("prep-inferred-grid")
-                                .num_columns(3)
-                                .striped(true)
-                                .spacing([12.0, 4.0])
-                                .show(ui, |ui| {
-                                    ui.label(RichText::new("Move").strong().small());
-                                    ui.label(RichText::new("Likelihood").strong().small());
-                                    ui.label(RichText::new("vs field").strong().small());
-                                    ui.end_row();
-                                    for row in &inferred_moves {
-                                        ui.horizontal(|ui| {
-                                            let text = RichText::new(domain::figurine_san(&row.san))
-                                                .monospace()
-                                                .italics();
-                                            let response = ui
-                                                .selectable_label(false, text)
-                                                .on_hover_text("Hover to preview · click to play");
-                                            if response.hovered() {
-                                                hover_preview = preview_after_move(pos, row.mv);
-                                            }
-                                            if response.clicked() {
-                                                clicked = Some(row.mv);
-                                            }
-                                            ui.label(
-                                                RichText::new("[Inferred]").small().weak(),
-                                            );
-                                        });
-                                        ui.label(format!("{:.0}%", row.probability * 100.0));
-                                        ui.label(
-                                            row.vs_field_pp
-                                                .map(|pp| format!("{pp:+.0}pp"))
-                                                .unwrap_or_else(|| "—".to_string()),
-                                        );
-                                        ui.end_row();
-                                    }
-                                });
-                        }
                     }
                 } else {
                     ui.add_space(4.0);
@@ -13355,7 +14232,9 @@ impl App {
                         .weak(),
                     );
                 }
-                egui::CollapsingHeader::new(RichText::new("Opening tree").strong())
+                egui::CollapsingHeader::new(RichText::new(format!(
+                    "📚 General Reference Tree ({reference_source_label})"
+                )).strong())
                     .default_open(true)
                     .show(ui, |ui| {
                         if index.is_some() {
@@ -13367,6 +14246,7 @@ impl App {
                                 "No indexed game reached this position.",
                                 self.trend_config(),
                                 &mut hover_preview,
+                                Some(&book_games_map),
                             )
                             .or(clicked);
                         } else {
@@ -13436,7 +14316,7 @@ impl App {
                         } else {
                             let width = (ui.available_width() - 4.0).max(100.0);
                             for row in recent_rows.iter().take(recent_limit) {
-                                if game_row(
+                                let mut row_response = game_row(
                                     ui,
                                     false,
                                     "",
@@ -13452,8 +14332,11 @@ impl App {
                                     &row.subtitle,
                                     width,
                                     40.0,
-                                )
-                                .clicked()
+                                );
+                                paint_game_type_dot(ui, row_response.rect, row.type_color);
+                                row_response =
+                                    row_response.on_hover_text(row.type_label);
+                                if row_response.clicked()
                                 {
                                     if let Some(merged) = row.merged_index {
                                         merged_preview = Some(merged);
@@ -13517,7 +14400,8 @@ impl App {
                         } else {
                             let width = (ui.available_width() - 4.0).max(100.0);
                             for (subtitle, game) in &online_rows {
-                                if game_row(
+                                let (online_type_color, online_type_label) = game_type_style(game);
+                                let mut online_response = game_row(
                                     ui,
                                     false,
                                     "",
@@ -13543,8 +14427,11 @@ impl App {
                                     subtitle,
                                     width,
                                     40.0,
-                                )
-                                .clicked()
+                                );
+                                paint_game_type_dot(ui, online_response.rect, online_type_color);
+                                online_response =
+                                    online_response.on_hover_text(online_type_label);
+                                if online_response.clicked()
                                 {
                                     online_preview = Some(game.clone());
                                 }
@@ -13668,8 +14555,13 @@ impl App {
             .current
             .as_ref()
             .and_then(|game| my_player_color(&self.prep_player_names, game));
-        if let Some(color) = orientation {
-            self.orientation = color;
+        if self.prep.is_none() {
+            if let Some(color) = orientation {
+                self.orientation = color;
+            }
+        } else if let Some(locked) = self.prep_locked_orientation() {
+            // Previews during preparation keep the locked board orientation.
+            self.orientation = locked;
         }
         self.focus_right_tab(RightTab::Moves);
         self.goto(0);
@@ -14041,32 +14933,40 @@ impl App {
                                             }) else {
                                                 continue;
                                             };
-                                            let Some(slot) = view.session.slot(id) else {
+                                            let Some(_) = view.session.slot(id) else {
                                                 continue;
                                             };
+                                            let view_headers = view.session.slot_headers(id);
+                                            let view_header = |key: &str| {
+                                                view_headers
+                                                    .and_then(|list| list.iter().find(|(name, _)| name.eq_ignore_ascii_case(key)))
+                                                    .map(|(_, value)| value.as_str())
+                                            };
                                             let white_title =
-                                                title_from_tag(slot.header("WhiteTitle"));
+                                                title_from_tag(view_header("WhiteTitle"));
                                             let black_title =
-                                                title_from_tag(slot.header("BlackTitle"));
+                                                title_from_tag(view_header("BlackTitle"));
                                             let white_country = player_country_from_header(
-                                                slot.header("WhiteCountry")
-                                                    .or_else(|| slot.header("WhiteFed")),
+                                                view_header("WhiteCountry")
+                                                    .or_else(|| view_header("WhiteFed")),
                                             );
                                             let black_country = player_country_from_header(
-                                                slot.header("BlackCountry")
-                                                    .or_else(|| slot.header("BlackFed")),
+                                                view_header("BlackCountry")
+                                                    .or_else(|| view_header("BlackFed")),
                                             );
                                             let subtitle =
-                                                format!("{} · {}", slot.event(), slot.date());
+                                                format!("{} · {}", view_header("Event").unwrap_or("?"), view_header("Date").unwrap_or("????.??.??"));
                                             let width = ui.available_width();
+                                            let view_white = view.session.slot_white(id);
+                                            let view_black = view.session.slot_black(id);
                                             let response = game_row(
                                                 ui,
                                                 false,
                                                 "",
-                                                RowName::new(slot.white(), white_title)
+                                                RowName::new(&view_white, white_title)
                                                     .with_country(white_country.map(|c| c.badge)),
                                                 Some(
-                                                    RowName::new(slot.black(), black_title)
+                                                    RowName::new(&view_black, black_title)
                                                         .with_country(
                                                             black_country.map(|c| c.badge),
                                                         ),
@@ -19446,6 +20346,7 @@ fn find_database_in_dir(dir: &std::path::Path) -> anyhow::Result<std::path::Path
 }
 
 fn open_library(path: &std::path::Path) -> anyhow::Result<Arc<dyn GameLibrary>> {
+    let started = std::time::Instant::now();
     let resolved = if path.is_dir() {
         find_database_in_dir(path)?
     } else {
@@ -19456,7 +20357,7 @@ fn open_library(path: &std::path::Path) -> anyhow::Result<Arc<dyn GameLibrary>> 
         .and_then(|extension| extension.to_str())
         .unwrap_or_default()
         .to_ascii_lowercase();
-    if extension == "si4" || extension == "si3" {
+    let result = if extension == "si4" || extension == "si3" {
         ScidLibrary::open(&resolved).map(|library| Arc::new(library) as Arc<dyn GameLibrary>)
     } else if extension == "cbv" {
         CbhLibrary::open_cbv(&resolved).map(|library| Arc::new(library) as Arc<dyn GameLibrary>)
@@ -19466,7 +20367,29 @@ fn open_library(path: &std::path::Path) -> anyhow::Result<Arc<dyn GameLibrary>> 
         TwoCbhLibrary::open(&resolved).map(|library| Arc::new(library) as Arc<dyn GameLibrary>)
     } else {
         PgnLibrary::build(resolved).map(|library| Arc::new(library) as Arc<dyn GameLibrary>)
+    };
+    let elapsed = started.elapsed();
+    match &result {
+        Ok(library) => tracing::info!(
+            "open_library {} ({} games) took {:.2}s",
+            path.display(),
+            library.len(),
+            elapsed.as_secs_f64()
+        ),
+        Err(err) => tracing::debug!(
+            "open_library {} failed in {:.2}s: {err:#}",
+            path.display(),
+            elapsed.as_secs_f64()
+        ),
     }
+    if elapsed.as_millis() > 100 {
+        tracing::warn!(
+            "slow open_library {} took {:.2}s",
+            path.display(),
+            elapsed.as_secs_f64()
+        );
+    }
+    result
 }
 
 fn index_summary(index: &PositionIndex) -> String {
@@ -19514,6 +20437,67 @@ fn outcome_label(result: &str, color: Color) -> &'static str {
         ("1/2-1/2", _) => "drew",
         _ => "unfinished",
     }
+}
+
+/// Game-type colour coding shared by the game list and preparation rows:
+/// Classical OTB emerald, Rapid/Blitz OTB sky, Online violet.
+fn game_type_style(game: &Game) -> (Color32, &'static str) {
+    let (tc, is_online, _) = players::classify_game_metadata(game);
+    game_type_style_for(tc, is_online)
+}
+
+fn game_type_style_for(tc: players::TimeControlClass, is_online: bool) -> (Color32, &'static str) {
+    if is_online {
+        (Color32::from_rgb(0xC6, 0x8A, 0xE8), "Online")
+    } else {
+        match tc {
+            players::TimeControlClass::Classical => {
+                (Color32::from_rgb(0x7E, 0xD3, 0x8A), "Classical OTB")
+            }
+            _ => (Color32::from_rgb(0x6A, 0xB0, 0xE8), "Rapid/Blitz OTB"),
+        }
+    }
+}
+
+/// Classify an indexed game without loading the full record.
+fn indexed_game_type_style(indexed: &crate::library::IndexedGame) -> (Color32, &'static str) {
+    let game = Game {
+        headers: [
+            ("Event", indexed.event()),
+            ("Site", indexed.header("Site").unwrap_or("?")),
+            ("TimeControl", indexed.header("TimeControl").unwrap_or("?")),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect(),
+        ..Game::default()
+    };
+    game_type_style(&game)
+}
+
+fn slot_game_type_by_headers(
+    event: Option<&str>,
+    _result: Option<&str>,
+) -> (Color32, &'static str) {
+    let _ = _result;
+    let game = Game {
+        headers: [
+            ("Event", event.unwrap_or("?")),
+            ("Site", "?"),
+            ("TimeControl", "?"),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect(),
+        ..Game::default()
+    };
+    game_type_style(&game)
+}
+
+/// Paint a small game-type dot at the right edge of a game row.
+fn paint_game_type_dot(ui: &Ui, rect: egui::Rect, color: Color32) {
+    let center = pos2(rect.right() - 12.0, rect.center().y);
+    ui.painter().circle_filled(center, 4.0, color);
 }
 
 fn prep_matches(app: &App, player_key: &str) -> bool {
@@ -19699,6 +20683,59 @@ fn trend_badge_color(badge: crate::recent::TrendBadge) -> Color32 {
 /// Normalized points come from [`crate::recent::MoveTrend::sparkline_points`]
 /// (`y` higher means higher share); the baseline level, when known, is drawn
 /// as a faint horizontal line.
+/// Columns of the Smart predictor table in the preparation panel. Kept as
+/// a named constant so tests can assert the probability column is present.
+const PREP_SMART_COLUMNS: [&str; 7] = [
+    "Move",
+    "Predicted",
+    "Opp Games(Recent)",
+    "Score(+/=/-)",
+    "vs Ref",
+    "Last Played",
+    "",
+];
+
+/// Prominent probability colour for the Smart predictor table, applied to
+/// both the move and its predicted likelihood: green at/above 50%, gold
+/// from 20% up to 50%, blue-gray below 20%.
+fn predicted_prob_color(probability: f64) -> Color32 {
+    if probability >= 0.5 {
+        Color32::from_rgb(0x7E, 0xD3, 0x8A)
+    } else if probability >= 0.2 {
+        Color32::from_rgb(0xD4, 0xB0, 0x4A)
+    } else {
+        Color32::from_rgb(0x7E, 0x93, 0xAD)
+    }
+}
+
+/// Draw a compact sparkline from normalized `(x, y)` points, used for the
+/// Smart predictor's popularity trend column.
+fn draw_points_sparkline(ui: &mut Ui, points: &[(f32, f32)], color: Color32) {
+    let (rect, response) = ui.allocate_exact_size(vec2(44.0, 14.0), Sense::hover());
+    if points.is_empty() {
+        response.on_hover_text("No trend data.");
+        return;
+    }
+    response.on_hover_text("Popularity trend.");
+    let painter = ui.painter_at(rect);
+    let screen_pts: Vec<egui::Pos2> = points
+        .iter()
+        .map(|(x, y)| {
+            pos2(
+                rect.min.x + x.clamp(0.0, 1.0) * rect.width(),
+                rect.max.y - y.clamp(0.0, 1.0) * rect.height(),
+            )
+        })
+        .collect();
+    painter.add(egui::Shape::line(
+        screen_pts.clone(),
+        Stroke::new(1.4, color),
+    ));
+    if let Some(&last) = screen_pts.last() {
+        painter.circle_filled(last, 2.0, color);
+    }
+}
+
 fn draw_trend_sparkline(
     ui: &mut Ui,
     trend: &crate::recent::MoveTrend,
@@ -19738,6 +20775,7 @@ fn draw_trend_sparkline(
 
 /// Normal opening-tree summary and table for one position. Kept free of
 /// scrolling so preparation mode can place it inside its own scroll area.
+#[allow(clippy::too_many_arguments)]
 fn opening_tree_table(
     ui: &mut Ui,
     index: Option<&PositionIndex>,
@@ -19746,6 +20784,7 @@ fn opening_tree_table(
     empty_message: &str,
     trends: crate::recent::TrendConfig,
     hover_preview: &mut Option<HoverPreview>,
+    book_games: Option<&HashMap<u32, u32>>,
 ) -> Option<Move> {
     let Some(index) = index else {
         ui.label(RichText::new(empty_message).weak());
@@ -19802,8 +20841,9 @@ fn opening_tree_table(
 
     let mut clicked = None;
     ui.add_space(4.0);
+    let show_book_badge = book_games.is_some_and(|map| !map.is_empty());
     egui::Grid::new("opening-tree-grid")
-        .num_columns(7)
+        .num_columns(if show_book_badge { 8 } else { 7 })
         .striped(true)
         .spacing([10.0, 4.0])
         .show(ui, |ui| {
@@ -19814,6 +20854,9 @@ fn opening_tree_table(
             ui.label(RichText::new("Elo").strong());
             ui.label(RichText::new("Years").strong());
             ui.label(RichText::new("Trend").strong());
+            if show_book_badge {
+                ui.label(RichText::new("📖 In PlayerBook").strong());
+            }
             ui.end_row();
 
             for (san, mv, stat) in rows {
@@ -19855,6 +20898,17 @@ fn opening_tree_table(
                         ui.label(RichText::new("—").weak()).on_hover_text(
                             "Not enough dated games in both windows for a trend badge.",
                         );
+                    }
+                }
+                if show_book_badge {
+                    match book_games.and_then(|map| map.get(&stat.mv)) {
+                        Some(games) => {
+                            ui.label(RichText::new(format!("📖 {games}")).small().strong())
+                                .on_hover_text("Also present in the prepared player's book.");
+                        }
+                        None => {
+                            ui.label(RichText::new("—").weak().small());
+                        }
                     }
                 }
                 ui.end_row();
@@ -20949,6 +22003,12 @@ mod tests {
             prep_setup_accounts: Vec::new(),
             prep_setup_account_service: OnlineSource::Lichess,
             prep_setup_account_name: String::new(),
+            prep_setup_chessabc_candidates: Vec::new(),
+            prep_setup_chessabc_selected: Vec::new(),
+            prep_setup_chessabc_status: String::new(),
+            prep_setup_chessabc_rx: None,
+            prep_setup_search: String::new(),
+            prep_setup_player: None,
             prep_setup_as_white: true,
             prep_merged_games: Vec::new(),
             prep_load_rx: None,
@@ -22575,6 +23635,7 @@ mod tests {
             mode: crate::settings::PrepMode::default(),
             filter: players::PrepFilterConfig::default(),
             accounts: Vec::new(),
+            chessabc_fide_ids: Vec::new(),
             sources_label: String::new(),
         };
         // We play White, so the opponent faces Black.
@@ -22592,6 +23653,114 @@ mod tests {
         app.prep_show_all_games = false;
         app.prep_filter_facing_color = false;
         assert_eq!(app.prep_list_color_filter(), None);
+    }
+
+    #[test]
+    fn prep_start_pins_orientation_to_our_color() {
+        let mut app = test_app();
+        let index = app.players.ensure_player("Opponent Name");
+        // A pathological alias matching the opponent must not sway the
+        // board: preparation always orients to our colour.
+        app.prep_player_names = vec!["Opponent Name".to_string()];
+        app.prep_setup_player = Some(index);
+        app.selected_player = None;
+        app.open_prep_setup_any();
+        assert!(
+            app.prep_setup_open,
+            "File → Prepare opens the dialog with no prior selection"
+        );
+        app.start_prep(false);
+        assert_eq!(app.selected_player, Some(index));
+        let prep = app.prep.as_ref().expect("prep session started");
+        assert_eq!(prep.our_color, Color::Black);
+        assert_eq!(app.orientation, Color::Black);
+        assert_eq!(app.prep_locked_orientation(), Some(Color::Black));
+        // Navigation re-pins the locked orientation.
+        app.orientation = Color::White;
+        let node = app.node;
+        app.goto(node);
+        assert_eq!(app.orientation, Color::Black);
+        // The swapped view locks to the opponent's colour instead.
+        app.prep_swapped_view = true;
+        assert_eq!(app.prep_locked_orientation(), Some(Color::White));
+        app.orientation = Color::Black;
+        app.goto(node);
+        assert_eq!(app.orientation, Color::White);
+    }
+
+    #[test]
+    fn prep_start_uses_dialog_opponent_without_prior_selection() {
+        let mut app = test_app();
+        let index = app.players.ensure_player("Chosen Opponent");
+        app.selected_player = None;
+        app.prep_setup_player = Some(index);
+        app.start_prep(true);
+        assert!(app.prep.is_some());
+        assert_eq!(
+            app.prep.as_ref().map(|prep| prep.player_key.as_str()),
+            Some("chosen opponent")
+        );
+        assert_eq!(app.orientation, Color::White);
+    }
+
+    #[test]
+    fn smart_predictor_table_is_sorted_by_descending_probability() {
+        // e4 is the clear favourite, d4 a rare sideline: the Smart table
+        // must lead with the highest posterior probability.
+        let pgn = b"[Event \"T\"]\n[White \"Opp\"]\n[Black \"X\"]\n[Date \"2025.01.01\"]\n[Result \"*\"]\n\n1. e4 e5 *\n[Event \"T\"]\n[White \"Opp\"]\n[Black \"X\"]\n[Date \"2025.02.01\"]\n[Result \"*\"]\n\n1. e4 e5 *\n[Event \"T\"]\n[White \"Opp\"]\n[Black \"X\"]\n[Date \"2025.03.01\"]\n[Result \"*\"]\n\n1. e4 e5 *\n[Event \"T\"]\n[White \"Opp\"]\n[Black \"Y\"]\n[Date \"2025.04.01\"]\n[Result \"*\"]\n\n1. d4 d5 *\n";
+        let games = domain::parse_pgn(&pgn[..]).unwrap();
+        let book = players::PlayerBook::from_games(
+            "opp",
+            "Opp",
+            &games,
+            players::PredictionConfig::default(),
+            players::today(),
+        );
+        let key = position::position_key(&crate::chess::Chess::default());
+        let legal = crate::chess::Chess::default().legal_moves().len();
+        let prediction = players::predict_v2(
+            &book,
+            key,
+            &[],
+            players::PriorSource::CurrentDatabase,
+            legal,
+            None,
+            None,
+            None,
+        );
+        assert!(prediction.moves.len() >= 2);
+        assert!(
+            prediction
+                .moves
+                .windows(2)
+                .all(|pair| pair[0].probability >= pair[1].probability),
+            "Smart rows sort by descending probability: {:?}",
+            prediction
+                .moves
+                .iter()
+                .map(|mv| mv.probability)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            prediction.moves[0].player_games >= prediction.moves[1].player_games,
+            "the favourite is the most-played move"
+        );
+        assert!(
+            PREP_SMART_COLUMNS.contains(&"Predicted"),
+            "Smart table keeps its probability column"
+        );
+        assert_eq!(
+            predicted_prob_color(0.88),
+            Color32::from_rgb(0x7E, 0xD3, 0x8A)
+        );
+        assert_eq!(
+            predicted_prob_color(0.30),
+            Color32::from_rgb(0xD4, 0xB0, 0x4A)
+        );
+        assert_eq!(
+            predicted_prob_color(0.05),
+            Color32::from_rgb(0x7E, 0x93, 0xAD)
+        );
     }
 
     #[test]
@@ -22622,6 +23791,7 @@ mod tests {
             mode: crate::settings::PrepMode::default(),
             filter: players::PrepFilterConfig::default(),
             accounts: Vec::new(),
+            chessabc_fide_ids: Vec::new(),
             sources_label: String::new(),
         });
 
@@ -22673,6 +23843,7 @@ mod tests {
             mode: crate::settings::PrepMode::default(),
             filter: players::PrepFilterConfig::default(),
             accounts: Vec::new(),
+            chessabc_fide_ids: Vec::new(),
             sources_label: String::new(),
         });
 

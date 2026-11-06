@@ -26,7 +26,6 @@ struct HeaderOverride {
 
 enum SlotSource {
     Primary {
-        library: Arc<dyn GameLibrary>,
         index: usize,
     },
     External {
@@ -49,10 +48,10 @@ pub struct GameSlot {
 }
 
 impl GameSlot {
-    fn primary(id: usize, library: Arc<dyn GameLibrary>, index: usize) -> Self {
+    fn primary(id: usize, index: usize) -> Self {
         Self {
             id,
-            source: SlotSource::Primary { library, index },
+            source: SlotSource::Primary { index },
             edited: None,
             cached_headers: std::sync::OnceLock::new(),
         }
@@ -87,7 +86,12 @@ impl GameSlot {
             return &edited.headers;
         }
         match &self.source {
-            SlotSource::Primary { library, index } | SlotSource::External { library, index } => {
+            // Primary headers are resolved through `GameList` (single shared
+            // Arc); without it only the lazy cache can be served.
+            SlotSource::Primary { .. } => {
+                self.cached_headers.get().map(Vec::as_slice).unwrap_or(&[])
+            }
+            SlotSource::External { library, index } => {
                 if let Some(game) = library.games().get(*index) {
                     return game.headers();
                 }
@@ -96,6 +100,33 @@ impl GameSlot {
                     .as_slice()
             }
             SlotSource::Local(local) => &local.headers,
+        }
+    }
+
+    /// Primary-aware header resolution via the list's shared library Arc.
+    pub fn headers_with<'a>(
+        &'a self,
+        primary: Option<&'a Arc<dyn GameLibrary>>,
+    ) -> &'a [(SharedStr, SharedStr)] {
+        if let Some(edited) = &self.edited {
+            return &edited.headers;
+        }
+        match &self.source {
+            SlotSource::Primary { index } => {
+                if let Some(library) = primary
+                    && let Some(game) = library.games().get(*index)
+                {
+                    return game.headers();
+                }
+                if let Some(library) = primary {
+                    return self
+                        .cached_headers
+                        .get_or_init(|| library.game_headers(*index))
+                        .as_slice();
+                }
+                self.cached_headers.get().map(Vec::as_slice).unwrap_or(&[])
+            }
+            _ => self.headers(),
         }
     }
 
@@ -133,12 +164,26 @@ impl GameSlot {
         }
     }
 
-    fn matches(&self, needle: &str) -> bool {
+    fn matches_with(&self, needle: &str, primary: Option<&Arc<dyn GameLibrary>>) -> bool {
         if let Some(edited) = &self.edited {
             return edited.search.contains(needle);
         }
         match &self.source {
-            SlotSource::Primary { library, index } | SlotSource::External { library, index } => {
+            SlotSource::Primary { index } => {
+                if let Some(library) = primary {
+                    if let Some(game) = library.games().get(*index) {
+                        return game.matches(needle);
+                    }
+                    return self
+                        .headers_with(primary)
+                        .iter()
+                        .any(|(_, v)| v.to_lowercase().contains(needle));
+                }
+                self.headers()
+                    .iter()
+                    .any(|(_, v)| v.to_lowercase().contains(needle))
+            }
+            SlotSource::External { library, index } => {
                 if let Some(game) = library.games().get(*index) {
                     return game.matches(needle);
                 }
@@ -207,18 +252,66 @@ impl GameList {
     }
 
     pub fn from_library(library: Arc<dyn GameLibrary>) -> Self {
+        let len = library.len();
         let mut list = Self {
-            primary: Some(library.clone()),
-            slots: Vec::with_capacity(library.len()),
-            positions: (0..library.len()).collect(),
-            source_slots: (0..library.len()).collect(),
-            next_id: library.len(),
+            primary: Some(library),
+            slots: Vec::with_capacity(len),
+            positions: (0..len).collect(),
+            source_slots: (0..len).collect(),
+            next_id: len,
         };
-        for index in 0..library.len() {
-            list.slots
-                .push(GameSlot::primary(index, library.clone(), index));
+        // No per-slot Arc clone: primary slots hold only the source index and
+        // resolve through the single shared `primary` Arc above.
+        for index in 0..len {
+            list.slots.push(GameSlot::primary(index, index));
         }
         list
+    }
+
+    /// Shared primary library Arc (single clone, not one per slot).
+    pub fn primary_library(&self) -> Option<&Arc<dyn GameLibrary>> {
+        self.primary.as_ref()
+    }
+
+    /// Primary-aware headers for a stable slot id.
+    pub fn slot_headers(&self, id: usize) -> Option<&[(SharedStr, SharedStr)]> {
+        let slot = self.slot(id)?;
+        // Extend the borrow of `self` to the returned slice: both `slot` and
+        // `primary` borrow from `self`, so this is safe.
+        let primary = self.primary.as_ref();
+        Some(slot.headers_with(primary))
+    }
+
+    fn header_for(&self, id: usize, key: &str) -> Option<String> {
+        self.slot_headers(id)?
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(key))
+            .map(|(_, v)| v.to_string())
+    }
+
+    pub fn slot_white(&self, id: usize) -> String {
+        self.header_for(id, "White")
+            .unwrap_or_else(|| "?".to_string())
+    }
+
+    pub fn slot_black(&self, id: usize) -> String {
+        self.header_for(id, "Black")
+            .unwrap_or_else(|| "?".to_string())
+    }
+
+    pub fn slot_event(&self, id: usize) -> String {
+        self.header_for(id, "Event")
+            .unwrap_or_else(|| "?".to_string())
+    }
+
+    pub fn slot_date(&self, id: usize) -> String {
+        self.header_for(id, "Date")
+            .unwrap_or_else(|| "????.??.??".to_string())
+    }
+
+    pub fn slot_result(&self, id: usize) -> String {
+        self.header_for(id, "Result")
+            .unwrap_or_else(|| "*".to_string())
     }
 
     pub fn len(&self) -> usize {
@@ -270,9 +363,10 @@ impl GameList {
         if needle.is_empty() {
             return self.slots.iter().map(|slot| slot.id).collect();
         }
+        let primary = self.primary.as_ref();
         self.slots
             .iter()
-            .filter(|slot| slot.matches(&needle))
+            .filter(|slot| slot.matches_with(&needle, primary))
             .map(|slot| slot.id)
             .collect()
     }
@@ -285,7 +379,7 @@ impl GameList {
             .slot(id)
             .with_context(|| format!("game row {id} is gone"))?;
         match &slot.source {
-            SlotSource::Primary { index, .. } => self
+            SlotSource::Primary { index } => self
                 .primary
                 .as_ref()
                 .context("no primary database is open")?
@@ -338,7 +432,7 @@ impl GameList {
                 headers_vec = library.game_headers(index);
                 &headers_vec
             };
-            let candidates = duplicate_candidates(&self.slots, headers);
+            let candidates = self.duplicate_candidate_ids(headers);
             if !candidates.is_empty() {
                 let incoming = library
                     .load(index)
@@ -450,6 +544,8 @@ impl GameList {
 /// and transliterated so `Müller, Jörg` matches `Joerg Mueller`, and a Cyrillic
 /// spelling can match its Latin transliteration. Date and result must also
 /// agree; callers can verify the moves before rejecting a game.
+/// NOTE: for primary-backed slots use `GameList::duplicate_candidate_ids`,
+/// which resolves headers through the shared library Arc.
 pub fn duplicate_candidates(slots: &[GameSlot], headers: &[(SharedStr, SharedStr)]) -> Vec<usize> {
     let key = duplicate_key(headers);
     slots
@@ -457,6 +553,19 @@ pub fn duplicate_candidates(slots: &[GameSlot], headers: &[(SharedStr, SharedStr
         .filter(|slot| duplicate_key(slot.headers()) == key)
         .map(|slot| slot.id)
         .collect()
+}
+
+impl GameList {
+    /// Primary-aware duplicate candidates (single shared Arc, no per-slot clone).
+    pub fn duplicate_candidate_ids(&self, headers: &[(SharedStr, SharedStr)]) -> Vec<usize> {
+        let key = duplicate_key(headers);
+        let primary = self.primary.as_ref();
+        self.slots
+            .iter()
+            .filter(|slot| duplicate_key(slot.headers_with(primary)) == key)
+            .map(|slot| slot.id)
+            .collect()
+    }
 }
 
 fn duplicate_key(headers: &[(SharedStr, SharedStr)]) -> String {
@@ -601,7 +710,7 @@ pub fn find_duplicate(
     game: &Game,
     edited: &HashMap<usize, Game>,
 ) -> Result<Option<usize>> {
-    for id in duplicate_candidates(list.slots(), headers) {
+    for id in list.duplicate_candidate_ids(headers) {
         let existing = list.load(id, edited)?;
         if same_game(&existing, game) {
             return Ok(Some(id));
@@ -726,25 +835,25 @@ mod tests {
         let library: Arc<dyn GameLibrary> = Arc::new(PgnLibrary::build(&path).unwrap());
         let mut list = GameList::from_library(library);
 
-        assert_eq!(list.slot(0).unwrap().white(), "Alpha");
+        assert_eq!(list.slot_white(0), "Alpha");
         assert_eq!(list.source_slot(1), Some(1));
 
         assert!(list.move_slot(2, 0));
         assert_eq!(list.position_of(2), Some(0));
-        assert_eq!(list.slot(2).unwrap().white(), "Epsilon");
-        assert_eq!(list.slot(0).unwrap().white(), "Alpha");
+        assert_eq!(list.slot_white(2), "Epsilon");
+        assert_eq!(list.slot_white(0), "Alpha");
         assert_eq!(list.source_slot(0), Some(0));
         assert_eq!(list.source_slot(2), Some(2));
 
         assert!(list.remove(1).is_some());
         assert!(list.slot(1).is_none());
         assert!(list.source_slot(1).is_none());
-        assert_eq!(list.slot(2).unwrap().white(), "Epsilon");
+        assert_eq!(list.slot_white(2), "Epsilon");
 
         let inserted = list.insert_game(game("Local", "Row", "2020.01.04", "1. e4"), Some(0));
         assert_eq!(list.position_of(inserted), Some(0));
         assert_eq!(list.slot(inserted).unwrap().white(), "Local");
-        assert_eq!(list.slot(2).unwrap().white(), "Epsilon");
+        assert_eq!(list.slot_white(2), "Epsilon");
 
         let _ = std::fs::remove_file(path);
     }

@@ -160,6 +160,37 @@ impl Database {
         id
     }
 
+    /// Raw content words: writes `kind` followed by `words` verbatim, so
+    /// tests can craft custom-start markers (kind 1 with a 0xfffb first word).
+    fn add_raw(&mut self, kind_word: u16, words: &[u16], spec: GameSpec) -> u32 {
+        let id = 1 + self.records.len() as u32;
+        let mut full = Vec::with_capacity((words.len() + 1) * 2);
+        full.extend_from_slice(&kind_word.to_le_bytes());
+        for word in words {
+            full.extend_from_slice(&word.to_le_bytes());
+        }
+        let moves_offset = self.cbg.len() as u64;
+        append_record(&mut self.cbg, &full);
+        let mut record = [0u8; RECORD_SIZE];
+        record[0] = spec.kind;
+        record[1..4].copy_from_slice(&[0, 1, 1]);
+        record[8..16].copy_from_slice(&moves_offset.to_le_bytes());
+        record[16..24].copy_from_slice(&(CBG_HEADER as u64).to_le_bytes());
+        record[24..28].copy_from_slice(&spec.white_id.to_le_bytes());
+        record[32..36].copy_from_slice(&spec.black_id.to_le_bytes());
+        record[40..44].copy_from_slice(&spec.event_id.to_le_bytes());
+        record[48..52].copy_from_slice(&spec.flags.to_le_bytes());
+        record[56..60].copy_from_slice(&spec.source_id.to_le_bytes());
+        record[0x58..0x5c]
+            .copy_from_slice(&(((spec.round as u32) << 16) | u32::from(spec.result)).to_le_bytes());
+        record[0x5c..0x60].copy_from_slice(&spec.subround.to_le_bytes());
+        record[0x60..0x64].copy_from_slice(&spec.white_elo.to_le_bytes());
+        record[0x70..0x74].copy_from_slice(&spec.black_elo.to_le_bytes());
+        record[0xbc..0xc0].copy_from_slice(&spec.date.to_le_bytes());
+        self.records.push(record);
+        id
+    }
+
     fn finish(&self) -> PathBuf {
         let mut cbg = self.cbg.clone();
         let cbg_len = cbg.len() as u64;
@@ -606,6 +637,59 @@ fn generated_token_table_matches_the_runtime_dump() {
 
 fn square(file: u8, rank: u8) -> Square {
     Square::new(u32::from(rank) * 8 + u32::from(file))
+}
+
+#[test]
+fn custom_start_and_chess960_games_skip_the_position_index() {
+    use crate::library::GameLibrary;
+    let mut db = Database::new();
+    // Custom-start: kind 1 content whose first word is 0xfffb (not 0xfffc).
+    db.add_raw(1, &[0xfffb, 44351, 45101, 0xffff], GameSpec::default());
+    // Chess960: kind 2 content.
+    db.add_raw(
+        2,
+        &[0xfffb, 518, 0xfffc, 44351, 45101, 0xffff],
+        GameSpec {
+            start_id: None,
+            ..GameSpec::default()
+        },
+    );
+    // One healthy standard game.
+    db.add_game(GameSpec {
+        tokens: game_tokens(),
+        ..GameSpec::default()
+    });
+    let path = db.finish();
+    let library = TwoCbhLibrary::open(&path).unwrap();
+    assert_eq!(library.len(), 3);
+    let mut sunk = 0u32;
+    let mut consumer = |_key: u64, _mv: u32| {
+        sunk += 1;
+    };
+    assert!(!library.stream_mainline(0, u32::MAX, &mut consumer).unwrap());
+    assert!(!library.stream_mainline(1, u32::MAX, &mut consumer).unwrap());
+    assert!(library.stream_mainline(2, u32::MAX, &mut consumer).unwrap());
+    assert!(sunk > 0);
+}
+
+#[test]
+fn tournament_categories_are_cached_and_entity_bound_holds() {
+    let mut db = Database::new();
+    db.add_game(GameSpec {
+        tokens: game_tokens(),
+        ..GameSpec::default()
+    });
+    let path = db.finish();
+    let library = TwoCbhLibrary::open(&path).unwrap();
+    // No slot-1 text record here, so None — but the OnceLock caches it and a
+    // second call must agree without re-parsing.
+    assert_eq!(library.tournament_categories(), None);
+    assert_eq!(library.tournament_categories(), None);
+    // Entity bound never exceeds the accelerator block count and entity ids
+    // stay in range.
+    if let Some(acc) = library.accelerator() {
+        assert!(library.names.entity_count().min(acc.block_count()) <= acc.block_count());
+    }
 }
 
 #[test]

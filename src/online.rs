@@ -407,15 +407,7 @@ pub struct ChessAbcPlayer {
     pub rating: u64,
 }
 
-fn resolve_chessabc_player(agent: &ureq::Agent, query: &str) -> Result<ChessAbcPlayer> {
-    if query.chars().all(|c| c.is_ascii_digit()) {
-        return Ok(ChessAbcPlayer {
-            fide_id: query.to_string(),
-            name: query.to_string(),
-            rating: 0,
-        });
-    }
-
+fn collect_chessabc_candidates(agent: &ureq::Agent, query: &str) -> Result<Vec<ChessAbcPlayer>> {
     let mut players = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for variant in chessabc_search_queries(query) {
@@ -432,10 +424,127 @@ fn resolve_chessabc_player(agent: &ureq::Agent, query: &str) -> Result<ChessAbcP
             fetch_chessabc_search(agent, &variant, &mut players, &mut seen)?;
         }
     }
+    Ok(players)
+}
+
+fn resolve_chessabc_player(agent: &ureq::Agent, query: &str) -> Result<ChessAbcPlayer> {
+    if query.chars().all(|c| c.is_ascii_digit()) {
+        return Ok(ChessAbcPlayer {
+            fide_id: query.to_string(),
+            name: query.to_string(),
+            rating: 0,
+        });
+    }
+
+    let players = collect_chessabc_candidates(agent, query)?;
     if players.is_empty() {
         bail!("ChessABC found no player matching {query}");
     }
     Ok(choose_chessabc_player(&players, query).expect("non-empty player list"))
+}
+
+/// Search ChessABC for every player profile matching `query`, highest rated
+/// first. Used by the preparation setup dialog so an ambiguous name shows a
+/// checklist instead of silently picking one profile.
+pub fn search_chessabc_candidates(query: &str) -> Result<Vec<ChessAbcPlayer>> {
+    let query = validate_query(OnlineSource::ChessAbc, query)?.to_string();
+    if query.chars().all(|c| c.is_ascii_digit()) {
+        return Ok(vec![ChessAbcPlayer {
+            fide_id: query.clone(),
+            name: query,
+            rating: 0,
+        }]);
+    }
+    let agent = ureq::AgentBuilder::new()
+        .user_agent(USER_AGENT)
+        .timeout_connect(Duration::from_secs(20))
+        .timeout(Duration::from_secs(180))
+        .build();
+    let mut players = collect_chessabc_candidates(&agent, &query)?;
+    players.sort_by(|a, b| {
+        b.rating
+            .cmp(&a.rating)
+            .then_with(|| a.name.cmp(&b.name))
+            .then_with(|| a.fide_id.cmp(&b.fide_id))
+    });
+    Ok(players)
+}
+
+/// Pick the unambiguous ChessABC profile for `query`, if there is one:
+/// an exact FIDE id, a single full-name exact match, or a single
+/// surname-initial match whose rating is within 100 Elo of `player_elo`
+/// (or any single surname-initial match when no Elo is known).
+/// Anything else returns `None` so the UI can ask the user to choose.
+pub fn auto_select_chessabc_candidate(
+    candidates: &[ChessAbcPlayer],
+    query: &str,
+    player_elo: Option<u32>,
+) -> Option<ChessAbcPlayer> {
+    let trimmed = query.trim();
+    if !trimmed.is_empty() && trimmed.chars().all(|c| c.is_ascii_digit()) {
+        return candidates
+            .iter()
+            .find(|player| player.fide_id == trimmed)
+            .cloned();
+    }
+    let query_key = crate::players::player_key(trimmed)?;
+    let exact: Vec<&ChessAbcPlayer> = candidates
+        .iter()
+        .filter(|player| {
+            crate::players::player_key(&player.name).as_deref() == Some(query_key.as_str())
+        })
+        .collect();
+    if exact.len() == 1 {
+        return Some((*exact[0]).clone());
+    }
+    if !exact.is_empty() {
+        return None;
+    }
+    let truncated: Vec<&ChessAbcPlayer> = candidates
+        .iter()
+        .filter(|player| {
+            crate::players::matches_truncated_or_enumerated_name(trimmed, &player.name)
+        })
+        .collect();
+    if truncated.len() != 1 {
+        return None;
+    }
+    let only = truncated[0];
+    match player_elo {
+        Some(elo) => {
+            let rating = u64::from(elo);
+            if only.rating.abs_diff(rating) <= 100 {
+                Some(only.clone())
+            } else {
+                None
+            }
+        }
+        None => Some(only.clone()),
+    }
+}
+
+/// Download a player's ChessABC games directly by FIDE id. Used when the
+/// preparation setup dialog resolved the opponent to explicit profiles.
+pub fn fetch_chessabc_games_by_fide_id(
+    fide_id: &str,
+    max_games: usize,
+) -> Result<Vec<domain::Game>> {
+    let fide_id = fide_id.trim();
+    if fide_id.is_empty() || fide_id.len() > 16 || !fide_id.chars().all(|c| c.is_ascii_digit()) {
+        bail!("invalid FIDE id");
+    }
+    let max_games = max_games.clamp(1, 5000);
+    let agent = ureq::AgentBuilder::new()
+        .user_agent(USER_AGENT)
+        .timeout_connect(Duration::from_secs(20))
+        .timeout(Duration::from_secs(180))
+        .build();
+    let (body, _) = download_chessabc_games(&agent, fide_id, max_games, &mut |_message| {})?;
+    let games = domain::parse_pgn(body.as_bytes()).context("parsing downloaded games")?;
+    if games.is_empty() {
+        bail!("ChessABC returned no parseable games for FIDE id {fide_id}");
+    }
+    Ok(games)
 }
 
 fn fetch_chessabc_search(
@@ -952,6 +1061,78 @@ mod tests {
             "Carlsen, Magnus"
         );
         assert!(validate_query(OnlineSource::ChessAbc, "name/../other").is_err());
+    }
+
+    #[test]
+    fn chessabc_auto_select_picks_only_unambiguous_profiles() {
+        let carlsen = |fide_id: &str, rating: u64| ChessAbcPlayer {
+            fide_id: fide_id.to_string(),
+            name: "Carlsen, Magnus".to_string(),
+            rating,
+        };
+        // Exact FIDE id wins even among several profiles.
+        let candidates = vec![
+            carlsen("1503014", 2823),
+            ChessAbcPlayer {
+                fide_id: "999".to_string(),
+                name: "Carlsen, Christian".to_string(),
+                rating: 1626,
+            },
+        ];
+        assert_eq!(
+            auto_select_chessabc_candidate(&candidates, "1503014", None)
+                .unwrap()
+                .fide_id,
+            "1503014"
+        );
+        assert!(auto_select_chessabc_candidate(&candidates, "1234567", None).is_none());
+        // A single full-name exact match is unambiguous.
+        assert_eq!(
+            auto_select_chessabc_candidate(&candidates, "Magnus Carlsen", None)
+                .unwrap()
+                .fide_id,
+            "1503014"
+        );
+        // Two full-name exact matches are ambiguous.
+        let doubled = vec![carlsen("1503014", 2823), carlsen("1704444", 2500)];
+        assert!(auto_select_chessabc_candidate(&doubled, "Magnus Carlsen", None).is_none());
+        // A single surname-initial match with compatible Elo is selected.
+        let initial = vec![
+            ChessAbcPlayer {
+                fide_id: "1".to_string(),
+                name: "Hinterreiter,M".to_string(),
+                rating: 2450,
+            },
+            ChessAbcPlayer {
+                fide_id: "2".to_string(),
+                name: "Huber, M".to_string(),
+                rating: 1800,
+            },
+        ];
+        assert_eq!(
+            auto_select_chessabc_candidate(&initial, "Hinterreiter, Martin", Some(2500))
+                .unwrap()
+                .fide_id,
+            "1"
+        );
+        // An incompatible Elo (>100 away) stays ambiguous.
+        assert!(
+            auto_select_chessabc_candidate(&initial, "Hinterreiter, Martin", Some(1800)).is_none()
+        );
+        // Two surname-initial matches for the same query stay ambiguous.
+        let paired = vec![
+            ChessAbcPlayer {
+                fide_id: "1".to_string(),
+                name: "Meyer,M 1".to_string(),
+                rating: 2400,
+            },
+            ChessAbcPlayer {
+                fide_id: "2".to_string(),
+                name: "Meyer,M 2".to_string(),
+                rating: 2350,
+            },
+        ];
+        assert!(auto_select_chessabc_candidate(&paired, "Meyer, Max", Some(2400)).is_none());
     }
 
     #[test]

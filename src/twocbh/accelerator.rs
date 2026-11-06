@@ -26,10 +26,13 @@
 //!   visited set and a cap of `block_count + 1` blocks.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::fs;
+use std::fs::{self, File};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
+use memmap2::Mmap;
 
 use super::TwoCbhFile;
 
@@ -66,12 +69,27 @@ type InlineEntry = (u64, u64, u32);
 /// `(first_block, last_block, count, overflow_chunks)` of a chained entry.
 type ChainedEntry = (u64, u64, u32, Vec<Vec<u64>>);
 
-/// A validated `.2lgd` sidecar.
+/// A validated `.2lgd` sidecar backed by a memory map (zero heap copy).
 #[derive(Clone, Debug)]
 pub struct TwoCbhAccelerator {
     path: PathBuf,
-    bytes: Vec<u8>,
+    backing: Arc<Backing>,
     block_count: usize,
+}
+
+#[derive(Debug)]
+enum Backing {
+    Mapped(Mmap),
+    Owned(Vec<u8>),
+}
+
+impl Backing {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Mapped(mmap) => mmap,
+            Self::Owned(vec) => vec,
+        }
+    }
 }
 
 impl TwoCbhAccelerator {
@@ -86,14 +104,61 @@ impl TwoCbhAccelerator {
         PathBuf::from(name)
     }
 
-    /// Open and validate an existing sidecar.
+    /// Open and validate an existing sidecar via `mmap` (no 2.2 GB heap
+    /// copy); falls back to an owned read only when mapping fails.
     pub fn open(path: &Path) -> Result<Self> {
-        let bytes =
-            fs::read(path).with_context(|| format!("reading 2LGD sidecar {}", path.display()))?;
-        Self::from_bytes(path.to_path_buf(), bytes)
+        let started = Instant::now();
+        let mapped = File::open(path)
+            .with_context(|| format!("opening 2LGD sidecar {}", path.display()))
+            .and_then(|file| {
+                // SAFETY: read-only map; the sidecar is treated as immutable
+                // while open.
+                unsafe { Mmap::map(&file) }
+                    .with_context(|| format!("mapping 2LGD sidecar {}", path.display()))
+            });
+        let backing = match mapped {
+            Ok(mmap) => {
+                tracing::debug!(
+                    "2LGD mmap {} ({:.1} MiB) in {:.2}s",
+                    path.display(),
+                    mmap.len() as f64 / (1024.0 * 1024.0),
+                    started.elapsed().as_secs_f64()
+                );
+                Backing::Mapped(mmap)
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "2LGD mmap failed for {} ({err:#}); falling back to read",
+                    path.display()
+                );
+                let bytes = fs::read(path)
+                    .with_context(|| format!("reading 2LGD sidecar {}", path.display()))?;
+                return Self::from_bytes(path.to_path_buf(), bytes);
+            }
+        };
+        let elapsed = started.elapsed();
+        if elapsed.as_millis() > 100 {
+            tracing::warn!(
+                "slow 2LGD open {} took {:.2}s",
+                path.display(),
+                elapsed.as_secs_f64()
+            );
+        } else {
+            tracing::info!(
+                "2LGD open {} took {:.2}s",
+                path.display(),
+                elapsed.as_secs_f64()
+            );
+        }
+        Self::from_backing(path.to_path_buf(), backing)
     }
 
     fn from_bytes(path: PathBuf, bytes: Vec<u8>) -> Result<Self> {
+        Self::from_backing(path, Backing::Owned(bytes))
+    }
+
+    fn from_backing(path: PathBuf, backing: Backing) -> Result<Self> {
+        let bytes = backing.as_slice();
         if bytes.len() < LGD_HEADER_LEN {
             bail!("{} is shorter than a 2LGD header", path.display());
         }
@@ -118,9 +183,13 @@ impl TwoCbhAccelerator {
         }
         Ok(Self {
             path,
-            bytes,
+            backing: Arc::new(backing),
             block_count,
         })
+    }
+
+    fn bytes(&self) -> &[u8] {
+        self.backing.as_slice()
     }
 
     pub fn path(&self) -> &Path {
@@ -137,7 +206,7 @@ impl TwoCbhAccelerator {
             bail!("2LGD block {id} is outside 0..{}", self.block_count);
         }
         let at = LGD_HEADER_LEN + id * LGD_BLOCK_LEN;
-        self.bytes
+        self.bytes()
             .get(at..at + LGD_BLOCK_LEN)
             .with_context(|| format!("2LGD block {id} is truncated"))
     }
@@ -251,6 +320,7 @@ impl TwoCbhAccelerator {
     /// Build a sidecar for `cbh` with one scan of `1..slot_count` and write
     /// it to `path` using exactly the layout above.
     pub fn build_to(cbh: &TwoCbhFile, path: &Path) -> Result<()> {
+        let build_started = Instant::now();
         let mut player: HashMap<u32, Vec<u32>> = HashMap::new();
         let mut event: HashMap<u32, Vec<u32>> = HashMap::new();
         let mut source: HashMap<u32, Vec<u32>> = HashMap::new();
@@ -450,6 +520,19 @@ impl TwoCbhAccelerator {
         }
         fs::write(path, &file)
             .with_context(|| format!("writing 2LGD sidecar {}", path.display()))?;
+        let elapsed = build_started.elapsed();
+        tracing::info!(
+            "2LGD build_to {} took {:.2}s ({block_count} blocks)",
+            path.display(),
+            elapsed.as_secs_f64()
+        );
+        if elapsed.as_millis() > 100 {
+            tracing::warn!(
+                "slow 2LGD build_to {} took {:.2}s",
+                path.display(),
+                elapsed.as_secs_f64()
+            );
+        }
         Ok(())
     }
 }
@@ -603,5 +686,31 @@ mod tests {
         // Empty slot: entity 3 has no postings.
         assert!(acc.event_games(3).unwrap().is_empty());
         let _ = std::fs::remove_file(&dir);
+    }
+
+    #[test]
+    fn open_uses_mmap_backing_and_clones_cheaply() {
+        let (path, _dir) = temp_stem("mmap-open");
+        let games = vec![Ok(test_game("Alpha, A", "Beta, B", "Mmap Open"))];
+        crate::twocbh::writer::write_database_with_options(
+            &path,
+            crate::twocbh::writer::TwoCbhWriteOptions {
+                allow_annotation_loss: true,
+            },
+            games,
+        )
+        .unwrap();
+        let cbh = TwoCbhFile::open(&path).unwrap();
+        let sidecar = TwoCbhAccelerator::path_for(&path);
+        TwoCbhAccelerator::build_to(&cbh, &sidecar).unwrap();
+        let acc = TwoCbhAccelerator::open(&sidecar).unwrap();
+        assert!(acc.block_count() > 0);
+        // Mmap-backed: byte length matches the file size exactly without a
+        // heap copy per open, and clones share the mapping.
+        let len = std::fs::metadata(&sidecar).unwrap().len() as usize;
+        assert_eq!(acc.bytes().len(), len);
+        let cloned = acc.clone();
+        assert_eq!(cloned.bytes().len(), len);
+        assert_eq!(cloned.block_count(), acc.block_count());
     }
 }

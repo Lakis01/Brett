@@ -602,10 +602,94 @@ pub fn player_key(name: &str) -> Option<String> {
     Some(words.join(" "))
 }
 
-static CHESSCOM_SITE_RE: std::sync::LazyLock<regex::Regex> =
-    std::sync::LazyLock::new(|| regex::Regex::new(r"(?i)\bchess\.?com\b").expect("valid regex"));
+/// Split a name into normalized alphanumeric tokens, dropping standalone
+/// numbers (ChessABC enumeration suffixes such as the `1` in `M 1`).
+fn name_tokens(name: &str) -> Vec<String> {
+    name.split(|c: char| !c.is_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .map(|token| token.to_lowercase())
+        .filter(|token| token.chars().any(|c| c.is_alphabetic()))
+        .collect()
+}
 
-static CHESSCOM_ONLINE_EVENT_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(
+/// Surname of a normalized token list: the comma head (`Surname, Given`) or
+/// the last token (`First Surname`).
+fn surname_of(full: &str, tokens: &[String]) -> String {
+    if let Some((head, _)) = full.split_once(',') {
+        name_tokens(head).join("")
+    } else {
+        tokens.last().cloned().unwrap_or_default()
+    }
+}
+
+/// Match a canonical full name (`Surname, First`) against a truncated or
+/// enumerated ChessABC-style candidate (`Surname, F`, `Surname, F.`,
+/// `Surname, F 1`, `Surname,F`, or a reordered `First Surname`).
+///
+/// Comparison is case- and punctuation-insensitive; the surname must match
+/// exactly while the given name may match exactly or by initial. A missing
+/// given part on either side still matches on the surname alone.
+pub fn matches_truncated_or_enumerated_name(full: &str, cand: &str) -> bool {
+    let full_tokens = name_tokens(full);
+    let cand_tokens = name_tokens(cand);
+    if full_tokens.is_empty() || cand_tokens.is_empty() {
+        return false;
+    }
+    let surname = surname_of(full, &full_tokens);
+    if surname.is_empty() || !cand_tokens.contains(&surname) {
+        return false;
+    }
+    let full_given: Vec<&String> = full_tokens
+        .iter()
+        .filter(|token| **token != surname)
+        .collect();
+    let cand_given: Vec<&String> = cand_tokens
+        .iter()
+        .filter(|token| **token != surname)
+        .collect();
+    // Surname-only on either side matches on the surname alone. Repeated
+    // surnames (e.g. double-barrelled names tokenized twice) are ignored.
+    let Some(full_first) = full_given.first().map(|token| token.as_str()) else {
+        return true;
+    };
+    let Some(cand_first) = cand_given.first().map(|token| token.as_str()) else {
+        return true;
+    };
+    if full_first == cand_first {
+        return true;
+    }
+    match (full_first.chars().next(), cand_first.chars().next()) {
+        (Some(f), Some(c)) if f == c => {
+            // An initial on either side matches the full token: `M` matches
+            // `martin` and vice versa.
+            full_first.chars().count() == 1 || cand_first.chars().count() == 1
+        }
+        _ => false,
+    }
+}
+
+/// Normalize the `White`/`Black` tags of a game to the canonical opponent
+/// name when they name the same player through a truncated or enumerated
+/// ChessABC spelling (e.g. `Hinterreiter,M 1` vs `Hinterreiter, Martin`).
+/// Without this the book's canonical-key colour match drops those games.
+pub fn canonicalize_player_tags(game: &mut Game, canonical_name: &str) {
+    let canonical_key = player_key(canonical_name);
+    for side in ["White", "Black"] {
+        let Some(current) = game.header(side) else {
+            continue;
+        };
+        if current == canonical_name {
+            continue;
+        }
+        if player_key(current).as_deref() == canonical_key.as_deref()
+            || matches_truncated_or_enumerated_name(canonical_name, current)
+        {
+            game.set_header(side, canonical_name.to_string());
+        }
+    }
+}
+
+static CHESSCOM_TOURNAMENT_EVENT_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(
     || {
         regex::Regex::new(
         r"(?i)(\btitled\s+tuesday\b|\bpro(?:\s+chess)?\s+league\b|\barena\s+kings\b|\b(?:speed|bullet)\s+chess\s+championship\b)",
@@ -614,41 +698,53 @@ static CHESSCOM_ONLINE_EVENT_RE: std::sync::LazyLock<regex::Regex> = std::sync::
     },
 );
 
-static ONLINE_SITE_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-    regex::Regex::new(r"(?i)^(?:\?|int|internet|online|tornelo|chess\.com.*)$")
+/// Chess.com's online tournament site marker (`Site "Chess.com INT"`).
+static CHESSCOM_INT_SITE_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"(?i)\bchess\.?com\b.*\bint\b|\bint\b.*\bchess\.?com\b")
         .expect("valid regex")
 });
 
-/// Determine whether a game belongs to an online Chess.com event that should
-/// be excluded from serious opening preparation to avoid database pollution.
+/// Event keywords that mark a Chess.com INT game as a tournament game rather
+/// than an ordinary online account game.
+static TOURNAMENT_KEYWORD_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(
+        r"(?i)\b(tournament|championship|league|cup|arena|swiss|grand\s*prix|qualifier|playoff|final|open|tuesday|kings)\b",
+    )
+    .expect("valid regex")
+});
+
+/// Determine whether a game belongs to a Chess.com online tournament that
+/// should be excluded from serious opening preparation.
 ///
-/// Returns `true` for online blitz/bullet/rapid events on Chess.com (such as
-/// Titled Tuesday, Arena Kings, Speed Chess Championship, or games with
-/// Site `Chess.com INT`). Physical OTB tournaments sponsored by Chess.com
-/// (e.g. `Chess.com Isle of Man International` with Site `Douglas, Isle of Man`)
-/// are kept.
-pub fn is_chesscom_event(event: &str, site: &str) -> bool {
+/// Returns `true` only for Chess.com tournament events (Titled Tuesday, Arena
+/// Kings, Speed/Bullet Chess Championship, Pro Chess League, or `Site`
+/// `Chess.com INT` games whose event carries tournament keywords). Ordinary
+/// online account games — even when their `Site` mentions Chess.com — are
+/// kept, so user-added online accounts are never filtered out by this check.
+/// Physical OTB tournaments sponsored by Chess.com (e.g.
+/// `Chess.com Isle of Man International` with Site `Douglas, Isle of Man`)
+/// are also kept.
+pub fn is_chesscom_tournament_game(event: &str, site: &str) -> bool {
     let site_trimmed = site.trim();
     let event_trimmed = event.trim();
 
-    // 1. Explicit online event names that are uniquely Chess.com
-    if CHESSCOM_ONLINE_EVENT_RE.is_match(event_trimmed) {
+    // 1. Named Chess.com tournament events, wherever they were reported.
+    if CHESSCOM_TOURNAMENT_EVENT_RE.is_match(event_trimmed) {
         return true;
     }
 
-    // 2. Site is explicitly Chess.com
-    if CHESSCOM_SITE_RE.is_match(site_trimmed) {
-        return true;
-    }
-
-    // 3. Event mentions Chess.com and site is either missing, generic online/int, or not physical
-    if CHESSCOM_SITE_RE.is_match(event_trimmed)
-        && (site_trimmed.is_empty() || site_trimmed == "?" || ONLINE_SITE_RE.is_match(site_trimmed))
+    // 2. Chess.com INT site with an event that reads like a tournament.
+    if CHESSCOM_INT_SITE_RE.is_match(site_trimmed) && TOURNAMENT_KEYWORD_RE.is_match(event_trimmed)
     {
         return true;
     }
 
     false
+}
+
+/// Backwards-compatible alias for [`is_chesscom_tournament_game`].
+pub fn is_chesscom_event(event: &str, site: &str) -> bool {
+    is_chesscom_tournament_game(event, site)
 }
 
 /// Broad time-control bucket for preparation filtering.
@@ -778,8 +874,8 @@ fn looks_online(event: &str, site: &str) -> bool {
             return true;
         }
     }
-    // Chess.com online events per the existing detector also count.
-    is_chesscom_event(event, site)
+    // Chess.com tournament events per the detector above also count.
+    is_chesscom_tournament_game(event, site)
 }
 
 fn is_rated_game(game: &Game) -> bool {
@@ -874,7 +970,8 @@ pub struct PrepFilterConfig {
     pub include_online: bool,
     pub online_time_controls: TimeControlMask,
     pub online_date_cutoff: DateCutoff,
-    pub online_rated_only: bool,
+    pub include_rated: bool,
+    pub include_casual: bool,
 }
 
 impl Default for PrepFilterConfig {
@@ -885,7 +982,8 @@ impl Default for PrepFilterConfig {
             include_online: true,
             online_time_controls: TimeControlMask::default(),
             online_date_cutoff: DateCutoff::Months(24),
-            online_rated_only: true,
+            include_rated: true,
+            include_casual: true,
         }
     }
 }
@@ -904,7 +1002,11 @@ impl PrepFilterConfig {
             if !self.include_online {
                 return false;
             }
-            if self.online_rated_only && !is_rated {
+            if is_rated {
+                if !self.include_rated {
+                    return false;
+                }
+            } else if !self.include_casual {
                 return false;
             }
             if !self.online_time_controls.matches(tc) {
@@ -932,12 +1034,103 @@ impl PrepFilterConfig {
     }
 }
 
+/// Per-account filter for one linked online account. Applied when the
+/// account's games are fetched, so enabling an account never requires
+/// rebuilding the book.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AccountFilter {
+    pub include_rated: bool,
+    pub include_casual: bool,
+    pub min_elo: Option<u16>,
+    pub max_elo: Option<u16>,
+    pub date_cutoff: DateCutoff,
+    pub time_controls: TimeControlMask,
+}
+
+impl Default for AccountFilter {
+    fn default() -> Self {
+        Self {
+            include_rated: true,
+            include_casual: true,
+            min_elo: None,
+            max_elo: None,
+            date_cutoff: DateCutoff::Months(24),
+            time_controls: TimeControlMask::default(),
+        }
+    }
+}
+
+impl AccountFilter {
+    /// Reason this filter cannot match any game, if any. Used for the
+    /// zero-overlap warning badge on the account row.
+    pub fn has_zero_overlap(&self) -> Option<&'static str> {
+        if !self.include_rated && !self.include_casual {
+            return Some("rated and casual are both off — no games can pass");
+        }
+        if !self.time_controls.classical
+            && !self.time_controls.rapid
+            && !self.time_controls.blitz
+            && !self.time_controls.bullet
+        {
+            return Some("all time controls are off — no games can pass");
+        }
+        if let (Some(min), Some(max)) = (self.min_elo, self.max_elo)
+            && min > max
+        {
+            return Some("minimum Elo is above maximum Elo — no games can pass");
+        }
+        None
+    }
+
+    /// Check one fetched game against this account filter. The Elo bounds
+    /// apply to the higher of the two recorded Elos; games without Elo tags
+    /// pass the Elo check.
+    pub fn matches_game(&self, game: &Game, as_of: u32) -> bool {
+        let (tc, _is_online, is_rated) = classify_game_metadata(game);
+        if is_rated {
+            if !self.include_rated {
+                return false;
+            }
+        } else if !self.include_casual {
+            return false;
+        }
+        if !self.time_controls.matches(tc) {
+            return false;
+        }
+        if !self
+            .date_cutoff
+            .matches(parse_date(game.date()).unwrap_or(0), as_of)
+        {
+            return false;
+        }
+        if self.min_elo.is_some() || self.max_elo.is_some() {
+            let min = self.min_elo.unwrap_or(0);
+            let max = self.max_elo.unwrap_or(u16::MAX);
+            let mut found = false;
+            let mut in_range = false;
+            for tag in [game.header("WhiteElo"), game.header("BlackElo")] {
+                if let Some(elo) = tag.and_then(|text| text.trim().parse::<u16>().ok()) {
+                    found = true;
+                    if elo >= min && elo <= max {
+                        in_range = true;
+                    }
+                }
+            }
+            if found && !in_range {
+                return false;
+            }
+        }
+        true
+    }
+}
+
 /// One linked online account used for preparation imports.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PrepOnlineAccount {
     pub source: OnlineSource,
     pub username: String,
     pub enabled: bool,
+    pub filter: AccountFilter,
 }
 
 impl PrepOnlineAccount {
@@ -963,7 +1156,72 @@ impl PrepOnlineAccount {
             "service": Self::service_slug(self.source),
             "username": self.username,
             "enabled": self.enabled,
+            "filter": {
+                "include_rated": self.filter.include_rated,
+                "include_casual": self.filter.include_casual,
+                "min_elo": self.filter.min_elo,
+                "max_elo": self.filter.max_elo,
+                "date_cutoff": match self.filter.date_cutoff {
+                    DateCutoff::AllTime => serde_json::json!("all"),
+                    DateCutoff::Months(months) => serde_json::json!({"months": months}),
+                    DateCutoff::SinceDate(date) => serde_json::json!({"since": date}),
+                },
+                "time_controls": {
+                    "classical": self.filter.time_controls.classical,
+                    "rapid": self.filter.time_controls.rapid,
+                    "blitz": self.filter.time_controls.blitz,
+                    "bullet": self.filter.time_controls.bullet,
+                },
+            },
         })
+    }
+
+    fn account_filter_from_value(value: &serde_json::Value) -> AccountFilter {
+        let mut filter = AccountFilter::default();
+        if let Some(rated) = value
+            .get("include_rated")
+            .and_then(serde_json::Value::as_bool)
+        {
+            filter.include_rated = rated;
+        }
+        if let Some(casual) = value
+            .get("include_casual")
+            .and_then(serde_json::Value::as_bool)
+        {
+            filter.include_casual = casual;
+        }
+        filter.min_elo = value
+            .get("min_elo")
+            .and_then(serde_json::Value::as_u64)
+            .filter(|elo| *elo > 0 && *elo <= 4000)
+            .map(|elo| elo as u16);
+        filter.max_elo = value
+            .get("max_elo")
+            .and_then(serde_json::Value::as_u64)
+            .filter(|elo| *elo > 0 && *elo <= 4000)
+            .map(|elo| elo as u16);
+        if let Some(cutoff) = value.get("date_cutoff") {
+            if cutoff.as_str().is_some_and(|text| text == "all") {
+                filter.date_cutoff = DateCutoff::AllTime;
+            } else if let Some(months) = cutoff.get("months").and_then(serde_json::Value::as_u64) {
+                filter.date_cutoff = DateCutoff::Months(months.clamp(1, 1200) as u32);
+            } else if let Some(since) = cutoff.get("since").and_then(serde_json::Value::as_u64) {
+                filter.date_cutoff = DateCutoff::SinceDate(since as u32);
+            }
+        }
+        if let Some(mask) = value.get("time_controls") {
+            for (key, slot) in [
+                ("classical", &mut filter.time_controls.classical),
+                ("rapid", &mut filter.time_controls.rapid),
+                ("blitz", &mut filter.time_controls.blitz),
+                ("bullet", &mut filter.time_controls.bullet),
+            ] {
+                if let Some(enabled) = mask.get(key).and_then(serde_json::Value::as_bool) {
+                    *slot = enabled;
+                }
+            }
+        }
+        filter
     }
 
     pub fn from_value(value: &serde_json::Value) -> Option<Self> {
@@ -985,6 +1243,10 @@ impl PrepOnlineAccount {
                 .get("enabled")
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(true),
+            filter: value
+                .get("filter")
+                .map(Self::account_filter_from_value)
+                .unwrap_or_default(),
         })
     }
 }
@@ -1443,7 +1705,7 @@ impl PlayerBook {
     }
 
     fn add_game(&mut self, game: &Game, game_index: Option<usize>) {
-        if self.config.exclude_chesscom && is_chesscom_event(game.event(), game.site()) {
+        if self.config.exclude_chesscom && is_chesscom_tournament_game(game.event(), game.site()) {
             return;
         }
         let white_key = player_key(game.white());
@@ -1746,6 +2008,11 @@ impl PlayerBook {
         filter: &PrepFilterConfig,
         ply: u32,
     ) -> bool {
+        // Shallow positions (fewer than 4 plies) never count: the colours
+        // have barely been established, so a "swapped" sample here is noise.
+        if ply < 4 {
+            return false;
+        }
         let (n, w) = self.filtered_game_count(key, our_color, filter);
         if n >= 3 {
             return true;
@@ -3233,36 +3500,61 @@ mod tests {
     }
 
     #[test]
-    fn chesscom_tournament_exclusion_regex() {
-        // Online Chess.com events are excluded
-        assert!(is_chesscom_event(
+    fn chesscom_tournament_exclusion_scoping() {
+        // Named Chess.com tournament events are excluded
+        assert!(is_chesscom_tournament_game(
             "Titled Tuesday intern op 21st Feb Early",
             "Chess.com INT"
         ));
-        assert!(is_chesscom_event("Titled Tuesday", ""));
-        assert!(is_chesscom_event("Arena Kings Season 9", "?"));
-        assert!(is_chesscom_event(
+        assert!(is_chesscom_tournament_game("Titled Tuesday", ""));
+        assert!(is_chesscom_tournament_game("Arena Kings Season 9", "?"));
+        assert!(is_chesscom_tournament_game(
             "Speed Chess Championship Main Event",
             "chess.com"
         ));
-        assert!(is_chesscom_event("Bullet Chess Championship", "Internet"));
-        assert!(is_chesscom_event(
+        assert!(is_chesscom_tournament_game(
+            "Bullet Chess Championship",
+            "Internet"
+        ));
+        assert!(is_chesscom_tournament_game(
             "PRO Chess League Prelims",
             "chess.com INT"
         ));
-        assert!(is_chesscom_event("Random Online Blitz", "Chess.com"));
+        // Chess.com INT site with a tournament event is excluded
+        assert!(is_chesscom_tournament_game(
+            "Club Championship Qualifier",
+            "Chess.com INT"
+        ));
+
+        // Ordinary online account games are kept, even on Chess.com
+        assert!(!is_chesscom_tournament_game(
+            "Random Online Blitz",
+            "Chess.com"
+        ));
+        assert!(!is_chesscom_tournament_game("Casual game", "Chess.com"));
+        assert!(!is_chesscom_tournament_game("Live Chess", "Chess.com INT"));
 
         // OTB tournaments are preserved, even if sponsored by Chess.com
-        assert!(!is_chesscom_event("Tata Steel Masters", "Wijk aan Zee"));
-        assert!(!is_chesscom_event("World Championship Match", "Dubai"));
-        assert!(!is_chesscom_event(
+        assert!(!is_chesscom_tournament_game(
+            "Tata Steel Masters",
+            "Wijk aan Zee"
+        ));
+        assert!(!is_chesscom_tournament_game(
+            "World Championship Match",
+            "Dubai"
+        ));
+        assert!(!is_chesscom_tournament_game(
             "Chess.com Isle of Man International",
             "Douglas, Isle of Man"
         ));
-        assert!(!is_chesscom_event(
+        assert!(!is_chesscom_tournament_game(
             "FIDE Chess.com Grand Swiss",
             "Douglas IOM"
         ));
+
+        // The legacy alias agrees with the scoped detector.
+        assert!(is_chesscom_event("Titled Tuesday", ""));
+        assert!(!is_chesscom_event("Random Online Blitz", "Chess.com"));
     }
 
     #[test]
@@ -3364,6 +3656,252 @@ mod tests {
                 ("TimeControl", "180+1"),
             ],
         )
+    }
+
+    fn casual_online_game(white: &str, black: &str, date: &str, movetext: &str) -> Game {
+        game_with_headers(
+            movetext,
+            &[
+                ("Event", "Casual game"),
+                ("Site", "lichess.org"),
+                ("Date", date),
+                ("White", white),
+                ("Black", black),
+                ("Result", "1-0"),
+                ("TimeControl", "180+1"),
+            ],
+        )
+    }
+
+    #[test]
+    fn truncated_and_enumerated_names_match_full_name() {
+        assert!(matches_truncated_or_enumerated_name(
+            "Hinterreiter, Martin",
+            "Hinterreiter, M"
+        ));
+        assert!(matches_truncated_or_enumerated_name(
+            "Hinterreiter, Martin",
+            "Hinterreiter,M"
+        ));
+        assert!(matches_truncated_or_enumerated_name(
+            "Hinterreiter, Martin",
+            "Hinterreiter, M."
+        ));
+        assert!(matches_truncated_or_enumerated_name(
+            "Hinterreiter, Martin",
+            "Hinterreiter, M 1"
+        ));
+        assert!(matches_truncated_or_enumerated_name(
+            "Carlsen, Magnus",
+            "Carlsen, M 2"
+        ));
+        assert!(matches_truncated_or_enumerated_name(
+            "Carlsen, Magnus",
+            "Magnus Carlsen"
+        ));
+        assert!(matches_truncated_or_enumerated_name(
+            "CARLSEN, magnus",
+            "carlsen m."
+        ));
+        assert!(matches_truncated_or_enumerated_name("Carlsen", "Carlsen"));
+        assert!(!matches_truncated_or_enumerated_name(
+            "Carlsen, Magnus",
+            "Carlsen, H"
+        ));
+        assert!(!matches_truncated_or_enumerated_name(
+            "Carlsen, Magnus",
+            "Nakamura, M"
+        ));
+        assert!(!matches_truncated_or_enumerated_name(
+            "Carlsen, Magnus",
+            "Carlsen, Hikaru"
+        ));
+        assert!(!matches_truncated_or_enumerated_name("", "Carlsen, M"));
+        assert!(!matches_truncated_or_enumerated_name(
+            "Carlsen, Magnus",
+            "?"
+        ));
+    }
+
+    #[test]
+    fn canonicalized_tags_keep_truncated_chessabc_games() {
+        let mut game = otb_game("Hinterreiter,M 1", "Opponent", "2025.05.01", "1. e4 e5 1-0");
+        canonicalize_player_tags(&mut game, "Hinterreiter, Martin");
+        assert_eq!(game.white(), "Hinterreiter, Martin");
+        assert_eq!(game.black(), "Opponent");
+        // A genuinely different player is untouched.
+        let mut other = otb_game("Nakamura, H", "Opponent", "2025.05.01", "1. e4 e5 1-0");
+        canonicalize_player_tags(&mut other, "Hinterreiter, Martin");
+        assert_eq!(other.white(), "Nakamura, H");
+    }
+
+    #[test]
+    fn rated_and_casual_toggles_filter_online_games() {
+        let rated = online_game("Opponent", "Trendy", "2025.06.01", "1. e4 c5 2. Nf3 d6 1-0");
+        let casual =
+            casual_online_game("Opponent", "Trendy", "2025.06.01", "1. e4 c5 2. Nf3 d6 0-1");
+        let book = PlayerBook::from_games(
+            "trendy",
+            "Trendy",
+            &[rated, casual],
+            PredictionConfig::default(),
+            2026_1001,
+        );
+        let after_e4 = Chess::default()
+            .play(
+                SanPlus::from_ascii(b"e4")
+                    .unwrap()
+                    .san
+                    .to_move(&Chess::default())
+                    .unwrap(),
+            )
+            .unwrap();
+        let key = position::position_key(&after_e4);
+        let both = PrepFilterConfig::default();
+        assert!(both.include_rated && both.include_casual);
+        assert_eq!(
+            book.filtered_moves(key, Color::Black, &both)
+                .iter()
+                .map(|m| m.games)
+                .sum::<u32>(),
+            2
+        );
+        let rated_only = PrepFilterConfig {
+            include_casual: false,
+            ..PrepFilterConfig::default()
+        };
+        assert_eq!(
+            book.filtered_moves(key, Color::Black, &rated_only)
+                .iter()
+                .map(|m| m.games)
+                .sum::<u32>(),
+            1
+        );
+        let casual_only = PrepFilterConfig {
+            include_rated: false,
+            ..PrepFilterConfig::default()
+        };
+        assert_eq!(
+            book.filtered_moves(key, Color::Black, &casual_only)
+                .iter()
+                .map(|m| m.games)
+                .sum::<u32>(),
+            1
+        );
+        let neither = PrepFilterConfig {
+            include_rated: false,
+            include_casual: false,
+            ..PrepFilterConfig::default()
+        };
+        assert!(book.filtered_moves(key, Color::Black, &neither).is_empty());
+    }
+
+    #[test]
+    fn account_filter_zero_overlap_badge_logic() {
+        assert!(AccountFilter::default().has_zero_overlap().is_none());
+        assert!(
+            AccountFilter {
+                include_rated: false,
+                include_casual: false,
+                ..AccountFilter::default()
+            }
+            .has_zero_overlap()
+            .is_some()
+        );
+        assert!(
+            AccountFilter {
+                time_controls: TimeControlMask {
+                    classical: false,
+                    rapid: false,
+                    blitz: false,
+                    bullet: false,
+                },
+                ..AccountFilter::default()
+            }
+            .has_zero_overlap()
+            .is_some()
+        );
+        assert!(
+            AccountFilter {
+                min_elo: Some(2500),
+                max_elo: Some(2000),
+                ..AccountFilter::default()
+            }
+            .has_zero_overlap()
+            .is_some()
+        );
+        // A bounded but consistent range overlaps.
+        assert!(
+            AccountFilter {
+                min_elo: Some(2000),
+                max_elo: Some(2500),
+                ..AccountFilter::default()
+            }
+            .has_zero_overlap()
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn account_filter_matches_games() {
+        let filter = AccountFilter::default();
+        let as_of = 2026_1001;
+        let rated = online_game("Opponent", "Trendy", "2025.06.01", "1. e4 e5 1-0");
+        assert!(filter.matches_game(&rated, as_of));
+        let casual = casual_online_game("Opponent", "Trendy", "2025.06.01", "1. e4 e5 1-0");
+        assert!(filter.matches_game(&casual, as_of));
+        let no_casual = AccountFilter {
+            include_casual: false,
+            ..AccountFilter::default()
+        };
+        assert!(no_casual.matches_game(&rated, as_of));
+        assert!(!no_casual.matches_game(&casual, as_of));
+        // Elo bounds apply when tags are present; untagged games pass.
+        let mut elo_game = rated.clone();
+        elo_game.set_header("WhiteElo", "2600".to_string());
+        elo_game.set_header("BlackElo", "2550".to_string());
+        let bounded = AccountFilter {
+            min_elo: Some(2400),
+            max_elo: Some(2700),
+            ..AccountFilter::default()
+        };
+        assert!(bounded.matches_game(&elo_game, as_of));
+        let too_strong = AccountFilter {
+            min_elo: Some(2700),
+            ..AccountFilter::default()
+        };
+        assert!(!too_strong.matches_game(&elo_game, as_of));
+        assert!(too_strong.matches_game(&rated, as_of));
+        // Stale games fall outside the default 24-month window.
+        let stale = online_game("Opponent", "Trendy", "2020.03.01", "1. e4 e5 1-0");
+        assert!(!filter.matches_game(&stale, as_of));
+    }
+
+    #[test]
+    fn account_filter_round_trips_through_json() {
+        let account = PrepOnlineAccount {
+            source: OnlineSource::Lichess,
+            username: "DrNykterstein".to_string(),
+            enabled: true,
+            filter: AccountFilter {
+                include_casual: false,
+                min_elo: Some(2200),
+                max_elo: Some(2800),
+                date_cutoff: DateCutoff::Months(12),
+                ..AccountFilter::default()
+            },
+        };
+        let restored = PrepOnlineAccount::from_value(&account.to_value()).expect("round trip");
+        assert_eq!(restored, account);
+        // Legacy entries without a filter object keep working.
+        let legacy = serde_json::json!({
+            "service": "chesscom",
+            "username": "hikaru",
+            "enabled": false,
+        });
+        let restored = PrepOnlineAccount::from_value(&legacy).expect("legacy entry");
+        assert_eq!(restored.filter, AccountFilter::default());
+        assert!(!restored.enabled);
     }
 
     #[test]
@@ -3530,15 +4068,19 @@ mod tests {
         let filter = PrepFilterConfig::default();
         let start = position::position_key(&Chess::default());
         assert!(
-            book.has_swapped_color_experience(start, Color::White, &filter, 2),
-            "three games with our colour is meaningful"
+            !book.has_swapped_color_experience(start, Color::White, &filter, 2),
+            "positions shallower than 4 plies never count as swapped experience"
         );
         assert!(
-            has_meaningful_swapped_color_experience(&book, start, Color::White, &filter, 2),
+            book.has_swapped_color_experience(start, Color::White, &filter, 4),
+            "three games with our colour is meaningful once the line is deep enough"
+        );
+        assert!(
+            has_meaningful_swapped_color_experience(&book, start, Color::White, &filter, 4),
             "free-function wrapper agrees"
         );
         assert!(
-            !book.has_swapped_color_experience(start, Color::Black, &filter, 2),
+            !book.has_swapped_color_experience(start, Color::Black, &filter, 4),
             "no Black games exist in this fixture"
         );
         // Two games are meaningful once the line is deep.
@@ -3549,7 +4091,7 @@ mod tests {
             PredictionConfig::default(),
             2026_1001,
         );
-        assert!(!pair.has_swapped_color_experience(start, Color::White, &filter, 2));
+        assert!(!pair.has_swapped_color_experience(start, Color::White, &filter, 4));
         assert!(pair.has_swapped_color_experience(start, Color::White, &filter, 8));
     }
 
