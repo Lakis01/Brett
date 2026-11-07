@@ -699,9 +699,23 @@ struct PrepRecentRow {
     white_fide_id: Option<String>,
     black_fide_id: Option<String>,
     subtitle: String,
+    /// Up to six mainline plies that follow this position in the game,
+    /// rendered on the recent-game row (for example `3. Bb5 a6 4. Ba4`).
+    continuation: String,
     /// Game-type pill colour + label from `classify_game_metadata`.
     type_color: Color32,
     type_label: &'static str,
+}
+
+/// A game whose moves are being browsed with the keyboard while its row is
+/// hovered. `cursor_node` moves through the game without touching the
+/// preparation cursor in `self.node`.
+#[derive(Clone, Debug)]
+struct HoveredGameBrowse {
+    id: String,
+    game: Game,
+    anchor_node: usize,
+    cursor_node: usize,
 }
 
 /// Read-only game preview. The previous game, row, and cursor are kept intact
@@ -1012,6 +1026,8 @@ pub struct App {
     player_book_status: String,
     prep: Option<PrepSession>,
     prep_recent_limit: usize,
+    /// Show every game reaching the position instead of only the last N.
+    prep_recent_all: bool,
     prep_exclude_chesscom: bool,
     /// Ordered aliases for the user. The first match sets board orientation on
     /// open; the first alias replaces `You` in preparation tags.
@@ -1150,6 +1166,10 @@ pub struct App {
     /// Position temporarily overlaid on the board while a candidate move is
     /// hovered in the tree, engine, or reference panels.
     hover_preview: Option<HoverPreview>,
+    /// Row under the pointer whose game can be stepped with arrow keys.
+    hovered_game_browse: Option<HoveredGameBrowse>,
+    /// True while a game row is hovered in the current frame.
+    hovered_game_active_this_frame: bool,
     online_open: bool,
     online_source: OnlineSource,
     online_username: String,
@@ -1432,6 +1452,7 @@ impl App {
             player_book_status: "Select a player to build their preparation book.".to_string(),
             prep: None,
             prep_recent_limit: display_prefs.prep_recent_limit,
+            prep_recent_all: true,
             prep_exclude_chesscom: preparation_prefs.exclude_chesscom,
             prep_player_names: preparation_prefs.prep_player_names.clone(),
             prep_mode: preparation_prefs.prep_mode,
@@ -1528,6 +1549,8 @@ impl App {
             rating_priority: display_prefs.rating_priority,
             show_all_ratings: display_prefs.show_all_ratings,
             hover_preview: None,
+            hovered_game_browse: None,
+            hovered_game_active_this_frame: false,
             online_open: false,
             online_source: OnlineSource::Lichess,
             online_username: String::new(),
@@ -10402,16 +10425,32 @@ impl App {
         });
 
         if right {
-            self.next_move();
+            if self.hovered_game_active_this_frame && self.hovered_game_browse.is_some() {
+                self.step_hovered_game(1);
+            } else {
+                self.next_move();
+            }
         }
         if left {
-            self.prev_move();
+            if self.hovered_game_active_this_frame && self.hovered_game_browse.is_some() {
+                self.step_hovered_game(-1);
+            } else {
+                self.prev_move();
+            }
         }
         if home {
-            self.goto(0);
+            if self.hovered_game_active_this_frame && self.hovered_game_browse.is_some() {
+                self.step_hovered_game(isize::MIN / 2);
+            } else {
+                self.goto(0);
+            }
         }
         if end {
-            self.go_end();
+            if self.hovered_game_active_this_frame && self.hovered_game_browse.is_some() {
+                self.step_hovered_game(isize::MAX / 2);
+            } else {
+                self.go_end();
+            }
         }
         if page_up {
             self.goto(0);
@@ -11175,6 +11214,7 @@ impl App {
                                     &subtitle,
                                     width,
                                     42.0,
+                                    None,
                                 )
                                 .clicked()
                                 {
@@ -11354,8 +11394,16 @@ impl App {
                             &subtitle,
                             width,
                             row_h - 2.0,
+                            Some(type_color),
                         );
-                        paint_game_type_dot(ui, response.rect, type_color);
+                        if response.hovered()
+                            && let Some(game) = self.prep_merged_games.get(position).cloned()
+                        {
+                            self.activate_hovered_game_browse(
+                                format!("merged:{position}"),
+                                game,
+                            );
+                        }
                         if response.clicked() {
                             merged_preview = Some(position);
                         }
@@ -11479,8 +11527,8 @@ impl App {
                         &subtitle,
                         width,
                         row_h - 2.0,
+                        Some(type_color),
                     );
-                    paint_game_type_dot(ui, response.rect, type_color);
                     if response.sense.senses_drag() {
                         response.dnd_set_drag_payload(GameRowDrag { id });
                     }
@@ -11858,7 +11906,38 @@ impl App {
         ui.separator();
 
         let row_h = 42.0;
-        let total = game_indices.len();
+        let merged_active = self
+            .prep
+            .as_ref()
+            .is_some_and(|prep| prep.player_key == player.key)
+            && !self.prep_merged_games.is_empty();
+        let merged_positions: Vec<usize> = if merged_active {
+            let mut out = Vec::new();
+            for (position, game) in self.prep_merged_games.iter().enumerate() {
+                let player_white = players::player_key(game.white()).as_deref()
+                    == Some(player.key.as_str());
+                let player_black = players::player_key(game.black()).as_deref()
+                    == Some(player.key.as_str());
+                if !player_white && !player_black {
+                    continue;
+                }
+                if let Some(color) = prep_color {
+                    let want_white = color == Color::White;
+                    if want_white != player_white {
+                        continue;
+                    }
+                }
+                out.push(position);
+            }
+            out
+        } else {
+            Vec::new()
+        };
+        let total = if merged_active {
+            merged_positions.len()
+        } else {
+            game_indices.len()
+        };
         ui.label(RichText::new(format!("Games ({total})")).strong());
         if let Some(color) = prep_color {
             ui.label(
@@ -11873,6 +11952,69 @@ impl App {
         }
         if total == 0 {
             ui.label(RichText::new("No games for this player.").weak());
+        } else if merged_active {
+            let mut merged_preview: Option<usize> = None;
+            egui::ScrollArea::vertical()
+                .id_salt("player-games")
+                .auto_shrink([false, false])
+                .show_rows(ui, row_h, total, |ui, range| {
+                    for pos in range {
+                        let Some(&position) = merged_positions.get(pos) else {
+                            continue;
+                        };
+                        let Some(game) = self.prep_merged_games.get(position) else {
+                            continue;
+                        };
+                        let player_white = players::player_key(game.white()).as_deref()
+                            == Some(player.key.as_str());
+                        let (opponent, opponent_color, color) = if player_white {
+                            (game.black().to_string(), Color::Black, "White")
+                        } else {
+                            (game.white().to_string(), Color::White, "Black")
+                        };
+                        let (type_color, _) = game_type_style(game);
+                        let subtitle = format!(
+                            "{} · {} · {}",
+                            game.result(),
+                            game.event(),
+                            game.date()
+                        );
+                        let width = ui.available_width();
+                        let response = game_row(
+                            ui,
+                            false,
+                            "vs ",
+                            RowName::new(&opponent, player_title(game, opponent_color))
+                                .with_country(
+                                    player_country(game, opponent_color).map(|c| c.badge),
+                                )
+                                .with_fide_id(
+                                    player_fide_id(game, opponent_color).as_deref(),
+                                ),
+                            None,
+                            &format!(" · as {color}"),
+                            &subtitle,
+                            width,
+                            row_h - 2.0,
+                            Some(type_color),
+                        );
+                        if response.hovered() {
+                            self.activate_hovered_game_browse(
+                                format!("player:{position}"),
+                                game.clone(),
+                            );
+                        }
+                        if response.clicked() {
+                            merged_preview = Some(position);
+                        }
+                    }
+                });
+            if let Some(position) = merged_preview
+                && let Some(game) = self.prep_merged_games.get(position).cloned()
+            {
+                let label = format!("Preparation game {} · read only", position + 1);
+                self.open_game_preview(game, label);
+            }
         } else {
             egui::ScrollArea::vertical()
                 .id_salt("player-games")
@@ -11991,6 +12133,11 @@ impl App {
                             .is_some_and(|id| self.current_slot == Some(id))
                             && self.prep.is_none();
                         let width = ui.available_width();
+                        let probe = Game {
+                            headers: vec![("Event".to_string(), event.clone())],
+                            ..Game::default()
+                        };
+                        let (type_color, _) = game_type_style(&probe);
                         if game_row(
                             ui,
                             selected,
@@ -12003,6 +12150,7 @@ impl App {
                             &subtitle,
                             width,
                             row_h - 2.0,
+                            Some(type_color),
                         )
                         .clicked()
                         {
@@ -14650,6 +14798,7 @@ impl App {
                         outcome_label(&result, game.color),
                         event
                     ),
+                    continuation: String::new(),
                     type_color,
                     type_label,
                 })
@@ -14680,6 +14829,12 @@ impl App {
                 let position = game_ref.index;
                 let game = self.prep_merged_games.get(position)?;
                 let (type_color, type_label) = game_type_style(game);
+                let continuation = continuation_moves_snippet(game, key, None);
+                let continuation_suffix = if continuation.is_empty() {
+                    String::new()
+                } else {
+                    format!(" · ▶ {continuation}")
+                };
                 Some(PrepRecentRow {
                     index: position,
                     merged_index: Some(position),
@@ -14692,13 +14847,15 @@ impl App {
                     white_fide_id: player_fide_id(game, Color::White).map(str::to_string),
                     black_fide_id: player_fide_id(game, Color::Black).map(str::to_string),
                     subtitle: format!(
-                        "{} · {} · as {} · {} · {}",
+                        "{} · {} · as {} · {} · {}{}",
                         type_label,
                         game.date(),
                         color_name(game_ref.color),
                         outcome_label(game.result(), game_ref.color),
-                        game.event()
+                        game.event(),
+                        continuation_suffix
                     ),
+                    continuation,
                     type_color,
                     type_label,
                 })
@@ -14865,6 +15022,7 @@ impl App {
             });
         let mut recent_limit = self.prep_recent_limit.clamp(1, 50);
         let mut recent_limit_changed = false;
+        let mut recent_all = self.prep_recent_all;
         let mut clicked = None;
         let mut preview = None;
         let mut merged_preview: Option<usize> = None;
@@ -14956,6 +15114,28 @@ impl App {
             prep_eval_by_san.values().map(|(score, _)| *score),
             pos.turn(),
         );
+        // Positions on the current preparation line. A candidate move that
+        // lands back on one of these repeats an ancestor instead of making
+        // progress, so those rows sort last and carry a recycle marker.
+        let ancestor_keys: HashSet<u64> = {
+            let mut keys = HashSet::new();
+            if let Some(game) = self.current.as_ref() {
+                let mut n = self.node.min(game.nodes.len().saturating_sub(1));
+                loop {
+                    if let Some(node) = game.nodes.get(n) {
+                        keys.insert(position::position_key(&node.pos));
+                        if let Some(parent) = node.parent {
+                            n = parent;
+                        } else {
+                            break;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+            }
+            keys
+        };
 
         // Chosen inside the tree below; applied after the scroll area so the
         // `reference_tree` borrow above can end first.
@@ -15206,12 +15386,26 @@ impl App {
                     } else if mode == crate::settings::PrepMode::Smart {
                         ui.add_space(4.0);
                         // Explicit probability order: highest predicted likelihood first.
+                        // Moves looping back to an ancestor in the current line
+                        // sort after genuine progress.
+                        let is_loop = |mv: Move| {
+                            pos.clone()
+                                .play(mv)
+                                .map(|after| {
+                                    ancestor_keys.contains(&position::position_key(&after))
+                                })
+                                .unwrap_or(false)
+                        };
                         let mut smart_rows: Vec<_> = player_moves.iter().collect();
                         smart_rows.sort_by(|a, b| {
-                            b.probability
-                                .total_cmp(&a.probability)
-                                .then(b.player_games.cmp(&a.player_games))
-                                .then(a.san.cmp(&b.san))
+                            is_loop(a.mv)
+                                .cmp(&is_loop(b.mv))
+                                .then(
+                                    b.probability
+                                        .total_cmp(&a.probability)
+                                        .then(b.player_games.cmp(&a.player_games))
+                                        .then(a.san.cmp(&b.san)),
+                                )
                         });
                         egui::Grid::new("prep-smart-grid")
                             .num_columns(8)
@@ -15225,13 +15419,23 @@ impl App {
 
                                 for row in &smart_rows {
                                     let prob_color = predicted_prob_color(row.probability);
-                                    let text = RichText::new(domain::figurine_san(&row.san))
+                                    let loops = is_loop(row.mv);
+                                    let mut label =
+                                        domain::figurine_san(&row.san).to_string();
+                                    if loops {
+                                        label.push_str(" ↺");
+                                    }
+                                    let text = RichText::new(label)
                                         .monospace()
                                         .strong()
                                         .color(prob_color);
-                                    let response = ui
-                                        .selectable_label(false, text)
-                                        .on_hover_text("Hover to preview · click to play");
+                                    let response = ui.selectable_label(false, text).on_hover_text(
+                                        if loops {
+                                            "Repeats an earlier position in this line"
+                                        } else {
+                                            "Hover to preview · click to play"
+                                        },
+                                    );
                                     if response.hovered() {
                                         hover_preview = preview_after_move(pos, row.mv);
                                     }
@@ -15378,13 +15582,37 @@ impl App {
                                 }
                                 ui.end_row();
 
-                                for row in &player_moves {
-                                    let text = RichText::new(domain::figurine_san(&row.san))
-                                        .monospace()
-                                        .strong();
-                                    let response = ui
-                                        .selectable_label(false, text)
-                                        .on_hover_text("Hover to preview · click to play");
+                                let mut classic_rows: Vec<_> = player_moves.iter().collect();
+                                classic_rows.sort_by_key(|row| {
+                                    pos.clone()
+                                        .play(row.mv)
+                                        .map(|after| {
+                                            ancestor_keys.contains(&position::position_key(&after))
+                                        })
+                                        .unwrap_or(false)
+                                });
+                                for row in &classic_rows {
+                                    let loops = pos
+                                        .clone()
+                                        .play(row.mv)
+                                        .map(|after| {
+                                            ancestor_keys.contains(&position::position_key(&after))
+                                        })
+                                        .unwrap_or(false);
+                                    let mut label =
+                                        domain::figurine_san(&row.san).to_string();
+                                    if loops {
+                                        label.push_str(" ↺");
+                                    }
+                                    let text =
+                                        RichText::new(label).monospace().strong();
+                                    let response = ui.selectable_label(false, text).on_hover_text(
+                                        if loops {
+                                            "Repeats an earlier position in this line"
+                                        } else {
+                                            "Hover to preview · click to play"
+                                        },
+                                    );
                                     if response.hovered() {
                                         hover_preview = preview_after_move(pos, row.mv);
                                     }
@@ -15585,6 +15813,8 @@ impl App {
                                 recent_limit_changed = true;
                             }
                             ui.label("games");
+                            ui.checkbox(&mut recent_all, "Show all")
+                                .on_hover_text("Show every game reaching this position, uncapped");
                         });
                         ui.label(
                             RichText::new(if use_unified {
@@ -15615,7 +15845,12 @@ impl App {
                             );
                         } else {
                             let width = (ui.available_width() - 4.0).max(100.0);
-                            for row in recent_rows.iter().take(recent_limit) {
+                            let visible: Vec<&PrepRecentRow> = if recent_all {
+                                recent_rows.iter().collect()
+                            } else {
+                                recent_rows.iter().take(recent_limit).collect()
+                            };
+                            for row in visible {
                                 let mut row_response = game_row(
                                     ui,
                                     false,
@@ -15632,10 +15867,20 @@ impl App {
                                     &row.subtitle,
                                     width,
                                     40.0,
+                                    Some(row.type_color),
                                 );
-                                paint_game_type_dot(ui, row_response.rect, row.type_color);
                                 row_response =
                                     row_response.on_hover_text(row.type_label);
+                                if row_response.hovered()
+                                    && let Some(merged) = row.merged_index
+                                    && let Some(game) =
+                                        self.prep_merged_games.get(merged).cloned()
+                                {
+                                    self.activate_hovered_game_browse(
+                                        format!("recent:{merged}"),
+                                        game,
+                                    );
+                                }
                                 if row_response.clicked()
                                 {
                                     if let Some(merged) = row.merged_index {
@@ -15645,7 +15890,7 @@ impl App {
                                     }
                                 }
                             }
-                            if recent_rows.len() > recent_limit {
+                            if !recent_all && recent_rows.len() > recent_limit {
                                 ui.label(
                                     RichText::new(format!(
                                         "Showing {} of {} recent games.",
@@ -15694,6 +15939,7 @@ impl App {
             self.prep_swapped_view = false;
         }
         self.prep_recent_limit = recent_limit;
+        self.prep_recent_all = recent_all;
         if recent_limit_changed {
             self.save_display_prefs();
         }
@@ -15728,9 +15974,125 @@ impl App {
         }
     }
 
+    /// Start (or continue) keyboard browsing for a hovered game row. The
+    /// cursor is anchored at the preparation position when the row first
+    /// activates, then preserved while the same row remains under the pointer.
+    fn activate_hovered_game_browse(&mut self, id: String, game: Game) {
+        if self
+            .hovered_game_browse
+            .as_ref()
+            .is_some_and(|browse| browse.id == id)
+        {
+            let preview = {
+                let browse = self.hovered_game_browse.as_mut().unwrap();
+                browse.game = game;
+                let cursor = browse.cursor_node.min(browse.game.nodes.len().saturating_sub(1));
+                browse.cursor_node = cursor;
+                browse.game.nodes.get(cursor).map(|node| HoverPreview {
+                    pos: node.pos.clone(),
+                    last_move: domain::last_move_squares(node),
+                })
+            };
+            self.hovered_game_active_this_frame = true;
+            if let Some(preview) = preview {
+                self.hover_preview = Some(preview);
+            }
+            return;
+        }
+        let current_key = self.current.as_ref().and_then(|current| {
+            current
+                .nodes
+                .get(self.node.min(current.nodes.len().saturating_sub(1)))
+                .map(|node| position::position_key(&node.pos))
+        });
+        let anchor_node = current_key
+            .and_then(|key| find_node_for_position_key(&game, key))
+            .unwrap_or(0);
+        let preview = game.nodes.get(anchor_node).map(|node| HoverPreview {
+            pos: node.pos.clone(),
+            last_move: domain::last_move_squares(node),
+        });
+        self.hovered_game_browse = Some(HoveredGameBrowse {
+            id,
+            game,
+            anchor_node,
+            cursor_node: anchor_node,
+        });
+        self.hovered_game_active_this_frame = true;
+        if let Some(preview) = preview {
+            self.hover_preview = Some(preview);
+        }
+    }
+
+    /// Move the hovered-game cursor by `delta` plies along its mainline.
+    fn step_hovered_game(&mut self, delta: isize) {
+        let preview = {
+            let Some(browse) = self.hovered_game_browse.as_mut() else {
+                return;
+            };
+            let mut node = browse
+                .cursor_node
+                .min(browse.game.nodes.len().saturating_sub(1));
+            if delta > 0 {
+                for _ in 0..delta {
+                    let Some(child) = browse
+                        .game
+                        .nodes
+                        .get(node)
+                        .and_then(|node| node.children.first().copied())
+                    else {
+                        break;
+                    };
+                    node = child;
+                }
+            } else {
+                for _ in 0..delta.unsigned_abs() {
+                    let Some(parent) = browse
+                        .game
+                        .nodes
+                        .get(node)
+                        .and_then(|node| node.parent)
+                    else {
+                        break;
+                    };
+                    node = parent;
+                }
+            }
+            browse.cursor_node = node;
+            browse.game.nodes.get(node).map(|node| HoverPreview {
+                pos: node.pos.clone(),
+                last_move: domain::last_move_squares(node),
+            })
+        };
+        self.hovered_game_active_this_frame = true;
+        if let Some(preview) = preview {
+            self.hover_preview = Some(preview);
+        }
+    }
+
     /// Open any game read-only while preserving the game and cursor that were
     /// on the board. Used by recent-game rows and Lichess top games.
+    /// Jumps to the current/browsed position instead of ply 0.
     fn open_game_preview(&mut self, game: Game, label: impl Into<String>) {
+        let return_key = self.current.as_ref().and_then(|return_game| {
+            return_game
+                .nodes
+                .get(self.node.min(return_game.nodes.len().saturating_sub(1)))
+                .map(|node| position::position_key(&node.pos))
+        });
+        let hovered_target = self
+            .hovered_game_browse
+            .as_ref()
+            .filter(|browse| same_game(&browse.game, &game))
+            .map(|browse| browse.cursor_node.min(game.nodes.len().saturating_sub(1)));
+        let target_node = hovered_target
+            .or_else(|| return_key.and_then(|key| find_node_for_position_key(&game, key)))
+            .unwrap_or(0);
+        self.open_game_preview_at(game, label, target_node);
+    }
+
+    /// Open a preview at an explicit node (hover-browsed or position-matched).
+    fn open_game_preview_at(&mut self, game: Game, label: impl Into<String>, target_node: usize) {
         if self.recent_preview.is_some() {
             return;
         }
@@ -15777,7 +16139,9 @@ impl App {
             self.orientation = locked;
         }
         self.focus_right_tab(RightTab::Moves);
-        self.goto(0);
+        self.goto(target_node);
+        self.hovered_game_browse = None;
+        self.hovered_game_active_this_frame = false;
         self.status = format!("Previewing {label}");
     }
 
@@ -16188,6 +16552,7 @@ impl App {
                                                 &subtitle,
                                                 width,
                                                 row_h - 2.0,
+                                                None,
                                             );
                                             if response.sense.senses_drag() {
                                                 response.dnd_set_drag_payload(ViewGameDrag {
@@ -17297,6 +17662,9 @@ impl eframe::App for App {
         self.hover_preview = None;
 
         self.handle_keys(&ctx);
+        // Hover state is refreshed by the game lists below; keys above used
+        // the previous frame's hover, which is what the user was looking at.
+        self.hovered_game_active_this_frame = false;
         self.menu_bar(ui);
         self.database_panel(ui);
         if self.online_reference_open {
@@ -17839,6 +18207,67 @@ fn preview_after_uci_move(pos: &Chess, uci: UciMove) -> Option<HoverPreview> {
 
 fn preview_after_move(pos: &Chess, mv: Move) -> Option<HoverPreview> {
     preview_after_uci_move(pos, UciMove::from_move(mv, CastlingMode::Standard))
+}
+
+/// Node in `game` whose position matches `target_key`.
+fn find_node_for_position_key(game: &Game, target_key: u64) -> Option<usize> {
+    game.nodes
+        .iter()
+        .position(|node| position::position_key(&node.pos) == target_key)
+}
+
+/// Two separately loaded copies of the same game, compared by the metadata
+/// that survives a library round trip.
+fn same_game(a: &Game, b: &Game) -> bool {
+    a.nodes.len() == b.nodes.len()
+        && a.white() == b.white()
+        && a.black() == b.black()
+        && a.date() == b.date()
+        && a.result() == b.result()
+        && a.event() == b.event()
+}
+
+/// Up to six mainline plies from the node matching `key` (or `cursor_node`),
+/// formatted for a compact recent-game row (`3. Bb5 a6 4. Ba4 Nf6`).
+fn continuation_moves_snippet(game: &Game, key: u64, cursor_node: Option<usize>) -> String {
+    let Some(start) = cursor_node
+        .filter(|&node| {
+            game.nodes
+                .get(node)
+                .is_some_and(|node| position::position_key(&node.pos) == key)
+        })
+        .or_else(|| find_node_for_position_key(game, key))
+    else {
+        return String::new();
+    };
+    let mut out = String::new();
+    let mut node = start;
+    for _ in 0..6 {
+        let Some(child) = game
+            .nodes
+            .get(node)
+            .and_then(|node| node.children.first().copied())
+        else {
+            break;
+        };
+        let Some(mv) = game.nodes.get(child).and_then(|node| node.mv.as_ref()) else {
+            break;
+        };
+        let san = domain::figurine_san(&mv.san);
+        if mv.color == Color::White {
+            if !out.is_empty() {
+                out.push(' ');
+            }
+            out.push_str(&format!("{}. {san}", mv.number));
+        } else if out.is_empty() {
+            out.push_str(&format!("{}... {san}", mv.number));
+        } else {
+            out.push(' ');
+            out.push_str(&san);
+        }
+        node = child;
+    }
+    out
 }
 
 /// Convert a UCI principal variation into figurine SAN moves, keeping the
@@ -20413,6 +20842,7 @@ fn game_row(
     subtitle: &str,
     width: f32,
     height: f32,
+    text_color: Option<Color32>,
 ) -> egui::Response {
     let sense = if rows_are_draggable(ui) {
         Sense::click_and_drag()
@@ -20433,7 +20863,7 @@ fn game_row(
 
     let name_format = TextFormat {
         font_id: FontId::proportional(14.0),
-        color: visuals.strong_text_color(),
+        color: text_color.unwrap_or_else(|| visuals.strong_text_color()),
         ..Default::default()
     };
     let title_format = TextFormat {
@@ -21859,12 +22289,6 @@ fn slot_game_type_by_headers(
     game_type_style(&game)
 }
 
-/// Paint a small game-type dot at the right edge of a game row.
-fn paint_game_type_dot(ui: &Ui, rect: egui::Rect, color: Color32) {
-    let center = pos2(rect.right() - 12.0, rect.center().y);
-    ui.painter().circle_filled(center, 4.0, color);
-}
-
 /// Load every game naming `canonical_name` from an already-open library
 /// (2CBH/CBH/SCID/PGN all arrive here through [`open_library`]). The
 /// backend's per-player accelerator is preferred; otherwise the headers are
@@ -23199,6 +23623,7 @@ mod tests {
                     "Paris · 1858",
                     300.0,
                     40.0,
+                    None,
                 );
                 sense = Some(response.sense);
             });
@@ -23524,6 +23949,7 @@ mod tests {
             player_book_status: String::new(),
             prep: None,
             prep_recent_limit: 10,
+            prep_recent_all: true,
             prep_exclude_chesscom: false,
             prep_player_names: Vec::new(),
             prep_mode: crate::settings::PrepMode::default(),
@@ -23603,6 +24029,8 @@ mod tests {
             rating_priority: RatingPriority::Elo,
             show_all_ratings: false,
             hover_preview: None,
+            hovered_game_browse: None,
+            hovered_game_active_this_frame: false,
             online_open: false,
             online_source: OnlineSource::Lichess,
             online_username: String::new(),
@@ -26341,5 +26769,38 @@ mod tests {
         let loaded = DisplayPrefs::load();
         assert!(!loaded.show_annotations);
         assert!(!loaded.show_pgn_tags);
+    }
+
+    #[test]
+    fn open_game_preview_starts_at_current_preparation_position_not_ply_zero() {
+        let mut app = test_app();
+        let prep_pgn = b"[Event \"Preparation\"]\n[White \"You\"]\n[Black \"Kern, Johannes\"]\n\n1. e4 e5 2. Nf3 Nc6 *\n";
+        app.current = Some(crate::domain::parse_pgn(prep_pgn).unwrap().remove(0));
+        app.goto(3); // after 1. e4 e5 2. Nf3
+
+        let recent_pgn = b"[White \"Player A\"]\n[Black \"Kern, Johannes\"]\n\n1. e4 e5 2. Nf3 Nc6 3. Bb5 a6 1-0\n";
+        let recent_game = crate::domain::parse_pgn(recent_pgn).unwrap().remove(0);
+        app.open_game_preview(recent_game, "Recent game 1");
+        assert_eq!(
+            app.node, 3,
+            "clicking recent game must load at the position we were just at (ply 3), not ply 0"
+        );
+    }
+
+    #[test]
+    fn hovered_game_arrow_keys_step_hovered_game_and_update_preview() {
+        let mut app = test_app();
+        let prep_pgn = b"[Event \"Preparation\"]\n[White \"You\"]\n[Black \"Kern, Johannes\"]\n\n1. e4 e5 *\n";
+        app.current = Some(crate::domain::parse_pgn(prep_pgn).unwrap().remove(0));
+        app.goto(2); // after 1. e4 e5
+
+        let hovered_pgn = b"[White \"X\"]\n[Black \"Kern, Johannes\"]\n\n1. e4 e5 2. Nf3 Nc6 3. Bc4 *\n";
+        let hovered_game = crate::domain::parse_pgn(hovered_pgn).unwrap().remove(0);
+        app.activate_hovered_game_browse("merged:0".to_string(), hovered_game);
+        assert_eq!(app.hovered_game_browse.as_ref().unwrap().cursor_node, 2);
+
+        app.step_hovered_game(1);
+        assert_eq!(app.hovered_game_browse.as_ref().unwrap().cursor_node, 3);
+        assert_eq!(app.node, 2, "preparation node must not move while stepping hovered game");
     }
 }
