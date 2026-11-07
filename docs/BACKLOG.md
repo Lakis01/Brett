@@ -8,17 +8,21 @@ in `README.md`; this file tracks what is next.
 community-maintained project. Functional correctness, data safety, and clear
 documentation come first; visual polish is queued and may land incrementally.
 
-**Status (2026-11-07 backlog sync):** items 1–7, 11–14, and 17 are implemented, and the latest
-moves-panel interaction polish is complete. Item 39's preparation/predictor
-round-2 batch largely landed 2026-11-07 (opponent-repetition continuation
-indexing, `Schnellschach`/J1 classification, `.2lid` accelerator lookup,
-uncapped online/ChessABC fetch, composite eval bar with chessdb.cn + DB
-aggregate, streaming multi-source prep with cached account checks, book
-reference tree, font-colored rows with hover/arrow-key browsing); only
-`predict_v2` calibration (adaptive `alpha0`) remains queued. Item 8's cloud, opening-tree,
-reference-source, and native-book parts are done; M2b mega-scale ingest remains,
-with the first safety pass now keeping huge archives responsive and avoiding
-automatic full indexing. Item 9's editable session, database views,
+**Status (2026-11-07 Cycle 2 backlog sync):** items 1–7, 11–14, 17, 39 (largely), and 40 are implemented,
+and the latest moves-panel interaction polish and Cycle 2 preparation/trends features are complete.
+Cycle 2 landed 2026-11-07 (opponent-search resolution and `bye` placeholder exclusion + honorific
+stripping in `player_key`, ChessABC `>=1`-game profile filtering and collapsed most-probable selection
+with bounded scroll, `F11` fullscreen toggle, unified Recent Games limit ComboBox selector,
+compact folded `chessdb.cn` candidate moves without Lichess hits, Live Reference Tree & Default Book
+support for `live:lichess-masters`, `live:lichess-all`, and `live:chessabc`, plus Live Trend Sources
+`TrendSource::ActiveTree`/`ChessAbc`/`LichessMasters`/`LichessAll` with Lichess `&since` querying,
+recent window-count trends, empirical-Bayes shrunk trend badges, and an outdated database warning for
+bases older than 180 days). Item 39's preparation/predictor round-2 batch largely landed
+(repetition indexing, uncapped fetch, composite eval bar, streaming prep, hover browsing); only
+`predict_v2` calibration (adaptive `alpha0` + unseen alpha) and move overlay remain queued.
+Item 8's cloud, opening-tree, reference-source, and native-book parts are done; M2b mega-scale ingest
+remains, with the first safety pass now keeping huge archives responsive and avoiding automatic full
+indexing (Mega open freeze fixes queued). Item 9's editable session, database views,
 reorder/merge, PGN export, native SCID writer, classic CBH writer, 2CBH writer,
 and unified **Save database** / **Save database as…** flow are done. Item 10 is
 no longer blocked: the current ICCF SCID source is available and the automatic
@@ -262,7 +266,7 @@ opponent-rating, local-engine, and fully incremental reference-refresh features
 remain deferred; a changed reference source rebuilds the cached window.
 
 **Next-gen evolution (queued, design pass done; scheduled for implementation — do not mark done):** *Smart Preparation v2 & Move Predictor v2* (Hierarchical Empirical-Bayes / Dirichlet-Multinomial). Multi-source merge (Current DB + Reference Mega via `.2lgd`/`.cbp`/`.brettacc` + ChessABC one-shot + multiple Lichess/Chess.com accounts per site persisted per `player_key`), cross-source dedup (spine hash first 30 plies + ±3 days/`YYYYMM`), dual Classic Stats vs Smart Predictor modes, separate OTB vs Online pre-filters (TC Classical/Rapid/Blitz/Bullet, date cutoff All/6/12/24/60mo, rated-only, `include_online` default ON, instant `<1ms` refilter), recency `2^(-dt/365)*w_tc` (`1.0`/`0.85`/`0.65`), facing-color left-list filter + Last X games, swapped-color smart threshold (`N>=3` OR `(N>=2 AND (ply>=8 OR W>=1.2))` OR `(ply>=14 AND recent<=12mo)`) with Show N games selection view, Consistency (inverse perplexity) + Booked-up (mean theory exit ply) badges, strict OTB prior (correspondence never; hierarchy Reference->Tree->Masters->CurrentDB+tip; ChessABC games one-shot not per-ply), threshold-capped inferred moves (`>=8%`, max 3, separate section). **Preparation UX (queued — design done, scheduled):** File->Prepare menu with opponent picker; board orientation pinned to user side; ChessABC default-ON with truncated/enumerated name resolution (auto + multi-profile checklist); online accounts exclude ChessABC service; per-account expandable filters with separate Rated+Casual ticks (both default ON) and zero-overlap ⚠️ badge; Chess.com tournament-games-only exclusion; clear prep panel (Predicted-first color-coded sorted Smart table, Played vs Inferred sections, Your-move Times-Faced view, 📖 In PlayerBook badges, ply>=4 swapped gate); game-type color coding (Classical emerald / Rapid-Blitz sky / Online violet) in left + recent lists. Requires dedicated design pass done.
-  - **Round-2 fixes (largely landed 2026-11-07; `predict_v2` calibration still queued):** opponent-reply indexing (both colors in `PlayerBook`, `Be3`/`Bc4`/`Bg5`/`f3` cases via edge-deduplicated post-repetition indexing); strict reference tree (never current DB, typo fix). See item 39 for the full prep/predictor round-2 batch.
+  - **Round-2 & Cycle 2 fixes (largely landed 2026-11-07; `predict_v2` calibration still queued):** opponent-reply indexing (both colors in `PlayerBook`, `Be3`/`Bc4`/`Bg5`/`f3` cases via edge-deduplicated post-repetition indexing); strict reference tree (never current DB, typo fix); live reference sources (`live:lichess-masters`, `live:lichess-all`, `live:chessabc`) and live trend sources (`TrendSource`) with outdated DB warning. See items 39 and 40 for details.
 
 **Goal:** make preparation probabilities honest, calibrated, and less dependent
 on the loaded player database.
@@ -393,7 +397,9 @@ part of the roadmap.
   readers now live in `src/book.rs` and `src/book/`.
 - **Reference sources (done):** the Refs tab exposes the current database and
   a Mega-style reference database path, plus Lichess/Chess.com/ChessABC
-  opponent lookups (each service listed once). Importing is **File → Import**.
+  opponent lookups (each service listed once). Live reference sources
+  (`live:lichess-masters`, `live:lichess-all`, `live:chessabc`) can also be selected
+  as the general reference tree or default opening book directly. Importing is **File → Import**.
   The correspondence database is configured in **Settings**, not Refs.
 - **Reference merging:** combine several databases into one opening tree
   without rebuilding unrelated caches.
@@ -517,16 +523,19 @@ position-index book marking.
 
 ## 12. Preparation mode refinements
 
-**Status:** implemented (baseline). Preparation starts with the board oriented to the
+**Status:** implemented (baseline + Cycle 1/2 refinements). Preparation starts with the board oriented to the
 prepared player's side, with the name-priority list taking precedence. The
 left-hand game list filters to the prepared player's relevant color, the
-right-hand recent-games panel follows the current position and persists a
-1–50 limit, and ChessABC's latest games can be loaded on demand. Recent-game
+right-hand recent-games panel follows the current position with a unified limit selector
+(`All`, `5`, `10`, `15`, `25`, `50`, `100`), and ChessABC candidate resolution defaults to the
+most-probable profile with `>=1` games and a collapsed checklist. `bye` placeholders are excluded
+and honorifics stripped. Live reference tree/book sources (`live:lichess-masters`, `live:lichess-all`,
+`live:chessabc`) and live trend sources are supported. Recent-game
 rows remain read-only previews and preserve the preparation node, tab, and
 orientation.
 
-**Queued evolution:** Smart Preparation v2 extends this with multi-source merge/dedup, dual Classic Stats vs Smart Predictor modes, OTB vs Online pre-filters (instant `<1ms` refilter), facing-color/Last X filters, swapped-color smart threshold + Show N games view, and profile badges. **Preparation UX (queued — design done, scheduled):** File->Prepare menu with opponent picker; board orientation pinned to user side; ChessABC default-ON with truncated/enumerated name resolution (auto + multi-profile checklist); online accounts exclude ChessABC service; per-account expandable filters with separate Rated+Casual ticks (both default ON) and zero-overlap ⚠️ badge; Chess.com tournament-games-only exclusion; clear prep panel (Predicted-first color-coded sorted Smart table, Played vs Inferred sections, Your-move Times-Faced view, 📖 In PlayerBook badges, ply>=4 swapped gate); game-type color coding (Classical emerald / Rapid-Blitz sky / Online violet) in left + recent lists. See item 6 (next-gen evolution) for the full spec. Design pass done; scheduled for implementation — do not mark done.
-  - **Round-2 UX/fixes (largely landed 2026-11-07):** opponent banner top; search hidden when selected; ChessABC all-games label; live account `✓`/`✗` confirmations; fresh-start File → Prepare without open DB (`open_library` for reference + extra incl `2cbh`/`cbh`/`si4`, accelerated extraction); merged left + recent lists; Site/TimeControl color fix; `🟢` glyph fix; Your-Move line-grid removal. See item 39.
+**Queued evolution:** Smart Preparation v2 extends this with multi-source merge/dedup, dual Classic Stats vs Smart Predictor modes, OTB vs Online pre-filters (instant `<1ms` refilter), facing-color/Last X filters, swapped-color smart threshold + Show N games view, and profile badges. **Preparation UX (queued — design done, scheduled):** File->Prepare menu with opponent picker; board orientation pinned to user side; online accounts exclude ChessABC service; per-account expandable filters with separate Rated+Casual ticks (both default ON) and zero-overlap ⚠️ badge; Chess.com tournament-games-only exclusion; clear prep panel (Predicted-first color-coded sorted Smart table, Played vs Inferred sections, Your-move Times-Faced view, 📖 In PlayerBook badges, ply>=4 swapped gate); game-type color coding (Classical emerald / Rapid-Blitz sky / Online violet) in left + recent lists; hover game move overlay in moves section. See item 6 (next-gen evolution) for the full spec. Design pass done; scheduled for implementation — do not mark done.
+  - **Round-2 UX/fixes (largely landed 2026-11-07):** opponent banner top; search hidden when selected; ChessABC all-games label; live account `✓`/`✗` confirmations; fresh-start File → Prepare without open DB (`open_library` for reference + extra incl `2cbh`/`cbh`/`si4`, accelerated extraction); merged left + recent lists; Site/TimeControl color fix; `🟢` glyph fix; Your-Move line-grid removal. See items 39 and 40.
 
 - **Board orientation:** when preparation starts, flip the board to the side the
   prepared player will play (or the user’s side, per the explicit setting). Do
@@ -554,7 +563,8 @@ orientation.
 ## 13. Cloud analysis depth and ChessABC
 
 **Status:** Lichess depth/full-line display, ChessABC import/reference search,
-the ChessABC preparation list, and the compact chessdb-only tail in the Cloud
+the ChessABC preparation list (with `>=1`-game filtering, candidate relevance pruning, and collapsed
+most-probable selection), and compact folded chessdb-only candidate moves in the Cloud
 Engine table are implemented.
 
 - **Lichess depth:** show the Lichess cloud-evaluation depth as part of the
@@ -582,11 +592,13 @@ Engine table are implemented.
 - **ChessABC preparation (done):** Prep Mode can load the prepared player’s
   latest ChessABC games on demand, filters them to the side being prepared,
   respects the recent-game limit, and opens them as read-only previews.
-- **Compact chessdb-only tail (implemented 2026-10-29):** when the primary
-  Cloud Engine table ends with chessdb-only rows (no Lichess line), fold that
-  trailing group into one horizontal compact line showing only the eval and
-  move chips. Reuse the existing “More moves” chip renderer; do not give each
-  one-ply row its own variation column.
+  Profiles with 0 games are filtered out (`GET /games/player/paginated?fideId={id}&page=0&size=1`),
+  candidate relevance is checked, the dialog selects the single most-probable profile
+  by default and keeps the candidate list collapsed, and bounded scrolling avoids screen overflow.
+- **Compact folded chessdb moves (implemented 2026-10-29, refined 2026-11-07):** all
+  candidate moves from chessdb are shown without artificial truncation. Moves without Lichess hits
+  or local engine evaluations fold into a single compact `horizontal_wrapped` row with `chessdb:` prefix,
+  fitting multiple moves across 1–2 rows without fabricating `[Lichess d0]` evaluations.
 - Keep Lichess and Chess.com behavior unchanged. Do not scrape the web client
   when the JSON API is available.
 
@@ -625,6 +637,8 @@ Engine table are implemented.
 - **Round/Board shortening (implemented 2026-10-29):** **Round** and **Board**
   are shown in full by default; `R`/`B` appear only when the header row would
   otherwise squeeze the event below a usable width.
+- **Fullscreen toggle (implemented 2026-11-07):** `F11` (or `Fn+F11`) toggles
+  fullscreen immediately, handled before egui consumes keyboard input.
 - **Keyboard line playthrough:** hovering or selecting an engine, Lichess, or
   opening-tree line should let the user step through it with the arrow keys /
   `Enter` without replacing the open game; `Esc` returns to the game cursor.
@@ -726,11 +740,15 @@ See `THIRD_PARTY_NOTICES.md` and [`GPL_OPTIONS.md`](GPL_OPTIONS.md).
 
 ## 18. Recently trending move popularity
 
-**Status:** backend implemented 2026-10-29; the Tree shows a compact trend
-badge, tooltip, and egui sparkline (`src/recent.rs::sparkline_points`/
-`baseline_y`, `src/app.rs::draw_trend_sparkline`), and **Settings → Move trends**
-exposes the window, baseline, and minimum sample. Moves-panel sparkline/trend
-rendering remains planned.
+**Status:** backend implemented 2026-10-29; Cycle 2 (2026-11-07) landed live trend
+sources (`TrendSource::ActiveTree`, `ChessAbc`, `LichessMasters`, `LichessAll`),
+Lichess `&since=YYYY` and `&since=YYYY-MM` explorer querying, recent window-count trends,
+empirical-Bayes shrunk trend badges, background ChessABC recent tree, and an outdated
+database warning banner when the active tree is >180 days older than today. The Tree shows
+a compact trend badge, tooltip, and egui sparkline (`src/recent.rs::sparkline_points`/
+`baseline_y`, `src/app.rs::draw_trend_sparkline`), and **Settings → Move trends** (plus an
+inline bar) exposes the trend source, window, baseline, and minimum sample. Moves-panel
+sparkline/trend rendering and multi-move area chart remain planned.
 
 **Goal:** surface opening ideas whose popularity has recently picked up, rather
 than only showing all-time frequency, and make the trend visible at a glance.
@@ -1296,3 +1314,22 @@ releases.
 - **Eval-loss quality column (cache-only):** show `?!`/`?`/`??` plus an **Eval** column using `40`/`90`/`200` cp thresholds from cache-only/composite evaluation data (no forced fresh engine run implied).
 
 **Depends on:** `src/players.rs`/PlayerBook, predictor/reference paths (item 6), prep UI/session/library paths (items 5/8/12/13), `src/recent.rs`, settings/book/reference configuration, `src/analysis_cache.rs`/`src/eval.rs`/review display. **Related:** items 2, 5, 6, 8, 12, 13.
+
+## 40. Preparation Opponent & ChessABC Polish, Fullscreen, Unified Recent Limit, Folded ChessDB, Live References & Trends (Cycle 2)
+
+**Status:** implemented 2026-11-07 (commits `98755ef`..`ba4ed20`, 423 lib tests green).
+
+**Goal:** address critical Prep opponent selection defects (`bye` default, 0-game ChessABC candidate overflow), provide `F11` fullscreen and unified recent games limit, fold chessdb-only candidate moves compactly, and support live online sources for reference trees, default book, and move trends with outdated database detection.
+
+**Implemented 2026-11-07 (`docs/superpowers/specs/2026-11-07-prep-chessabc-live-ref-trends-design.md`):**
+
+- **`bye` exclusion & honorific stripping:** `player_key` in `src/players.rs` normalizes names by stripping academic/generational honorifics (`Dr.`, `Prof.`, `Ing.`, `Mag.`, `Dipl.`, `Jr.`, `Sr.`, `II`, `III`) and rejects `"bye"` placeholders (along with `""` and `"?"`).
+- **Prep opponent search resolution:** `prep_setup_search` is evaluated ahead of `self.prep_setup_player.or(self.selected_player)` so entering an opponent search or clicking "Change opponent" never falls back to the default index 0 (`"bye"`).
+- **ChessABC candidate filtering & collapsed picker:** `collect_chessabc_candidates` in `src/online.rs` prunes irrelevant substring matches and queries `chessabc_player_game_count` (`GET /games/player/paginated?fideId={id}&page=0&size=1` -> `totalElements`), discarding profiles with `< 1` games. When a player is selected, the dialog selects the single most-probable profile (`best_chessabc_candidate`), keeps the candidate list collapsed with a one-line summary and a `Change profile…` button, and provides a `Confirm` collapse button and bounded scroll area (`max_height(150.0)`) to prevent dialog overflow.
+- **`F11` fullscreen toggle:** `Key::F11` in `src/app.rs` toggles fullscreen before egui consumes keyboard input.
+- **Unified Recent Games limit selector:** discrete ComboBox with options `All` (`prep_recent_all = true`) or `5, 10, 15, 25, 50, 100` replacing the separate DragValue and Show all checkbox.
+- **Cloud Engine folded `chessdb.cn` candidate moves:** moves without Lichess hits or engine lines fold compactly into a single `horizontal_wrapped` row with `chessdb:` prefix; candidate moves are un-truncated; chessdb-only moves no longer fabricate `[Lichess d0]`.
+- **Live Reference Trees & Default Book:** `LiveReferenceSource` supporting `"live:lichess-masters"`, `"live:lichess-all"`, and `"live:chessabc"` for opening books and general reference trees across startup dialog, Tree tab, Refs tab, and Prep tab.
+- **Live Trend Sources & Outdated DB warning:** `TrendSource` (`ActiveTree`, `ChessAbc`, `LichessMasters`, `LichessAll`) in settings and inline controls; Lichess explorer `&since=YYYY` and `&since=YYYY-MM` fetching with empirical-Bayes shrunk trend badges; background ChessABC recent tree; and outdated database warning banner when `TrendSource::ActiveTree` is used on a database older than 180 days.
+
+**Depends on:** `src/players.rs`, `src/online.rs`, `src/app.rs`, `src/cloud.rs`, `src/recent.rs`, `src/position.rs`, `src/settings.rs`.
