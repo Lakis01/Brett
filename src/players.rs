@@ -586,7 +586,7 @@ fn is_recent_date(date: u32, as_of: u32, config: PredictionConfig) -> bool {
     (a - d).max(0) <= config.recent_days
 }
 
-const HONORIFICS: &[&str] = &["dr", "prof", "ing", "mag", "dipl"];
+const HONORIFICS: &[&str] = &["dr", "prof", "ing", "mag", "dipl", "jr", "sr"];
 const PLACEHOLDERS: &[&str] = &[
     "bye", "forfeit", "unpaired", "vacant", "unknown", "none", "n/a", "na", "tbd", "anonymous",
     "?",
@@ -611,10 +611,28 @@ pub fn player_key(name: &str) -> Option<String> {
         return None;
     }
     // Strip common academic/generational honorific tokens when at least one
-    // non-honorific token remains.
+    // non-honorific token remains. Generational suffixes ("jr", "sr") are
+    // stripped when appended after punctuation (e.g. "Mustermann, Max, Jr."),
+    // preserving distinct generational names like "Magnus Carlsen Jr".
     let non_honorifics: Vec<String> = words
         .iter()
-        .filter(|word| !HONORIFICS.contains(&word.as_str()))
+        .filter(|word| {
+            if !HONORIFICS.contains(&word.as_str()) {
+                return true;
+            }
+            if *word == "jr" || *word == "sr" {
+                let lower = name.to_ascii_lowercase();
+                let is_suffixed = lower
+                    .match_indices(word.as_str())
+                    .any(|(idx, _)| {
+                        let prefix = name[..idx].trim_end();
+                        prefix.ends_with(',') || prefix.ends_with('.')
+                    });
+                !is_suffixed
+            } else {
+                false
+            }
+        })
         .cloned()
         .collect();
     let mut words = if !non_honorifics.is_empty() {
@@ -3220,7 +3238,7 @@ mod tests {
             player_key("Magnus Carlsen")
         );
         assert_eq!(
-            player_key("Dipl.-Ing. Max Mustermann"),
+            player_key("Dipl.-Ing. Max Mustermann, Jr."),
             player_key("Max Mustermann")
         );
     }

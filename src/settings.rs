@@ -879,7 +879,7 @@ impl DisplayPrefs {
             .get("prep_recent_limit")
             .and_then(Value::as_u64)
             .unwrap_or(10)
-            .clamp(1, 50) as usize;
+            .clamp(1, 100) as usize;
         let show_empty_pgn_tags = value
             .get("show_empty_pgn_tags")
             .and_then(Value::as_bool)
@@ -1675,7 +1675,7 @@ mod tests {
             r#"{"opening_book_path":" /tmp/book.ctg ","prep_recent_limit":999}"#,
         );
         assert_eq!(display.opening_book_path, "/tmp/book.ctg");
-        assert_eq!(display.prep_recent_limit, 50);
+        assert_eq!(display.prep_recent_limit, 100);
         assert_eq!(
             DisplayPrefs::from_json(r#"{"prep_recent_limit":0}"#).prep_recent_limit,
             1
