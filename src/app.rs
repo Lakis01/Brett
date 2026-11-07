@@ -4681,6 +4681,7 @@ impl App {
             trend_window: self.trend_window,
             trend_baseline: self.trend_baseline,
             trend_min_games: self.trend_min_games.clamp(3, 200),
+            trend_source: crate::recent::TrendSource::ActiveTree,
             engine_limit_mode: self.engine_limit_mode.config_value().to_string(),
             engine_depth: self.engine_depth,
             engine_time_ms: self.engine_time_ms,

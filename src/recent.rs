@@ -103,6 +103,65 @@ impl TrendBaseline {
     }
 }
 
+/// Source used to compute move-popularity trends.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TrendSource {
+    /// Active local tree / Mega Database.
+    #[default]
+    ActiveTree,
+    /// Live ChessABC master games.
+    ChessAbc,
+    /// Live Lichess Masters database.
+    LichessMasters,
+    /// Live Lichess complete games corpus.
+    LichessAll,
+}
+
+impl TrendSource {
+    pub const ALL: [Self; 4] = [
+        Self::ActiveTree,
+        Self::ChessAbc,
+        Self::LichessMasters,
+        Self::LichessAll,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ActiveTree => "Database / Mega",
+            Self::ChessAbc => "ChessABC (live)",
+            Self::LichessMasters => "Lichess Masters (live)",
+            Self::LichessAll => "Lichess All (live)",
+        }
+    }
+
+    pub fn short_label(self) -> &'static str {
+        match self {
+            Self::ActiveTree => "DB / Mega",
+            Self::ChessAbc => "ChessABC",
+            Self::LichessMasters => "Masters",
+            Self::LichessAll => "Lichess",
+        }
+    }
+
+    pub fn config_value(self) -> &'static str {
+        match self {
+            Self::ActiveTree => "active_tree",
+            Self::ChessAbc => "chessabc",
+            Self::LichessMasters => "lichess_masters",
+            Self::LichessAll => "lichess_all",
+        }
+    }
+
+    pub fn from_config(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "chessabc" | "live:chessabc" => Self::ChessAbc,
+            "lichess_masters" | "masters" | "live:lichess-masters" => Self::LichessMasters,
+            "lichess_all" | "lichess" | "live:lichess-all" => Self::LichessAll,
+            _ => Self::ActiveTree,
+        }
+    }
+}
+
 /// Configuration for computing move-popularity trends at a position.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TrendConfig {
@@ -568,6 +627,50 @@ pub fn position_trend_map(moves: &[MoveStat], config: TrendConfig) -> HashMap<u3
         .into_iter()
         .map(|t| (t.mv, t))
         .collect()
+}
+
+/// Check if an opening tree/database is stale compared to the given date.
+pub fn is_database_outdated(latest_date: u32, as_of: u32, max_age_days: i64) -> bool {
+    if latest_date == 0 {
+        return true;
+    }
+    match (
+        crate::players::date_to_days(as_of),
+        crate::players::date_to_days(latest_date),
+    ) {
+        (Some(now), Some(last)) => now.saturating_sub(last) > max_age_days,
+        _ => true,
+    }
+}
+
+/// Compute move trends from explicit `(mv, recent_games, total_games)` window counts,
+/// such as those obtained from Lichess opening explorer `since` queries.
+pub fn trends_from_window_counts(
+    counts: &[(u32, u32, u32)],
+    mut config: TrendConfig,
+) -> HashMap<u32, MoveTrend> {
+    config.baseline = TrendBaseline::AllPrior;
+    let mut stats = Vec::with_capacity(counts.len());
+    for &(mv, recent_games, total_games) in counts {
+        let mut buckets = [0u32; TREND_BUCKETS];
+        buckets[TREND_BUCKETS - 1] = recent_games;
+        stats.push(MoveStat {
+            key: 0,
+            mv,
+            games: total_games,
+            white: 0,
+            draw: 0,
+            black: 0,
+            elo_sum: 0,
+            elo_count: 0,
+            first_date: 0,
+            last_date: 0,
+            anchor_quarter: 100,
+            older_dated: total_games.saturating_sub(recent_games),
+            buckets,
+        });
+    }
+    position_trend_map(&stats, config)
 }
 
 fn align_move_stat(stat: &mut MoveStat, new_q: u32) {
@@ -1289,5 +1392,59 @@ mod tests {
         };
         assert!(sparse_single.sparkline_points().is_empty());
         assert_eq!(sparse_single.sparkline_baseline_y(), None);
+    }
+
+    #[test]
+    fn database_outdated_checks() {
+        assert!(is_database_outdated(0, 20261107, 180));
+        assert!(is_database_outdated(20250101, 20261107, 180));
+        assert!(!is_database_outdated(20260901, 20261107, 180));
+    }
+
+    #[test]
+    fn trends_from_window_counts_computes_badges() {
+        let counts = vec![
+            (1, 50, 50),   // New (0 prior, 50 recent)
+            (2, 5, 100),   // Falling (95 prior, 5 recent)
+            (3, 20, 24),   // Rising (4 prior, 20 recent -> 10% recent vs 4% baseline)
+            (4, 125, 126), // Background volume
+        ];
+        let trends = trends_from_window_counts(
+            &counts,
+            TrendConfig {
+                min_recent_games: 10,
+                ..TrendConfig::default()
+            },
+        );
+        assert_eq!(trends.get(&1).and_then(|t| t.badge), Some(TrendBadge::New));
+        assert_eq!(trends.get(&2).and_then(|t| t.badge), Some(TrendBadge::Falling));
+        assert_eq!(trends.get(&3).and_then(|t| t.badge), Some(TrendBadge::Rising));
+    }
+
+    #[test]
+    fn trend_source_round_trips_and_labels() {
+        assert_eq!(TrendSource::default(), TrendSource::ActiveTree);
+        assert_eq!(TrendSource::from_config("active_tree"), TrendSource::ActiveTree);
+        assert_eq!(TrendSource::from_config("chessabc"), TrendSource::ChessAbc);
+        assert_eq!(TrendSource::from_config("live:chessabc"), TrendSource::ChessAbc);
+        assert_eq!(
+            TrendSource::from_config("lichess_masters"),
+            TrendSource::LichessMasters
+        );
+        assert_eq!(
+            TrendSource::from_config("live:lichess-masters"),
+            TrendSource::LichessMasters
+        );
+        assert_eq!(TrendSource::from_config("lichess_all"), TrendSource::LichessAll);
+        assert_eq!(
+            TrendSource::from_config("live:lichess-all"),
+            TrendSource::LichessAll
+        );
+        assert_eq!(TrendSource::ActiveTree.label(), "Database / Mega");
+        assert_eq!(TrendSource::ChessAbc.label(), "ChessABC (live)");
+        assert_eq!(TrendSource::LichessMasters.label(), "Lichess Masters (live)");
+        assert_eq!(TrendSource::LichessAll.label(), "Lichess All (live)");
+        assert_eq!(TrendSource::ActiveTree.short_label(), "DB / Mega");
+        assert_eq!(TrendSource::ActiveTree.config_value(), "active_tree");
     }
 }

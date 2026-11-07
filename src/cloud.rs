@@ -362,6 +362,49 @@ pub fn fetch_masters_explorer_with_timeout(
     fetch_explorer(&agent, fen, token, ExplorerSource::Masters).map_err(|err| format!("{err:#}"))
 }
 
+pub fn explorer_since_url(
+    fen: &str,
+    source: ExplorerSource,
+    since_year: u32,
+    since_month: u32,
+) -> String {
+    let mut url = format!(
+        "{}?variant=standard&fen={}&moves=12&topGames=4&recentGames=0",
+        source.endpoint(),
+        encode_component(fen)
+    );
+    match source {
+        ExplorerSource::Masters | ExplorerSource::Both => {
+            url.push_str(&format!("&since={since_year}"));
+        }
+        ExplorerSource::Lichess => {
+            url.push_str(&format!("&since={since_year:04}-{since_month:02}"));
+        }
+    }
+    url
+}
+
+/// Query the Lichess opening explorer for games since a given year/month.
+pub fn fetch_explorer_since(
+    fen: &str,
+    lichess_token: Option<&str>,
+    explorer_source: ExplorerSource,
+    since_year: u32,
+    since_month: u32,
+) -> Result<Explorer, String> {
+    let agent = ureq::AgentBuilder::new()
+        .user_agent(USER_AGENT)
+        .timeout(REQUEST_TIMEOUT)
+        .build();
+    let token = lichess_token
+        .map(str::trim)
+        .filter(|t| !t.is_empty());
+    let url = explorer_since_url(fen, explorer_source, since_year, since_month);
+    let text = get_text(&agent, &url, token)
+        .map_err(|err| format!("querying Lichess explorer with since: {err:#}"))?;
+    parse_explorer(&text).map_err(|err| format!("parsing explorer response: {err:#}"))
+}
+
 fn fetch_both_explorers(agent: &ureq::Agent, fen: &str, token: Option<&str>) -> Result<Explorer> {
     let masters = fetch_explorer(agent, fen, token, ExplorerSource::Masters);
     let lichess = if token.is_some() {
@@ -759,6 +802,18 @@ pub fn uci_san(pos: &Chess, uci: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explorer_since_url_appends_correct_since_parameter() {
+        let fen = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
+        let masters_url = explorer_since_url(fen, ExplorerSource::Masters, 2025, 4);
+        assert!(masters_url.starts_with("https://explorer.lichess.org/masters?"));
+        assert!(masters_url.ends_with("&since=2025"));
+
+        let lichess_url = explorer_since_url(fen, ExplorerSource::Lichess, 2025, 4);
+        assert!(lichess_url.starts_with("https://explorer.lichess.org/lichess?"));
+        assert!(lichess_url.ends_with("&since=2025-04"));
+    }
 
     #[test]
     fn explorer_source_defaults_to_masters_and_accepts_the_full_database() {

@@ -650,6 +650,29 @@ impl PositionIndex {
         self.inner.stats(key)
     }
 
+    /// Latest game date recorded in this index (as `YYYYMMDD`, or `0` if empty or undated).
+    pub fn latest_date(&self) -> u32 {
+        let root_date = self
+            .stats(position_key(&crate::chess::Chess::default()))
+            .map(|s| s.last_date)
+            .unwrap_or(0);
+        if root_date > 0 {
+            return root_date;
+        }
+        let segs = self.inner.segments_arc();
+        let segs = segs.read().expect("segments lock poisoned");
+        let mut max_date = 0;
+        for seg in segs.iter() {
+            for i in 0..seg.edge_count() {
+                let d = seg.edge_at(i).last_date;
+                if d > max_date {
+                    max_date = d;
+                }
+            }
+        }
+        max_date
+    }
+
     fn source_matches(&self, meta: &SourceMeta) -> bool {
         let segs = self.inner.segments_arc();
         let segs = segs.read().expect("segments lock poisoned");
@@ -1892,6 +1915,51 @@ mod tests {
             .unwrap();
         let inc_bytes = std::fs::read(&inc_path).unwrap();
         assert_eq!(&single_bytes[HEADER_LEN..], &inc_bytes[HEADER_LEN..]);
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn position_index_reports_latest_date() {
+        let pgn = r#"
+[Event "Old"]
+[Date "2024.01.15"]
+[White "A"]
+[Black "B"]
+[Result "1-0"]
+
+1. e4 e5 1-0
+
+[Event "New"]
+[Date "2026.05.20"]
+[White "C"]
+[Black "D"]
+[Result "0-1"]
+
+1. d4 d5 0-1
+"#;
+        let dir = std::env::temp_dir().join(format!(
+            "brett-position-latest-date-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pgn_path = dir.join("games.pgn");
+        let index_path = dir.join("games.brettpos");
+        std::fs::write(&pgn_path, pgn).unwrap();
+
+        PositionIndex::build_to(
+            &pgn_path,
+            &index_path,
+            BuildOptions::default(),
+            |_| {},
+        )
+        .unwrap();
+        let index = PositionIndex::open(&index_path).unwrap();
+        assert_eq!(index.latest_date(), 20260520);
 
         std::fs::remove_dir_all(dir).unwrap();
     }

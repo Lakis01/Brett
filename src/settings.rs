@@ -751,6 +751,8 @@ pub struct DisplayPrefs {
     /// Minimum dated games required in both windows at a position before
     /// showing a trend badge (`3..=200`).
     pub trend_min_games: u32,
+    /// Corpus used to compute move-popularity trends.
+    pub trend_source: crate::recent::TrendSource,
     /// Engine search limit mode: `infinite` (default), `depth`, or `time`.
     pub engine_limit_mode: String,
     /// Target depth when limit mode is `depth`.
@@ -792,6 +794,7 @@ impl Default for DisplayPrefs {
             trend_window: crate::recent::TrendWindow::default(),
             trend_baseline: crate::recent::TrendBaseline::default(),
             trend_min_games: 10,
+            trend_source: crate::recent::TrendSource::default(),
             engine_limit_mode: "infinite".to_string(),
             engine_depth: 25,
             engine_time_ms: 1_500,
@@ -948,6 +951,11 @@ impl DisplayPrefs {
             .and_then(Value::as_u64)
             .unwrap_or(10)
             .clamp(3, 200) as u32;
+        let trend_source = value
+            .get("trend_source")
+            .and_then(Value::as_str)
+            .map(crate::recent::TrendSource::from_config)
+            .unwrap_or_default();
         let engine_limit_mode = value
             .get("engine_limit_mode")
             .and_then(Value::as_str)
@@ -995,6 +1003,7 @@ impl DisplayPrefs {
             trend_window,
             trend_baseline,
             trend_min_games,
+            trend_source,
             engine_limit_mode,
             engine_depth,
             engine_time_ms,
@@ -1030,6 +1039,7 @@ impl DisplayPrefs {
             "trend_window": self.trend_window.config_value(),
             "trend_baseline": self.trend_baseline.config_value(),
             "trend_min_games": self.trend_min_games,
+            "trend_source": self.trend_source.config_value(),
             "engine_limit_mode": self.engine_limit_mode,
             "engine_depth": self.engine_depth,
             "engine_time_ms": self.engine_time_ms,
@@ -1506,6 +1516,7 @@ mod tests {
             trend_window: crate::recent::TrendWindow::SixMonths,
             trend_baseline: crate::recent::TrendBaseline::Prior24Months,
             trend_min_games: 15,
+            trend_source: crate::recent::TrendSource::LichessMasters,
             engine_limit_mode: "depth".to_string(),
             engine_depth: 30,
             engine_time_ms: 2_500,
@@ -1513,6 +1524,18 @@ mod tests {
         };
         assert_eq!(DisplayPrefs::from_json(&prefs.to_json()), prefs);
         assert_eq!(DisplayPrefs::from_json("not json"), DisplayPrefs::default());
+        assert_eq!(
+            DisplayPrefs::default().trend_source,
+            crate::recent::TrendSource::ActiveTree
+        );
+        assert_eq!(
+            DisplayPrefs::from_json(r#"{"trend_source":"chessabc"}"#).trend_source,
+            crate::recent::TrendSource::ChessAbc
+        );
+        assert_eq!(
+            DisplayPrefs::from_json(r#"{"trend_source":"lichess_masters"}"#).trend_source,
+            crate::recent::TrendSource::LichessMasters
+        );
         assert_eq!(
             DisplayPrefs::from_json(r#"{"rating_priority":"uscf"}"#).rating_priority,
             RatingPriority::Uscf
