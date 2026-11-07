@@ -8,8 +8,14 @@ in `README.md`; this file tracks what is next.
 community-maintained project. Functional correctness, data safety, and clear
 documentation come first; visual polish is queued and may land incrementally.
 
-**Status (2026-11-06 backlog sync):** items 1–7, 11–14, and 17 are implemented, and the latest
-moves-panel interaction polish is complete. Item 8's cloud, opening-tree,
+**Status (2026-11-07 backlog sync):** items 1–7, 11–14, and 17 are implemented, and the latest
+moves-panel interaction polish is complete. Item 39's preparation/predictor
+round-2 batch largely landed 2026-11-07 (opponent-repetition continuation
+indexing, `Schnellschach`/J1 classification, `.2lid` accelerator lookup,
+uncapped online/ChessABC fetch, composite eval bar with chessdb.cn + DB
+aggregate, streaming multi-source prep with cached account checks, book
+reference tree, font-colored rows with hover/arrow-key browsing); only
+`predict_v2` calibration (adaptive `alpha0`) remains queued. Item 8's cloud, opening-tree,
 reference-source, and native-book parts are done; M2b mega-scale ingest remains,
 with the first safety pass now keeping huge archives responsive and avoiding
 automatic full indexing. Item 9's editable session, database views,
@@ -256,7 +262,7 @@ opponent-rating, local-engine, and fully incremental reference-refresh features
 remain deferred; a changed reference source rebuilds the cached window.
 
 **Next-gen evolution (queued, design pass done; scheduled for implementation — do not mark done):** *Smart Preparation v2 & Move Predictor v2* (Hierarchical Empirical-Bayes / Dirichlet-Multinomial). Multi-source merge (Current DB + Reference Mega via `.2lgd`/`.cbp`/`.brettacc` + ChessABC one-shot + multiple Lichess/Chess.com accounts per site persisted per `player_key`), cross-source dedup (spine hash first 30 plies + ±3 days/`YYYYMM`), dual Classic Stats vs Smart Predictor modes, separate OTB vs Online pre-filters (TC Classical/Rapid/Blitz/Bullet, date cutoff All/6/12/24/60mo, rated-only, `include_online` default ON, instant `<1ms` refilter), recency `2^(-dt/365)*w_tc` (`1.0`/`0.85`/`0.65`), facing-color left-list filter + Last X games, swapped-color smart threshold (`N>=3` OR `(N>=2 AND (ply>=8 OR W>=1.2))` OR `(ply>=14 AND recent<=12mo)`) with Show N games selection view, Consistency (inverse perplexity) + Booked-up (mean theory exit ply) badges, strict OTB prior (correspondence never; hierarchy Reference->Tree->Masters->CurrentDB+tip; ChessABC games one-shot not per-ply), threshold-capped inferred moves (`>=8%`, max 3, separate section). **Preparation UX (queued — design done, scheduled):** File->Prepare menu with opponent picker; board orientation pinned to user side; ChessABC default-ON with truncated/enumerated name resolution (auto + multi-profile checklist); online accounts exclude ChessABC service; per-account expandable filters with separate Rated+Casual ticks (both default ON) and zero-overlap ⚠️ badge; Chess.com tournament-games-only exclusion; clear prep panel (Predicted-first color-coded sorted Smart table, Played vs Inferred sections, Your-move Times-Faced view, 📖 In PlayerBook badges, ply>=4 swapped gate); game-type color coding (Classical emerald / Rapid-Blitz sky / Online violet) in left + recent lists. Requires dedicated design pass done.
-  - **Round-2 fixes (queued, design done, scheduled; no code this sync):** `predict_v2` calibration `18/18` → `>=90%` with adaptive `alpha0` + reserved/unseen alpha; opponent-reply indexing (both colors in `PlayerBook`, fix `Be3`/`Bc4`/`Bg5`/`f3` cases); strict reference tree (never current DB, typo fix). See item 39 for the full prep/predictor round-2 batch.
+  - **Round-2 fixes (largely landed 2026-11-07; `predict_v2` calibration still queued):** opponent-reply indexing (both colors in `PlayerBook`, `Be3`/`Bc4`/`Bg5`/`f3` cases via edge-deduplicated post-repetition indexing); strict reference tree (never current DB, typo fix). See item 39 for the full prep/predictor round-2 batch.
 
 **Goal:** make preparation probabilities honest, calibrated, and less dependent
 on the loaded player database.
@@ -520,7 +526,7 @@ rows remain read-only previews and preserve the preparation node, tab, and
 orientation.
 
 **Queued evolution:** Smart Preparation v2 extends this with multi-source merge/dedup, dual Classic Stats vs Smart Predictor modes, OTB vs Online pre-filters (instant `<1ms` refilter), facing-color/Last X filters, swapped-color smart threshold + Show N games view, and profile badges. **Preparation UX (queued — design done, scheduled):** File->Prepare menu with opponent picker; board orientation pinned to user side; ChessABC default-ON with truncated/enumerated name resolution (auto + multi-profile checklist); online accounts exclude ChessABC service; per-account expandable filters with separate Rated+Casual ticks (both default ON) and zero-overlap ⚠️ badge; Chess.com tournament-games-only exclusion; clear prep panel (Predicted-first color-coded sorted Smart table, Played vs Inferred sections, Your-move Times-Faced view, 📖 In PlayerBook badges, ply>=4 swapped gate); game-type color coding (Classical emerald / Rapid-Blitz sky / Online violet) in left + recent lists. See item 6 (next-gen evolution) for the full spec. Design pass done; scheduled for implementation — do not mark done.
-  - **Round-2 UX/fixes (queued, design done, scheduled; no code this sync):** opponent banner top; search hidden when selected; ChessABC all-games label; live account `✓`/`✗` confirmations; fresh-start File → Prepare without open DB (`open_library` for reference + extra incl `2cbh`/`cbh`/`si4`, accelerated extraction); merged left + recent lists; Site/TimeControl color fix; `🟢` glyph fix; Your-Move line-grid removal. See item 39.
+  - **Round-2 UX/fixes (largely landed 2026-11-07):** opponent banner top; search hidden when selected; ChessABC all-games label; live account `✓`/`✗` confirmations; fresh-start File → Prepare without open DB (`open_library` for reference + extra incl `2cbh`/`cbh`/`si4`, accelerated extraction); merged left + recent lists; Site/TimeControl color fix; `🟢` glyph fix; Your-Move line-grid removal. See item 39.
 
 - **Board orientation:** when preparation starts, flip the board to the side the
   prepared player will play (or the user’s side, per the explicit setting). Do
@@ -1274,9 +1280,11 @@ releases.
 
 ## 39. Preparation & Predictor Round-2 Fixes (Queued)
 
-**Status:** queued — design done, scheduled (2026-11-06 backlog sync). No code and no commit in this sync.
+**Status:** largely landed 2026-11-07 (6 commits, full `cargo test` green). Still queued: `predict_v2` calibration (`18/18` → `>=90%`, adaptive `alpha0` + reserved/unseen alpha).
 
 **Goal:** land the batched Preparation/predictor/UI fixes identified for round 2 without regressing the queued Smart Preparation v2 / Predictor v2 design.
+
+**Landed 2026-11-07 (`docs/superpowers/plans/2026-11-07-prep-ux-eval-and-perf.md` Tasks 1–6):**
 
 - **Opponent-reply indexing:** index both colors in `PlayerBook`; fix opponent-reply generation/lookup for `Be3`/`Bc4`/`Bg5`/`f3` and similar cases.
 - **`predict_v2` calibration:** raise calibration from the `18/18` baseline context to `>=90%`; add adaptive `alpha0` and reserved/unseen alpha handling for unobserved legal moves.
