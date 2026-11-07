@@ -800,15 +800,27 @@ impl TwoCbhLibrary {
                 loose.push(entity);
             }
         }
-        let entities = if exact.is_empty() { loose } else { exact };
+        let primary = if exact.is_empty() { &loose } else { &exact };
         let mut indices = Vec::new();
-        for entity in entities {
+        for &entity in primary {
             let Ok(ids) = acc.player_games(entity) else {
                 continue;
             };
             for record_id in ids {
                 if let Some(index) = self.game_index_for_record(record_id) {
                     indices.push(index);
+                }
+            }
+        }
+        if indices.is_empty() {
+            for &entity in &loose {
+                let Ok(ids) = acc.player_games(entity) else {
+                    continue;
+                };
+                for record_id in ids {
+                    if let Some(index) = self.game_index_for_record(record_id) {
+                        indices.push(index);
+                    }
                 }
             }
         }

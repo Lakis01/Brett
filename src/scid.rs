@@ -422,15 +422,25 @@ impl GameLibrary for ScidLibrary {
                 loose.push(id as u32);
             }
         }
-        let entities = if exact.is_empty() { loose } else { exact };
+        let primary = if exact.is_empty() { &loose } else { &exact };
         let mut indices = Vec::new();
-        for id in entities {
+        for &id in primary {
             indices.extend(
                 accelerator
                     .player_games(id)
                     .iter()
                     .map(|&index| index as usize),
             );
+        }
+        if indices.is_empty() {
+            for &id in &loose {
+                indices.extend(
+                    accelerator
+                        .player_games(id)
+                        .iter()
+                        .map(|&index| index as usize),
+                );
+            }
         }
         indices.sort_unstable();
         indices.dedup();

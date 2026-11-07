@@ -699,9 +699,6 @@ struct PrepRecentRow {
     white_fide_id: Option<String>,
     black_fide_id: Option<String>,
     subtitle: String,
-    /// Up to six mainline plies that follow this position in the game,
-    /// rendered on the recent-game row (for example `3. Bb5 a6 4. Ba4`).
-    continuation: String,
     /// Game-type pill colour + label from `classify_game_metadata`.
     type_color: Color32,
     type_label: &'static str,
@@ -1492,7 +1489,13 @@ impl App {
             reference: None,
             reference_rx: None,
             reference_job: None,
-            reference_book: None,
+            reference_book: if preparation_prefs.reference_enabled
+                && is_opening_book_path(Path::new(&reference_path))
+            {
+                Book::open(Path::new(&reference_path)).ok()
+            } else {
+                None
+            },
             reference_status,
             correspondence_enabled: preparation_prefs.correspondence_enabled,
             correspondence_path,
@@ -5103,7 +5106,11 @@ impl App {
             self.reference = None;
             self.reference_rx = None;
             self.reference_job = None;
-            if self.reference_book.is_none() {
+            if self
+                .reference_book
+                .as_ref()
+                .is_none_or(|book| book.path() != Path::new(path))
+            {
                 match Book::open(Path::new(path)) {
                     Ok(book) => {
                         self.reference_status = format!(
@@ -6924,10 +6931,17 @@ impl App {
                     self.prep_setup_chessabc_status =
                         format!("No ChessABC profiles found for {query}.");
                 } else {
-                    self.prep_setup_chessabc_selected = candidates
-                        .iter()
-                        .map(|candidate| candidate.fide_id.clone())
-                        .collect();
+                    if self.prep_setup_chessabc_selected.iter().any(|id| {
+                        candidates.iter().any(|candidate| &candidate.fide_id == id)
+                    }) {
+                        self.prep_setup_chessabc_selected
+                            .retain(|id| candidates.iter().any(|c| &c.fide_id == id));
+                    } else {
+                        self.prep_setup_chessabc_selected = candidates
+                            .iter()
+                            .map(|candidate| candidate.fide_id.clone())
+                            .collect();
+                    }
                     self.prep_setup_chessabc_status =
                         format!("Select matching profile(s) for {query}:");
                 }
@@ -9100,6 +9114,7 @@ impl App {
         eval::choose_composite([local, cloud, chessdb, pgn, db_agg].into_iter().flatten())
     }
 
+    #[cfg(test)]
     fn current_board_eval(&self) -> Option<BoardEval> {
         self.eval_for_node(self.node)
     }
@@ -12033,6 +12048,7 @@ impl App {
                             result,
                             event,
                             date,
+                            type_color,
                         ) = if let Some(entry) = library.get(idx) {
                             let player_white = players::player_key(entry.white()).as_deref()
                                 == Some(player.key.as_str());
@@ -12064,6 +12080,7 @@ impl App {
                                         })
                                     }),
                             );
+                            let (type_color, _) = indexed_game_type_style(entry);
                             (
                                 opponent,
                                 opponent_title,
@@ -12073,6 +12090,7 @@ impl App {
                                 entry.result().to_string(),
                                 entry.event().to_string(),
                                 entry.date().to_string(),
+                                type_color,
                             )
                         } else {
                             let (white_name, black_name) = library.game_players(idx);
@@ -12114,6 +12132,11 @@ impl App {
                             let result = find_h("Result").unwrap_or("*").to_string();
                             let event = find_h("Event").unwrap_or("?").to_string();
                             let date = find_h("Date").unwrap_or("????.??.??").to_string();
+                            let (type_color, _) = slot_game_type_by_headers(
+                                Some(&event),
+                                find_h("Site"),
+                                find_h("TimeControl"),
+                            );
                             (
                                 opponent,
                                 opponent_title,
@@ -12123,6 +12146,7 @@ impl App {
                                 result,
                                 event,
                                 date,
+                                type_color,
                             )
                         };
                         let suffix = format!(" · as {color}");
@@ -12133,11 +12157,6 @@ impl App {
                             .is_some_and(|id| self.current_slot == Some(id))
                             && self.prep.is_none();
                         let width = ui.available_width();
-                        let probe = Game {
-                            headers: vec![("Event".to_string(), event.clone())],
-                            ..Game::default()
-                        };
-                        let (type_color, _) = game_type_style(&probe);
                         if game_row(
                             ui,
                             selected,
@@ -14798,7 +14817,6 @@ impl App {
                         outcome_label(&result, game.color),
                         event
                     ),
-                    continuation: String::new(),
                     type_color,
                     type_label,
                 })
@@ -14855,7 +14873,6 @@ impl App {
                         game.event(),
                         continuation_suffix
                     ),
-                    continuation,
                     type_color,
                     type_label,
                 })
@@ -14948,8 +14965,8 @@ impl App {
         } else {
             self.prep_prediction_data(prep, pos, key)
         };
-        let legacy_rows = self.prep_recent_rows(prep, key, 500);
-        let unified_rows = self.prep_unified_recent_rows(prep, facing, key, 500);
+        let legacy_rows = self.prep_recent_rows(prep, key, usize::MAX);
+        let unified_rows = self.prep_unified_recent_rows(prep, facing, key, usize::MAX);
         // Most-recent games come from the merged multi-source book; while it
         // is still loading the legacy database rows are shown instead.
         let use_unified = !self.prep_merged_games.is_empty();
@@ -15023,6 +15040,7 @@ impl App {
         let mut recent_limit = self.prep_recent_limit.clamp(1, 50);
         let mut recent_limit_changed = false;
         let mut recent_all = self.prep_recent_all;
+        let mut recent_all_changed = false;
         let mut clicked = None;
         let mut preview = None;
         let mut merged_preview: Option<usize> = None;
@@ -15811,10 +15829,19 @@ impl App {
                                 .changed()
                             {
                                 recent_limit_changed = true;
+                                recent_all = false;
+                                recent_all_changed = true;
                             }
                             ui.label("games");
-                            ui.checkbox(&mut recent_all, "Show all")
-                                .on_hover_text("Show every game reaching this position, uncapped");
+                            if ui
+                                .checkbox(&mut recent_all, "Show all")
+                                .on_hover_text(
+                                    "Show every game reaching this position, uncapped",
+                                )
+                                .changed()
+                            {
+                                recent_all_changed = true;
+                            }
                         });
                         ui.label(
                             RichText::new(if use_unified {
@@ -15938,8 +15965,10 @@ impl App {
         if back_to_facing {
             self.prep_swapped_view = false;
         }
-        self.prep_recent_limit = recent_limit;
-        self.prep_recent_all = recent_all;
+        if recent_limit_changed || recent_all_changed {
+            self.prep_recent_limit = recent_limit;
+            self.prep_recent_all = recent_all;
+        }
         if recent_limit_changed {
             self.save_display_prefs();
         }
@@ -15978,11 +16007,18 @@ impl App {
     /// cursor is anchored at the preparation position when the row first
     /// activates, then preserved while the same row remains under the pointer.
     fn activate_hovered_game_browse(&mut self, id: String, game: Game) {
-        if self
-            .hovered_game_browse
-            .as_ref()
-            .is_some_and(|browse| browse.id == id)
-        {
+        let current_key = self.current.as_ref().and_then(|current| {
+            current
+                .nodes
+                .get(self.node.min(current.nodes.len().saturating_sub(1)))
+                .map(|node| position::position_key(&node.pos))
+        });
+        let anchor_node = current_key
+            .and_then(|key| find_node_for_position_key(&game, key))
+            .unwrap_or(0);
+        if self.hovered_game_browse.as_ref().is_some_and(|browse| {
+            browse.id == id && browse.anchor_node == anchor_node
+        }) {
             let preview = {
                 let browse = self.hovered_game_browse.as_mut().unwrap();
                 browse.game = game;
@@ -15999,15 +16035,6 @@ impl App {
             }
             return;
         }
-        let current_key = self.current.as_ref().and_then(|current| {
-            current
-                .nodes
-                .get(self.node.min(current.nodes.len().saturating_sub(1)))
-                .map(|node| position::position_key(&node.pos))
-        });
-        let anchor_node = current_key
-            .and_then(|key| find_node_for_position_key(&game, key))
-            .unwrap_or(0);
         let preview = game.nodes.get(anchor_node).map(|node| HoverPreview {
             pos: node.pos.clone(),
             last_move: domain::last_move_squares(node),
@@ -17671,6 +17698,9 @@ impl eframe::App for App {
             self.online_reference_panel(ui);
         }
         self.moves_panel(ui);
+        if !self.hovered_game_active_this_frame {
+            self.hovered_game_browse = None;
+        }
         self.sync_current_slot();
         self.bottom_bar(ui);
 
@@ -26802,5 +26832,33 @@ mod tests {
         app.step_hovered_game(1);
         assert_eq!(app.hovered_game_browse.as_ref().unwrap().cursor_node, 3);
         assert_eq!(app.node, 2, "preparation node must not move while stepping hovered game");
+    }
+
+    #[test]
+    fn hovered_game_browse_resets_cursor_when_preparation_position_changes() {
+        let mut app = test_app();
+        let prep_pgn = b"[Event \"Preparation\"]\n[White \"You\"]\n[Black \"Kern, Johannes\"]\n\n1. e4 e5 2. Nf3 Nc6 *\n";
+        app.current = Some(crate::domain::parse_pgn(prep_pgn).unwrap().remove(0));
+        app.goto(2); // after 1. e4 e5
+
+        let hovered_pgn = b"[White \"X\"]\n[Black \"Kern, Johannes\"]\n\n1. e4 e5 2. Nf3 Nc6 3. Bc4 *\n";
+        let hovered_game = crate::domain::parse_pgn(hovered_pgn).unwrap().remove(0);
+        app.activate_hovered_game_browse("merged:0".to_string(), hovered_game);
+        assert_eq!(app.hovered_game_browse.as_ref().unwrap().cursor_node, 2);
+
+        // Stepping forward, then moving the preparation cursor to a new
+        // position must re-anchor the browse instead of keeping the stale
+        // cursor.
+        app.step_hovered_game(2);
+        assert_eq!(app.hovered_game_browse.as_ref().unwrap().cursor_node, 4);
+        app.goto(4); // preparation moves to after 2... Nc6
+        let hovered_game = crate::domain::parse_pgn(hovered_pgn).unwrap().remove(0);
+        app.activate_hovered_game_browse("merged:0".to_string(), hovered_game);
+        let browse = app.hovered_game_browse.as_ref().unwrap();
+        assert_eq!(browse.anchor_node, 4);
+        assert_eq!(
+            browse.cursor_node, 4,
+            "cursor must reset to the new anchor when the preparation position changes"
+        );
     }
 }
