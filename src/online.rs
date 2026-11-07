@@ -135,7 +135,7 @@ pub fn fetch_player_games(
     max_games: usize,
 ) -> Result<Vec<domain::Game>> {
     let username = validate_query(source, username)?;
-    let max_games = max_games.clamp(1, 5000);
+    let max_games = normalized_max_games(max_games);
     let agent = ureq::AgentBuilder::new()
         .user_agent(USER_AGENT)
         .timeout_connect(Duration::from_secs(20))
@@ -160,7 +160,7 @@ pub fn fetch_chessabc_player_games(
     max_games: usize,
 ) -> Result<(ChessAbcPlayer, Vec<domain::Game>)> {
     let query = validate_query(OnlineSource::ChessAbc, query)?;
-    let max_games = max_games.clamp(1, 5000);
+    let max_games = normalized_max_games(max_games);
     let agent = ureq::AgentBuilder::new()
         .user_agent(USER_AGENT)
         .timeout_connect(Duration::from_secs(20))
@@ -230,6 +230,28 @@ pub fn fetch_recent_chessabc_games(max_games: usize) -> Result<Vec<domain::Game>
     Ok(games)
 }
 
+/// Treat `0` and very large limits as "uncapped" and leave small limits
+/// untouched. The prep flow passes `usize::MAX` to mean every game.
+fn normalized_max_games(max_games: usize) -> usize {
+    if max_games == 0 || max_games > 50_000 {
+        usize::MAX
+    } else {
+        max_games
+    }
+}
+
+fn lichess_export_url(username: &str, max_games: usize) -> String {
+    if max_games == 0 || max_games > 50_000 {
+        format!(
+            "https://lichess.org/api/games/user/{username}?clocks=false&evals=false&opening=false&tags=true&sort=dateDesc"
+        )
+    } else {
+        format!(
+            "https://lichess.org/api/games/user/{username}?max={max_games}&clocks=false&evals=false&opening=false&tags=true&sort=dateDesc"
+        )
+    }
+}
+
 fn download_player_pgn(
     agent: &ureq::Agent,
     source: OnlineSource,
@@ -240,9 +262,7 @@ fn download_player_pgn(
     match source {
         OnlineSource::Lichess => {
             progress(format!("Downloading {username}'s Lichess games…"));
-            let url = format!(
-                "https://lichess.org/api/games/user/{username}?max={max_games}&clocks=false&evals=false&opening=false&tags=true&sort=dateDesc"
-            );
+            let url = lichess_export_url(username, max_games);
             let body = get_text(agent, &url, Some("application/x-chess-pgn"))?;
             if body.trim().is_empty() {
                 bail!("Lichess returned no games for {username}");
@@ -262,7 +282,12 @@ fn download_player_pgn(
             }
 
             let mut pgns = Vec::new();
-            for (number, archive_url) in urls.iter().rev().take(MAX_ARCHIVES).enumerate() {
+            let archives_to_fetch = if max_games > 50_000 {
+                urls.len()
+            } else {
+                urls.len().min(MAX_ARCHIVES)
+            };
+            for (number, archive_url) in urls.iter().rev().take(archives_to_fetch).enumerate() {
                 progress(format!(
                     "Downloading Chess.com archive {} · {} games so far…",
                     number + 1,
@@ -533,7 +558,7 @@ pub fn fetch_chessabc_games_by_fide_id(
     if fide_id.is_empty() || fide_id.len() > 16 || !fide_id.chars().all(|c| c.is_ascii_digit()) {
         bail!("invalid FIDE id");
     }
-    let max_games = max_games.clamp(1, 5000);
+    let max_games = normalized_max_games(max_games);
     let agent = ureq::AgentBuilder::new()
         .user_agent(USER_AGENT)
         .timeout_connect(Duration::from_secs(20))
@@ -614,7 +639,33 @@ fn chessabc_search_queries(query: &str) -> Vec<String> {
     push_unique(&mut out, deunicode::deunicode(&base));
     push_unique(&mut out, deunicode::deunicode(&expand_german(&base)));
     push_unique(&mut out, phonetic_query(&base));
+    if let Some(initial_query) = surname_initial_query(query) {
+        push_unique(&mut out, initial_query.clone());
+        push_unique(&mut out, deunicode::deunicode(&initial_query));
+    }
     out
+}
+
+/// `"Surname, First"` / `"First Surname"` → `"Surname F"`, the spelling
+/// ChessABC's substring search needs to return truncated or enumerated
+/// profiles such as `"Kern, J"` and `"Kern, J1"`.
+fn surname_initial_query(query: &str) -> Option<String> {
+    let trimmed = query.trim();
+    let (surname_raw, given_raw) = if let Some((surname, given)) = trimmed.split_once(',') {
+        (surname, given)
+    } else {
+        let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+        if tokens.len() < 2 {
+            return None;
+        }
+        (tokens[tokens.len() - 1], tokens[0])
+    };
+    let surname = clean_search_name(surname_raw);
+    if surname.is_empty() {
+        return None;
+    }
+    let initial = given_raw.chars().find(|ch| ch.is_alphabetic())?;
+    Some(format!("{surname} {}", initial.to_uppercase()))
 }
 
 fn chessabc_prefix_queries(query: &str) -> Vec<String> {
@@ -1235,5 +1286,26 @@ mod tests {
         assert!(name.ends_with(".pgn"));
         assert!(path.starts_with(cache_root()));
         assert!(path.parent().unwrap().ends_with("online"));
+    }
+
+    #[test]
+    fn chessabc_search_queries_include_surname_and_first_initial() {
+        let queries = chessabc_search_queries("Kern, Johannes");
+        assert!(
+            queries.iter().any(|q| q.eq_ignore_ascii_case("Kern J")),
+            "expected 'Kern J' in {queries:?}"
+        );
+    }
+
+    #[test]
+    fn lichess_export_url_omits_max_when_uncapped() {
+        assert_eq!(
+            lichess_export_url("DrNykterstein", usize::MAX),
+            "https://lichess.org/api/games/user/DrNykterstein?clocks=false&evals=false&opening=false&tags=true&sort=dateDesc"
+        );
+        assert_eq!(
+            lichess_export_url("DrNykterstein", 300),
+            "https://lichess.org/api/games/user/DrNykterstein?max=300&clocks=false&evals=false&opening=false&tags=true&sort=dateDesc"
+        );
     }
 }
