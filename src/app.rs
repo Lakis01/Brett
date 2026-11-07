@@ -339,6 +339,9 @@ struct ReferenceJob {
     target: u32,
     band: u32,
     offset: i32,
+    /// Multi-million-game database: use one player-independent cache
+    /// (`filter: None`, `max_plies: 36`) shared by every opponent.
+    shared: bool,
 }
 
 impl ReferenceJob {
@@ -347,6 +350,9 @@ impl ReferenceJob {
     }
 
     fn label(&self) -> String {
+        if self.shared {
+            return "all ratings · shared Mega index".to_string();
+        }
         let offset = if self.offset == 0 {
             String::new()
         } else {
@@ -460,6 +466,9 @@ struct AccountCheckResult {
     kept: usize,
     /// Error text when the account/profile could not be resolved.
     error: Option<String>,
+    /// Fetched games, kept in memory so preparation can reuse them and filter
+    /// changes only recompute `kept` without another network request.
+    games: Arc<Vec<Game>>,
 }
 
 impl AccountCheckResult {
@@ -470,8 +479,20 @@ impl AccountCheckResult {
             total: 0,
             kept: 0,
             error: None,
+            games: Arc::new(Vec::new()),
         }
     }
+}
+
+/// One background account-confirmation request. A long-lived worker consumes
+/// these so accounts added while another check is in flight are still fetched.
+#[derive(Clone)]
+struct AccountCheckRequest {
+    key: String,
+    source: OnlineSource,
+    username: String,
+    filter: players::AccountFilter,
+    is_chessabc: bool,
 }
 
 /// One-line live confirmation for a linked account or ChessABC profile:
@@ -491,6 +512,53 @@ fn account_check_text(check: &AccountCheckResult) -> RichText {
     }
 }
 
+/// Compact `✓ N games` / `⏳` / `✗` badge used next to the ChessABC checkbox.
+fn account_check_badge(check: &AccountCheckResult) -> RichText {
+    if check.fetching {
+        RichText::new("⏳").color(Color32::from_gray(160))
+    } else if check.error.is_some() {
+        RichText::new("✗").color(Color32::from_rgb(0xE0, 0x6C, 0x6C))
+    } else {
+        RichText::new(format!("✓ {} games", check.kept))
+            .color(Color32::from_rgb(0x7E, 0xD3, 0x8A))
+    }
+}
+
+/// Aggregate confirmation across every selected ChessABC profile.
+fn chessabc_aggregate_check(
+    checks: &HashMap<String, AccountCheckResult>,
+    selected: &[String],
+) -> Option<AccountCheckResult> {
+    if selected.is_empty() {
+        return None;
+    }
+    let mut aggregate = AccountCheckResult {
+        key: "chessabc:aggregate".to_string(),
+        fetching: false,
+        total: 0,
+        kept: 0,
+        error: None,
+        games: Arc::new(Vec::new()),
+    };
+    let mut errors = Vec::new();
+    for fide_id in selected {
+        match checks.get(&format!("chessabc:{fide_id}")) {
+            Some(check) if check.fetching => aggregate.fetching = true,
+            Some(check) => {
+                if let Some(error) = &check.error {
+                    errors.push(error.clone());
+                } else {
+                    aggregate.total += check.total;
+                    aggregate.kept += check.kept;
+                }
+            }
+            None => aggregate.fetching = true,
+        }
+    }
+    aggregate.error = errors.into_iter().next();
+    Some(aggregate)
+}
+
 /// Stable lookup key for a live account-confirmation row.
 fn prep_account_check_key(source: OnlineSource, username: &str) -> String {
     format!(
@@ -508,6 +576,29 @@ struct PrepLoadResult {
     book: PlayerBook,
     games: Vec<Game>,
     sources_label: String,
+}
+
+/// Streaming progress from the multi-source preparation loader.
+///
+/// `Status` is sent before a source starts, `Progress` after it finishes with
+/// the partial deduplicated book and games so the UI can render immediately,
+/// and `Done` carries the final result (or an error).
+enum PrepLoadMessage {
+    Status {
+        step: usize,
+        total: usize,
+        current_label: String,
+        completed_notes: Vec<String>,
+    },
+    Progress {
+        step: usize,
+        total: usize,
+        current_label: String,
+        sources_label: String,
+        book: PlayerBook,
+        games: Vec<Game>,
+    },
+    Done(Result<PrepLoadResult, String>),
 }
 
 /// Which side of the board the left game list is restricted to while
@@ -957,6 +1048,8 @@ pub struct App {
     /// `chessabc:<fide-id>` for resolved ChessABC profiles).
     prep_setup_account_checks: HashMap<String, AccountCheckResult>,
     prep_setup_account_rx: Option<mpsc::Receiver<AccountCheckResult>>,
+    /// Request channel for the long-lived account-confirmation worker.
+    prep_setup_account_tx: Option<mpsc::Sender<AccountCheckRequest>>,
     /// Search text for the opponent selector at the top of the setup dialog.
     prep_setup_search: String,
     /// Show the opponent search box even when an opponent is already
@@ -970,7 +1063,7 @@ pub struct App {
     prep_setup_as_white: bool,
     /// Unified deduplicated games from every selected source.
     prep_merged_games: Vec<Game>,
-    prep_load_rx: Option<mpsc::Receiver<Result<PrepLoadResult, String>>>,
+    prep_load_rx: Option<mpsc::Receiver<PrepLoadMessage>>,
     prep_load_job: Option<String>,
     /// Online accounts per prepared player, persisted in preparation prefs.
     prep_saved_accounts: std::collections::HashMap<String, Vec<players::PrepOnlineAccount>>,
@@ -982,6 +1075,9 @@ pub struct App {
     reference: Option<ReferenceIndex>,
     reference_rx: Option<mpsc::Receiver<ReferenceMessage>>,
     reference_job: Option<ReferenceJob>,
+    /// Native opening book used as the General Reference Tree / prior when the
+    /// configured reference path is a `.bin`, `.ctg`, `.abk`, or `.bkt` file.
+    reference_book: Option<Book>,
     reference_status: String,
     /// Optional local correspondence database used automatically in the
     /// Engine tab as a third position reference.
@@ -1358,6 +1454,7 @@ impl App {
             prep_setup_chessabc_rx: None,
             prep_setup_account_checks: HashMap::new(),
             prep_setup_account_rx: None,
+            prep_setup_account_tx: None,
             prep_setup_search: String::new(),
             prep_setup_change_opponent: false,
             prep_setup_player: None,
@@ -1374,6 +1471,7 @@ impl App {
             reference: None,
             reference_rx: None,
             reference_job: None,
+            reference_book: None,
             reference_status,
             correspondence_enabled: preparation_prefs.correspondence_enabled,
             correspondence_path,
@@ -4377,7 +4475,7 @@ impl App {
                             "Choose default reference database",
                             self.last_database_dir.as_deref(),
                             "Reference databases",
-                            "*.2cbh *.2CBH *.cbh *.CBH *.si4 *.SI4 *.pgn *.PGN",
+                            "*.2cbh *.2CBH *.cbh *.CBH *.si4 *.SI4 *.pgn *.PGN *.bin *.BIN *.ctg *.CTG *.abk *.ABK *.bkt *.BKT",
                         )
                     {
                         self.reference_path = path.display().to_string();
@@ -4412,13 +4510,7 @@ impl App {
                 }
             }
             if !self.reference_path.trim().is_empty() {
-                self.reference_enabled = true;
-                self.reference = None;
-                self.reference_rx = None;
-                self.reference_job = None;
-                self.reference_status =
-                    "Reference database configured; it will be indexed for the prepared player's rating."
-                        .to_string();
+                self.set_reference_path_or_book(self.reference_path.trim().to_string());
             }
             self.save_reference_prefs();
             self.status = "Default opening book and reference database saved.".to_string();
@@ -4916,11 +5008,51 @@ impl App {
         self.reference = None;
         self.reference_rx = None;
         self.reference_job = None;
+        self.reference_book = None;
         self.reference_status = format!(
             "{path} is now the default reference database. Open Players → Prepare to index it."
         );
         self.save_reference_prefs();
         self.status = format!("Default reference database: {path}");
+    }
+
+    /// Configure the reference source from a database or opening-book path.
+    /// Opening books are opened immediately so the General Reference Tree and
+    /// the preparation prior can serve their moves without an index build.
+    fn set_reference_path_or_book(&mut self, path: String) {
+        let trimmed = path.trim().to_string();
+        self.reference_path = trimmed.clone();
+        self.reference_enabled = true;
+        self.reference = None;
+        self.reference_rx = None;
+        self.reference_job = None;
+        self.reference_book = None;
+        if trimmed.is_empty() {
+            self.reference_status =
+                "No reference database configured — using the current database prior (may be skewed)."
+                    .to_string();
+        } else if is_opening_book_path(Path::new(&trimmed)) {
+            match Book::open(Path::new(&trimmed)) {
+                Ok(book) => {
+                    self.reference_status = format!(
+                        "Opening book ready: {} · {}",
+                        book.path().display(),
+                        book.summary()
+                    );
+                    self.reference_book = Some(book);
+                }
+                Err(err) => {
+                    self.reference_status = format!(
+                        "Opening book could not be opened: {err:#} — using the current database prior (may be skewed)."
+                    );
+                }
+            }
+        } else {
+            self.reference_status =
+                "Reference database configured; it will be indexed for the prepared player's rating."
+                    .to_string();
+        }
+        self.save_reference_prefs();
     }
 
     fn ensure_reference_for_player(&mut self, player: &players::PlayerSummary) {
@@ -4938,26 +5070,60 @@ impl App {
             self.reference = None;
             self.reference_rx = None;
             self.reference_job = None;
+            self.reference_book = None;
             self.reference_status =
                 "No reference database configured — using the current database prior (may be skewed)."
                     .to_string();
             return;
         }
-        let Some(target) = self.reference_target(player) else {
+        if is_opening_book_path(Path::new(path)) {
             self.reference = None;
             self.reference_rx = None;
             self.reference_job = None;
-            self.reference_status = format!(
-                "{} has no usable rating; cannot build a rating-filtered reference window. Using the current database prior; it may be skewed.",
-                player.name
-            );
+            if self.reference_book.is_none() {
+                match Book::open(Path::new(path)) {
+                    Ok(book) => {
+                        self.reference_status = format!(
+                            "Opening book ready: {} · {}",
+                            book.path().display(),
+                            book.summary()
+                        );
+                        self.reference_book = Some(book);
+                    }
+                    Err(err) => {
+                        self.reference_book = None;
+                        self.reference_status = format!(
+                            "Opening book could not be opened: {err:#} — using the current database prior (may be skewed)."
+                        );
+                    }
+                }
+            }
             return;
+        }
+        self.reference_book = None;
+        let mega = reference_path_is_mega(Path::new(path));
+        let target = if mega {
+            // Shared player-independent Mega index: no rating window.
+            0
+        } else {
+            let Some(target) = self.reference_target(player) else {
+                self.reference = None;
+                self.reference_rx = None;
+                self.reference_job = None;
+                self.reference_status = format!(
+                    "{} has no usable rating; cannot build a rating-filtered reference window. Using the current database prior; it may be skewed.",
+                    player.name
+                );
+                return;
+            };
+            target
         };
         let job = ReferenceJob {
             path: PathBuf::from(path),
             target,
             band: self.reference_band.clamp(25, 1_000),
             offset: self.reference_offset,
+            shared: mega,
         };
         if self
             .reference
@@ -5001,7 +5167,12 @@ impl App {
             let thread_job = job.clone();
             let result = open_library(&thread_job.path)
                 .and_then(|library| {
-                    let filter = Some(thread_job.rating_filter());
+                    let filter = if thread_job.shared {
+                        None
+                    } else {
+                        Some(thread_job.rating_filter())
+                    };
+                    let max_plies = if thread_job.shared { 36 } else { u32::MAX };
                     let cache = position::reference_cache_path(&thread_job.path, filter);
                     if let Some(index) =
                         PositionIndex::open_cached_for_at(library.as_ref(), &cache)?
@@ -5012,7 +5183,7 @@ impl App {
                         library,
                         &cache,
                         BuildOptions {
-                            max_plies: u32::MAX,
+                            max_plies,
                             rating_filter: filter,
                             ..BuildOptions::default()
                         },
@@ -5109,6 +5280,68 @@ impl App {
             .or(self.tree_index.as_ref())
     }
 
+    /// Resolve a position key back to a board when it is on the current game
+    /// line or is the standard start position. Opening books are keyed by the
+    /// full position, so the prior needs the board to probe them.
+    fn position_for_key(&self, key: u64) -> Option<Chess> {
+        if let Some(game) = self.current.as_ref()
+            && let Some(node) = game
+                .nodes
+                .iter()
+                .find(|node| position::position_key(&node.pos) == key)
+        {
+            return Some(node.pos.clone());
+        }
+        let start = Chess::default();
+        (position::position_key(&start) == key).then_some(start)
+    }
+
+    /// Book moves at `pos` converted to background [`position::MoveStat`]
+    /// rows. Polyglot entries have no W/D/L split, so the weight doubles as the
+    /// game count.
+    fn reference_book_moves(&self, pos: &Chess, key: u64) -> Vec<position::MoveStat> {
+        let Some(book) = self.reference_book.as_ref() else {
+            return Vec::new();
+        };
+        let Ok(moves) = book.moves(pos) else {
+            return Vec::new();
+        };
+        let mut stats = Vec::new();
+        for book_move in moves {
+            let Some(code) = position::encode_move(book_move.mv) else {
+                continue;
+            };
+            let games = book_move.games.max(book_move.weight);
+            if games == 0 {
+                continue;
+            }
+            let cap = |value: u64, limit: u64| value.min(limit).min(u64::from(u32::MAX)) as u32;
+            let total = cap(games, u64::from(u32::MAX));
+            let white = cap(book_move.white, games);
+            let draw = cap(book_move.draw, games.saturating_sub(u64::from(white)));
+            let black = cap(
+                book_move.black,
+                games.saturating_sub(u64::from(white) + u64::from(draw)),
+            );
+            stats.push(position::MoveStat {
+                key,
+                mv: code,
+                games: total,
+                white,
+                draw,
+                black,
+                elo_sum: 0,
+                elo_count: 0,
+                first_date: 0,
+                last_date: 0,
+                anchor_quarter: 0,
+                older_dated: 0,
+                buckets: [0; position::TREND_BUCKETS],
+            });
+        }
+        stats
+    }
+
     fn prior_for_position(&self, key: u64) -> (Vec<position::MoveStat>, players::PriorSource) {
         if self.reference_wanted()
             && let Some(reference) = &self.reference
@@ -5120,6 +5353,14 @@ impl App {
         }
         if let Some(tree) = &self.tree_index {
             let moves = tree.moves(key);
+            if !moves.is_empty() {
+                return (moves, players::PriorSource::Reference);
+            }
+        }
+        if self.reference_wanted()
+            && let Some(pos) = self.position_for_key(key)
+        {
+            let moves = self.reference_book_moves(&pos, key);
             if !moves.is_empty() {
                 return (moves, players::PriorSource::Reference);
             }
@@ -5211,6 +5452,9 @@ impl App {
 
     fn prior_warning(&self, source: players::PriorSource) -> Option<String> {
         if source == players::PriorSource::Reference {
+            return None;
+        }
+        if self.reference_wanted() && self.reference_book.is_some() {
             return None;
         }
         let warning = if !self.reference_enabled {
@@ -6545,10 +6789,10 @@ impl App {
         }
     }
 
-    /// Maximum games fetched per online source during preparation.
-    const PREP_ONLINE_MAX: usize = 300;
-    /// Maximum ChessABC OTB games fetched during preparation.
-    const PREP_CHESSABC_MAX: usize = 2000;
+    /// Online fetches are uncapped by default; the account filter trims them.
+    const PREP_ONLINE_MAX: usize = usize::MAX;
+    /// ChessABC fetches are uncapped by default.
+    const PREP_CHESSABC_MAX: usize = usize::MAX;
 
     // Temporary minimal stub for the in-progress preparation-setup task.
     fn open_prep_setup(&mut self, as_white: bool) {
@@ -6581,6 +6825,12 @@ impl App {
         self.prep_setup_chessabc_selected.clear();
         self.prep_setup_chessabc_status.clear();
         self.prep_setup_chessabc_rx = None;
+        let active_chessabc_ids = self
+            .prep
+            .as_ref()
+            .filter(|prep| prep.player_key == player.key)
+            .map(|prep| prep.chessabc_fide_ids.clone())
+            .unwrap_or_default();
         // ChessABC matching is on by default: resolve the opponent's profile
         // in the background so the dialog can confirm ambiguous names.
         let elo = player
@@ -6589,6 +6839,9 @@ impl App {
             .filter(|elo| *elo > 0)
             .or_else(|| (player.elo_max > 0).then_some(player.elo_max));
         self.refresh_chessabc_candidates(player.name.clone(), elo);
+        if !active_chessabc_ids.is_empty() {
+            self.prep_setup_chessabc_selected = active_chessabc_ids;
+        }
         self.refresh_prep_account_checks();
         self.prep_setup_open = true;
     }
@@ -6656,9 +6909,13 @@ impl App {
                         format!("Select matching profile(s) for {query}:");
                 }
                 self.prep_setup_chessabc_candidates = candidates;
+                // Auto-selected profiles (or a checked candidate list) must be
+                // confirmed immediately: ✓/⏳/✗ next to "ChessABC games".
+                self.refresh_prep_account_checks();
             }
             Ok((_, _, Err(err))) => {
                 self.prep_setup_chessabc_status = format!("ChessABC search failed: {err}");
+                self.refresh_prep_account_checks();
             }
             Err(TryRecvError::Empty) => {
                 self.prep_setup_chessabc_rx = Some(rx);
@@ -6731,6 +6988,7 @@ impl App {
         let use_current = self.prep_setup_use_current && library.is_some();
         let use_reference_file = self.prep_setup_use_reference;
         let reference_path = self.reference_path.clone();
+        let reference_is_book = is_opening_book_path(Path::new(reference_path.trim()));
         let use_chessabc = self.prep_setup_use_chessabc;
         let chessabc_ids: Vec<String> = self
             .prep
@@ -6746,6 +7004,15 @@ impl App {
             .filter(|prep| prep.player_key == player.key)
             .map(|prep| prep.accounts.clone())
             .unwrap_or_default();
+        // Probed games are kept by the setup dialog's account checks: reuse
+        // them so pressing Start never downloads an already-verified account
+        // or ChessABC profile a second time.
+        let cached_checks: HashMap<String, Arc<Vec<Game>>> = self
+            .prep_setup_account_checks
+            .iter()
+            .filter(|(_, check)| !check.fetching && check.error.is_none())
+            .map(|(key, check)| (key.clone(), check.games.clone()))
+            .collect();
         self.prep_load_job = Some(player.key.clone());
         self.player_book_status = format!("Loading {} games from all sources…", player.name);
         let (tx, rx) = mpsc::channel();
@@ -6755,12 +7022,78 @@ impl App {
             ..Default::default()
         };
         let max_games = Self::PREP_ONLINE_MAX;
+        let total = {
+            let mut total = 0usize;
+            if use_current {
+                total += 1;
+            }
+            if use_reference_file
+                && !reference_path.trim().is_empty()
+                && !reference_is_book
+            {
+                total += 1;
+            }
+            if use_chessabc {
+                total += 1;
+            }
+            total += accounts.iter().filter(|account| account.enabled).count();
+            if !extra_path.is_empty() {
+                total += 1;
+            }
+            total
+        };
         std::thread::spawn(move || {
             let prep_started = std::time::Instant::now();
             let as_of = players::today();
             let mut sources: Vec<(players::SourceTag, Vec<Game>)> = Vec::new();
             let mut notes: Vec<String> = Vec::new();
+            let mut step = 0usize;
+            let send_status = |step: usize, label: &str, notes: &[String]| {
+                let _ = tx.send(PrepLoadMessage::Status {
+                    step,
+                    total,
+                    current_label: label.to_string(),
+                    completed_notes: notes.to_vec(),
+                });
+                ctx.request_repaint();
+            };
+            let emit_progress = |sources: &[(players::SourceTag, Vec<Game>)],
+                                 notes: &[String],
+                                 step: usize,
+                                 label: &str| {
+                let cloned = sources
+                    .iter()
+                    .map(|(tag, games)| (tag.clone(), games.clone()))
+                    .collect();
+                let mut merged = players::deduplicate_and_merge_games(cloned);
+                merged.retain(|(_, game)| {
+                    players::player_key(game.white()).as_deref() == Some(player.key.as_str())
+                        || players::player_key(game.black()).as_deref()
+                            == Some(player.key.as_str())
+                });
+                let games: Vec<Game> = merged.into_iter().map(|(_, game)| game).collect();
+                let book = PlayerBook::from_merged_games(
+                    player.key.clone(),
+                    player.name.clone(),
+                    &games,
+                    config,
+                    as_of,
+                );
+                let sources_label = format!("{} · {} games", notes.join(" + "), book.games());
+                let _ = tx.send(PrepLoadMessage::Progress {
+                    step,
+                    total,
+                    current_label: label.to_string(),
+                    sources_label,
+                    book,
+                    games,
+                });
+                ctx.request_repaint();
+            };
             if use_current && let Some(library) = library.as_ref() {
+                step += 1;
+                let label = "Loading current database…";
+                send_status(step, label, &notes);
                 let mut games = Vec::new();
                 for &game_index in &player.game_indices {
                     match library.load(game_index) {
@@ -6775,33 +7108,48 @@ impl App {
                     players::SourceTag::Other("Current database".to_string()),
                     games,
                 ));
+                emit_progress(&sources, &notes, step, label);
             }
             if use_reference_file {
                 let trimmed = reference_path.trim();
                 if !trimmed.is_empty() {
-                    // Any supported database format (2CBH/CBH/SCID/PGN);
-                    // only the prepared player's games are merged in.
-                    match open_library(Path::new(trimmed)) {
-                        Ok(reference) => {
-                            let games =
-                                player_games_from_library(&reference, &player.key, &canonical_name);
-                            notes.push(format!("Reference file {}", games.len()));
-                            if !games.is_empty() {
-                                sources.push((
-                                    players::SourceTag::Other("Reference file".to_string()),
-                                    games,
-                                ));
+                    if reference_is_book {
+                        notes.push("Reference book prior".to_string());
+                    } else {
+                        step += 1;
+                        let label = "Loading reference file…";
+                        send_status(step, label, &notes);
+                        // Any supported database format (2CBH/CBH/SCID/PGN);
+                        // only the prepared player's games are merged in.
+                        match open_library(Path::new(trimmed)) {
+                            Ok(reference) => {
+                                let games = player_games_from_library(
+                                    &reference,
+                                    &player.key,
+                                    &canonical_name,
+                                );
+                                notes.push(format!("Reference file {}", games.len()));
+                                if !games.is_empty() {
+                                    sources.push((
+                                        players::SourceTag::Other("Reference file".to_string()),
+                                        games,
+                                    ));
+                                }
+                            }
+                            Err(err) => {
+                                notes.push(format!("Reference file unreadable: {err:#}"));
                             }
                         }
-                        Err(err) => {
-                            notes.push(format!("Reference file unreadable: {err:#}"));
-                        }
+                        emit_progress(&sources, &notes, step, label);
                     }
                 } else {
                     notes.push("Reference prior".to_string());
                 }
             }
             if use_chessabc {
+                step += 1;
+                let label = "Loading ChessABC games…";
+                send_status(step, label, &notes);
                 let max_chessabc = Self::PREP_CHESSABC_MAX;
                 let mut chessabc_games = Vec::new();
                 if chessabc_ids.is_empty() {
@@ -6824,6 +7172,12 @@ impl App {
                 } else {
                     let mut fetched = 0usize;
                     for fide_id in &chessabc_ids {
+                        let cache_key = format!("chessabc:{fide_id}");
+                        if let Some(games) = cached_checks.get(&cache_key) {
+                            fetched += games.len();
+                            chessabc_games.extend(games.iter().cloned());
+                            continue;
+                        }
                         match online::fetch_chessabc_games_by_fide_id(fide_id, max_chessabc) {
                             Ok(games) => {
                                 fetched += games.len();
@@ -6847,39 +7201,64 @@ impl App {
                         chessabc_games,
                     ));
                 }
+                emit_progress(&sources, &notes, step, label);
             }
             for account in &accounts {
                 if !account.enabled {
                     continue;
                 }
+                step += 1;
+                let label = format!(
+                    "Loading {} · {}…",
+                    account.source.label(),
+                    account.username
+                );
+                send_status(step, &label, &notes);
                 let as_of_account = as_of;
-                match online::fetch_player_games(account.source, &account.username, max_games) {
-                    Ok(fetched) => {
-                        let total = fetched.len();
-                        let mut games = fetched;
-                        players::canonicalize_account_games(
-                            &mut games,
-                            &account.username,
-                            &canonical_name,
-                        );
-                        let kept: Vec<Game> = games
-                            .into_iter()
-                            .filter(|game| account.filter.matches_game(game, as_of_account))
-                            .collect();
-                        notes.push(format!(
-                            "{} {}/{}",
-                            account.source.label(),
-                            kept.len(),
-                            total
-                        ));
-                        sources.push((players::SourceTag::Online(account.source), kept));
+                let cache_key = prep_account_check_key(account.source, &account.username);
+                let fetched = if let Some(cached) = cached_checks.get(&cache_key) {
+                    cached.as_ref().clone()
+                } else {
+                    match online::fetch_player_games(
+                        account.source,
+                        &account.username,
+                        max_games,
+                    ) {
+                        Ok(fetched) => fetched,
+                        Err(err) => {
+                            notes.push(format!(
+                                "{} unavailable ({err:#})",
+                                account.source.label()
+                            ));
+                            emit_progress(&sources, &notes, step, &label);
+                            continue;
+                        }
                     }
-                    Err(err) => {
-                        notes.push(format!("{} unavailable ({err:#})", account.source.label()));
-                    }
-                }
+                };
+                let total = fetched.len();
+                let mut games = fetched;
+                players::canonicalize_account_games(
+                    &mut games,
+                    &account.username,
+                    &canonical_name,
+                );
+                let kept: Vec<Game> = games
+                    .into_iter()
+                    .filter(|game| account.filter.matches_game(game, as_of_account))
+                    .collect();
+                notes.push(format!(
+                    "{} {}/{}",
+                    account.source.label(),
+                    kept.len(),
+                    total
+                ));
+                sources.push((players::SourceTag::Online(account.source), kept));
+                emit_progress(&sources, &notes, step, &label);
             }
             if !extra_path.is_empty() {
+                step += 1;
+                let label = "Loading extra file…";
+                send_status(step, label, &notes);
                 // Any supported database format (2CBH/CBH/SCID/PGN); only the
                 // prepared player's games are merged in.
                 match open_library(Path::new(&extra_path)) {
@@ -6895,11 +7274,15 @@ impl App {
                         notes.push(format!("Extra file unreadable: {err:#}"));
                     }
                 }
+                emit_progress(&sources, &notes, step, label);
             }
             if sources.is_empty() {
                 // Classic single-source fallback: no source produced games,
                 // so index the current database alone (when one is open).
                 if let Some(library) = library.as_ref() {
+                    let fallback_step = step.max(1).min(total.max(1));
+                    let label = "Loading current database…";
+                    send_status(fallback_step, label, &notes);
                     let mut games = Vec::new();
                     for &game_index in &player.game_indices {
                         if let Ok(game) = library.load(game_index) {
@@ -6911,6 +7294,7 @@ impl App {
                         players::SourceTag::Other("Current database".to_string()),
                         games,
                     ));
+                    emit_progress(&sources, &notes, fallback_step, label);
                 } else {
                     notes.push("No sources selected".to_string());
                 }
@@ -6947,7 +7331,7 @@ impl App {
                     prep_started.elapsed().as_secs_f64()
                 );
             }
-            let _ = tx.send(result);
+            let _ = tx.send(PrepLoadMessage::Done(result));
             ctx.request_repaint();
         });
         self.prep_load_rx = Some(rx);
@@ -6957,38 +7341,88 @@ impl App {
         let Some(rx) = self.prep_load_rx.take() else {
             return;
         };
-        match rx.try_recv() {
-            Ok(Ok(result)) => {
-                let key = result.book.player_key().to_string();
-                let name = result.book.player_name().to_string();
-                let games = result.book.games();
-                let label = result.sources_label.clone();
-                if self
-                    .prep
-                    .as_ref()
-                    .is_some_and(|prep| prep.player_key == key)
-                {
-                    self.prep_merged_games = result.games;
-                    self.player_book = Some(result.book);
-                    self.player_book_job = None;
-                    if let Some(prep) = self.prep.as_mut() {
-                        prep.sources_label = label.clone();
-                    }
-                    self.player_book_status = format!("{games} games merged for {name} · {label}");
+        let mut keep = true;
+        loop {
+            match rx.try_recv() {
+                Ok(PrepLoadMessage::Status {
+                    step,
+                    total,
+                    current_label,
+                    completed_notes,
+                }) => {
+                    let ready = if completed_notes.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" · Ready: {}", completed_notes.join(" + "))
+                    };
+                    self.player_book_status =
+                        format!("Compiling playerbase ({step}/{total}): {current_label}{ready}");
                 }
-                self.prep_load_job = None;
+                Ok(PrepLoadMessage::Progress {
+                    step,
+                    total,
+                    current_label,
+                    sources_label,
+                    book,
+                    games,
+                }) => {
+                    let key = book.player_key().to_string();
+                    if self
+                        .prep
+                        .as_ref()
+                        .is_some_and(|prep| prep.player_key == key)
+                    {
+                        self.prep_merged_games = games;
+                        self.player_book = Some(book);
+                        if let Some(prep) = self.prep.as_mut() {
+                            prep.sources_label = sources_label.clone();
+                        }
+                        self.player_book_status = format!(
+                            "Compiling playerbase ({step}/{total}): {current_label} · Ready: {sources_label}"
+                        );
+                    }
+                }
+                Ok(PrepLoadMessage::Done(Ok(result))) => {
+                    let key = result.book.player_key().to_string();
+                    let name = result.book.player_name().to_string();
+                    let games = result.book.games();
+                    let label = result.sources_label.clone();
+                    if self
+                        .prep
+                        .as_ref()
+                        .is_some_and(|prep| prep.player_key == key)
+                    {
+                        self.prep_merged_games = result.games;
+                        self.player_book = Some(result.book);
+                        self.player_book_job = None;
+                        if let Some(prep) = self.prep.as_mut() {
+                            prep.sources_label = label.clone();
+                        }
+                        self.player_book_status =
+                            format!("{games} games merged for {name} · {label}");
+                    }
+                    self.prep_load_job = None;
+                    keep = false;
+                    break;
+                }
+                Ok(PrepLoadMessage::Done(Err(err))) => {
+                    self.prep_load_job = None;
+                    self.player_book_status = format!("Preparation load failed: {err}");
+                    keep = false;
+                    break;
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    self.prep_load_job = None;
+                    self.player_book_status =
+                        "Preparation load stopped unexpectedly.".to_string();
+                    keep = false;
+                    break;
+                }
             }
-            Ok(Err(err)) => {
-                self.prep_load_job = None;
-                self.player_book_status = format!("Preparation load failed: {err}");
-            }
-            Err(TryRecvError::Empty) => {
-                self.prep_load_rx = Some(rx);
-            }
-            Err(TryRecvError::Disconnected) => {
-                self.prep_load_job = None;
-                self.player_book_status = "Preparation load stopped unexpectedly.".to_string();
-            }
+        }
+        if keep {
+            self.prep_load_rx = Some(rx);
         }
     }
 
@@ -7056,16 +7490,9 @@ impl App {
 
     /// Confirm every enabled online account (plus resolved ChessABC
     /// profiles) in the background without blocking the setup dialog.
-    /// Each row renders ⏳ while fetching, then ✓ with game counts or ✗.
+    /// Verified accounts are not re-fetched: only newly added keys are queued,
+    /// and filter changes recompute `kept` from the cached games.
     fn refresh_prep_account_checks(&mut self) {
-        #[derive(Clone)]
-        struct Request {
-            key: String,
-            source: OnlineSource,
-            username: String,
-            filter: players::AccountFilter,
-            is_chessabc: bool,
-        }
         let mut requests = Vec::new();
         for account in &self.prep_setup_accounts {
             if !account.enabled {
@@ -7075,7 +7502,7 @@ impl App {
             if username.is_empty() {
                 continue;
             }
-            requests.push(Request {
+            requests.push(AccountCheckRequest {
                 key: prep_account_check_key(account.source, &username),
                 source: account.source,
                 username,
@@ -7088,7 +7515,7 @@ impl App {
             if fide_id.is_empty() {
                 continue;
             }
-            requests.push(Request {
+            requests.push(AccountCheckRequest {
                 key: format!("chessabc:{fide_id}"),
                 source: OnlineSource::ChessAbc,
                 username: fide_id,
@@ -7096,47 +7523,93 @@ impl App {
                 is_chessabc: true,
             });
         }
-        for request in &requests {
+        let live: HashSet<String> = requests.iter().map(|request| request.key.clone()).collect();
+        self.prep_setup_account_checks
+            .retain(|key, _| live.contains(key));
+        let as_of = players::today();
+        let mut queued = Vec::new();
+        for request in requests {
+            let mut cached = false;
+            if let Some(existing) = self.prep_setup_account_checks.get_mut(&request.key) {
+                if existing.fetching {
+                    // Already in flight: the worker will deliver its result.
+                    continue;
+                }
+                if existing.error.is_none() {
+                    existing.kept = if request.is_chessabc {
+                        existing.total
+                    } else {
+                        existing
+                            .games
+                            .iter()
+                            .filter(|game| request.filter.matches_game(game, as_of))
+                            .count()
+                    };
+                    cached = true;
+                }
+            }
+            if cached {
+                continue;
+            }
             self.prep_setup_account_checks.insert(
                 request.key.clone(),
                 AccountCheckResult::fetching(request.key.clone()),
             );
+            queued.push(request);
         }
-        let live: HashSet<String> = requests.iter().map(|request| request.key.clone()).collect();
-        self.prep_setup_account_checks
-            .retain(|key, _| live.contains(key));
-        if requests.is_empty() {
-            self.prep_setup_account_rx = None;
+        if queued.is_empty() {
             return;
         }
+        self.ensure_prep_account_check_worker();
+        if let Some(tx) = &self.prep_setup_account_tx {
+            for request in queued {
+                let _ = tx.send(request);
+            }
+        }
+    }
+
+    /// Start the long-lived account-confirmation worker once. It stays alive
+    /// for the app's lifetime so accounts added during a fetch are not lost.
+    fn ensure_prep_account_check_worker(&mut self) {
         if self.prep_setup_account_rx.is_some() {
             return;
         }
-        let (tx, rx) = mpsc::channel();
+        let (request_tx, request_rx) = mpsc::channel::<AccountCheckRequest>();
+        let (tx, rx) = mpsc::channel::<AccountCheckResult>();
+        self.prep_setup_account_tx = Some(request_tx);
         self.prep_setup_account_rx = Some(rx);
         let ctx = self.ctx.clone();
         std::thread::spawn(move || {
-            let as_of = players::today();
-            for request in requests {
+            for request in request_rx {
+                let as_of = players::today();
                 let result = if request.is_chessabc {
-                    match online::fetch_chessabc_games_by_fide_id(&request.username, 100) {
-                        Ok(games) => AccountCheckResult {
-                            key: request.key.clone(),
-                            fetching: false,
-                            total: games.len(),
-                            kept: games.len(),
-                            error: None,
-                        },
+                    match online::fetch_chessabc_games_by_fide_id(&request.username, usize::MAX) {
+                        Ok(games) => {
+                            let total = games.len();
+                            AccountCheckResult {
+                                key: request.key.clone(),
+                                fetching: false,
+                                total,
+                                kept: total,
+                                error: None,
+                                games: Arc::new(games),
+                            }
+                        }
                         Err(err) => AccountCheckResult {
                             key: request.key.clone(),
                             fetching: false,
                             total: 0,
                             kept: 0,
                             error: Some(format!("{err:#}")),
+                            games: Arc::new(Vec::new()),
                         },
                     }
                 } else {
-                    match online::fetch_player_games(request.source, &request.username, 100) {
+                    match online::fetch_player_games(
+                        request.source,
+                        &request.username,
+                        usize::MAX,
+                    ) {
                         Ok(games) => {
                             let total = games.len();
                             let kept = games
@@ -7149,6 +7622,7 @@ impl App {
                                 total,
                                 kept,
                                 error: None,
+                                games: Arc::new(games),
                             }
                         }
                         Err(err) => AccountCheckResult {
@@ -7157,6 +7631,7 @@ impl App {
                             total: 0,
                             kept: 0,
                             error: Some(format!("{err:#}")),
+                            games: Arc::new(Vec::new()),
                         },
                     }
                 };
@@ -7187,6 +7662,7 @@ impl App {
         if keep {
             self.prep_setup_account_rx = Some(rx);
         } else {
+            self.prep_setup_account_tx = None;
             for check in self.prep_setup_account_checks.values_mut() {
                 if check.fetching {
                     check.fetching = false;
@@ -7250,6 +7726,12 @@ impl App {
         } else {
             format!("Start preparation vs {player_name}")
         };
+        let update_mode = self
+            .prep
+            .as_ref()
+            .is_some_and(|prep| !player_key.is_empty() && prep.player_key == player_key);
+        let chessabc_check =
+            chessabc_aggregate_check(&account_checks, &self.prep_setup_chessabc_selected);
         egui::Window::new(title)
             .open(&mut open)
             .default_size([520.0, 640.0])
@@ -7385,10 +7867,12 @@ impl App {
                 .on_hover_text(
                     "The reference database supplies the background prior; PGN reference files also contribute their games.",
                 );
-                ui.checkbox(
-                    &mut self.prep_setup_use_chessabc,
-                    "All ChessABC games for this player",
-                );
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut self.prep_setup_use_chessabc, "ChessABC games");
+                    if let Some(check) = &chessabc_check {
+                        ui.label(account_check_badge(check).small());
+                    }
+                });
                 ui.horizontal(|ui| {
                     ui.label("Extra DB file:");
                     ui.add(
@@ -7567,7 +8051,12 @@ impl App {
                 });
                 ui.separator();
                 ui.horizontal(|ui| {
-                    if ui.button("Start preparation").clicked() {
+                    let start_label = if update_mode {
+                        "Update preparation"
+                    } else {
+                        "Start preparation"
+                    };
+                    if ui.button(start_label).clicked() {
                         start = true;
                     }
                     if ui.button("Cancel").clicked() {
@@ -7662,13 +8151,51 @@ impl App {
             self.prep_setup_open = false;
             // The dialog's opponent selector wins; with no open database a
             // typed name, account, or ChessABC profile starts preparation.
-            if let Some(index) = self.resolve_prep_player_index() {
+            let index = self.resolve_prep_player_index();
+            if let Some(index) = index {
                 self.selected_player = Some(index);
                 self.prep_setup_player = Some(index);
                 self.prep_setup_change_opponent = false;
             }
-            let as_white = self.prep_setup_as_white;
-            self.start_prep(as_white);
+            let same_player = index.is_some_and(|index| {
+                self.players.get(index).is_some_and(|player| {
+                    self.prep
+                        .as_ref()
+                        .is_some_and(|prep| prep.player_key == player.key)
+                })
+            });
+            if same_player {
+                // Live source editing: keep the current line/node and update
+                // the running session in place, then restart only the load.
+                if let Some(index) = index
+                    && let Some(player) = self.players.get(index).cloned()
+                {
+                    self.ensure_reference_for_player(&player);
+                    if let Some(prep) = self.prep.as_mut() {
+                        prep.accounts = self
+                            .prep_setup_accounts
+                            .iter()
+                            .filter(|account| account.enabled)
+                            .cloned()
+                            .collect();
+                        prep.chessabc_fide_ids = self.prep_setup_chessabc_selected.clone();
+                        prep.filter = self.prep_setup_filter;
+                    }
+                    self.prep_load_rx = None;
+                    self.prep_load_job = None;
+                    self.start_smart_prep_load(index);
+                    self.status = format!(
+                        "Updating preparation against {}…",
+                        self.players
+                            .get(index)
+                            .map(|player| natural_player_name(&player.name))
+                            .unwrap_or_default()
+                    );
+                }
+            } else {
+                let as_white = self.prep_setup_as_white;
+                self.start_prep(as_white);
+            }
         }
         self.prep_setup_open = open;
     }
@@ -11317,6 +11844,7 @@ impl App {
             self.reference = None;
             self.reference_job = None;
             self.reference_rx = None;
+            self.reference_book = None;
             self.reference_status =
                 "No reference database configured — using the current database prior (may be skewed)."
                     .to_string();
@@ -11928,20 +12456,22 @@ impl App {
             reference_enabled = true;
         }
         if reference_path != self.reference_path || reference_enabled != self.reference_enabled {
-            self.reference_path = reference_path;
-            self.reference_enabled = reference_enabled;
-            self.reference = None;
-            self.reference_rx = None;
-            self.reference_job = None;
-            self.reference_status = if use_current_reference {
-                "Using the current database as the reference source.".to_string()
-            } else if self.reference_path.trim().is_empty() {
-                "No reference database configured — using the current database prior.".to_string()
+            if reference_enabled && !reference_path.trim().is_empty() {
+                self.set_reference_path_or_book(reference_path);
             } else {
-                "Reference database configured. Open Players → Prepare to build its index."
-                    .to_string()
-            };
-            self.save_reference_prefs();
+                self.reference_path = reference_path;
+                self.reference_enabled = reference_enabled;
+                self.reference = None;
+                self.reference_rx = None;
+                self.reference_job = None;
+                self.reference_book = None;
+                self.reference_status = if use_current_reference {
+                    "Using the current database as the reference source.".to_string()
+                } else {
+                    "No reference database configured — using the current database prior.".to_string()
+                };
+                self.save_reference_prefs();
+            }
         }
         if refresh {
             self.refresh_cloud();
@@ -14178,14 +14708,28 @@ impl App {
 
     fn prep_tree(&mut self, ui: &mut Ui, prep: &PrepSession, pos: &crate::chess::Chess, key: u64) {
         let mut exit = false;
+        let mut edit_sources = false;
         ui.horizontal(|ui| {
             ui.heading("Player tree");
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if ui.small_button("Exit prep").clicked() {
                     exit = true;
                 }
+                if ui
+                    .small_button("Add / Edit sources…")
+                    .on_hover_text("Change the sources without leaving preparation")
+                    .clicked()
+                {
+                    edit_sources = true;
+                }
             });
         });
+        if self.prep_load_rx.is_some() {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(RichText::new(&self.player_book_status).small().weak());
+            });
+        }
         ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new("vs").weak());
             if let Some(title) = prep.player_title {
@@ -14231,6 +14775,9 @@ impl App {
         if exit {
             self.exit_prep();
             return;
+        }
+        if edit_sources {
+            self.open_prep_setup(prep.our_color == Color::White);
         }
 
         let facing = if self.prep_swapped_view {
@@ -14370,6 +14917,8 @@ impl App {
             "Reference database"
         } else if self.tree_index.is_some() {
             "Opening tree"
+        } else if self.reference_book.is_some() {
+            "Opening book"
         } else {
             "No reference yet"
         };
@@ -14915,6 +15464,84 @@ impl App {
                                 Some(&book_games_map),
                             )
                             .or(clicked);
+                        } else if let Some(book) = self.reference_book.as_ref() {
+                            ui.label(
+                                RichText::new(format!(
+                                    "{} · {}",
+                                    book.path().display(),
+                                    book.summary()
+                                ))
+                                .weak()
+                                .small(),
+                            );
+                            match book.moves(pos) {
+                                Ok(moves) if !moves.is_empty() => {
+                                    egui::Grid::new("prep-reference-book-grid")
+                                        .num_columns(6)
+                                        .striped(true)
+                                        .show(ui, |ui| {
+                                            ui.label(RichText::new("Move").strong());
+                                            ui.label(RichText::new("Games").strong());
+                                            ui.label(RichText::new("W").strong());
+                                            ui.label(RichText::new("D").strong());
+                                            ui.label(RichText::new("B").strong());
+                                            ui.label(RichText::new("Score").strong());
+                                            ui.end_row();
+                                            for book_move in &moves {
+                                                let san = SanPlus::from_move(pos.clone(), book_move.mv)
+                                                    .to_string();
+                                                let response = ui.selectable_label(
+                                                    false,
+                                                    RichText::new(&san).strong(),
+                                                );
+                                                if response.hovered() {
+                                                    hover_preview =
+                                                        preview_after_move(pos, book_move.mv);
+                                                }
+                                                if response.clicked() {
+                                                    clicked = Some(book_move.mv);
+                                                }
+                                                let games =
+                                                    book_move.games.max(book_move.weight);
+                                                ui.label(games.to_string());
+                                                ui.label(book_move.white.to_string());
+                                                ui.label(book_move.draw.to_string());
+                                                ui.label(book_move.black.to_string());
+                                                let score = book_move
+                                                    .score_white()
+                                                    .map(|score| format!("{:.0}%", score * 100.0))
+                                                    .unwrap_or_else(|| "—".to_string());
+                                                ui.label(score);
+                                                ui.end_row();
+                                            }
+                                        });
+                                }
+                                Ok(_) => {
+                                    ui.label(
+                                        RichText::new("No book move reached this position.")
+                                            .weak()
+                                            .italics(),
+                                    );
+                                }
+                                Err(err) => {
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "Opening book read failed: {err:#}"
+                                        ))
+                                        .weak(),
+                                    );
+                                }
+                            }
+                            if ui.small_button("Choose reference database or book…").clicked()
+                                && let Some(path) = open_file_dialog(
+                                    "Choose reference database or book",
+                                    self.last_database_dir.as_deref(),
+                                    "Reference databases and opening books",
+                                    "*.2cbh *.2CBH *.cbh *.CBH *.si4 *.SI4 *.pgn *.PGN *.bin *.BIN *.ctg *.CTG *.abk *.ABK *.bkt *.BKT",
+                                )
+                            {
+                                pending_reference_path = Some(path.display().to_string());
+                            }
                         } else {
                             ui.label(RichText::new(&reference_status).weak());
                             if reference_tree_building {
@@ -14928,12 +15555,12 @@ impl App {
                             } else if let Some(job) = &reference_tree_job {
                                 ui.label(RichText::new(job).weak().small());
                             }
-                            if ui.small_button("Choose reference database…").clicked()
+                            if ui.small_button("Choose reference database or book…").clicked()
                                 && let Some(path) = open_file_dialog(
-                                    "Choose reference database",
+                                    "Choose reference database or book",
                                     self.last_database_dir.as_deref(),
-                                    "Reference databases",
-                                    "*.2cbh *.2CBH *.cbh *.CBH *.si4 *.SI4 *.pgn *.PGN",
+                                    "Reference databases and opening books",
+                                    "*.2cbh *.2CBH *.cbh *.CBH *.si4 *.SI4 *.pgn *.PGN *.bin *.BIN *.ctg *.CTG *.abk *.ABK *.bkt *.BKT",
                                 )
                             {
                                 pending_reference_path = Some(path.display().to_string());
@@ -15042,14 +15669,7 @@ impl App {
             });
 
         if let Some(path) = pending_reference_path {
-            self.reference_path = path;
-            self.reference_enabled = true;
-            self.reference = None;
-            self.reference_rx = None;
-            self.reference_job = None;
-            self.reference_status =
-                "Reference database configured; open Players → Prepare to index it.".to_string();
-            self.save_reference_prefs();
+            self.set_reference_path_or_book(path);
         }
 
         if mode != prep.mode {
@@ -21813,6 +22433,51 @@ fn default_reference_path() -> Option<PathBuf> {
         .find(|path| path.exists())
 }
 
+/// True when `path` names a native opening book rather than a game database.
+fn is_opening_book_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "bin" | "ctg" | "abk" | "bkt"
+            )
+        })
+}
+
+/// Multi-million-game reference databases (Mega) must share one unfiltered
+/// index instead of rebuilding a rating-window index for every opponent.
+/// The header/move-file size is an exact game-count proxy for both native
+/// formats and avoids opening the database on the UI thread.
+fn reference_path_is_mega(path: &Path) -> bool {
+    const MEGA_GAMES: u64 = 500_000;
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase);
+    match extension.as_deref() {
+        Some("2cbh") => std::fs::metadata(path)
+            .map(|metadata| metadata.len() / 192 >= MEGA_GAMES)
+            .unwrap_or(false),
+        Some("cbh") => std::fs::metadata(path)
+            .map(|metadata| metadata.len() / 46 >= MEGA_GAMES)
+            .unwrap_or(false),
+        Some("cbv" | "cba" | "cbg") => {
+            let stem = path.with_extension("");
+            let cbh = stem.with_extension("cbh");
+            let two_cbh = stem.with_extension("2cbh");
+            std::fs::metadata(&two_cbh)
+                .map(|metadata| metadata.len() / 192 >= MEGA_GAMES)
+                .or_else(|_| {
+                    std::fs::metadata(&cbh)
+                        .map(|metadata| metadata.len() / 46 >= MEGA_GAMES)
+                })
+                .unwrap_or(false)
+        }
+        _ => false,
+    }
+}
+
 /// The correspondence database used automatically in the Engine tab.
 /// `BRETT_CORRESPONDENCE` wins, then the snapshot bundled in a source
 /// checkout, then the conventional Brett Resources location. The file remains
@@ -22881,6 +23546,7 @@ mod tests {
             prep_setup_chessabc_rx: None,
             prep_setup_account_checks: HashMap::new(),
             prep_setup_account_rx: None,
+            prep_setup_account_tx: None,
             prep_setup_search: String::new(),
             prep_setup_change_opponent: false,
             prep_setup_player: None,
@@ -22897,6 +23563,7 @@ mod tests {
             reference: None,
             reference_rx: None,
             reference_job: None,
+            reference_book: None,
             reference_status: String::new(),
             correspondence_enabled: true,
             correspondence_path: String::new(),
@@ -24447,6 +25114,7 @@ mod tests {
                 target: 2_500,
                 band: 200,
                 offset: 0,
+                shared: false,
             },
         });
         let key = position::position_key(&Chess::default());
@@ -24462,6 +25130,60 @@ mod tests {
         assert_eq!(source, players::PriorSource::Reference);
 
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn refresh_prep_account_checks_preserves_already_verified_accounts() {
+        let mut app = test_app();
+        app.prep_setup_accounts.push(players::PrepOnlineAccount {
+            source: OnlineSource::Lichess,
+            username: "existing_user".to_string(),
+            enabled: true,
+            filter: players::AccountFilter::default(),
+        });
+        let key = prep_account_check_key(OnlineSource::Lichess, "existing_user");
+        let mut g = Game::default();
+        g.set_header("White", "existing_user".to_string());
+        g.set_header("Black", "opp".to_string());
+        app.prep_setup_account_checks.insert(
+            key.clone(),
+            AccountCheckResult {
+                key: key.clone(),
+                fetching: false,
+                total: 1,
+                kept: 1,
+                error: None,
+                games: Arc::new(vec![g]),
+            },
+        );
+        app.refresh_prep_account_checks();
+        let check = app.prep_setup_account_checks.get(&key).unwrap();
+        assert!(
+            !check.fetching,
+            "already verified account must not be reset to fetching"
+        );
+        assert_eq!(check.total, 1);
+    }
+
+    #[test]
+    fn general_reference_tree_and_prior_accept_opening_book() {
+        let mut app = test_app();
+        let pos = Chess::default();
+        let key = position::position_key(&pos);
+        // Configure an in-memory/temp Polyglot book and verify prior_for_position uses it.
+        let tmp = std::env::temp_dir().join("brett_test_ref_book.bin");
+        // 16-byte polyglot entry for initial position e2e4 (polyglot key 0x463b96181691fc9c, move e2e4 = 0x031c, weight 10)
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0x463b96181691fc9cu64.to_be_bytes());
+        bytes.extend_from_slice(&0x031cu16.to_be_bytes());
+        bytes.extend_from_slice(&10u16.to_be_bytes());
+        bytes.extend_from_slice(&0u32.to_be_bytes());
+        std::fs::write(&tmp, &bytes).unwrap();
+        app.set_reference_path_or_book(tmp.display().to_string());
+        let (moves, source) = app.prior_for_position(key);
+        let _ = std::fs::remove_file(&tmp);
+        assert_eq!(source, players::PriorSource::Reference);
+        assert!(!moves.is_empty());
     }
 
     #[test]
@@ -24535,6 +25257,7 @@ mod tests {
                 target: 2500,
                 band: 200,
                 offset: 0,
+                shared: false,
             },
         });
         assert!(app.reference_tree_index().is_some());
