@@ -466,6 +466,17 @@ pub trait GameLibrary: Send + Sync {
     fn accelerated_player_games(&self) -> Option<Vec<AcceleratedPlayer>> {
         None
     }
+
+    /// Targeted per-player lookup that filters the name store before decoding
+    /// accelerator postings. `None` means "no targeted fast path; the caller
+    /// falls back to [`Self::accelerated_player_games`] or a header scan".
+    fn accelerated_games_for_player(
+        &self,
+        _player_key: &str,
+        _canonical_name: &str,
+    ) -> Option<Vec<usize>> {
+        None
+    }
 }
 
 pub(crate) fn filter_games(games: &[IndexedGame], needle: &str) -> Vec<usize> {

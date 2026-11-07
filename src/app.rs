@@ -21166,32 +21166,39 @@ fn player_games_from_library(
     canonical_name: &str,
 ) -> Vec<Game> {
     let mut indices: Vec<usize> = Vec::new();
-    if let Some(accelerated) = library.accelerated_player_games() {
-        for entry in &accelerated {
-            if players::player_key(&entry.name).as_deref() == Some(player_key) {
-                indices.extend(entry.indices.iter().copied());
-            }
-        }
-        // The accelerator may miss truncated online spellings: also accept
-        // entries that match loosely.
-        if indices.is_empty() {
+    if let Some(targeted) = library.accelerated_games_for_player(player_key, canonical_name) {
+        // The targeted lookup is authoritative when the backend advertises
+        // one: it filters the name store before decoding postings, so a
+        // present-but-empty result means the player truly has no games.
+        indices = targeted;
+    } else {
+        if let Some(accelerated) = library.accelerated_player_games() {
             for entry in &accelerated {
-                if players::matches_truncated_or_enumerated_name(canonical_name, &entry.name) {
+                if players::player_key(&entry.name).as_deref() == Some(player_key) {
                     indices.extend(entry.indices.iter().copied());
                 }
             }
+            // The accelerator may miss truncated online spellings: also accept
+            // entries that match loosely.
+            if indices.is_empty() {
+                for entry in &accelerated {
+                    if players::matches_truncated_or_enumerated_name(canonical_name, &entry.name) {
+                        indices.extend(entry.indices.iter().copied());
+                    }
+                }
+            }
         }
-    }
-    if indices.is_empty() {
-        indices = (0..library.len())
-            .filter(|&index| {
-                let (white, black) = library.game_players(index);
-                players::player_key(&white).as_deref() == Some(player_key)
-                    || players::player_key(&black).as_deref() == Some(player_key)
-                    || players::matches_truncated_or_enumerated_name(canonical_name, &white)
-                    || players::matches_truncated_or_enumerated_name(canonical_name, &black)
-            })
-            .collect();
+        if indices.is_empty() {
+            indices = (0..library.len())
+                .filter(|&index| {
+                    let (white, black) = library.game_players(index);
+                    players::player_key(&white).as_deref() == Some(player_key)
+                        || players::player_key(&black).as_deref() == Some(player_key)
+                        || players::matches_truncated_or_enumerated_name(canonical_name, &white)
+                        || players::matches_truncated_or_enumerated_name(canonical_name, &black)
+                })
+                .collect();
+        }
     }
     let mut games = Vec::new();
     for index in indices {
@@ -22614,6 +22621,54 @@ mod tests {
         let eval = app.current_board_eval().unwrap();
         assert_eq!(eval.depth, 26);
         assert_eq!(eval.score, crate::eval::WhiteScore::Cp(-35));
+    }
+
+    #[test]
+    fn player_games_from_library_uses_targeted_player_accelerator() {
+        struct TargetedLib {
+            game: Game,
+        }
+        impl GameLibrary for TargetedLib {
+            fn path(&self) -> &Path { Path::new("targeted.2cbh") }
+            fn file_len(&self) -> u64 { 1 }
+            fn len(&self) -> usize { 1 }
+            fn indexed_in(&self) -> Duration { Duration::ZERO }
+            fn games(&self) -> &[crate::library::IndexedGame] { &[] }
+            fn source_meta(&self) -> anyhow::Result<crate::library::SourceMeta> {
+                Ok(crate::library::SourceMeta {
+                    len: 1,
+                    mtime_secs: 0,
+                    mtime_nanos: 0,
+                })
+            }
+            fn get(&self, _: usize) -> Option<&crate::library::IndexedGame> { None }
+            fn load(&self, index: usize) -> anyhow::Result<Game> {
+                assert_eq!(index, 0);
+                Ok(self.game.clone())
+            }
+            fn filter(&self, _: &str) -> Vec<usize> { vec![0] }
+            fn accelerated_player_games(&self) -> Option<Vec<crate::library::AcceleratedPlayer>> {
+                panic!("must not scan all players when targeted lookup is available");
+            }
+            fn accelerated_games_for_player(
+                &self,
+                player_key: &str,
+                _canonical_name: &str,
+            ) -> Option<Vec<usize>> {
+                if player_key == "johannes kern" {
+                    Some(vec![0])
+                } else {
+                    Some(Vec::new())
+                }
+            }
+        }
+        let mut game = Game::default();
+        game.set_header("White", "Kern, J1".to_string());
+        game.set_header("Black", "Other, Player".to_string());
+        let lib: Arc<dyn GameLibrary> = Arc::new(TargetedLib { game });
+        let loaded = player_games_from_library(&lib, "johannes kern", "Kern, Johannes");
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].white(), "Kern, Johannes");
     }
 
     fn test_app() -> App {

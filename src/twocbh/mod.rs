@@ -774,6 +774,49 @@ impl TwoCbhLibrary {
         out
     }
 
+    /// Targeted per-player game indices. Filters the `.2lid` name store first
+    /// and only decodes `.2lgd` posting lists for matching entities, so a
+    /// multi-million-game Mega database answers in milliseconds.
+    pub fn accelerated_games_for_player(
+        &self,
+        player_key: &str,
+        canonical_name: &str,
+    ) -> Option<Vec<usize>> {
+        let acc = self.accelerator.as_ref()?;
+        let bound = self.entity_bound() as u32;
+        let mut exact = Vec::new();
+        let mut loose = Vec::new();
+        for entity in 0..bound {
+            let player = self.names.player(entity);
+            if player.name == "?" {
+                continue;
+            }
+            if crate::players::player_key(&player.name).as_deref() == Some(player_key) {
+                exact.push(entity);
+            } else if crate::players::matches_truncated_or_enumerated_name(
+                canonical_name,
+                &player.name,
+            ) {
+                loose.push(entity);
+            }
+        }
+        let entities = if exact.is_empty() { loose } else { exact };
+        let mut indices = Vec::new();
+        for entity in entities {
+            let Ok(ids) = acc.player_games(entity) else {
+                continue;
+            };
+            for record_id in ids {
+                if let Some(index) = self.game_index_for_record(record_id) {
+                    indices.push(index);
+                }
+            }
+        }
+        indices.sort_unstable();
+        indices.dedup();
+        Some(indices)
+    }
+
     /// Per-player game lists resolved through the `.2lgd` accelerator.
     /// Each entity id with a non-empty player posting list contributes one
     /// entry named from the `.2lid`; record ids map to game indices.
@@ -982,6 +1025,14 @@ impl GameLibrary for TwoCbhLibrary {
 
     fn accelerated_player_games(&self) -> Option<Vec<crate::library::AcceleratedPlayer>> {
         TwoCbhLibrary::accelerated_players(self)
+    }
+
+    fn accelerated_games_for_player(
+        &self,
+        player_key: &str,
+        canonical_name: &str,
+    ) -> Option<Vec<usize>> {
+        TwoCbhLibrary::accelerated_games_for_player(self, player_key, canonical_name)
     }
 }
 

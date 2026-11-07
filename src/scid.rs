@@ -403,6 +403,39 @@ impl GameLibrary for ScidLibrary {
         }
         if out.is_empty() { None } else { Some(out) }
     }
+
+    fn accelerated_games_for_player(
+        &self,
+        player_key: &str,
+        canonical_name: &str,
+    ) -> Option<Vec<usize>> {
+        let accelerator = self.accelerator.as_ref()?;
+        let mut exact = Vec::new();
+        let mut loose = Vec::new();
+        for (id, name) in self.names.players.iter().enumerate() {
+            if name.is_empty() || name == "?" {
+                continue;
+            }
+            if crate::players::player_key(name).as_deref() == Some(player_key) {
+                exact.push(id as u32);
+            } else if crate::players::matches_truncated_or_enumerated_name(canonical_name, name) {
+                loose.push(id as u32);
+            }
+        }
+        let entities = if exact.is_empty() { loose } else { exact };
+        let mut indices = Vec::new();
+        for id in entities {
+            indices.extend(
+                accelerator
+                    .player_games(id)
+                    .iter()
+                    .map(|&index| index as usize),
+            );
+        }
+        indices.sort_unstable();
+        indices.dedup();
+        Some(indices)
+    }
 }
 
 /// Parse a namebase. The caller must have checked the magic already.
