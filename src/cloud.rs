@@ -21,7 +21,7 @@ const USER_AGENT: &str = "Brett/0.1 (native Linux chess preparation app)";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Which Lichess opening-explorer corpus is queried.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ExplorerSource {
     /// Lichess Masters: strong over-the-board games, the useful default.
     #[default]

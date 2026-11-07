@@ -204,6 +204,55 @@ enum BookMessage {
     Done(Result<Arc<Book>, String>),
 }
 
+/// Identifiers for live online opening sources used as books or reference trees.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LiveReferenceSource {
+    LichessMasters,
+    LichessAll,
+    ChessAbc,
+}
+
+impl LiveReferenceSource {
+    pub const ALL: [Self; 3] = [
+        Self::LichessMasters,
+        Self::LichessAll,
+        Self::ChessAbc,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::LichessMasters => "Lichess Masters (live)",
+            Self::LichessAll => "Lichess All (live)",
+            Self::ChessAbc => "ChessABC (live)",
+        }
+    }
+
+    pub fn short_label(self) -> &'static str {
+        match self {
+            Self::LichessMasters => "Masters",
+            Self::LichessAll => "Lichess",
+            Self::ChessAbc => "ChessABC",
+        }
+    }
+
+    pub fn config_str(self) -> &'static str {
+        match self {
+            Self::LichessMasters => "live:lichess-masters",
+            Self::LichessAll => "live:lichess-all",
+            Self::ChessAbc => "live:chessabc",
+        }
+    }
+
+    pub fn from_config_str(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "live:lichess-masters" | "live:masters" => Some(Self::LichessMasters),
+            "live:lichess-all" | "live:lichess" => Some(Self::LichessAll),
+            "live:chessabc" => Some(Self::ChessAbc),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum EngineView {
     Local,
@@ -921,6 +970,11 @@ pub(crate) struct CloudEngineRow {
     alt_variation_source: Option<String>,
 }
 
+type ExplorerSinceEntry = (
+    (cloud::ExplorerSource, String, u32, u32),
+    Result<cloud::Explorer, String>,
+);
+
 pub struct App {
     library: Option<Arc<dyn GameLibrary>>,
     /// Ordered, editable view of the games currently shown in the Games tab.
@@ -1055,6 +1109,7 @@ pub struct App {
     /// Selected ChessABC FIDE ids used for the ChessABC fetch.
     prep_setup_chessabc_selected: Vec<String>,
     prep_setup_chessabc_status: String,
+    prep_setup_chessabc_expanded: bool,
     prep_setup_chessabc_rx: Option<mpsc::Receiver<ChessAbcSearchResult>>,
     /// Live per-account confirmation: background fetches that never block the
     /// setup dialog. Keyed by [`prep_account_check_key`] (plus
@@ -1092,6 +1147,11 @@ pub struct App {
     /// configured reference path is a `.bin`, `.ctg`, `.abk`, or `.bkt` file.
     reference_book: Option<Book>,
     reference_status: String,
+    chessabc_live_tree: Option<crate::recent::RecentTree>,
+    chessabc_live_rx: Option<mpsc::Receiver<Result<crate::recent::RecentTree, String>>>,
+    chessabc_live_status: String,
+    explorer_since_cache: HashMap<(cloud::ExplorerSource, String, u32, u32), cloud::Explorer>,
+    explorer_since_rx: Option<mpsc::Receiver<ExplorerSinceEntry>>,
     /// Optional local correspondence database used automatically in the
     /// Engine tab as a third position reference.
     correspondence_enabled: bool,
@@ -1243,6 +1303,7 @@ pub struct App {
     trend_window: crate::recent::TrendWindow,
     trend_baseline: crate::recent::TrendBaseline,
     trend_min_games: u32,
+    trend_source: crate::recent::TrendSource,
     filter: String,
     pending_pgn_export: Option<PendingPgnExport>,
     pending_scid_export: Option<PendingScidExport>,
@@ -1287,6 +1348,7 @@ pub struct App {
     settings_trend_window: crate::recent::TrendWindow,
     settings_trend_baseline: crate::recent::TrendBaseline,
     settings_trend_min_games: u32,
+    settings_trend_source: crate::recent::TrendSource,
     settings_token: String,
     settings_token_visible: bool,
     settings_token_from_env: bool,
@@ -1469,6 +1531,7 @@ impl App {
             prep_setup_chessabc_candidates: Vec::new(),
             prep_setup_chessabc_selected: Vec::new(),
             prep_setup_chessabc_status: String::new(),
+            prep_setup_chessabc_expanded: false,
             prep_setup_chessabc_rx: None,
             prep_setup_account_checks: HashMap::new(),
             prep_setup_account_rx: None,
@@ -1497,6 +1560,11 @@ impl App {
                 None
             },
             reference_status,
+            chessabc_live_tree: None,
+            chessabc_live_rx: None,
+            chessabc_live_status: String::new(),
+            explorer_since_cache: HashMap::new(),
+            explorer_since_rx: None,
             correspondence_enabled: preparation_prefs.correspondence_enabled,
             correspondence_path,
             correspondence: None,
@@ -1659,6 +1727,7 @@ impl App {
             trend_window: display_prefs.trend_window,
             trend_baseline: display_prefs.trend_baseline,
             trend_min_games: display_prefs.trend_min_games,
+            trend_source: display_prefs.trend_source,
             filter: String::new(),
             pending_pgn_export: None,
             pending_scid_export: None,
@@ -1701,6 +1770,7 @@ impl App {
             settings_trend_window: display_prefs.trend_window,
             settings_trend_baseline: display_prefs.trend_baseline,
             settings_trend_min_games: display_prefs.trend_min_games,
+            settings_trend_source: display_prefs.trend_source,
             settings_token: String::new(),
             settings_token_visible: false,
             settings_token_from_env: false,
@@ -4492,6 +4562,15 @@ impl App {
                         self.book_path = path.display().to_string();
                     }
                 });
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("Live:").small().weak());
+                    for src in LiveReferenceSource::ALL {
+                        let active = LiveReferenceSource::from_config_str(&self.book_path) == Some(src);
+                        if ui.selectable_label(active, src.short_label()).clicked() {
+                            self.book_path = src.config_str().to_string();
+                        }
+                    }
+                });
                 ui.add_space(4.0);
                 ui.label(RichText::new("Reference database (.2cbh / .cbh / .si4 / .pgn)").strong());
                 ui.horizontal(|ui| {
@@ -4505,6 +4584,15 @@ impl App {
                         )
                     {
                         self.reference_path = path.display().to_string();
+                    }
+                });
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("Live:").small().weak());
+                    for src in LiveReferenceSource::ALL {
+                        let active = LiveReferenceSource::from_config_str(&self.reference_path) == Some(src);
+                        if ui.selectable_label(active, src.short_label()).clicked() {
+                            self.reference_path = src.config_str().to_string();
+                        }
                     }
                 });
                 ui.add_space(8.0);
@@ -4805,6 +4893,7 @@ impl App {
         self.settings_trend_window = self.trend_window;
         self.settings_trend_baseline = self.trend_baseline;
         self.settings_trend_min_games = self.trend_min_games;
+        self.settings_trend_source = self.trend_source;
         self.settings_token_from_env = std::env::var("BRETT_LICHESS_TOKEN")
             .ok()
             .is_some_and(|token| !token.trim().is_empty());
@@ -4860,6 +4949,7 @@ impl App {
         self.trend_window = self.settings_trend_window;
         self.trend_baseline = self.settings_trend_baseline;
         self.trend_min_games = self.settings_trend_min_games.clamp(3, 200);
+        self.trend_source = self.settings_trend_source;
         self.prep_player_names = self
             .settings_my_player_names
             .lines()
@@ -5018,6 +5108,7 @@ impl App {
         self.settings_trend_window = self.trend_window;
         self.settings_trend_baseline = self.trend_baseline;
         self.settings_trend_min_games = self.trend_min_games;
+        self.settings_trend_source = self.trend_source;
         self.settings_token = self.lichess_token.clone().unwrap_or_default();
 
         self.status = "Settings successfully imported.".to_string();
@@ -5058,6 +5149,11 @@ impl App {
             self.reference_status =
                 "No reference database configured — using the current database prior (may be skewed)."
                     .to_string();
+        } else if let Some(live) = LiveReferenceSource::from_config_str(&trimmed) {
+            self.reference_status = format!("Using {} as live reference.", live.label());
+            if live == LiveReferenceSource::ChessAbc {
+                self.trigger_chessabc_live_fetch();
+            }
         } else if is_opening_book_path(Path::new(&trimmed)) {
             match Book::open(Path::new(&trimmed)) {
                 Ok(book) => {
@@ -5101,6 +5197,17 @@ impl App {
             self.reference_status =
                 "No reference database configured — using the current database prior (may be skewed)."
                     .to_string();
+            return;
+        }
+        if let Some(live) = LiveReferenceSource::from_config_str(path) {
+            self.reference = None;
+            self.reference_rx = None;
+            self.reference_job = None;
+            self.reference_book = None;
+            self.reference_status = format!("Using {} as live reference.", live.label());
+            if live == LiveReferenceSource::ChessAbc {
+                self.trigger_chessabc_live_fetch();
+            }
             return;
         }
         if is_opening_book_path(Path::new(path)) {
@@ -5396,6 +5503,30 @@ impl App {
                 return (moves, players::PriorSource::Reference);
             }
         }
+        if self.reference_wanted()
+            && let Some(live) = LiveReferenceSource::from_config_str(&self.reference_path)
+        {
+            match live {
+                LiveReferenceSource::ChessAbc => {
+                    if let Some(tree) = &self.chessabc_live_tree {
+                        let moves = tree.moves(key);
+                        if !moves.is_empty() {
+                            return (moves, players::PriorSource::Reference);
+                        }
+                    }
+                }
+                LiveReferenceSource::LichessMasters => {
+                    if let Some(moves) = self.cached_explorer_prior(key, cloud::ExplorerSource::Masters) {
+                        return (moves, players::PriorSource::Reference);
+                    }
+                }
+                LiveReferenceSource::LichessAll => {
+                    if let Some(moves) = self.cached_explorer_prior(key, cloud::ExplorerSource::Lichess) {
+                        return (moves, players::PriorSource::Reference);
+                    }
+                }
+            }
+        }
         if let Some(moves) = self.cached_masters_prior(key) {
             return (moves, players::PriorSource::Reference);
         }
@@ -5407,10 +5538,14 @@ impl App {
         (moves, players::PriorSource::CurrentDatabase)
     }
 
-    /// Lichess Masters explorer moves for the current position, converted to
+    /// Lichess explorer moves for the current position, converted to
     /// background [`position::MoveStat`] rows. Only the in-memory cache is
     /// consulted, so calling this never triggers network traffic.
-    fn cached_masters_prior(&self, key: u64) -> Option<Vec<position::MoveStat>> {
+    fn cached_explorer_prior(
+        &self,
+        key: u64,
+        source: cloud::ExplorerSource,
+    ) -> Option<Vec<position::MoveStat>> {
         let game = self.current.as_ref()?;
         let node = game.nodes.get(self.node)?;
         let pos = &node.pos;
@@ -5418,9 +5553,7 @@ impl App {
             return None;
         }
         let fen = Fen::from_position(pos, EnPassantMode::Legal).to_string();
-        let snapshot = self
-            .cloud_cache
-            .get(&(cloud::ExplorerSource::Masters, fen))?;
+        let snapshot = self.cloud_cache.get(&(source, fen))?;
         let explorer = snapshot.explorer.as_ref().ok()?;
         if explorer.moves.is_empty() {
             return None;
@@ -5457,6 +5590,180 @@ impl App {
             });
         }
         (!stats.is_empty()).then_some(stats)
+    }
+
+    /// Lichess Masters explorer moves for the current position, converted to
+    /// background [`position::MoveStat`] rows. Only the in-memory cache is
+    /// consulted, so calling this never triggers network traffic.
+    fn cached_masters_prior(&self, key: u64) -> Option<Vec<position::MoveStat>> {
+        self.cached_explorer_prior(key, cloud::ExplorerSource::Masters)
+    }
+
+    fn trigger_chessabc_live_fetch(&mut self) {
+        if self.chessabc_live_rx.is_some() || self.chessabc_live_tree.is_some() {
+            return;
+        }
+        self.chessabc_live_status = "Fetching live games from ChessABC…".to_string();
+        let (tx, rx) = mpsc::channel();
+        self.chessabc_live_rx = Some(rx);
+        let ctx = self.ctx.clone();
+        std::thread::spawn(move || {
+            let res = online::fetch_recent_chessabc_games(1500)
+                .map_err(|e| format!("{e:#}"))
+                .map(|games| crate::recent::RecentTree::from_games(&games, players::today(), 365));
+            let _ = tx.send(res);
+            ctx.request_repaint();
+        });
+    }
+
+    fn poll_chessabc_live(&mut self) {
+        let Some(rx) = self.chessabc_live_rx.take() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Ok(tree)) => {
+                self.chessabc_live_status = format!(
+                    "Live ChessABC tree ready ({} games).",
+                    tree.games()
+                );
+                self.chessabc_live_tree = Some(tree);
+            }
+            Ok(Err(err)) => {
+                self.chessabc_live_status = format!("Live ChessABC fetch failed: {err}");
+            }
+            Err(TryRecvError::Empty) => {
+                self.chessabc_live_rx = Some(rx);
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.chessabc_live_status = "Live ChessABC fetch stopped.".to_string();
+            }
+        }
+    }
+
+    fn trigger_explorer_since_fetch(
+        &mut self,
+        source: cloud::ExplorerSource,
+        fen: String,
+        since_year: u32,
+        since_month: u32,
+    ) {
+        let key = (source, fen.clone(), since_year, since_month);
+        if self.explorer_since_cache.contains_key(&key) || self.explorer_since_rx.is_some() {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        self.explorer_since_rx = Some(rx);
+        let ctx = self.ctx.clone();
+        let token = self.lichess_token.clone();
+        std::thread::spawn(move || {
+            let res = cloud::fetch_explorer_since(
+                &fen,
+                token.as_deref(),
+                source,
+                since_year,
+                since_month,
+            );
+            let _ = tx.send((key, res));
+            ctx.request_repaint();
+        });
+    }
+
+    fn poll_explorer_since(&mut self) {
+        let Some(rx) = self.explorer_since_rx.take() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok((key, Ok(explorer))) => {
+                self.explorer_since_cache.insert(key, explorer);
+            }
+            Ok((_key, Err(_err))) => {}
+            Err(TryRecvError::Empty) => {
+                self.explorer_since_rx = Some(rx);
+            }
+            Err(TryRecvError::Disconnected) => {}
+        }
+    }
+
+    fn current_trend_override(
+        &mut self,
+        pos: &Chess,
+        key: u64,
+    ) -> Option<HashMap<u32, crate::recent::MoveTrend>> {
+        match self.trend_source {
+            crate::recent::TrendSource::ActiveTree => None,
+            crate::recent::TrendSource::ChessAbc => {
+                if self.chessabc_live_tree.is_none() && self.chessabc_live_rx.is_none() {
+                    self.trigger_chessabc_live_fetch();
+                }
+                let tree = self.chessabc_live_tree.as_ref()?;
+                let moves = tree.moves(key);
+                if moves.is_empty() {
+                    return None;
+                }
+                Some(
+                    crate::recent::position_trends(&moves, self.trend_config())
+                        .into_iter()
+                        .map(|t| (t.mv, t))
+                        .collect(),
+                )
+            }
+            crate::recent::TrendSource::LichessMasters
+            | crate::recent::TrendSource::LichessAll => {
+                let explorer_source = match self.trend_source {
+                    crate::recent::TrendSource::LichessMasters => cloud::ExplorerSource::Masters,
+                    _ => cloud::ExplorerSource::Lichess,
+                };
+                let fen = Fen::from_position(pos, EnPassantMode::Legal).to_string();
+                let today = players::today();
+                let current_year = today / 10000;
+                let current_month = (today % 10000) / 100;
+                let (since_year, since_month) = match self.trend_window {
+                    crate::recent::TrendWindow::SixMonths => {
+                        if current_month <= 6 {
+                            (current_year.saturating_sub(1), current_month + 6)
+                        } else {
+                            (current_year, current_month - 6)
+                        }
+                    }
+                    crate::recent::TrendWindow::TwelveMonths => {
+                        (current_year.saturating_sub(1), current_month)
+                    }
+                    crate::recent::TrendWindow::TwentyFourMonths => {
+                        (current_year.saturating_sub(2), current_month)
+                    }
+                };
+                let since_key = (explorer_source, fen.clone(), since_year, since_month);
+                let recent_explorer = if let Some(e) = self.explorer_since_cache.get(&since_key) {
+                    e
+                } else {
+                    self.trigger_explorer_since_fetch(explorer_source, fen.clone(), since_year, since_month);
+                    return None;
+                };
+
+                let total_key = (explorer_source, fen.clone());
+                let total_exp = self
+                    .cloud_cache
+                    .get(&total_key)
+                    .and_then(|s| s.explorer.as_ref().ok())?;
+
+                let mut counts = Vec::new();
+                for em in &total_exp.moves {
+                    let Ok(uci) = em.uci.parse::<UciMove>() else { continue };
+                    let Ok(mv) = uci.to_move(pos) else { continue };
+                    let Some(code) = position::encode_move(mv) else { continue };
+                    let total_games = em.total().min(u64::from(u32::MAX)) as u32;
+                    let recent_games = recent_explorer
+                        .moves
+                        .iter()
+                        .find(|rm| rm.uci == em.uci)
+                        .map(|rm| rm.total().min(u64::from(u32::MAX)) as u32)
+                        .unwrap_or(0);
+                    counts.push((code, recent_games, total_games));
+                }
+
+                Some(crate::recent::trends_from_window_counts(&counts, self.trend_config()))
+            }
+        }
     }
 
     /// True when no OTB background source (reference database or opening-tree
@@ -6855,6 +7162,7 @@ impl App {
         self.prep_setup_chessabc_candidates.clear();
         self.prep_setup_chessabc_selected.clear();
         self.prep_setup_chessabc_status.clear();
+        self.prep_setup_chessabc_expanded = false;
         self.prep_setup_chessabc_rx = None;
         let active_chessabc_ids = self
             .prep
@@ -6921,28 +7229,30 @@ impl App {
             return;
         };
         match rx.try_recv() {
-            Ok((query, elo, Ok(candidates))) => {
-                if let Some(single) =
-                    online::auto_select_chessabc_candidate(&candidates, &query, elo)
-                {
-                    self.prep_setup_chessabc_selected = vec![single.fide_id.clone()];
-                    self.prep_setup_chessabc_status =
-                        format!("Auto-selected {} · FIDE {}.", single.name, single.fide_id);
-                } else if candidates.is_empty() {
+            Ok((query, elo, Ok(mut candidates))) => {
+                candidates.retain(|c| c.games != Some(0));
+                if candidates.is_empty() {
                     self.prep_setup_chessabc_status =
                         format!("No ChessABC profiles found for {query}.");
+                    self.prep_setup_chessabc_selected.clear();
+                } else if self.prep_setup_chessabc_selected.iter().any(|id| {
+                    candidates.iter().any(|candidate| &candidate.fide_id == id)
+                }) {
+                    self.prep_setup_chessabc_selected
+                        .retain(|id| candidates.iter().any(|c| &c.fide_id == id));
+                } else if let Some(best) = online::best_chessabc_candidate(&candidates, &query, elo) {
+                    self.prep_setup_chessabc_selected = vec![best.fide_id.clone()];
+                    self.prep_setup_chessabc_status = format!(
+                        "Selected {} · Elo {} · FIDE {}{}",
+                        best.name,
+                        best.rating,
+                        best.fide_id,
+                        best.games
+                            .map(|g| format!(" ({g} games)"))
+                            .unwrap_or_default()
+                    );
                 } else {
-                    if self.prep_setup_chessabc_selected.iter().any(|id| {
-                        candidates.iter().any(|candidate| &candidate.fide_id == id)
-                    }) {
-                        self.prep_setup_chessabc_selected
-                            .retain(|id| candidates.iter().any(|c| &c.fide_id == id));
-                    } else {
-                        self.prep_setup_chessabc_selected = candidates
-                            .iter()
-                            .map(|candidate| candidate.fide_id.clone())
-                            .collect();
-                    }
+                    self.prep_setup_chessabc_selected.clear();
                     self.prep_setup_chessabc_status =
                         format!("Select matching profile(s) for {query}:");
                 }
@@ -6988,6 +7298,7 @@ impl App {
                 .map(|prep| prep.filter)
                 .unwrap_or_default();
         }
+        self.prep_setup_chessabc_expanded = false;
         self.prep_setup_change_opponent = false;
         self.refresh_prep_account_checks();
         self.prep_setup_open = true;
@@ -7472,14 +7783,31 @@ impl App {
     fn resolve_prep_player_index(&mut self) -> Option<usize> {
         if let Some(index) = self
             .prep_setup_player
-            .or(self.selected_player)
             .filter(|&index| self.players.get(index).is_some())
         {
             return Some(index);
         }
         let typed = self.prep_setup_search.trim().to_string();
         if !typed.is_empty() {
+            let matches = self.players.filter(&typed);
+            if let Some(&exact) = matches.iter().find(|&&idx| {
+                self.players.get(idx).is_some_and(|p| {
+                    players::player_key(&p.name) == players::player_key(&typed)
+                })
+            }) {
+                return Some(exact);
+            }
+            if matches.len() == 1 {
+                return Some(matches[0]);
+            }
             return Some(self.players.ensure_player(&typed));
+        }
+        if !self.prep_setup_change_opponent
+            && let Some(index) = self
+                .selected_player
+                .filter(|&index| self.players.get(index).is_some())
+        {
+            return Some(index);
         }
         if let Some(name) = self
             .prep_setup_accounts
@@ -7718,10 +8046,12 @@ impl App {
         }
         self.poll_chessabc_candidates();
         self.poll_prep_account_checks();
-        let chosen = self
-            .prep_setup_player
-            .or(self.selected_player)
-            .filter(|&index| self.players.get(index).is_some());
+        let chosen = if self.prep_setup_change_opponent {
+            self.prep_setup_player
+        } else {
+            self.prep_setup_player.or(self.selected_player)
+        }
+        .filter(|&index| self.players.get(index).is_some());
         let player_name = chosen
             .and_then(|index| self.players.get(index))
             .map(|player| player.name.clone())
@@ -7775,68 +8105,108 @@ impl App {
             .default_size([520.0, 640.0])
             .min_width(440.0)
             .show(ctx, |ui| {
-                // Identified opponent banner first: Name · Elo · FIDE plus
-                // the ChessABC profile checklist.
-                if !show_search
-                    && let Some((name, elo, fide_id, title)) = banner.clone()
-                {
-                    ui.horizontal_wrapped(|ui| {
-                        if let Some(title) = title {
-                            ui.label(RichText::new(title.short()).small().strong().color(GOLD));
-                        }
-                        ui.label(RichText::new(&name).strong());
-                        if let Some(elo) = elo {
-                            ui.label(RichText::new(format!("· Elo {elo}")).weak().small());
-                        }
-                        if let Some(fide_id) = &fide_id {
-                            ui.label(RichText::new(format!("· FIDE {fide_id}")).weak().small());
-                        }
-                        if ui.small_button("Change opponent").clicked() {
-                            change_opponent = true;
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        let status = if self.prep_setup_chessabc_status.is_empty() {
-                            "Resolve ChessABC profiles to fetch up to 2000 games.".to_string()
-                        } else {
-                            self.prep_setup_chessabc_status.clone()
-                        };
-                        ui.label(RichText::new(status).small());
-                        if ui.small_button("Find profiles").clicked() {
-                            find_profiles = true;
-                        }
-                    });
-                    let candidates = self.prep_setup_chessabc_candidates.clone();
-                    for candidate in &candidates {
-                        let mut selected = self
-                            .prep_setup_chessabc_selected
-                            .contains(&candidate.fide_id);
-                        let label = format!(
-                            "{} · Elo {} · FIDE {}",
-                            candidate.name, candidate.rating, candidate.fide_id
-                        );
-                        if ui.checkbox(&mut selected, label).changed() {
-                            if selected {
-                                if !self
-                                    .prep_setup_chessabc_selected
-                                    .contains(&candidate.fide_id)
-                                {
-                                    self.prep_setup_chessabc_selected
-                                        .push(candidate.fide_id.clone());
+                egui::ScrollArea::vertical()
+                    .id_salt("prep-setup-body-scroll")
+                    .max_height(560.0)
+                    .show(ui, |ui| {
+                        // Identified opponent banner first: Name · Elo · FIDE plus
+                        // the ChessABC profile checklist.
+                        if !show_search
+                            && let Some((name, elo, fide_id, title)) = banner.clone()
+                        {
+                            ui.horizontal_wrapped(|ui| {
+                                if let Some(title) = title {
+                                    ui.label(RichText::new(title.short()).small().strong().color(GOLD));
                                 }
+                                ui.label(RichText::new(&name).strong());
+                                if let Some(elo) = elo {
+                                    ui.label(RichText::new(format!("· Elo {elo}")).weak().small());
+                                }
+                                if let Some(fide_id) = &fide_id {
+                                    ui.label(RichText::new(format!("· FIDE {fide_id}")).weak().small());
+                                }
+                                if ui.small_button("Change opponent").clicked() {
+                                    change_opponent = true;
+                                }
+                            });
+                            if !self.prep_setup_chessabc_expanded {
+                                ui.horizontal(|ui| {
+                                    let status = if !self.prep_setup_chessabc_status.is_empty() {
+                                        self.prep_setup_chessabc_status.clone()
+                                    } else if let Some(first_id) = self.prep_setup_chessabc_selected.first() {
+                                        format!("ChessABC: FIDE {first_id}")
+                                    } else {
+                                        "No ChessABC profile selected.".to_string()
+                                    };
+                                    ui.label(RichText::new(status).small());
+                                    if ui.small_button("Change profile…").clicked() {
+                                        self.prep_setup_chessabc_expanded = true;
+                                        if self.prep_setup_chessabc_candidates.is_empty()
+                                            && self.prep_setup_chessabc_rx.is_none()
+                                        {
+                                            find_profiles = true;
+                                        }
+                                    }
+                                });
                             } else {
-                                self.prep_setup_chessabc_selected
-                                    .retain(|id| id != &candidate.fide_id);
+                                ui.horizontal(|ui| {
+                                    let status = if self.prep_setup_chessabc_status.is_empty() {
+                                        "Select matching profile(s):".to_string()
+                                    } else {
+                                        self.prep_setup_chessabc_status.clone()
+                                    };
+                                    ui.label(RichText::new(status).small());
+                                    if ui.small_button("Confirm").clicked() {
+                                        self.prep_setup_chessabc_expanded = false;
+                                    }
+                                    if ui.small_button("Refresh").clicked() {
+                                        find_profiles = true;
+                                    }
+                                });
+                                egui::ScrollArea::vertical()
+                                    .id_salt("prep-chessabc-candidates-scroll")
+                                    .max_height(140.0)
+                                    .show(ui, |ui| {
+                                        let candidates = self.prep_setup_chessabc_candidates.clone();
+                                        for candidate in &candidates {
+                                            let mut selected = self
+                                                .prep_setup_chessabc_selected
+                                                .contains(&candidate.fide_id);
+                                            let games_suffix = candidate
+                                                .games
+                                                .map(|g| format!(" ({g} games)"))
+                                                .unwrap_or_default();
+                                            let label = format!(
+                                                "{} · Elo {} · FIDE {}{}",
+                                                candidate.name,
+                                                candidate.rating,
+                                                candidate.fide_id,
+                                                games_suffix,
+                                            );
+                                            if ui.checkbox(&mut selected, label).changed() {
+                                                if selected {
+                                                    if !self
+                                                        .prep_setup_chessabc_selected
+                                                        .contains(&candidate.fide_id)
+                                                    {
+                                                        self.prep_setup_chessabc_selected
+                                                            .push(candidate.fide_id.clone());
+                                                    }
+                                                } else {
+                                                    self.prep_setup_chessabc_selected
+                                                        .retain(|id| id != &candidate.fide_id);
+                                                }
+                                                refresh_checks = true;
+                                            }
+                                            let key = format!("chessabc:{}", candidate.fide_id);
+                                            if let Some(check) = account_checks.get(&key) {
+                                                ui.label(account_check_text(check).small());
+                                            }
+                                        }
+                                    });
                             }
-                            refresh_checks = true;
+                            ui.separator();
                         }
-                        let key = format!("chessabc:{}", candidate.fide_id);
-                        if let Some(check) = account_checks.get(&key) {
-                            ui.label(account_check_text(check).small());
-                        }
-                    }
-                    ui.separator();
-                }
                 if show_search {
                     ui.label(RichText::new("Opponent").strong());
                     ui.add(
@@ -8087,8 +8457,9 @@ impl App {
                         self.save_reference_prefs();
                     }
                 });
-                ui.separator();
-                ui.horizontal(|ui| {
+            });
+            ui.separator();
+            ui.horizontal(|ui| {
                     let start_label = if update_mode {
                         "Update preparation"
                     } else {
@@ -8154,6 +8525,7 @@ impl App {
         {
             self.prep_setup_player = Some(index);
             self.prep_setup_change_opponent = false;
+            self.prep_setup_chessabc_expanded = false;
             if let Some(player) = self.players.get(index).cloned() {
                 let key_changed = player.key != player_key;
                 self.prep_setup_accounts = self
@@ -10353,6 +10725,10 @@ impl App {
     }
 
     fn handle_keys(&mut self, ctx: &egui::Context) {
+        if ctx.input(|i| i.key_pressed(Key::F11)) {
+            let is_fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!is_fullscreen));
+        }
         let cancel = ctx.input(|i| i.key_pressed(Key::Escape));
         if cancel {
             if self.branch_choice.take().is_some() {
@@ -12004,9 +12380,7 @@ impl App {
                                 .with_country(
                                     player_country(game, opponent_color).map(|c| c.badge),
                                 )
-                                .with_fide_id(
-                                    player_fide_id(game, opponent_color).as_deref(),
-                                ),
+                                .with_fide_id(player_fide_id(game, opponent_color)),
                             None,
                             &format!(" · as {color}"),
                             &subtitle,
@@ -12532,6 +12906,16 @@ impl App {
                             );
                             if ui.button("Choose…").clicked() {
                                 choose_reference = true;
+                            }
+                        });
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(RichText::new("Live:").small().weak());
+                            for src in LiveReferenceSource::ALL {
+                                let active = LiveReferenceSource::from_config_str(&reference_path) == Some(src);
+                                if ui.selectable_label(active, src.short_label()).clicked() {
+                                    reference_path = src.config_str().to_string();
+                                    reference_enabled = true;
+                                }
                             }
                         });
                         ui.checkbox(
@@ -14067,6 +14451,20 @@ impl App {
                     }
                 });
                 ui.label(RichText::new(&book_status).small().weak());
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("Live:").small().weak());
+                    for src in LiveReferenceSource::ALL {
+                        let active = LiveReferenceSource::from_config_str(&self.book_path) == Some(src);
+                        if ui.selectable_label(active, src.short_label()).clicked() {
+                            self.book_path = src.config_str().to_string();
+                            self.book = None;
+                            self.book_rx = None;
+                            self.book_job = None;
+                            self.book_status = format!("Using {} as live opening book.", src.label());
+                            self.save_display_prefs();
+                        }
+                    }
+                });
                 ui.add_space(4.0);
                 ui.horizontal_wrapped(|ui| {
                     ui.label(RichText::new("Opening tree file").small().weak());
@@ -14126,6 +14524,18 @@ impl App {
                     ui.add_space(4.0);
                 }
 
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("Trends:").small().strong());
+                    for src in crate::recent::TrendSource::ALL {
+                        let active = self.trend_source == src;
+                        if ui.selectable_label(active, src.short_label()).clicked() {
+                            self.trend_source = src;
+                            self.settings_trend_source = src;
+                            self.save_display_prefs();
+                        }
+                    }
+                });
+                let trend_override = self.current_trend_override(&pos, key);
                 let tree_index = self.tree_index.as_ref().or(self.index.as_ref());
                 let tree_label = if self.tree_index.is_some() {
                     self.tree_library
@@ -14140,6 +14550,24 @@ impl App {
                         .strong()
                         .small(),
                 );
+                if self.trend_source == crate::recent::TrendSource::ActiveTree
+                    && let Some(index) = tree_index
+                    && crate::recent::is_database_outdated(index.latest_date(), players::today(), 180)
+                {
+                    let latest = index.latest_date();
+                    let date_str = if latest == 0 {
+                        "undated".to_string()
+                    } else {
+                        format!("{:04}.{:02}.{:02}", latest / 10000, (latest % 10000) / 100, latest % 100)
+                    };
+                    ui.label(
+                        RichText::new(format!(
+                            "⚠ Database may be outdated for trends (latest game: {date_str}). Consider switching Trends to ChessABC or Lichess Masters."
+                        ))
+                        .small()
+                        .color(GOLD),
+                    );
+                }
                 if let Some(index) = tree_index {
                     clicked = opening_tree_table(
                         ui,
@@ -14150,6 +14578,7 @@ impl App {
                         self.trend_config(),
                         &mut hover_preview,
                         None,
+                        trend_override.as_ref(),
                     );
                 } else {
                     ui.label(RichText::new(&self.index_status).weak().small());
@@ -15090,7 +15519,9 @@ impl App {
                     .collect()
             })
             .unwrap_or_default();
-        let reference_source_label: &'static str = if self.reference.is_some() {
+        let reference_source_label = if let Some(live) = LiveReferenceSource::from_config_str(&self.reference_path) {
+            live.label()
+        } else if self.reference.is_some() {
             "Reference database"
         } else if self.tree_index.is_some() {
             "Opening tree"
@@ -15140,14 +15571,10 @@ impl App {
             let mut keys = HashSet::new();
             if let Some(game) = self.current.as_ref() {
                 let mut n = self.node.min(game.nodes.len().saturating_sub(1));
-                loop {
-                    if let Some(node) = game.nodes.get(n) {
-                        keys.insert(position::position_key(&node.pos));
-                        if let Some(parent) = node.parent {
-                            n = parent;
-                        } else {
-                            break;
-                        }
+                while let Some(node) = game.nodes.get(n) {
+                    keys.insert(position::position_key(&node.pos));
+                    if let Some(parent) = node.parent {
+                        n = parent;
                     } else {
                         break;
                     }
@@ -15699,6 +16126,36 @@ impl App {
                 )).strong())
                     .default_open(true)
                     .show(ui, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(RichText::new("Trends:").small().strong());
+                            for src in crate::recent::TrendSource::ALL {
+                                let active = self.trend_source == src;
+                                if ui.selectable_label(active, src.short_label()).clicked() {
+                                    self.trend_source = src;
+                                    self.settings_trend_source = src;
+                                    self.save_display_prefs();
+                                }
+                            }
+                        });
+                        if self.trend_source == crate::recent::TrendSource::ActiveTree
+                            && let Some(index) = self.reference_tree_index()
+                            && crate::recent::is_database_outdated(index.latest_date(), players::today(), 180)
+                        {
+                            let latest = index.latest_date();
+                            let date_str = if latest == 0 {
+                                "undated".to_string()
+                            } else {
+                                format!("{:04}.{:02}.{:02}", latest / 10000, (latest % 10000) / 100, latest % 100)
+                            };
+                            ui.label(
+                                RichText::new(format!(
+                                    "⚠ Database may be outdated for trends (latest game: {date_str}). Consider switching Trends to ChessABC or Lichess Masters."
+                                ))
+                                .small()
+                                .color(GOLD),
+                            );
+                        }
+                        let trend_override = self.current_trend_override(pos, key);
                         if let Some(reference_tree) = self.reference_tree_index() {
                             clicked = opening_tree_table(
                                 ui,
@@ -15709,8 +16166,129 @@ impl App {
                                 self.trend_config(),
                                 &mut hover_preview,
                                 Some(&book_games_map),
+                                trend_override.as_ref(),
                             )
                             .or(clicked);
+                        } else if let Some(live) = LiveReferenceSource::from_config_str(&self.reference_path) {
+                            match live {
+                                LiveReferenceSource::ChessAbc => {
+                                    if let Some(tree) = &self.chessabc_live_tree {
+                                        let moves = tree.moves(key);
+                                        let stats = tree.stats(key);
+                                        if let Some(stats) = stats {
+                                            ui.horizontal(|ui| {
+                                                ui.label(RichText::new(games_label(stats.games as usize)).strong());
+                                                ui.label(RichText::new(format!("W {} · D {} · B {}", stats.white, stats.draw, stats.black)).weak());
+                                            });
+                                            wdl_bar(ui, &stats);
+                                        }
+                                        if !moves.is_empty() {
+                                            egui::Grid::new("prep-chessabc-live-tree-grid")
+                                                .num_columns(6)
+                                                .striped(true)
+                                                .show(ui, |ui| {
+                                                    ui.label(RichText::new("Move").strong());
+                                                    ui.label(RichText::new("Games").strong());
+                                                    ui.label(RichText::new("W").strong());
+                                                    ui.label(RichText::new("D").strong());
+                                                    ui.label(RichText::new("B").strong());
+                                                    ui.label(RichText::new("Score").strong());
+                                                    ui.end_row();
+                                                    for m in &moves {
+                                                        if let Some(decoded) = position::decode_move(pos, m.mv) {
+                                                            let san = SanPlus::from_move(pos.clone(), decoded).to_string();
+                                                            let response = ui.selectable_label(false, RichText::new(&san).strong());
+                                                            if response.hovered() {
+                                                                hover_preview = preview_after_move(pos, decoded);
+                                                            }
+                                                            if response.clicked() {
+                                                                clicked = Some(decoded);
+                                                            }
+                                                            ui.label(m.games.to_string());
+                                                            ui.label(m.white.to_string());
+                                                            ui.label(m.draw.to_string());
+                                                            ui.label(m.black.to_string());
+                                                            let pct = if m.games > 0 {
+                                                                (m.white as f64 + m.draw as f64 * 0.5) / m.games as f64 * 100.0
+                                                            } else {
+                                                                0.0
+                                                            };
+                                                            ui.label(format!("{pct:.0}%"));
+                                                            ui.end_row();
+                                                        }
+                                                    }
+                                                });
+                                        } else {
+                                            ui.label(RichText::new("No ChessABC game reached this position.").weak().italics());
+                                        }
+                                    } else {
+                                        ui.horizontal(|ui| {
+                                            ui.label(RichText::new(&self.chessabc_live_status).weak());
+                                            if self.chessabc_live_rx.is_some() {
+                                                ui.spinner();
+                                            }
+                                        });
+                                    }
+                                }
+                                LiveReferenceSource::LichessMasters | LiveReferenceSource::LichessAll => {
+                                    let source = match live {
+                                        LiveReferenceSource::LichessMasters => cloud::ExplorerSource::Masters,
+                                        _ => cloud::ExplorerSource::Lichess,
+                                    };
+                                    let fen = Fen::from_position(pos, EnPassantMode::Legal).to_string();
+                                    if let Some(snapshot) = self.cloud_cache.get(&(source, fen)) {
+                                        match &snapshot.explorer {
+                                            Ok(explorer) if !explorer.moves.is_empty() => {
+                                                egui::Grid::new("prep-live-explorer-grid")
+                                                    .num_columns(6)
+                                                    .striped(true)
+                                                    .show(ui, |ui| {
+                                                        ui.label(RichText::new("Move").strong());
+                                                        ui.label(RichText::new("Games").strong());
+                                                        ui.label(RichText::new("W").strong());
+                                                        ui.label(RichText::new("D").strong());
+                                                        ui.label(RichText::new("B").strong());
+                                                        ui.label(RichText::new("Score").strong());
+                                                        ui.end_row();
+                                                        for em in &explorer.moves {
+                                                            let Ok(uci) = em.uci.parse::<UciMove>() else { continue };
+                                                            let Ok(mv) = uci.to_move(pos) else { continue };
+                                                            let response = ui.selectable_label(
+                                                                false,
+                                                                RichText::new(&em.san).strong(),
+                                                            );
+                                                            if response.hovered() {
+                                                                hover_preview = preview_after_move(pos, mv);
+                                                            }
+                                                            if response.clicked() {
+                                                                clicked = Some(mv);
+                                                            }
+                                                            ui.label(em.total().to_string());
+                                                            ui.label(em.white.to_string());
+                                                            ui.label(em.draws.to_string());
+                                                            ui.label(em.black.to_string());
+                                                            let pct = if em.total() > 0 {
+                                                                (em.white as f64 + em.draws as f64 * 0.5) / em.total() as f64 * 100.0
+                                                            } else {
+                                                                0.0
+                                                            };
+                                                            ui.label(format!("{pct:.0}%"));
+                                                            ui.end_row();
+                                                        }
+                                                    });
+                                            }
+                                            Ok(_) => {
+                                                ui.label(RichText::new("No moves found in explorer for this position.").weak().italics());
+                                            }
+                                            Err(err) => {
+                                                ui.label(RichText::new(format!("Explorer query failed: {err}")).weak());
+                                            }
+                                        }
+                                    } else {
+                                        ui.label(RichText::new(format!("Loading {}...", live.label())).weak());
+                                    }
+                                }
+                            }
                         } else if let Some(book) = self.reference_book.as_ref() {
                             ui.label(
                                 RichText::new(format!(
@@ -15820,29 +16398,30 @@ impl App {
                     .default_open(true)
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
-                            ui.label("Show last");
-                            if ui
-                                .add(
-                                    egui::DragValue::new(&mut recent_limit)
-                                        .range(1..=50)
-                                        .speed(1.0),
-                                )
-                                .changed()
-                            {
-                                recent_limit_changed = true;
-                                recent_all = false;
-                                recent_all_changed = true;
-                            }
-                            ui.label("games");
-                            if ui
-                                .checkbox(&mut recent_all, "Show all")
-                                .on_hover_text(
-                                    "Show every game reaching this position, uncapped",
-                                )
-                                .changed()
-                            {
-                                recent_all_changed = true;
-                            }
+                            ui.label("Show:");
+                            let current_label = if recent_all {
+                                "All games".to_string()
+                            } else {
+                                format!("{recent_limit} games")
+                            };
+                            egui::ComboBox::from_id_salt("prep-recent-limit-combo")
+                                .selected_text(current_label)
+                                .show_ui(ui, |ui| {
+                                    for &n in &[5usize, 10, 15, 25, 50, 100] {
+                                        let text = format!("{n} games");
+                                        let selected = !recent_all && recent_limit == n;
+                                        if ui.selectable_label(selected, text).clicked() {
+                                            recent_limit = n;
+                                            recent_limit_changed = true;
+                                            recent_all = false;
+                                            recent_all_changed = true;
+                                        }
+                                    }
+                                    if ui.selectable_label(recent_all, "All games").clicked() {
+                                        recent_all = true;
+                                        recent_all_changed = true;
+                                    }
+                                });
                         });
                         ui.label(
                             RichText::new(if use_unified {
@@ -17169,6 +17748,12 @@ impl App {
                     .weak(),
                 );
                 ui.horizontal_wrapped(|ui| {
+                    ui.label("Trend source");
+                    for source in crate::recent::TrendSource::ALL {
+                        ui.radio_value(&mut self.settings_trend_source, source, source.label());
+                    }
+                });
+                ui.horizontal_wrapped(|ui| {
                     ui.label("Recent window");
                     for window in crate::recent::TrendWindow::ALL {
                         ui.radio_value(&mut self.settings_trend_window, window, window.label());
@@ -17638,6 +18223,8 @@ impl eframe::App for App {
         self.poll_cloud();
         self.poll_bar_cloud();
         self.poll_explorer();
+        self.poll_chessabc_live();
+        self.poll_explorer_since();
         self.poll_review_book();
         self.poll_engine();
         self.poll_review();
@@ -21252,7 +21839,7 @@ pub(crate) fn merge_multi_source_engine_rows(
                 chessdb: Some(mv.white_score(pos.turn())),
                 lichess: None,
                 lichess_depth: None,
-                lichess_pv: Some(vec![mv.uci.clone()]),
+                lichess_pv: None,
                 stockfish: None,
                 stockfish_depth: None,
                 stockfish_name: None,
@@ -21333,6 +21920,7 @@ fn cloud_engine_rows(snapshot: &cloud::Snapshot, pos: &Chess) -> Vec<CloudEngine
     merge_multi_source_engine_rows(Some(snapshot), &[], pos)
 }
 
+#[allow(dead_code)]
 /// Number of leading rows that still have an engine line. Any chessdb-only
 /// rows after the last engine variation are trailing and can be folded into one
 /// compact line.
@@ -21472,13 +22060,16 @@ fn cloud_engine_section(
                 });
                 ui.separator();
 
-                const PRIMARY_ROWS: usize = 8;
-                let primary_count = rows.len().min(PRIMARY_ROWS);
-                let primary = &rows[..primary_count];
-                let split = cloud_primary_split(primary);
-                let (primary_lines, trailing) = primary.split_at(split);
+                let (line_rows, folded_chessdb_rows): (Vec<&CloudEngineRow>, Vec<&CloudEngineRow>) = rows
+                    .iter()
+                    .partition(|row| {
+                        row.lichess.is_some()
+                            || row.stockfish.is_some()
+                            || row.leela.is_some()
+                            || row.variation.len() > 1
+                    });
 
-                for row in primary_lines {
+                for row in line_rows {
                     cloud_row_ui(
                         ui,
                         row,
@@ -21493,67 +22084,17 @@ fn cloud_engine_section(
                     );
                 }
 
-                let trailing_chessdb: Vec<&CloudEngineRow> = trailing
-                    .iter()
-                    .filter(|row| row.lichess.is_none() && row.stockfish.is_none() && row.leela.is_none())
-                    .collect();
-
-                if trailing_chessdb.len() >= 2 {
-                    ui.label(
-                        RichText::new("chessdb-only moves · no engine line")
-                            .small()
-                            .weak(),
-                    );
+                if !folded_chessdb_rows.is_empty() {
                     ui.add_space(2.0);
                     ui.horizontal_wrapped(|ui| {
-                        ui.spacing_mut().item_spacing = vec2(8.0, 3.0);
-                        for row in trailing_chessdb {
+                        ui.spacing_mut().item_spacing = vec2(5.0, 2.0);
+                        ui.label(RichText::new("chessdb:").small().weak());
+                        for row in folded_chessdb_rows {
                             cloud_compact_row_ui(
                                 ui,
                                 row,
                                 pos,
                                 best_score,
-                                &mut hover_preview,
-                                &mut clicked_line,
-                            );
-                        }
-                    });
-                } else {
-                    for row in trailing_chessdb {
-                        cloud_row_ui(
-                            ui,
-                            row,
-                            pos,
-                            best_score,
-                            has_chessdb,
-                            has_lichess,
-                            has_stockfish,
-                            has_leela,
-                            &mut hover_preview,
-                            &mut clicked_line,
-                        );
-                    }
-                }
-
-                if primary_count < rows.len() {
-                    let extra = &rows[primary_count..];
-                    egui::CollapsingHeader::new(
-                        RichText::new(format!("More moves ({})", extra.len()))
-                            .small()
-                            .weak(),
-                    )
-                    .default_open(false)
-                    .show(ui, |ui| {
-                        for row in extra {
-                            cloud_row_ui(
-                                ui,
-                                row,
-                                pos,
-                                best_score,
-                                has_chessdb,
-                                has_lichess,
-                                has_stockfish,
-                                has_leela,
                                 &mut hover_preview,
                                 &mut clicked_line,
                             );
@@ -22094,7 +22635,7 @@ fn cloud_compact_row_ui(
         .unwrap_or_else(|| "—".to_string());
     let label = format!("{eval} {line}");
     let response = ui
-        .selectable_label(false, RichText::new(label).monospace().small().color(color))
+        .selectable_label(false, RichText::new(label).monospace().size(11.0).color(color))
         .on_hover_text(cloud_eval_hint(row, delta));
     if response.hovered() {
         *hover_preview = steps
@@ -22672,6 +23213,7 @@ fn opening_tree_table(
     trends: crate::recent::TrendConfig,
     hover_preview: &mut Option<HoverPreview>,
     book_games: Option<&HashMap<u32, u32>>,
+    trend_override: Option<&HashMap<u32, crate::recent::MoveTrend>>,
 ) -> Option<Move> {
     let Some(index) = index else {
         ui.label(RichText::new(empty_message).weak());
@@ -22679,11 +23221,14 @@ fn opening_tree_table(
     };
     let stats = index.stats(key);
     let moves = index.moves(key);
-    let trend_by_move: HashMap<u32, crate::recent::MoveTrend> =
+    let trend_by_move: HashMap<u32, crate::recent::MoveTrend> = if let Some(over) = trend_override {
+        over.clone()
+    } else {
         crate::recent::position_trends(&moves, trends)
             .into_iter()
             .map(|trend| (trend.mv, trend))
-            .collect();
+            .collect()
+    };
 
     if let Some(stats) = stats {
         ui.horizontal(|ui| {
@@ -24000,6 +24545,7 @@ mod tests {
             prep_setup_chessabc_candidates: Vec::new(),
             prep_setup_chessabc_selected: Vec::new(),
             prep_setup_chessabc_status: String::new(),
+            prep_setup_chessabc_expanded: false,
             prep_setup_chessabc_rx: None,
             prep_setup_account_checks: HashMap::new(),
             prep_setup_account_rx: None,
@@ -24022,6 +24568,11 @@ mod tests {
             reference_job: None,
             reference_book: None,
             reference_status: String::new(),
+            chessabc_live_tree: None,
+            chessabc_live_rx: None,
+            chessabc_live_status: String::new(),
+            explorer_since_cache: HashMap::new(),
+            explorer_since_rx: None,
             correspondence_enabled: true,
             correspondence_path: String::new(),
             correspondence: None,
@@ -24141,6 +24692,7 @@ mod tests {
             trend_window: crate::recent::TrendWindow::default(),
             trend_baseline: crate::recent::TrendBaseline::default(),
             trend_min_games: 10,
+            trend_source: crate::recent::TrendSource::default(),
             filter: String::new(),
             pending_pgn_export: None,
             pending_scid_export: None,
@@ -24183,6 +24735,7 @@ mod tests {
             settings_trend_window: crate::recent::TrendWindow::default(),
             settings_trend_baseline: crate::recent::TrendBaseline::default(),
             settings_trend_min_games: 10,
+            settings_trend_source: crate::recent::TrendSource::default(),
             settings_token: String::new(),
             settings_token_visible: false,
             settings_token_from_env: false,
@@ -24266,6 +24819,79 @@ mod tests {
             "players without a photo-pack match keep the database spelling"
         );
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn live_reference_source_round_trips_config_strings() {
+        for src in LiveReferenceSource::ALL {
+            let s = src.config_str();
+            assert_eq!(LiveReferenceSource::from_config_str(s), Some(src));
+        }
+        assert_eq!(
+            LiveReferenceSource::from_config_str("live:masters"),
+            Some(LiveReferenceSource::LichessMasters)
+        );
+        assert_eq!(
+            LiveReferenceSource::from_config_str("live:lichess"),
+            Some(LiveReferenceSource::LichessAll)
+        );
+        assert_eq!(LiveReferenceSource::from_config_str("other"), None);
+    }
+
+    #[test]
+    fn resolve_prep_player_prefers_typed_search_over_selected_player_when_changing_opponent() {
+        let mut app = test_app();
+        let p0 = app.players.ensure_player("bye");
+        let p1 = app.players.ensure_player("Hinterreiter, Markus");
+        assert_eq!(p0, 0);
+        assert_eq!(p1, 1);
+        app.selected_player = Some(p0);
+
+        // Case 1: prep_setup_change_opponent is true, typing a name in prep_setup_search
+        app.prep_setup_change_opponent = true;
+        app.prep_setup_search = "Hinterreiter, Markus".to_string();
+        assert_eq!(app.resolve_prep_player_index(), Some(p1));
+
+        // Case 2: prep_setup_change_opponent is false, but user typed a search
+        app.prep_setup_change_opponent = false;
+        app.prep_setup_search = "Hinterreiter, Markus".to_string();
+        assert_eq!(app.resolve_prep_player_index(), Some(p1));
+
+        // Case 3: prep_setup_search is empty, not changing opponent -> uses selected_player
+        app.prep_setup_search.clear();
+        assert_eq!(app.resolve_prep_player_index(), Some(p0));
+
+        // Case 4: prep_setup_search is empty, changing opponent -> does NOT fall back to selected_player
+        app.prep_setup_change_opponent = true;
+        assert_eq!(app.resolve_prep_player_index(), None);
+    }
+
+    #[test]
+    fn cloud_engine_rows_leave_chessdb_only_moves_without_fake_lichess_pv() {
+        let pos = Chess::default();
+        let chessdb_data = cloud::ChessDb {
+            moves: vec![cloud::ChessDbMove {
+                uci: "e2e4".to_string(),
+                score: 25,
+                rank: 1,
+                note: "".to_string(),
+                winrate: 55.0,
+            }],
+        };
+        let snapshot = cloud::Snapshot {
+            fen: Fen::from_position(&pos, EnPassantMode::Legal).to_string(),
+            explorer_source: cloud::ExplorerSource::Masters,
+            chessdb: Ok(chessdb_data),
+            cloud_eval: Err("none".to_string()),
+            explorer: Err("none".to_string()),
+        };
+        let rows = merge_multi_source_engine_rows(Some(&snapshot), &[], &pos);
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.uci, "e2e4");
+        assert_eq!(row.chessdb, Some(25));
+        assert!(row.lichess.is_none());
+        assert_eq!(row.variation_source, None);
     }
 
     fn wiki_summary(title: &str) -> crate::wiki::Summary {

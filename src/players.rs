@@ -586,7 +586,7 @@ fn is_recent_date(date: u32, as_of: u32, config: PredictionConfig) -> bool {
     (a - d).max(0) <= config.recent_days
 }
 
-const HONORIFICS: &[&str] = &["dr", "prof", "ing", "mag", "dipl", "jr", "sr"];
+const HONORIFICS: &[&str] = &["dr", "prof", "ing", "mag", "dipl"];
 const PLACEHOLDERS: &[&str] = &[
     "bye", "forfeit", "unpaired", "vacant", "unknown", "none", "n/a", "na", "tbd", "anonymous",
     "?",
@@ -3220,7 +3220,7 @@ mod tests {
             player_key("Magnus Carlsen")
         );
         assert_eq!(
-            player_key("Dipl.-Ing. Max Mustermann, Jr."),
+            player_key("Dipl.-Ing. Max Mustermann"),
             player_key("Max Mustermann")
         );
     }
