@@ -586,20 +586,51 @@ fn is_recent_date(date: u32, as_of: u32, config: PredictionConfig) -> bool {
     (a - d).max(0) <= config.recent_days
 }
 
+const HONORIFICS: &[&str] = &["dr", "prof", "ing", "mag", "dipl", "jr", "sr"];
+const PLACEHOLDERS: &[&str] = &[
+    "bye", "forfeit", "unpaired", "vacant", "unknown", "none", "n/a", "na", "tbd", "anonymous",
+    "?",
+];
+
 /// Canonical player identity. Word order and punctuation are ignored so
 /// `Carlsen, Magnus` and `Magnus Carlsen` resolve to the same person.
 pub fn player_key(name: &str) -> Option<String> {
-    let mut words: Vec<String> = name
+    let trimmed = name.trim().to_ascii_lowercase();
+    if PLACEHOLDERS.contains(&trimmed.as_str()) {
+        return None;
+    }
+    let words: Vec<String> = name
         .split(|c: char| !c.is_alphanumeric())
         .filter(|word| !word.is_empty())
         .map(|word| word.to_lowercase())
         .collect();
-    if words.is_empty() || (words.len() == 1 && words[0] == "?") {
+    if words.is_empty() {
         return None;
     }
+    if words.len() == 1 && PLACEHOLDERS.contains(&words[0].as_str()) {
+        return None;
+    }
+    // Strip common academic/generational honorific tokens when at least one
+    // non-honorific token remains.
+    let non_honorifics: Vec<String> = words
+        .iter()
+        .filter(|word| !HONORIFICS.contains(&word.as_str()))
+        .cloned()
+        .collect();
+    let mut words = if !non_honorifics.is_empty() {
+        non_honorifics
+    } else {
+        words
+    };
     words.sort_unstable();
     words.dedup();
-    Some(words.join(" "))
+    let key = words.join(" ");
+    if PLACEHOLDERS.contains(&key.as_str())
+        || (words.len() == 1 && PLACEHOLDERS.contains(&words[0].as_str()))
+    {
+        return None;
+    }
+    Some(key)
 }
 
 /// Split a name into normalized alphanumeric tokens, dropping standalone
@@ -3160,6 +3191,38 @@ mod tests {
         );
         assert_eq!(player_key("?"), None);
         assert_eq!(player_key("  "), None);
+    }
+
+    #[test]
+    fn player_key_rejects_bye_and_placeholders() {
+        assert_eq!(player_key("bye"), None);
+        assert_eq!(player_key("BYE"), None);
+        assert_eq!(player_key("forfeit"), None);
+        assert_eq!(player_key("unknown"), None);
+        assert_eq!(player_key("unpaired"), None);
+        assert_eq!(player_key("vacant"), None);
+        assert_eq!(player_key("none"), None);
+        assert_eq!(player_key("n/a"), None);
+        assert_eq!(player_key("na"), None);
+        assert_eq!(player_key("tbd"), None);
+        assert_eq!(player_key("anonymous"), None);
+        assert_eq!(player_key("?"), None);
+    }
+
+    #[test]
+    fn player_key_strips_honorifics() {
+        assert_eq!(
+            player_key("Kern, Johannes, Dr."),
+            player_key("Johannes Kern")
+        );
+        assert_eq!(
+            player_key("Prof. Dr. Carlsen, Magnus"),
+            player_key("Magnus Carlsen")
+        );
+        assert_eq!(
+            player_key("Dipl.-Ing. Max Mustermann, Jr."),
+            player_key("Max Mustermann")
+        );
     }
 
     #[test]

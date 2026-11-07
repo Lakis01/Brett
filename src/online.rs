@@ -430,6 +430,114 @@ pub struct ChessAbcPlayer {
     pub fide_id: String,
     pub name: String,
     pub rating: u64,
+    pub games: Option<usize>,
+}
+
+pub fn candidate_matches_query(query: &str, candidate_name: &str) -> bool {
+    let query_tokens = normalized_name_tokens(query);
+    if query_tokens.is_empty() {
+        return false;
+    }
+    if query_tokens.len() >= 2 {
+        let query_surname = if let Some((head, _)) = query.split_once(',') {
+            normalized_name_tokens(head).join("")
+        } else {
+            query_tokens.last().cloned().unwrap_or_default()
+        };
+        let query_given_tokens: Vec<String> = query_tokens
+            .iter()
+            .filter(|t| **t != query_surname)
+            .cloned()
+            .collect();
+
+        let (cand_surname, cand_given_tokens) = if let Some((head, tail)) = candidate_name.split_once(',') {
+            let s = normalized_name_tokens(head).join("");
+            let g: Vec<String> = normalized_name_tokens(tail)
+                .into_iter()
+                .filter(|t| !["dr", "prof", "ing", "mag", "dipl", "jr", "sr"].contains(&t.as_str()))
+                .map(|t| {
+                    let clean = t.trim_end_matches(|c: char| c.is_ascii_digit());
+                    if !clean.is_empty() { clean.to_string() } else { t }
+                })
+                .collect();
+            (s, g)
+        } else {
+            let c_tokens = normalized_name_tokens(candidate_name);
+            let s = c_tokens.first().cloned().unwrap_or_default();
+            let g = if c_tokens.len() > 1 {
+                c_tokens[1..]
+                    .iter()
+                    .filter(|t| !["dr", "prof", "ing", "mag", "dipl", "jr", "sr"].contains(&t.as_str()))
+                    .map(|t| {
+                        let clean = t.trim_end_matches(|c: char| c.is_ascii_digit());
+                        if !clean.is_empty() { clean.to_string() } else { t.clone() }
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            (s, g)
+        };
+
+        let surname_matches = query_surname == cand_surname
+            || cand_surname.split_whitespace().any(|t| t == query_surname)
+            || token_match(&query_surname, &cand_surname).is_some_and(|s| s >= 0.8);
+        if !surname_matches {
+            return false;
+        }
+
+        if !query_given_tokens.is_empty() && !cand_given_tokens.is_empty() {
+            let given_matches = query_given_tokens.iter().any(|q_g| {
+                cand_given_tokens.iter().any(|c_g| {
+                    if q_g == c_g {
+                        return true;
+                    }
+                    if (q_g.chars().count() == 1 && c_g.starts_with(q_g))
+                        || (c_g.chars().count() == 1 && q_g.starts_with(c_g))
+                    {
+                        return true;
+                    }
+                    if let (Some(q_first), Some(c_first)) = (q_g.chars().next(), c_g.chars().next())
+                        && q_first == c_first
+                        && (q_g.chars().count() == 1 || c_g.chars().count() == 1)
+                    {
+                        return true;
+                    }
+                    token_match(q_g, c_g).is_some_and(|s| s >= 0.75)
+                })
+            });
+            if !given_matches {
+                return false;
+            }
+        }
+    }
+
+    if crate::players::player_key(query).is_some()
+        && crate::players::player_key(query) == crate::players::player_key(candidate_name)
+    {
+        return true;
+    }
+    if crate::players::matches_truncated_or_enumerated_name(query, candidate_name) {
+        return true;
+    }
+    name_match_score(query, candidate_name).is_some_and(|score| score >= 0.55)
+}
+
+fn chessabc_player_game_count(agent: &ureq::Agent, fide_id: &str) -> usize {
+    let url = format!(
+        "https://api.chessabc.com/games/player/paginated?fideId={}&page=0&size=1",
+        fide_id.trim()
+    );
+    let Ok(body) = get_text(agent, &url, Some("application/json")) else {
+        return 0;
+    };
+    let Ok(val) = serde_json::from_str::<Value>(&body) else {
+        return 0;
+    };
+    val.get("totalElements")
+        .and_then(Value::as_u64)
+        .map(|count| count as usize)
+        .unwrap_or(0)
 }
 
 fn collect_chessabc_candidates(agent: &ureq::Agent, query: &str) -> Result<Vec<ChessAbcPlayer>> {
@@ -449,19 +557,27 @@ fn collect_chessabc_candidates(agent: &ureq::Agent, query: &str) -> Result<Vec<C
             fetch_chessabc_search(agent, &variant, &mut players, &mut seen)?;
         }
     }
+    players.retain(|player| candidate_matches_query(query, &player.name));
     Ok(players)
 }
 
 fn resolve_chessabc_player(agent: &ureq::Agent, query: &str) -> Result<ChessAbcPlayer> {
     if query.chars().all(|c| c.is_ascii_digit()) {
+        let count = chessabc_player_game_count(agent, query);
         return Ok(ChessAbcPlayer {
             fide_id: query.to_string(),
             name: query.to_string(),
             rating: 0,
+            games: Some(count),
         });
     }
 
-    let players = collect_chessabc_candidates(agent, query)?;
+    let mut players = collect_chessabc_candidates(agent, query)?;
+    for p in &mut players {
+        let count = chessabc_player_game_count(agent, &p.fide_id);
+        p.games = Some(count);
+    }
+    players.retain(|p| p.games.unwrap_or(0) >= 1);
     if players.is_empty() {
         bail!("ChessABC found no player matching {query}");
     }
@@ -473,19 +589,26 @@ fn resolve_chessabc_player(agent: &ureq::Agent, query: &str) -> Result<ChessAbcP
 /// checklist instead of silently picking one profile.
 pub fn search_chessabc_candidates(query: &str) -> Result<Vec<ChessAbcPlayer>> {
     let query = validate_query(OnlineSource::ChessAbc, query)?.to_string();
-    if query.chars().all(|c| c.is_ascii_digit()) {
-        return Ok(vec![ChessAbcPlayer {
-            fide_id: query.clone(),
-            name: query,
-            rating: 0,
-        }]);
-    }
     let agent = ureq::AgentBuilder::new()
         .user_agent(USER_AGENT)
         .timeout_connect(Duration::from_secs(20))
         .timeout(Duration::from_secs(180))
         .build();
+    if query.chars().all(|c| c.is_ascii_digit()) {
+        let count = chessabc_player_game_count(&agent, &query);
+        return Ok(vec![ChessAbcPlayer {
+            fide_id: query.clone(),
+            name: query,
+            rating: 0,
+            games: Some(count),
+        }]);
+    }
     let mut players = collect_chessabc_candidates(&agent, &query)?;
+    for p in &mut players {
+        let count = chessabc_player_game_count(&agent, &p.fide_id);
+        p.games = Some(count);
+    }
+    players.retain(|p| p.games.unwrap_or(0) >= 1);
     players.sort_by(|a, b| {
         b.rating
             .cmp(&a.rating)
@@ -493,6 +616,88 @@ pub fn search_chessabc_candidates(query: &str) -> Result<Vec<ChessAbcPlayer>> {
             .then_with(|| a.fide_id.cmp(&b.fide_id))
     });
     Ok(players)
+}
+
+/// Pick the single most probable candidate from a candidate list for `query`.
+pub fn best_chessabc_candidate(
+    candidates: &[ChessAbcPlayer],
+    query: &str,
+    player_elo: Option<u32>,
+) -> Option<ChessAbcPlayer> {
+    let filtered: Vec<ChessAbcPlayer> = candidates
+        .iter()
+        .filter(|c| c.games != Some(0))
+        .cloned()
+        .collect();
+    if filtered.is_empty() {
+        return None;
+    }
+
+    // 1. First try auto_select_chessabc_candidate
+    if let Some(selected) = auto_select_chessabc_candidate(&filtered, query, player_elo) {
+        return Some(selected);
+    }
+
+    // 2. Next, check exact player_key matches
+    if let Some(query_key) = crate::players::player_key(query) {
+        let exact_matches: Vec<&ChessAbcPlayer> = filtered
+            .iter()
+            .filter(|c| crate::players::player_key(&c.name).as_deref() == Some(&query_key))
+            .collect();
+        if !exact_matches.is_empty() {
+            return exact_matches
+                .into_iter()
+                .min_by(|a, b| match player_elo {
+                    Some(elo) => {
+                        let diff_a = a.rating.abs_diff(u64::from(elo));
+                        let diff_b = b.rating.abs_diff(u64::from(elo));
+                        diff_a
+                            .cmp(&diff_b)
+                            .then_with(|| b.games.unwrap_or(0).cmp(&a.games.unwrap_or(0)))
+                            .then_with(|| b.rating.cmp(&a.rating))
+                    }
+                    None => b
+                        .rating
+                        .cmp(&a.rating)
+                        .then_with(|| b.games.unwrap_or(0).cmp(&a.games.unwrap_or(0))),
+                })
+                .cloned();
+        }
+    }
+
+    // 3. Next, check players::matches_truncated_or_enumerated_name(query, &c.name)
+    let truncated: Vec<&ChessAbcPlayer> = filtered
+        .iter()
+        .filter(|c| crate::players::matches_truncated_or_enumerated_name(query, &c.name))
+        .collect();
+    if !truncated.is_empty() {
+        return truncated
+            .into_iter()
+            .min_by(|a, b| match player_elo {
+                Some(elo) => {
+                    let a_has_rating = a.rating > 0;
+                    let b_has_rating = b.rating > 0;
+                    b_has_rating
+                        .cmp(&a_has_rating)
+                        .then_with(|| {
+                            let diff_a = a.rating.abs_diff(u64::from(elo));
+                            let diff_b = b.rating.abs_diff(u64::from(elo));
+                            diff_a.cmp(&diff_b)
+                        })
+                        .then_with(|| b.games.unwrap_or(0).cmp(&a.games.unwrap_or(0)))
+                        .then_with(|| b.rating.cmp(&a.rating))
+                }
+                None => b
+                    .games
+                    .unwrap_or(0)
+                    .cmp(&a.games.unwrap_or(0))
+                    .then_with(|| b.rating.cmp(&a.rating)),
+            })
+            .cloned();
+    }
+
+    // 4. Finally fall back to choose_chessabc_player
+    choose_chessabc_player(&filtered, query)
 }
 
 /// Pick the unambiguous ChessABC profile for `query`, if there is one:
@@ -605,6 +810,7 @@ fn fetch_chessabc_search(
                 fide_id,
                 name,
                 rating: value.get("rating").and_then(Value::as_u64).unwrap_or(0),
+                games: None,
             });
         }
     }
@@ -1120,6 +1326,7 @@ mod tests {
             fide_id: fide_id.to_string(),
             name: "Carlsen, Magnus".to_string(),
             rating,
+            games: None,
         };
         // Exact FIDE id wins even among several profiles.
         let candidates = vec![
@@ -1128,6 +1335,7 @@ mod tests {
                 fide_id: "999".to_string(),
                 name: "Carlsen, Christian".to_string(),
                 rating: 1626,
+                games: None,
             },
         ];
         assert_eq!(
@@ -1153,11 +1361,13 @@ mod tests {
                 fide_id: "1".to_string(),
                 name: "Hinterreiter,M".to_string(),
                 rating: 2450,
+                games: None,
             },
             ChessAbcPlayer {
                 fide_id: "2".to_string(),
                 name: "Huber, M".to_string(),
                 rating: 1800,
+                games: None,
             },
         ];
         assert_eq!(
@@ -1176,11 +1386,13 @@ mod tests {
                 fide_id: "1".to_string(),
                 name: "Meyer,M 1".to_string(),
                 rating: 2400,
+                games: None,
             },
             ChessAbcPlayer {
                 fide_id: "2".to_string(),
                 name: "Meyer,M 2".to_string(),
                 rating: 2350,
+                games: None,
             },
         ];
         assert!(auto_select_chessabc_candidate(&paired, "Meyer, Max", Some(2400)).is_none());
@@ -1193,16 +1405,19 @@ mod tests {
                 fide_id: "1".to_string(),
                 name: "Carlsen, Magnus".to_string(),
                 rating: 2823,
+                games: None,
             },
             ChessAbcPlayer {
                 fide_id: "2".to_string(),
                 name: "Carlsen, Magnus Junior".to_string(),
                 rating: 2900,
+                games: None,
             },
             ChessAbcPlayer {
                 fide_id: "3".to_string(),
                 name: "Carlsen, Christian".to_string(),
                 rating: 1626,
+                games: None,
             },
         ];
         assert_eq!(
@@ -1215,6 +1430,55 @@ mod tests {
             choose_chessabc_player(&players, "Carlsen").unwrap().fide_id,
             "2"
         );
+    }
+
+    #[test]
+    fn filter_matching_chessabc_candidates_drops_substring_noise() {
+        let query = "Johannes Kern";
+        assert!(!candidate_matches_query(query, "Brustkern, Juergen"));
+        assert!(!candidate_matches_query(query, "Bikernieks, Anrijs"));
+        assert!(!candidate_matches_query(query, "Kern, Benjamin"));
+        assert!(candidate_matches_query(query, "Kern, Johannes, Dr."));
+        assert!(candidate_matches_query(query, "Kern, J"));
+        assert!(candidate_matches_query(query, "Kern, J1"));
+    }
+
+    #[test]
+    fn best_chessabc_candidate_prefers_exact_and_closest_elo() {
+        let candidates = vec![
+            ChessAbcPlayer {
+                fide_id: "1646885".to_string(),
+                name: "Kern, Johann".to_string(),
+                rating: 0,
+                games: Some(0),
+            },
+            ChessAbcPlayer {
+                fide_id: "4604776".to_string(),
+                name: "Kern, Johannes, Dr.".to_string(),
+                rating: 2156,
+                games: Some(11),
+            },
+        ];
+        let best = best_chessabc_candidate(&candidates, "Johannes Kern", Some(2150));
+        assert_eq!(best.as_ref().map(|c| c.fide_id.as_str()), Some("4604776"));
+
+        // Even when Johann has games, Dr. stripped makes Johannes Dr. exact player_key match
+        let candidates2 = vec![
+            ChessAbcPlayer {
+                fide_id: "1646885".to_string(),
+                name: "Kern, Johann".to_string(),
+                rating: 0,
+                games: Some(5),
+            },
+            ChessAbcPlayer {
+                fide_id: "4604776".to_string(),
+                name: "Kern, Johannes, Dr.".to_string(),
+                rating: 2156,
+                games: Some(11),
+            },
+        ];
+        let best2 = best_chessabc_candidate(&candidates2, "Johannes Kern", Some(2150));
+        assert_eq!(best2.as_ref().map(|c| c.fide_id.as_str()), Some("4604776"));
     }
 
     #[test]
