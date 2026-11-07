@@ -10,15 +10,19 @@ use crate::engine::Score;
 pub enum EvalSource {
     Local,
     Cloud,
+    ChessDb,
     Pgn,
+    DbAggregate,
 }
 
 impl EvalSource {
     fn tie_rank(self) -> u8 {
         match self {
-            Self::Local => 3,
-            Self::Cloud => 2,
-            Self::Pgn => 1,
+            Self::Local => 5,
+            Self::Cloud => 4,
+            Self::ChessDb => 3,
+            Self::Pgn => 2,
+            Self::DbAggregate => 1,
         }
     }
 }
@@ -126,6 +130,32 @@ impl BoardEval {
         })
     }
 
+    /// chessdb.cn's top move, already normalized to White's perspective.
+    pub fn from_chessdb(white_cp: i32) -> Self {
+        Self {
+            score: WhiteScore::Cp(white_cp),
+            depth: 0,
+            source: EvalSource::ChessDb,
+        }
+    }
+
+    /// Convert a reference/current-database win/draw/loss aggregate into a
+    /// centipawn score using the inverse of the Lichess logistic curve. A
+    /// sample below five games is too noisy to display.
+    pub fn from_db_aggregate(white: u64, draws: u64, black: u64) -> Option<Self> {
+        let total = white.saturating_add(draws).saturating_add(black);
+        if total < 5 {
+            return None;
+        }
+        let w = ((white as f64 + 0.5 * draws as f64) / total as f64).clamp(0.05, 0.95);
+        let cp = ((-1.0 / 0.00368208) * ((1.0 / w) - 1.0).ln()).round() as i32;
+        Some(Self {
+            score: WhiteScore::Cp(cp),
+            depth: 0,
+            source: EvalSource::DbAggregate,
+        })
+    }
+
     /// Human-readable hover tooltip (`White +0.35 · Lichess cloud d24`).
     pub fn tooltip(self) -> String {
         let side = match self.score {
@@ -140,7 +170,9 @@ impl BoardEval {
             (EvalSource::Local, _) => "local engine".to_string(),
             (EvalSource::Cloud, d) if d > 0 => format!("Lichess cloud d{d}"),
             (EvalSource::Cloud, _) => "Lichess cloud".to_string(),
+            (EvalSource::ChessDb, _) => "chessdb.cn".to_string(),
             (EvalSource::Pgn, _) => "PGN eval".to_string(),
+            (EvalSource::DbAggregate, _) => "DB aggregate".to_string(),
         };
         format!("{side} · {source}")
     }
@@ -156,6 +188,14 @@ pub fn choose(
     [local, cloud, pgn]
         .into_iter()
         .flatten()
+        .max_by_key(|eval| (eval.depth, eval.source.tie_rank()))
+}
+
+/// Composite selection across every bar source. Highest depth wins; ties
+/// prefer `Local > Cloud > ChessDb > Pgn > DbAggregate`.
+pub fn choose_composite(candidates: impl IntoIterator<Item = BoardEval>) -> Option<BoardEval> {
+    candidates
+        .into_iter()
         .max_by_key(|eval| (eval.depth, eval.source.tie_rank()))
 }
 
@@ -255,5 +295,22 @@ mod tests {
 
         let mate = BoardEval::from_local(Score::Mate(2), Color::Black, 16);
         assert_eq!(mate.tooltip(), "Black mates in 2 · local engine d16");
+    }
+
+    #[test]
+    fn composite_eval_orders_local_cloud_chessdb_pgn_and_db_aggregate() {
+        let agg = BoardEval::from_db_aggregate(60, 20, 20).expect("enough games");
+        assert_eq!(agg.source, EvalSource::DbAggregate);
+        assert!(matches!(agg.score, WhiteScore::Cp(cp) if cp > 100));
+
+        let cdb = BoardEval::from_chessdb(42);
+        assert_eq!(cdb.source, EvalSource::ChessDb);
+        assert_eq!(cdb.score, WhiteScore::Cp(42));
+
+        assert_eq!(
+            choose_composite([agg, cdb]),
+            Some(cdb),
+            "chessdb.cn should outrank raw DB winrate aggregate"
+        );
     }
 }

@@ -8462,25 +8462,59 @@ impl App {
         }
     }
 
-    fn current_board_eval(&self) -> Option<BoardEval> {
+    /// Composite evaluation for any node along the current game, using that
+    /// node's position and every cached source: local engine / analysis cache,
+    /// Lichess cloud, chessdb.cn, PGN `[%eval]`, and the reference/current
+    /// database win-rate aggregate.
+    fn eval_for_node(&self, node_idx: usize) -> Option<BoardEval> {
         let game = self.game()?;
-        let node = game.nodes.get(self.node)?;
+        let node = game.nodes.get(node_idx)?;
         let pos = &node.pos;
         let fen = Fen::from_position(pos, EnPassantMode::Legal).to_string();
         let turn = pos.turn();
+        let key = position::position_key(pos);
 
-        let local = self.local_board_eval(&fen, turn);
+        let local = if node_idx == self.node {
+            self.local_board_eval(&fen, turn)
+        } else {
+            let analyses = if self.cached_analyses_pos == Some(key) {
+                self.cached_analyses.clone()
+            } else if let Some(cache) = &self.analysis_cache {
+                cache.query_position(key)
+            } else {
+                Vec::new()
+            };
+            let mut best = None;
+            for analysis in &analyses {
+                if analysis.multipv != 1 {
+                    continue;
+                }
+                let score = if let Some(mate) = analysis.score_mate {
+                    Score::Mate(mate)
+                } else if let Some(cp) = analysis.score_cp {
+                    match analysis.engine_family {
+                        crate::analysis_cache::EngineFamily::Leela => {
+                            Score::Cp(crate::analysis_cache::leela_to_stockfish_cp(cp))
+                        }
+                        crate::analysis_cache::EngineFamily::Stockfish
+                        | crate::analysis_cache::EngineFamily::Generic => Score::Cp(cp),
+                    }
+                } else {
+                    continue;
+                };
+                keep_deeper(&mut best, BoardEval::from_local(score, turn, analysis.depth));
+            }
+            best
+        };
 
-        let cloud_eval = self
-            .cloud
-            .as_ref()
-            .filter(|s| s.fen == fen)
-            .and_then(|s| s.cloud_eval.as_ref().ok())
+        let cloud_snapshot = self.cloud.as_ref().filter(|snapshot| snapshot.fen == fen);
+        let cloud_eval = cloud_snapshot
+            .and_then(|snapshot| snapshot.cloud_eval.as_ref().ok())
             .or_else(|| {
                 self.cloud_cache
                     .iter()
                     .find(|((_, f), _)| f == &fen)
-                    .and_then(|(_, s)| s.cloud_eval.as_ref().ok())
+                    .and_then(|(_, snapshot)| snapshot.cloud_eval.as_ref().ok())
             })
             .or_else(|| self.bar_cloud_cache.get(&fen).and_then(Option::as_ref));
         let cloud = cloud_eval.and_then(|ce| {
@@ -8488,9 +8522,63 @@ impl App {
             BoardEval::from_cloud(pv.cp, pv.mate, ce.depth)
         });
 
+        let chessdb = cloud_snapshot
+            .and_then(|snapshot| snapshot.chessdb.as_ref().ok())
+            .or_else(|| {
+                self.cloud_cache
+                    .iter()
+                    .find(|((_, f), _)| f == &fen)
+                    .and_then(|(_, snapshot)| snapshot.chessdb.as_ref().ok())
+            })
+            .and_then(|db| db.moves.first())
+            .map(|mv| BoardEval::from_chessdb(mv.white_score(turn)));
+
         let pgn = node.eval.and_then(BoardEval::from_pgn);
 
-        eval::choose(local, cloud, pgn)
+        let db_agg = self
+            .reference_tree_index()
+            .or(self.index.as_ref())
+            .and_then(|index| index.stats(key))
+            .and_then(|stats| {
+                BoardEval::from_db_aggregate(
+                    u64::from(stats.white),
+                    u64::from(stats.draw),
+                    u64::from(stats.black),
+                )
+            });
+
+        eval::choose_composite([local, cloud, chessdb, pgn, db_agg].into_iter().flatten())
+    }
+
+    fn current_board_eval(&self) -> Option<BoardEval> {
+        self.eval_for_node(self.node)
+    }
+
+    /// Current eval plus whether it was inherited from the nearest ancestor
+    /// that still has a reliable score. While a new ply's eval is pending the
+    /// bar holds that ancestor value instead of snapping to `0.00`.
+    fn current_board_eval_with_hold(&self) -> (Option<BoardEval>, bool) {
+        if let Some(direct) = self.eval_for_node(self.node) {
+            return (Some(direct), false);
+        }
+        let Some(game) = self.current.as_ref() else {
+            return (None, false);
+        };
+        let mut visited = HashSet::new();
+        let mut cursor = game.nodes.get(self.node).and_then(|node| node.parent);
+        for _ in 0..game.nodes.len() {
+            let Some(parent) = cursor else {
+                break;
+            };
+            if !visited.insert(parent) {
+                break;
+            }
+            if let Some(ancestor_eval) = self.eval_for_node(parent) {
+                return (Some(ancestor_eval), true);
+            }
+            cursor = game.nodes.get(parent).and_then(|node| node.parent);
+        }
+        (None, false)
     }
 
     /// Deepest available local evaluation for `fen`: live engine slots, the
@@ -16620,7 +16708,7 @@ impl eframe::App for App {
             ui.with_layout(Layout::top_down(Align::Center), |ui| {
                 ui.add_space(6.0);
                 let hover = self.hover_preview.as_ref();
-                let board_eval = self.current_board_eval();
+                let (board_eval, eval_held) = self.current_board_eval_with_hold();
                 let board_meta = self.game().map(|game| {
                     let node = &game.nodes[self.node];
                     let top_color = self.orientation.other();
@@ -16690,7 +16778,9 @@ impl eframe::App for App {
                             Layout::left_to_right(Align::Center),
                             |ui| {
                                 ui.spacing_mut().item_spacing.x = eval_bar::GAP;
-                                bar_response = Some(eval_bar::draw(ui, board_eval, side));
+                                bar_response = Some(eval_bar::draw_with_hold(
+                                    ui, board_eval, eval_held, side,
+                                ));
                                 event = board::draw(
                                     ui,
                                     &self.textures,
@@ -22669,6 +22759,18 @@ mod tests {
         let loaded = player_games_from_library(&lib, "johannes kern", "Kern, Johannes");
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].white(), "Kern, Johannes");
+    }
+
+    #[test]
+    fn eval_bar_holds_most_recent_reliable_eval_along_line_when_current_ply_unavailable() {
+        let mut app = test_app();
+        let pgn = b"[White \"A\"]\n[Black \"B\"]\n\n1. e4 { [%eval +0.35] } 1... e5 2. Nf3 *\n";
+        let games = crate::domain::parse_pgn(pgn).unwrap();
+        app.current = Some(games.into_iter().next().unwrap());
+        app.goto(3); // after 2. Nf3, no eval at node 2 or 3, but node 1 has +0.35
+        let (eval, held) = app.current_board_eval_with_hold();
+        assert!(held, "expected held=true when inheriting ancestor eval");
+        assert_eq!(eval.unwrap().score, crate::eval::WhiteScore::Cp(35));
     }
 
     fn test_app() -> App {

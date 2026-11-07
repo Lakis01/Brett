@@ -17,6 +17,17 @@ const CENTER_TICK: Color32 = Color32::from_rgba_premultiplied(0x77, 0x96, 0x56, 
 ///
 /// White fills from the bottom upward regardless of board orientation.
 pub fn draw(ui: &mut Ui, eval: Option<BoardEval>, side: f32) -> egui::Response {
+    draw_with_hold(ui, eval, false, side)
+}
+
+/// Draw the bar while flagging that `eval` is inherited from an earlier ply
+/// (the current position's evaluation is still being computed).
+pub fn draw_with_hold(
+    ui: &mut Ui,
+    eval: Option<BoardEval>,
+    is_held: bool,
+    side: f32,
+) -> egui::Response {
     let side = side.clamp(64.0, 4096.0);
     let (rect, response) = ui.allocate_exact_size(Vec2::new(WIDTH, side), Sense::click());
     let painter = ui.painter_at(rect);
@@ -57,9 +68,12 @@ pub fn draw(ui: &mut Ui, eval: Option<BoardEval>, side: f32) -> egui::Response {
     let border = ui.visuals().widgets.noninteractive.bg_stroke.color;
     painter.rect_stroke(rect, radius, Stroke::new(1.0, border), StrokeKind::Inside);
 
-    let tip = match eval {
-        Some(eval) => eval.tooltip(),
-        None => "Evaluation bar · waiting for evaluation".to_string(),
+    let tip = match (eval, is_held) {
+        (Some(eval), true) => {
+            format!("{} · held from previous ply (computing…)", eval.tooltip())
+        }
+        (Some(eval), false) => eval.tooltip(),
+        (None, _) => "Evaluation bar · waiting for evaluation".to_string(),
     };
     response.on_hover_text(tip)
 }
