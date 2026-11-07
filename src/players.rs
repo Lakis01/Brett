@@ -605,7 +605,7 @@ pub fn player_key(name: &str) -> Option<String> {
 /// Split a name into normalized alphanumeric tokens, dropping standalone
 /// numbers (ChessABC enumeration suffixes such as the `1` in `M 1`).
 fn name_tokens(name: &str) -> Vec<String> {
-    name.split(|c: char| !c.is_alphanumeric())
+    name.split(|c: char| !c.is_alphabetic())
         .filter(|token| !token.is_empty())
         .map(|token| token.to_lowercase())
         .filter(|token| token.chars().any(|c| c.is_alphabetic()))
@@ -863,7 +863,7 @@ fn tc_from_event_keywords(event: &str) -> Option<TimeControlClass> {
         Some(TimeControlClass::Bullet)
     } else if lower.contains("blitz") {
         Some(TimeControlClass::Blitz)
-    } else if lower.contains("rapid") {
+    } else if lower.contains("rapid") || lower.contains("schnellschach") {
         Some(TimeControlClass::Rapid)
     } else if lower.contains("titled tuesday") {
         // Titled Tuesday is an 11-round blitz event.
@@ -1770,28 +1770,31 @@ impl PlayerBook {
         let date = parse_date(game.date()).unwrap_or(0);
         let result = result_for(color, game.result());
         let (tc, is_online, is_rated) = classify_game_metadata(game);
-        let mut seen = HashSet::new();
+        let mut seen_positions = HashSet::new();
+        let mut seen_edges: HashSet<(u64, u32)> = HashSet::new();
         let mut node = 0;
         let mut depth: u32 = 0;
 
         loop {
-            let parent_pos = &game.nodes[node].pos;
-            let key = position::position_key(parent_pos);
-            if !seen.insert(key) {
+            if depth >= 400 {
                 break;
             }
-            self.depths.entry(key).or_insert(depth);
-            // Record every position the game reached, including the final
-            // position where no reply was played.
-            if let Some(index) = game_index {
-                self.game_refs.entry(key).or_default().push(PlayerGameRef {
-                    index,
-                    date,
-                    color,
-                    is_online,
-                    is_rated,
-                    tc,
-                });
+            let parent_pos = &game.nodes[node].pos;
+            let key = position::position_key(parent_pos);
+            if seen_positions.insert(key) {
+                self.depths.entry(key).or_insert(depth);
+                // Record every position the game reached, including the final
+                // position where no reply was played.
+                if let Some(index) = game_index {
+                    self.game_refs.entry(key).or_default().push(PlayerGameRef {
+                        index,
+                        date,
+                        color,
+                        is_online,
+                        is_rated,
+                        tc,
+                    });
+                }
             }
             let Some(&child) = game.nodes[node].children.first() else {
                 break;
@@ -1816,7 +1819,7 @@ impl PlayerBook {
             // the prepared player's perspective. Each observation remembers
             // which side moved so own-move readers can exclude replies.
             let reply = parent_pos.turn() != color;
-            {
+            if seen_edges.insert((key, code)) {
                 let (weight, recent) = recency(date, self.as_of, self.config);
                 let entry = self.positions[cidx]
                     .entry(key)
@@ -4621,5 +4624,45 @@ mod tests {
         );
         assert!(exclusive.probability_low <= exclusive.probability);
         assert!(exclusive.probability_high >= exclusive.probability);
+    }
+
+    #[test]
+    fn player_book_indexes_moves_after_single_position_repetition() {
+        let pgn = b"[White \"Kern, Johannes\"]\n[Black \"Opponent, Test\"]\n[Result \"1-0\"]\n\n1. Nf3 Nf6 2. Ng1 Ng8 3. e4 e5 4. Bc4 Nc6 1-0\n";
+        let games = crate::domain::parse_pgn(pgn).expect("valid pgn");
+        let book = PlayerBook::from_games(
+            "johannes kern",
+            "Kern, Johannes",
+            &games,
+            PredictionConfig::default(),
+            20261107,
+        );
+        let start = crate::chess::Chess::default();
+        let key = crate::position::position_key(&start);
+        let filter = PrepFilterConfig::default();
+        let moves = book.filtered_moves(key, Color::White, &filter);
+        let sans: Vec<String> = moves
+            .iter()
+            .filter_map(|m| crate::position::decode_move(&start, m.mv))
+            .map(|mv| crate::chess::SanPlus::from_move(start.clone(), mv).to_string())
+            .collect();
+        assert!(sans.contains(&"Nf3".to_string()), "expected Nf3 in {sans:?}");
+        assert!(sans.contains(&"e4".to_string()), "expected post-repetition e4 in {sans:?}");
+        let refs = book.recent_games_for_filtered(key, Color::White, &filter, 10);
+        assert!(refs.len() <= 1, "same game must not be duplicated in game_refs");
+    }
+
+    #[test]
+    fn truncated_name_matches_attached_enumeration_digits_and_schnellschach_is_otb_rapid() {
+        assert!(matches_truncated_or_enumerated_name("Kern, Johannes", "Kern, J1"));
+        assert!(matches_truncated_or_enumerated_name("Kern, Johannes", "Kern, J2"));
+        assert!(matches_truncated_or_enumerated_name("Hinterreiter, Martin", "Hinterreiter,M1"));
+
+        let mut g = Game::default();
+        g.set_header("Event", "Bezirks-Schnellschachmeisterschaft".to_string());
+        g.set_header("Site", "?".to_string());
+        let (tc, is_online, _) = classify_game_metadata(&g);
+        assert_eq!(tc, TimeControlClass::Rapid);
+        assert!(!is_online);
     }
 }

@@ -573,7 +573,7 @@ impl PositionIndex {
         {
             return false;
         }
-        let mut seen = HashSet::new();
+        let mut seen_edges: HashSet<(u64, u32)> = HashSet::new();
         let mut node = 0usize;
         let mut plies = 0u32;
         while let Some(&child) = game.nodes[node].children.first() {
@@ -594,10 +594,9 @@ impl PositionIndex {
                 break;
             };
             let key = position_key(&parent.pos);
-            if !seen.insert(key) {
-                break;
+            if seen_edges.insert((key, code)) {
+                accumulator.add_move(key, code, &game_meta);
             }
-            accumulator.add_move(key, code, &game_meta);
             node = child;
             plies += 1;
             if plies >= options.max_plies {
@@ -1521,7 +1520,7 @@ fn parse_date(value: &str) -> Option<u32> {
 struct GameState {
     pos: Chess,
     meta: GameMeta,
-    seen: HashSet<u64>,
+    seen_edges: HashSet<(u64, u32)>,
     active: bool,
     included: bool,
     plies: u32,
@@ -1543,7 +1542,7 @@ impl GameState {
         Self {
             pos,
             meta,
-            seen: HashSet::new(),
+            seen_edges: HashSet::new(),
             active: included,
             included,
             plies: 0,
@@ -1651,10 +1650,6 @@ where
             return ControlFlow::Continue(());
         };
         let key = position_key(&state.pos);
-        if !state.seen.insert(key) {
-            state.active = false;
-            return ControlFlow::Continue(());
-        }
         let after = match state.pos.clone().play(mv) {
             Ok(after) => after,
             Err(_) => {
@@ -1662,7 +1657,9 @@ where
                 return ControlFlow::Continue(());
             }
         };
-        self.accumulator.add_move(key, code, &state.meta);
+        if state.seen_edges.insert((key, code)) {
+            self.accumulator.add_move(key, code, &state.meta);
+        }
         state.pos = after;
         state.plies += 1;
         if state.plies >= self.options.max_plies {

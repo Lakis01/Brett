@@ -737,15 +737,12 @@ impl RecentTree {
             .is_some_and(|(date, as_of)| as_of.saturating_sub(date) <= i64::from(self.recent_days));
         let elo = average_elo(game);
         let result = game.result();
-        let mut seen = HashSet::new();
+        let mut seen_edges: HashSet<(u64, u32)> = HashSet::new();
         let mut node = 0usize;
 
         loop {
             let parent_pos = &game.nodes[node].pos;
             let key = position::position_key(parent_pos);
-            if !seen.insert(key) {
-                break;
-            }
             let Some(&child) = game.nodes[node].children.first() else {
                 break;
             };
@@ -764,12 +761,14 @@ impl RecentTree {
             let Some(code) = position::encode_move(mv) else {
                 break;
             };
-            self.positions
-                .entry(key)
-                .or_default()
-                .entry(code)
-                .or_default()
-                .add(result, elo, date, recent);
+            if seen_edges.insert((key, code)) {
+                self.positions
+                    .entry(key)
+                    .or_default()
+                    .entry(code)
+                    .or_default()
+                    .add(result, elo, date, recent);
+            }
             node = child;
         }
         self.games += 1;
