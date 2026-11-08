@@ -5,13 +5,14 @@ use egui::{Color32, CornerRadius, Pos2, Rect, Sense, Stroke, StrokeKind, Ui, Vec
 use crate::eval::BoardEval;
 
 /// Width of the evaluation bar in logical pixels.
-pub const WIDTH: f32 = 16.0;
+pub const WIDTH: f32 = 14.0;
 /// Horizontal gap between the evaluation bar and the board.
 pub const GAP: f32 = 6.0;
 
-const WHITE_FILL: Color32 = Color32::from_rgb(0xEB, 0xEC, 0xD0);
-const BLACK_FILL: Color32 = Color32::from_rgb(0x26, 0x24, 0x21);
-const CENTER_TICK: Color32 = Color32::from_rgba_premultiplied(0x77, 0x96, 0x56, 0xB0);
+const WHITE_FILL: Color32 = Color32::from_rgb(0xE8, 0xEC, 0xF2);
+const BLACK_FILL: Color32 = Color32::from_rgb(0x20, 0x24, 0x2C);
+const BORDER_COLOR: Color32 = Color32::from_rgb(0x26, 0x2B, 0x35);
+const CENTER_TICK: Color32 = Color32::from_rgba_premultiplied(0x9E, 0x7B, 0x56, 0xB0);
 
 /// Draw a vertical evaluation bar of height `side`.
 ///
@@ -65,8 +66,7 @@ pub fn draw_with_hold(
         Stroke::new(1.0, CENTER_TICK),
     );
 
-    let border = ui.visuals().widgets.noninteractive.bg_stroke.color;
-    painter.rect_stroke(rect, radius, Stroke::new(1.0, border), StrokeKind::Inside);
+    painter.rect_stroke(rect, radius, Stroke::new(1.0, BORDER_COLOR), StrokeKind::Inside);
 
     let tip = match (eval, is_held) {
         (Some(eval), true) => {

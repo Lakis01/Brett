@@ -45,11 +45,16 @@ use crate::ui::eval_bar;
 use crate::ui::fonts;
 use crate::ui::pieces::PieceTextures;
 
-const SURFACE: Color32 = Color32::from_rgb(0x22, 0x25, 0x28);
-const VARIATION_BG: Color32 = Color32::from_rgb(0x1D, 0x20, 0x23);
-const BORDER: Color32 = Color32::from_rgb(0x38, 0x3C, 0x40);
-const GOLD: Color32 = Color32::from_rgb(0xE8, 0xC4, 0x6A);
+const BG: Color32 = Color32::from_rgb(0x11, 0x13, 0x17);
+const PANEL: Color32 = Color32::from_rgb(0x17, 0x1A, 0x20);
+const SURFACE: Color32 = Color32::from_rgb(0x1E, 0x22, 0x2A);
+const SURFACE_ALT: Color32 = Color32::from_rgb(0x14, 0x17, 0x1C);
+const BORDER: Color32 = Color32::from_rgb(0x26, 0x2B, 0x35);
+const TEXT: Color32 = Color32::from_rgb(0xEC, 0xEF, 0xF4);
+const MUTED: Color32 = Color32::from_rgb(0x9A, 0xA3, 0xB2);
+const GOLD: Color32 = Color32::from_rgb(0xE6, 0xB4, 0x50);
 const GOLD_SOFT: Color32 = Color32::from_rgb(0x4A, 0x3F, 0x24);
+const VARIATION_BG: Color32 = Color32::from_rgb(0x14, 0x17, 0x1C);
 const COMMENT_TEXT: Color32 = Color32::from_rgb(0x9E, 0xB0, 0xA9);
 /// Warn before writing a PGN larger than this. Plain-text exports are much
 /// larger than the compressed databases they come from.
@@ -1403,9 +1408,17 @@ impl App {
         start: Option<std::path::PathBuf>,
     ) -> Self {
         let mut visuals = egui::Visuals::dark();
-        visuals.panel_fill = Color32::from_rgb(0x1B, 0x1D, 0x1F);
-        visuals.window_fill = Color32::from_rgb(0x22, 0x24, 0x27);
-        visuals.extreme_bg_color = Color32::from_rgb(0x14, 0x15, 0x17);
+        visuals.panel_fill = PANEL;
+        visuals.window_fill = SURFACE;
+        visuals.extreme_bg_color = BG;
+        visuals.widgets.noninteractive.bg_fill = PANEL;
+        visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, BORDER);
+        visuals.widgets.inactive.bg_fill = SURFACE;
+        visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, BORDER);
+        visuals.widgets.hovered.bg_fill = Color32::from_rgb(0x26, 0x2B, 0x35);
+        visuals.widgets.active.bg_fill = Color32::from_rgb(0x2F, 0x35, 0x42);
+        visuals.selection.bg_fill = Color32::from_rgba_premultiplied(0x4C, 0x9A, 0xFF, 0x40);
+        visuals.selection.stroke = Stroke::new(1.0, Color32::from_rgb(0x4C, 0x9A, 0xFF));
         cc.egui_ctx.set_visuals(visuals);
         fonts::install(&cc.egui_ctx);
         let engine_prefs = EnginePrefs::load();
@@ -7138,6 +7151,11 @@ impl App {
     const PREP_CHESSABC_MAX: usize = usize::MAX;
     pub(crate) const PREP_ACCOUNT_PROBE_MAX: usize = 200;
 
+    pub(crate) fn handle_prepare_color_action(&mut self, opponent_color: Color) {
+        let as_white = opponent_color == Color::Black;
+        self.open_prep_setup(as_white);
+    }
+
     // Temporary minimal stub for the in-progress preparation-setup task.
     fn open_prep_setup(&mut self, as_white: bool) {
         let index = self.selected_player.or(self.prep_setup_player);
@@ -12094,139 +12112,178 @@ impl App {
             })
             .collect();
         let mut back = false;
-        let mut start_white = false;
-        let mut start_black = false;
         let mut exit = false;
         let mut select_game = None;
         let mut apply_reference = false;
         let mut save_reference = false;
         let mut clear_reference = false;
+        let mut color_action: Option<Color> = None;
 
-        ui.horizontal(|ui| {
-            if ui.button("←").on_hover_text("All players").clicked() {
-                back = true;
-            }
-            if let Some(texture) = portrait.as_ref() {
-                let response = ui
-                    .add(
-                        egui::Image::from_texture(texture)
-                            .fit_to_exact_size(vec2(
-                                self.photo_size.pixels(),
-                                self.photo_size.pixels(),
-                            ))
-                            .sense(Sense::click()),
-                    )
-                    .on_hover_text("Open larger photo");
-                if response.clicked() {
-                    open_photo = true;
-                }
-            }
-            if let Some(title) = player.title {
-                ui.label(RichText::new(title.short()).small().strong().color(GOLD))
-                    .on_hover_text("Title from the database or imported PGN");
-            }
-            ui.heading(&player.name);
-            if let Some(country) = player.country {
-                ui.label(RichText::new(country.badge).small().weak())
-                    .on_hover_text(format!("{} ({})", country.name, country.code));
-            }
-            if let Some(id) = player.fide_id.as_deref()
-                && let Some(url) = fide::profile_url(id)
-                && ui
-                    .link(RichText::new(format!("FIDE {id} ↗")).small().weak())
-                    .on_hover_text("Open this player's FIDE rating profile in your browser")
-                    .clicked()
-            {
-                open_browser_url(ui.ctx(), &url);
-            }
-            if let Some(champion) = champion {
-                ui.label(RichText::new("👑").size(20.0).color(GOLD))
-                    .on_hover_text(champion.tooltip());
-            }
-            if top_priority_player_key(&self.prep_player_names).as_deref()
-                == Some(player.key.as_str())
-            {
-                ui.label(RichText::new("You").small().strong().color(GOLD))
-                    .on_hover_text("First name in the player-priority list");
-            }
-            if self
-                .prep
-                .as_ref()
-                .is_some_and(|prep| prep.player_key == player.key)
-                && ui.small_button("Exit prep").clicked()
-            {
-                exit = true;
-            }
-        });
-        ui.label(
-            RichText::new(format!(
-                "{} · score {:.0}% · avg Elo {} · {}",
-                games_label(player.games() as usize),
-                player.score() * 100.0,
-                player
-                    .elo_avg()
-                    .map(|elo| format!("{elo:.0}"))
-                    .unwrap_or_else(|| "—".to_string()),
-                player.years_label(),
-            ))
-            .weak(),
-        );
-        ui.horizontal_wrapped(|ui| {
-            ui.label(
-                RichText::new(format!(
-                    "W {} · D {} · L {}",
-                    player.wins(),
-                    player.draws(),
-                    player.losses()
-                ))
-                .strong(),
-            );
-            ui.label(
-                RichText::new(format!(
-                    "as White {}/{} · as Black {}/{}",
-                    player.white.score() * 100.0,
-                    player.white.games,
-                    player.black.score() * 100.0,
-                    player.black.games
-                ))
-                .weak()
-                .small(),
-            );
-        });
-        record_bar(ui, player.wins(), player.draws(), player.losses());
-        let mut detail = Vec::new();
-        if let Some(elo) = player.opponent_elo_avg() {
-            detail.push(format!("opp. avg Elo {elo:.0}"));
-        }
-        if player.elo_max > 0 {
-            detail.push(format!("peak Elo {}", player.elo_max));
-        }
-        if player.decided() > 0 {
-            detail.push(format!("win ratio {:.0}%", player.win_ratio() * 100.0));
-        }
-        if !detail.is_empty() {
-            ui.label(RichText::new(detail.join(" · ")).weak().small());
+        egui::Frame::new()
+            .fill(SURFACE)
+            .corner_radius(8.0)
+            .stroke(Stroke::new(1.0, BORDER))
+            .inner_margin(10.0)
+            .show(ui, |ui| {
+                // Header row: ← All players, FIDE profile, You badge, Exit prep
+                ui.horizontal(|ui| {
+                    if ui.small_button("← All players").clicked() {
+                        back = true;
+                    }
+                    if let Some(id) = player.fide_id.as_deref()
+                        && let Some(url) = fide::profile_url(id)
+                        && ui
+                            .link(RichText::new(format!("FIDE {id} ↗")).small().weak())
+                            .on_hover_text("Open this player's FIDE rating profile in your browser")
+                            .clicked()
+                    {
+                        open_browser_url(ui.ctx(), &url);
+                    }
+                    if top_priority_player_key(&self.prep_player_names).as_deref()
+                        == Some(player.key.as_str())
+                    {
+                        ui.label(RichText::new("You").small().strong().color(GOLD))
+                            .on_hover_text("First name in the player-priority list");
+                    }
+                    if self
+                        .prep
+                        .as_ref()
+                        .is_some_and(|prep| prep.player_key == player.key)
+                        && ui.small_button("Exit prep").clicked()
+                    {
+                        exit = true;
+                    }
+                });
+                ui.add_space(4.0);
+
+                // Main body: Left 64x64 portrait/silhouette, Right player details
+                ui.horizontal(|ui| {
+                    let photo_size = 64.0;
+                    let (photo_rect, photo_resp) =
+                        ui.allocate_exact_size(vec2(photo_size, photo_size), Sense::click());
+                    if let Some(texture) = portrait.as_ref() {
+                        let painter = ui.painter_at(photo_rect);
+                        painter.rect_filled(photo_rect, 6.0, Color32::from_rgb(0x2C, 0x30, 0x34));
+                        painter.image(
+                            texture.id(),
+                            photo_rect,
+                            egui::Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+                            Color32::WHITE,
+                        );
+                        painter.rect_stroke(
+                            photo_rect,
+                            6.0,
+                            Stroke::new(1.0, BORDER),
+                            StrokeKind::Inside,
+                        );
+                        if photo_resp.clicked() {
+                            open_photo = true;
+                        }
+                    } else {
+                        let painter = ui.painter_at(photo_rect);
+                        paint_player_silhouette(&painter, photo_rect);
+                    }
+
+                    ui.vertical(|ui| {
+                        // Line 1: Title pill + Name + Country flag
+                        ui.horizontal_wrapped(|ui| {
+                            if let Some(title) = player.title {
+                                ui.label(
+                                    RichText::new(title.short())
+                                        .small()
+                                        .strong()
+                                        .color(Color32::from_rgb(0x14, 0x17, 0x1C))
+                                        .background_color(GOLD),
+                                );
+                            }
+                            ui.label(RichText::new(&player.name).size(15.5).strong());
+                            if let Some(champion) = champion {
+                                ui.label(RichText::new("👑").size(16.0).color(GOLD))
+                                    .on_hover_text(champion.tooltip());
+                            }
+                            if let Some(country) = player.country {
+                                ui.label(RichText::new(country.badge).small().weak())
+                                    .on_hover_text(format!("{} ({})", country.name, country.code));
+                            }
+                        });
+
+                        // Line 2: FIDE Rating label on the left, prominent tabular rating
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("Rating:").small().weak());
+                            let elo_display = player
+                                .display_elo()
+                                .map(|elo| elo.to_string())
+                                .unwrap_or_else(|| "—".to_string());
+                            ui.label(RichText::new(elo_display).monospace().strong());
+                            if let Some(peak) = (player.elo_max > 0).then_some(player.elo_max) {
+                                ui.label(RichText::new(format!("(peak {peak})")).small().weak());
+                            }
+                        });
+
+                        // Line 3: Games / Score (N games · score X%) and W / D / L counts
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(format!(
+                                    "{} · score {:.0}% · W {} · D {} · L {}",
+                                    games_label(player.games() as usize),
+                                    player.score() * 100.0,
+                                    player.wins(),
+                                    player.draws(),
+                                    player.losses(),
+                                ))
+                                .small()
+                                .weak(),
+                            );
+                        });
+
+                        // Line 4: Full-width horizontal stacked W/D/B bar
+                        record_bar(ui, player.wins(), player.draws(), player.losses());
+                    });
+                });
+
+                ui.add_space(6.0);
+                // Bottom action bar: Sleek Prepare bar with White and Black square buttons
+                egui::Frame::new()
+                    .fill(SURFACE_ALT)
+                    .corner_radius(6.0)
+                    .inner_margin(egui::Margin::symmetric(8, 4))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            if ui
+                                .selectable_label(false, RichText::new("PREPARE").strong().small())
+                                .on_hover_text("Open preparation setup dialog")
+                                .clicked()
+                            {
+                                color_action = Some(Color::Black);
+                            }
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if paint_prepare_color_square(
+                                    ui,
+                                    Color32::from_rgb(0x20, 0x24, 0x2C),
+                                    "Opponent plays Black (you play White)",
+                                )
+                                .clicked()
+                                {
+                                    color_action = Some(Color::Black);
+                                }
+                                if paint_prepare_color_square(
+                                    ui,
+                                    Color32::from_rgb(0xE8, 0xEC, 0xF2),
+                                    "Opponent plays White (you play Black)",
+                                )
+                                .clicked()
+                                {
+                                    color_action = Some(Color::White);
+                                }
+                            });
+                        });
+                    });
+            });
+
+        if let Some(opp_color) = color_action {
+            self.handle_prepare_color_action(opp_color);
         }
         self.wiki_summary_section(ui, &player);
-
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            let display_name = natural_player_name(&player.name);
-            if ui
-                .button("Prepare as White")
-                .on_hover_text(format!("You play White; {display_name} is Black"))
-                .clicked()
-            {
-                start_white = true;
-            }
-            if ui
-                .button("Prepare as Black")
-                .on_hover_text(format!("You play Black; {display_name} is White"))
-                .clicked()
-            {
-                start_black = true;
-            }
-        });
         ui.label(RichText::new(&self.player_book_status).weak().small());
         ui.add_space(4.0);
         egui::CollapsingHeader::new(RichText::new("Reference database prior").strong())
@@ -12634,12 +12691,6 @@ impl App {
         if exit {
             self.exit_prep();
         }
-        if start_white {
-            self.open_prep_setup(true);
-        }
-        if start_black {
-            self.open_prep_setup(false);
-        }
         if let Some(index) = select_game {
             self.select_source(index);
         }
@@ -12688,8 +12739,7 @@ impl App {
                     };
                     let name = player.name.clone();
                     let key = player.key.clone();
-                    let player_title = player.title.map(titles::PlayerTitle::short);
-                    let player_country = player.country.map(|c| c.badge);
+                    let (player_title, player_elo, player_country) = player_list_row_meta(player);
                     let player_fide_id = player.fide_id.clone();
                     let is_you = you_key.as_deref() == Some(key.as_str());
                     let title = if is_you {
@@ -12698,7 +12748,7 @@ impl App {
                         name.clone()
                     };
                     let subtitle = format!(
-                        "{}{} · score {:.0}% · Elo {} · {}",
+                        "{}{} · score {:.0}% · {}",
                         if is_you {
                             format!("{name} · ")
                         } else {
@@ -12706,10 +12756,6 @@ impl App {
                         },
                         games_label(player.games() as usize),
                         player.score() * 100.0,
-                        player
-                            .elo_avg()
-                            .map(|elo| format!("{elo:.0}"))
-                            .unwrap_or_else(|| "—".to_string()),
                         player.years_label()
                     );
                     let selected = self.selected_player == Some(index);
@@ -12723,6 +12769,7 @@ impl App {
                         player_title,
                         player_country,
                         player_fide_id.as_deref(),
+                        player_elo,
                         &subtitle,
                         width,
                         photo.as_ref(),
@@ -18038,16 +18085,8 @@ impl eframe::App for App {
 
         egui::CentralPanel::default_margins().show(ui, |ui| {
             let avail = ui.available_size();
-            let top_strip_h = if self.show_player_photos && self.photos.is_some() {
-                self.photo_size.pixels() + 8.0
-            } else {
-                27.0
-            };
-            let bottom_strip_h = if self.show_player_photos && self.photos.is_some() {
-                self.photo_size.pixels() + 8.0
-            } else {
-                27.0
-            };
+            let top_strip_h = 36.0;
+            let bottom_strip_h = 36.0;
             let vertical_padding = top_strip_h + bottom_strip_h + 20.0;
             let bar_extra = if self.engine_bar {
                 eval_bar::WIDTH + eval_bar::GAP
@@ -18272,34 +18311,25 @@ fn player_strip(
     player: &PlayerBadge,
     show_clock: bool,
     photo: Option<&egui::TextureHandle>,
-    photo_size: PhotoSize,
+    _photo_size: PhotoSize,
     champion: Option<&'static champions::Champion>,
     move_counter: Option<&str>,
 ) -> PlayerStripAction {
-    let has_team = player
-        .team
-        .as_ref()
-        .is_some_and(|team| !team.trim().is_empty());
     let has_photo = photo.is_some();
-    let avatar_px = photo_size.pixels();
-    let height = if has_photo {
-        avatar_px + 8.0
-    } else if has_team {
-        34.0
-    } else {
-        27.0
-    };
+    let avatar_px = 28.0;
+    let height = 36.0;
     let (rect, response) = ui.allocate_exact_size(vec2(side, height), Sense::hover());
     let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, 6.0, Color32::from_rgb(0x1F, 0x22, 0x25));
+    painter.rect_filled(rect, 4.0, PANEL);
+    painter.rect_stroke(rect, 4.0, Stroke::new(1.0, BORDER), StrokeKind::Inside);
 
     let mut photo_clicked = false;
-    let text_left = if let Some(texture) = photo {
-        let avatar = egui::Rect::from_min_size(
-            pos2(rect.left() + 4.0, rect.top() + 4.0),
-            vec2(avatar_px, avatar_px),
-        );
-        painter.rect_filled(avatar, 5.0, Color32::from_rgb(0x2C, 0x30, 0x34));
+    let avatar = egui::Rect::from_min_size(
+        pos2(rect.left() + 4.0, rect.top() + 4.0),
+        vec2(avatar_px, avatar_px),
+    );
+    if let Some(texture) = photo {
+        painter.rect_filled(avatar, 4.0, Color32::from_rgb(0x2C, 0x30, 0x34));
         painter.image(
             texture.id(),
             avatar,
@@ -18308,8 +18338,8 @@ fn player_strip(
         );
         painter.rect_stroke(
             avatar,
-            5.0,
-            Stroke::new(1.0, Color32::from_gray(95)),
+            4.0,
+            Stroke::new(1.0, BORDER),
             StrokeKind::Inside,
         );
         let photo_response = ui.interact(avatar, response.id.with("photo"), Sense::click());
@@ -18317,17 +18347,10 @@ fn player_strip(
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         }
         photo_clicked = photo_response.clicked();
-        rect.left() + avatar_px + 12.0
     } else {
-        let dot = pos2(rect.left() + 12.0, rect.center().y);
-        let fill = match player.color {
-            Color::White => Color32::from_gray(235),
-            Color::Black => Color32::from_gray(35),
-        };
-        painter.circle_filled(dot, 4.5, fill);
-        painter.circle_stroke(dot, 4.5, Stroke::new(1.0, Color32::from_gray(135)));
-        rect.left() + 23.0
-    };
+        paint_player_silhouette(&painter, avatar);
+    }
+    let text_left = rect.left() + avatar_px + 10.0;
 
     let mut label = LayoutJob::default();
     if let Some(title) = &player.title {
@@ -18335,8 +18358,9 @@ fn player_strip(
             title,
             0.0,
             TextFormat {
-                font_id: FontId::proportional(12.0),
-                color: GOLD,
+                font_id: FontId::proportional(10.5),
+                color: Color32::from_rgb(0x14, 0x17, 0x1C),
+                background: GOLD,
                 ..Default::default()
             },
         );
@@ -18345,7 +18369,7 @@ fn player_strip(
             0.0,
             TextFormat {
                 font_id: FontId::proportional(14.0),
-                color: Color32::from_gray(226),
+                color: TEXT,
                 ..Default::default()
             },
         );
@@ -18355,14 +18379,25 @@ fn player_strip(
         0.0,
         TextFormat {
             font_id: FontId::proportional(14.0),
-            color: Color32::from_gray(226),
+            color: TEXT,
             ..Default::default()
         },
     );
+    if let Some(rating) = &player.rating {
+        label.append(
+            &format!("  ({rating})"),
+            0.0,
+            TextFormat {
+                font_id: FontId::monospace(12.5),
+                color: MUTED,
+                ..Default::default()
+            },
+        );
+    }
     if let Some(country) = player.country {
         let format = TextFormat {
             font_id: FontId::proportional(11.0),
-            color: Color32::from_gray(150),
+            color: MUTED,
             ..Default::default()
         };
         label.append(" · ", 0.0, format.clone());
@@ -18379,17 +18414,6 @@ fn player_strip(
             },
         );
     }
-    if let Some(rating) = &player.rating {
-        label.append(
-            &format!("  ({rating})"),
-            0.0,
-            TextFormat {
-                font_id: FontId::proportional(13.0),
-                color: Color32::from_gray(165),
-                ..Default::default()
-            },
-        );
-    }
     let right_limit = if move_counter.is_some() {
         (rect.center().x - 45.0).max(text_left + 40.0)
     } else if show_clock {
@@ -18400,13 +18424,7 @@ fn player_strip(
     let name_clip = egui::Rect::from_min_max(rect.min, pos2(right_limit, rect.bottom()));
     let name_painter = ui.painter_at(name_clip);
     let name_galley = name_painter.layout_job(label);
-    let name_y = if has_photo {
-        rect.center().y - 15.0
-    } else if has_team {
-        rect.top() + 5.0
-    } else {
-        rect.center().y - name_galley.size().y / 2.0
-    };
+    let name_y = rect.center().y - name_galley.size().y / 2.0;
     let crown_hovered = champion.is_some_and(|champion| {
         crown_hover(
             ui,
@@ -18419,7 +18437,7 @@ fn player_strip(
     name_painter.galley(
         pos2(text_left, name_y),
         name_galley.clone(),
-        Color32::from_gray(226),
+        TEXT,
     );
     let name_hit_rect = egui::Rect::from_min_size(pos2(text_left, name_y), name_galley.size());
     let name_response = ui.interact(
@@ -18439,17 +18457,17 @@ fn player_strip(
         let team_galley = name_painter.layout_no_wrap(
             team.trim().to_string(),
             FontId::proportional(10.5),
-            Color32::from_gray(145),
+            MUTED,
         );
         let team_y = if has_photo {
-            name_y + 20.0
+            name_y + 18.0
         } else {
-            rect.top() + 20.0
+            rect.top() + 18.0
         };
         name_painter.galley(
             pos2(text_left, team_y),
             team_galley,
-            Color32::from_gray(145),
+            MUTED,
         );
     }
 
@@ -18457,13 +18475,13 @@ fn player_strip(
         let counter_galley = painter.layout_no_wrap(
             counter.to_string(),
             FontId::proportional(11.5),
-            Color32::from_gray(155),
+            MUTED,
         );
         let counter_pos = pos2(
             rect.center().x - counter_galley.size().x / 2.0,
             rect.center().y - counter_galley.size().y / 2.0,
         );
-        painter.galley(counter_pos, counter_galley, Color32::from_gray(155));
+        painter.galley(counter_pos, counter_galley, MUTED);
     }
 
     if show_clock {
@@ -18472,22 +18490,28 @@ fn player_strip(
             .map(Clock::display)
             .unwrap_or_else(|| "--:--".to_string());
         let color = if player.clock.is_some() {
-            Color32::from_rgb(0xE8, 0xE4, 0xD8)
+            Color32::from_rgb(0xEC, 0xEF, 0xF4)
         } else {
-            Color32::from_gray(120)
+            MUTED
         };
-        let clock_galley = painter.layout_no_wrap(text, FontId::monospace(14.0), color);
+        let clock_galley = painter.layout_no_wrap(text, FontId::monospace(15.0), color);
         let clock_rect = egui::Rect::from_min_size(
             pos2(
-                rect.right() - clock_galley.size().x - 10.0,
+                rect.right() - clock_galley.size().x - 12.0,
                 rect.center().y - clock_galley.size().y / 2.0,
             ),
             clock_galley.size(),
         );
         painter.rect_filled(
-            clock_rect.expand2(vec2(7.0, 3.0)),
+            clock_rect.expand2(vec2(8.0, 4.0)),
             4.0,
-            Color32::from_rgb(0x2A, 0x2E, 0x32),
+            SURFACE_ALT,
+        );
+        painter.rect_stroke(
+            clock_rect.expand2(vec2(8.0, 4.0)),
+            4.0,
+            Stroke::new(1.0, BORDER),
+            StrokeKind::Inside,
         );
         painter.galley(clock_rect.min, clock_galley, color);
     }
@@ -20990,6 +21014,61 @@ struct GameRowDrag {
     id: usize,
 }
 
+pub(crate) fn player_list_row_meta(
+    player: &players::PlayerSummary,
+) -> (Option<&'static str>, Option<u16>, Option<&'static str>) {
+    let title = player.title.map(titles::PlayerTitle::short);
+    let elo = player.display_elo();
+    let country = player.country.map(|c| c.badge);
+    (title, elo, country)
+}
+
+fn paint_player_silhouette(painter: &egui::Painter, rect: Rect) {
+    let radius = CornerRadius::same(4);
+    painter.rect_filled(rect, radius, Color32::from_rgb(0x1E, 0x22, 0x2A));
+    painter.rect_stroke(
+        rect,
+        radius,
+        Stroke::new(1.0, Color32::from_rgb(0x26, 0x2B, 0x35)),
+        StrokeKind::Inside,
+    );
+    let center_x = rect.center().x;
+    let head_radius = (rect.height() * 0.18).clamp(3.0, 14.0);
+    let head_center = pos2(center_x, rect.top() + rect.height() * 0.35);
+    painter.circle_filled(head_center, head_radius, Color32::from_rgb(0x4A, 0x55, 0x68));
+    let torso_rect = Rect::from_min_max(
+        pos2(center_x - rect.width() * 0.30, rect.top() + rect.height() * 0.58),
+        pos2(center_x + rect.width() * 0.30, rect.bottom() - 2.0),
+    );
+    painter.rect_filled(
+        torso_rect,
+        CornerRadius {
+            nw: 5,
+            ne: 5,
+            sw: 2,
+            se: 2,
+        },
+        Color32::from_rgb(0x4A, 0x55, 0x68),
+    );
+}
+
+fn paint_prepare_color_square(ui: &mut Ui, fill: Color32, tooltip: &str) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(vec2(22.0, 22.0), Sense::click());
+    let painter = ui.painter_at(rect);
+    let radius = CornerRadius::same(4);
+    painter.rect_filled(rect, radius, fill);
+    painter.rect_stroke(
+        rect,
+        radius,
+        Stroke::new(1.0, Color32::from_rgb(0x26, 0x2B, 0x35)),
+        StrokeKind::Inside,
+    );
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    response.on_hover_text(tooltip)
+}
+
 /// Two-line, full-width selectable row for the game list.
 #[allow(clippy::too_many_arguments)]
 fn player_row(
@@ -20999,6 +21078,7 @@ fn player_row(
     title: Option<&str>,
     country: Option<&str>,
     fide_id: Option<&str>,
+    elo: Option<u16>,
     subtitle: &str,
     width: f32,
     photo: Option<&egui::TextureHandle>,
@@ -21009,49 +21089,50 @@ fn player_row(
     let bg = if selected {
         visuals.selection.bg_fill
     } else if response.hovered() {
-        visuals.widgets.hovered.bg_fill
+        Color32::from_rgb(0x1E, 0x22, 0x2A)
     } else {
         Color32::TRANSPARENT
     };
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 4.0, bg);
 
+    let avatar_rect =
+        egui::Rect::from_min_size(pos2(rect.left() + 6.0, rect.top() + 7.0), vec2(28.0, 28.0));
     let mut photo_clicked = false;
-    let text_left = if let Some(texture) = photo {
-        let avatar =
-            egui::Rect::from_min_size(pos2(rect.left() + 6.0, rect.top() + 6.0), vec2(34.0, 34.0));
-        painter.rect_filled(avatar, 4.0, Color32::from_rgb(0x2C, 0x30, 0x34));
+    if let Some(texture) = photo {
+        painter.rect_filled(avatar_rect, 4.0, Color32::from_rgb(0x2C, 0x30, 0x34));
         painter.image(
             texture.id(),
-            avatar,
+            avatar_rect,
             egui::Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
             Color32::WHITE,
         );
         painter.rect_stroke(
-            avatar,
+            avatar_rect,
             4.0,
-            Stroke::new(1.0, Color32::from_gray(95)),
+            Stroke::new(1.0, BORDER),
             StrokeKind::Inside,
         );
-        let photo_response = ui.interact(avatar, response.id.with("photo"), Sense::click());
+        let photo_response = ui.interact(avatar_rect, response.id.with("photo"), Sense::click());
         if photo_response.hovered() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         }
         photo_clicked = photo_response.clicked();
-        rect.left() + 48.0
     } else {
-        rect.left() + 8.0
-    };
+        paint_player_silhouette(&painter, avatar_rect);
+    }
+    let text_left = rect.left() + 42.0;
 
     let mut job = LayoutJob::default();
     let name_format = TextFormat {
-        font_id: FontId::proportional(14.0),
+        font_id: FontId::proportional(13.5),
         color: visuals.strong_text_color(),
         ..Default::default()
     };
     let title_format = TextFormat {
         font_id: FontId::proportional(10.5),
-        color: GOLD,
+        color: Color32::from_rgb(0x14, 0x17, 0x1C),
+        background: GOLD,
         ..Default::default()
     };
     let fide_format = TextFormat {
@@ -21063,12 +21144,23 @@ fn player_row(
         &mut job,
         name,
         title,
-        country,
+        None,
         fide_id,
         &title_format,
         &name_format,
         &fide_format,
     );
+    if let Some(elo) = elo {
+        job.append(
+            &format!("  Elo {elo}"),
+            0.0,
+            TextFormat {
+                font_id: FontId::monospace(12.0),
+                color: MUTED,
+                ..Default::default()
+            },
+        );
+    }
     if champion.is_some() {
         job.append(
             " 👑",
@@ -21095,11 +21187,20 @@ fn player_row(
         title_galley,
         visuals.strong_text_color(),
     );
+    if let Some(country) = country {
+        painter.text(
+            pos2(rect.right() - 8.0, rect.top() + 6.0),
+            Align2::RIGHT_TOP,
+            country,
+            FontId::proportional(11.0),
+            MUTED,
+        );
+    }
     painter.text(
-        pos2(text_left, rect.top() + 23.0),
+        pos2(text_left, rect.top() + 24.0),
         Align2::LEFT_TOP,
         subtitle,
-        FontId::proportional(11.0),
+        FontId::proportional(11.5),
         visuals.weak_text_color(),
     );
     (response, photo_clicked)
@@ -27466,5 +27567,50 @@ mod tests {
             Some(test_game.clone())
         });
         assert_eq!(loads, 1);
+    }
+
+    #[test]
+    fn player_row_summary_uses_latest_otb_elo_and_country_flag() {
+        let player = players::PlayerSummary {
+            name: "Carlsen, Magnus".to_string(),
+            key: "carlsen".to_string(),
+            title: Some(titles::PlayerTitle::Gm),
+            fide_id: Some("1503014".to_string()),
+            country: country::normalize("NOR"),
+            white: Default::default(),
+            black: Default::default(),
+            elo_sum: 0,
+            elo_count: 0,
+            elo_max: 2889,
+            latest_otb_elo: Some(2882),
+            latest_otb_date: 20261108,
+            opponent_elo_sum: 0,
+            opponent_elo_count: 0,
+            first_year: 2000,
+            last_year: 2026,
+            game_indices: Vec::new(),
+        };
+
+        let (title, elo, country_badge) = player_list_row_meta(&player);
+        assert_eq!(title, Some("GM"));
+        assert_eq!(elo, Some(2882));
+        assert_eq!(country_badge, Some("🇳🇴 NOR"));
+    }
+
+    #[test]
+    fn prepare_color_square_action_maps_opponent_color_to_our_color() {
+        let mut app = test_app();
+        let idx = app.players.ensure_player("Kasparov, Garry");
+        app.selected_player = Some(idx);
+
+        // Clicking White square (opponent plays White): our prep is as Black (prep_setup_as_white = false)
+        app.handle_prepare_color_action(Color::White);
+        assert!(app.prep_setup_open);
+        assert!(!app.prep_setup_as_white, "opponent White means our_color = Black");
+
+        // Clicking Black square (opponent plays Black): our prep is as White (prep_setup_as_white = true)
+        app.handle_prepare_color_action(Color::Black);
+        assert!(app.prep_setup_open);
+        assert!(app.prep_setup_as_white, "opponent Black means our_color = White");
     }
 }

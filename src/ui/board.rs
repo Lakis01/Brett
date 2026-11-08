@@ -4,8 +4,8 @@ use egui::{Color32, PointerButton, Pos2, Rect, Sense, Stroke, StrokeKind, Ui, Ve
 
 use crate::ui::pieces::PieceTextures;
 
-pub(crate) const LIGHT: Color32 = Color32::from_rgb(0xEB, 0xEC, 0xD0);
-pub(crate) const DARK: Color32 = Color32::from_rgb(0x77, 0x96, 0x56);
+pub(crate) const LIGHT: Color32 = Color32::from_rgb(0xDF, 0xCF, 0xB8);
+pub(crate) const DARK: Color32 = Color32::from_rgb(0x9E, 0x7B, 0x56);
 const LAST_MOVE: Color32 = Color32::from_rgba_premultiplied(0x58, 0x54, 0x15, 0x70);
 pub(crate) const SELECTED: Color32 = Color32::from_rgba_premultiplied(0x12, 0x51, 0x24, 0x90);
 const TARGET: Color32 = Color32::from_rgba_premultiplied(0x06, 0x13, 0x06, 0x66);
