@@ -523,6 +523,9 @@ struct AccountCheckResult {
     /// Fetched games, kept in memory so preparation can reuse them and filter
     /// changes only recompute `kept` without another network request.
     games: Arc<Vec<Game>>,
+    /// Whether the probe hit the probe limit (e.g. 200 games), meaning more games
+    /// likely exist and full preparation should fetch uncapped.
+    pub probe_capped: bool,
 }
 
 impl AccountCheckResult {
@@ -534,6 +537,7 @@ impl AccountCheckResult {
             kept: 0,
             error: None,
             games: Arc::new(Vec::new()),
+            probe_capped: false,
         }
     }
 }
@@ -593,6 +597,7 @@ fn chessabc_aggregate_check(
         kept: 0,
         error: None,
         games: Arc::new(Vec::new()),
+        probe_capped: false,
     };
     let mut errors = Vec::new();
     for fide_id in selected {
@@ -604,6 +609,9 @@ fn chessabc_aggregate_check(
                 } else {
                     aggregate.total += check.total;
                     aggregate.kept += check.kept;
+                    if check.probe_capped {
+                        aggregate.probe_capped = true;
+                    }
                 }
             }
             None => aggregate.fetching = true,
@@ -7384,7 +7392,7 @@ impl App {
         let cached_checks: HashMap<String, Arc<Vec<Game>>> = self
             .prep_setup_account_checks
             .iter()
-            .filter(|(_, check)| !check.fetching && check.error.is_none())
+            .filter(|(_, check)| !check.fetching && check.error.is_none() && !check.probe_capped)
             .map(|(key, check)| (key.clone(), check.games.clone()))
             .collect();
         self.prep_load_job = Some(player.key.clone());
@@ -7598,11 +7606,12 @@ impl App {
                 send_status(step, &label, &notes);
                 let as_of_account = as_of;
                 let cache_key = prep_account_check_key(account.source, &account.username);
-                let fetched = if let Some(cached) = cached_checks
-                    .get(&cache_key)
-                    .filter(|c| c.len() < Self::PREP_ACCOUNT_PROBE_MAX)
-                {
-                    cached.as_ref().clone()
+                let fetched = if let Some(cached) = cached_checks.get(&cache_key) {
+                    cached
+                        .iter()
+                        .filter(|game| account.filter.matches_game(game, as_of_account))
+                        .cloned()
+                        .collect()
                 } else {
                     match online::fetch_player_games_filtered(
                         account.source,
@@ -7998,6 +8007,7 @@ impl App {
                     ) {
                         Ok(games) => {
                             let total = games.len();
+                            let probe_capped = total >= App::PREP_ACCOUNT_PROBE_MAX;
                             AccountCheckResult {
                                 key: request.key.clone(),
                                 fetching: false,
@@ -8005,6 +8015,7 @@ impl App {
                                 kept: total,
                                 error: None,
                                 games: Arc::new(games),
+                                probe_capped,
                             }
                         }
                         Err(err) => AccountCheckResult {
@@ -8014,18 +8025,18 @@ impl App {
                             kept: 0,
                             error: Some(format!("{err:#}")),
                             games: Arc::new(Vec::new()),
+                            probe_capped: false,
                         },
                     }
                 } else {
-                    match online::fetch_player_games_filtered(
+                    match online::fetch_player_games(
                         request.source,
                         &request.username,
                         App::PREP_ACCOUNT_PROBE_MAX,
-                        Some(&request.filter),
-                        as_of,
                     ) {
                         Ok(games) => {
                             let total = games.len();
+                            let probe_capped = total >= App::PREP_ACCOUNT_PROBE_MAX;
                             let kept = games
                                 .iter()
                                 .filter(|game| request.filter.matches_game(game, as_of))
@@ -8037,6 +8048,7 @@ impl App {
                                 kept,
                                 error: None,
                                 games: Arc::new(games),
+                                probe_capped,
                             }
                         }
                         Err(err) => AccountCheckResult {
@@ -8046,6 +8058,7 @@ impl App {
                             kept: 0,
                             error: Some(format!("{err:#}")),
                             games: Arc::new(Vec::new()),
+                            probe_capped: false,
                         },
                     }
                 };
@@ -11875,14 +11888,13 @@ impl App {
                             None,
                         );
                         response = response.on_hover_text(cat.label());
-                        if response.hovered()
-                            && !self.is_hovered_game(&format!("merged:{position}"))
-                            && let Some(game) = self.prep_merged_games.get(position).cloned()
-                        {
-                            self.activate_hovered_game_browse(
-                                format!("merged:{position}"),
-                                game,
-                            );
+                        if response.hovered() {
+                            let id = format!("merged:{position}");
+                            if !self.touch_hovered_game(&id)
+                                && let Some(game) = self.prep_merged_games.get(position).cloned()
+                            {
+                                self.activate_hovered_game_browse(id, game);
+                            }
                         }
                         if response.clicked() {
                             merged_preview = Some(position);
@@ -12009,14 +12021,17 @@ impl App {
                         None,
                     );
                     response = response.on_hover_text(cat.label());
-                    if response.hovered() && !self.is_hovered_game(&format!("session:{id}")) {
-                        let game = self
-                            .edited
-                            .get(&id)
-                            .cloned()
-                            .or_else(|| self.session.load(id, &self.edited).ok());
-                        if let Some(game) = game {
-                            self.activate_hovered_game_browse(format!("session:{id}"), game);
+                    if response.hovered() {
+                        let browse_id = format!("session:{id}");
+                        if !self.touch_hovered_game(&browse_id) {
+                            let game = self
+                                .edited
+                                .get(&id)
+                                .cloned()
+                                .or_else(|| self.session.load(id, &self.edited).ok());
+                            if let Some(game) = game {
+                                self.activate_hovered_game_browse(browse_id, game);
+                            }
                         }
                     }
                     if response.sense.senses_drag() {
@@ -12209,7 +12224,7 @@ impl App {
 
                         // Line 2: FIDE Rating label on the left, prominent tabular rating
                         ui.horizontal(|ui| {
-                            ui.label(RichText::new("Rating:").small().weak());
+                            ui.label(RichText::new("FIDE Rating").small().weak());
                             let elo_display = player
                                 .display_elo()
                                 .map(|elo| elo.to_string())
@@ -12489,14 +12504,13 @@ impl App {
                             None,
                         );
                         response = response.on_hover_text(cat.label());
-                        if response.hovered()
-                            && !self.is_hovered_game(&format!("player:{position}"))
-                            && let Some(game) = self.prep_merged_games.get(position).cloned()
-                        {
-                            self.activate_hovered_game_browse(
-                                format!("player:{position}"),
-                                game,
-                            );
+                        if response.hovered() {
+                            let id = format!("player:{position}");
+                            if !self.touch_hovered_game(&id)
+                                && let Some(game) = self.prep_merged_games.get(position).cloned()
+                            {
+                                self.activate_hovered_game_browse(id, game);
+                            }
                         }
                         if response.clicked() {
                             merged_preview = Some(position);
@@ -14666,16 +14680,12 @@ impl App {
                     ui.add_space(4.0);
                 }
 
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(RichText::new("Trends:").small().strong());
-                    for src in crate::recent::TrendSource::ALL {
-                        let active = self.trend_source == src;
-                        if ui.selectable_label(active, src.short_label()).clicked() {
-                            self.trend_source = src;
-                            self.settings_trend_source = src;
-                            self.save_display_prefs();
-                        }
-                    }
+                let book_games_map: Option<HashMap<u32, u32>> = book.as_ref().map(|b| {
+                    b.moves(&pos)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter_map(|bm| position::encode_move(bm.mv).map(|em| (em, bm.games as u32)))
+                        .collect()
                 });
                 let trend_override = self.current_trend_override(&pos, key);
                 let tree_index = self.tree_index.as_ref().or(self.index.as_ref());
@@ -14719,7 +14729,7 @@ impl App {
                         "No indexed game reached this position.",
                         self.trend_config(),
                         &mut hover_preview,
-                        None,
+                        book_games_map.as_ref(),
                         trend_override.as_ref(),
                     );
                 } else {
@@ -14804,12 +14814,14 @@ impl App {
                                                     })
                                                     .unwrap_or_else(|| "—".to_string()),
                                             );
-                                            ui.label(format!(
-                                                "{}/{}/{}",
-                                                compact_count(mv.white),
-                                                compact_count(mv.draw),
-                                                compact_count(mv.black)
-                                            ));
+                                            draw_wdl_bar(
+                                                ui,
+                                                mv.white as u32,
+                                                mv.draw as u32,
+                                                mv.black as u32,
+                                                60.0,
+                                                10.0,
+                                            );
                                             let mut note = book_annotation_label(
                                                 mv.annotation,
                                                 mv.recommendation,
@@ -14862,15 +14874,14 @@ impl App {
                                         }
                                         if !moves.is_empty() {
                                             egui::Grid::new("tree-live-book-grid")
-                                                .num_columns(6)
+                                                .num_columns(4)
                                                 .striped(true)
+                                                .spacing([10.0, 4.0])
                                                 .show(ui, |ui| {
                                                     ui.label(RichText::new("Move").strong());
                                                     ui.label(RichText::new("Games").strong());
-                                                    ui.label(RichText::new("W").strong());
-                                                    ui.label(RichText::new("D").strong());
-                                                    ui.label(RichText::new("B").strong());
                                                     ui.label(RichText::new("Score").strong());
+                                                    ui.label(RichText::new("W/D/B").strong());
                                                     ui.end_row();
                                                     for m in &moves {
                                                         if let Some(decoded) = position::decode_move(&pos, m.mv) {
@@ -14883,15 +14894,13 @@ impl App {
                                                                 clicked = Some(decoded);
                                                             }
                                                             ui.label(m.games.to_string());
-                                                            ui.label(m.white.to_string());
-                                                            ui.label(m.draw.to_string());
-                                                            ui.label(m.black.to_string());
                                                             let pct = if m.games > 0 {
                                                                 (m.white as f64 + m.draw as f64 * 0.5) / m.games as f64 * 100.0
                                                             } else {
                                                                 0.0
                                                             };
                                                             ui.label(format!("{pct:.0}%"));
+                                                            draw_wdl_bar(ui, m.white, m.draw, m.black, 60.0, 10.0);
                                                             ui.end_row();
                                                         }
                                                     }
@@ -14918,15 +14927,14 @@ impl App {
                                         match &snapshot.explorer {
                                             Ok(explorer) if !explorer.moves.is_empty() => {
                                                 egui::Grid::new("tree-live-book-grid")
-                                                    .num_columns(6)
+                                                    .num_columns(4)
                                                     .striped(true)
+                                                    .spacing([10.0, 4.0])
                                                     .show(ui, |ui| {
                                                         ui.label(RichText::new("Move").strong());
                                                         ui.label(RichText::new("Games").strong());
-                                                        ui.label(RichText::new("W").strong());
-                                                        ui.label(RichText::new("D").strong());
-                                                        ui.label(RichText::new("B").strong());
                                                         ui.label(RichText::new("Score").strong());
+                                                        ui.label(RichText::new("W/D/B").strong());
                                                         ui.end_row();
                                                         for em in &explorer.moves {
                                                             let Ok(uci) = em.uci.parse::<UciMove>() else { continue };
@@ -14942,15 +14950,20 @@ impl App {
                                                                 clicked = Some(mv);
                                                             }
                                                             ui.label(em.total().to_string());
-                                                            ui.label(em.white.to_string());
-                                                            ui.label(em.draws.to_string());
-                                                            ui.label(em.black.to_string());
                                                             let pct = if em.total() > 0 {
                                                                 (em.white as f64 + em.draws as f64 * 0.5) / em.total() as f64 * 100.0
                                                             } else {
                                                                 0.0
                                                             };
                                                             ui.label(format!("{pct:.0}%"));
+                                                            draw_wdl_bar(
+                                                                ui,
+                                                                em.white as u32,
+                                                                em.draws as u32,
+                                                                em.black as u32,
+                                                                60.0,
+                                                                10.0,
+                                                            );
                                                             ui.end_row();
                                                         }
                                                     });
@@ -15859,17 +15872,67 @@ impl App {
                     ref_stats_map.insert(san, (m.games, m.white, m.draw, m.black));
                 }
             }
-        } else if let Some(live) = LiveReferenceSource::from_config_str(&self.reference_path)
-            && live == LiveReferenceSource::ChessAbc
-            && let Some(tree) = &self.chessabc_live_tree
-        {
-            for m in tree.moves(key) {
-                if let Some(mv) = position::decode_move(pos, m.mv) {
-                    let san = SanPlus::from_move(pos.clone(), mv).to_string();
-                    ref_stats_map.insert(san, (m.games, m.white, m.draw, m.black));
+        } else if let Some(live) = LiveReferenceSource::from_config_str(&self.reference_path) {
+            match live {
+                LiveReferenceSource::ChessAbc => {
+                    if let Some(tree) = &self.chessabc_live_tree {
+                        for m in tree.moves(key) {
+                            if let Some(mv) = position::decode_move(pos, m.mv) {
+                                let san = SanPlus::from_move(pos.clone(), mv).to_string();
+                                ref_stats_map.insert(san, (m.games, m.white, m.draw, m.black));
+                            }
+                        }
+                    }
+                }
+                LiveReferenceSource::LichessMasters | LiveReferenceSource::LichessAll => {
+                    let source = match live {
+                        LiveReferenceSource::LichessMasters => cloud::ExplorerSource::Masters,
+                        _ => cloud::ExplorerSource::Lichess,
+                    };
+                    let fen = Fen::from_position(pos, EnPassantMode::Legal).to_string();
+                    let cache_key = (source, fen.clone());
+                    if let Some(snapshot) = self.cloud_cache.get(&cache_key) {
+                        if let Ok(explorer) = &snapshot.explorer {
+                            for em in &explorer.moves {
+                                if let Ok(uci) = em.uci.parse::<UciMove>()
+                                    && let Ok(mv) = uci.to_move(pos)
+                                {
+                                    let san = SanPlus::from_move(pos.clone(), mv).to_string();
+                                    ref_stats_map.insert(
+                                        san,
+                                        (
+                                            em.total() as u32,
+                                            em.white as u32,
+                                            em.draws as u32,
+                                            em.black as u32,
+                                        ),
+                                    );
+                                }
+                            }
+                        }
+                    } else if self.cloud_rx.is_none() && self.cloud_pending.is_none() {
+                        self.maybe_request_cloud();
+                    }
                 }
             }
+        } else if let Some(book) = &self.reference_book
+            && let Ok(moves) = book.moves(pos)
+        {
+            for bm in moves {
+                let san = SanPlus::from_move(pos.clone(), bm.mv).to_string();
+                ref_stats_map.insert(
+                    san,
+                    (
+                        bm.games as u32,
+                        bm.white as u32,
+                        bm.draw as u32,
+                        bm.black as u32,
+                    ),
+                );
+            }
         }
+
+        let trend_overrides = self.current_trend_override(pos, key);
 
         // Chosen inside the tree below; applied after the scroll area so the
         // `reference_tree` borrow above can end first.
@@ -15907,6 +15970,45 @@ impl App {
                         .changed()
                     {
                         toggle_online = true;
+                    }
+                });
+                ui.horizontal_wrapped(|ui| {
+                    let tip = if self.prior_has_otb_background() {
+                        "Configured reference theory active"
+                    } else {
+                        "Tip: set a Mega reference database or opening-tree file for a stronger OTB background prior."
+                    };
+                    ui.label(RichText::new("Reference:").small().strong()).on_hover_text(tip);
+                    for src in LiveReferenceSource::ALL {
+                        let active =
+                            LiveReferenceSource::from_config_str(&self.reference_path)
+                                == Some(src);
+                        if ui.selectable_label(active, src.short_label()).clicked() {
+                            pending_reference_path = Some(src.config_str().to_string());
+                        }
+                    }
+                    if ui.small_button("Choose…").clicked()
+                        && let Some(path) = open_file_dialog(
+                            "Choose reference database or book",
+                            self.last_database_dir.as_deref(),
+                            "Reference databases and opening books",
+                            "*.2cbh *.2CBH *.cbh *.CBH *.si4 *.SI4 *.pgn *.PGN *.bin *.BIN *.ctg *.CTG *.abk *.ABK *.bkt *.BKT",
+                        )
+                    {
+                        pending_reference_path = Some(path.display().to_string());
+                    }
+                    ui.separator();
+                    ui.label(RichText::new("Trends:").small().strong());
+                    for src in crate::recent::TrendSource::ALL {
+                        let active = self.trend_source == src;
+                        if ui.selectable_label(active, src.short_label()).clicked() {
+                            self.trend_source = src;
+                            self.settings_trend_source = src;
+                            self.save_display_prefs();
+                        }
+                    }
+                    if self.chessabc_live_rx.is_some() || self.explorer_since_rx.is_some() {
+                        ui.spinner();
                     }
                 });
                 if self.prep_swapped_view {
@@ -15981,7 +16083,7 @@ impl App {
                                     .on_hover_text("Games in the opponent's book reaching this reply.");
                                 ui.label(RichText::new("Your Side Score").strong())
                                     .on_hover_text("Your score vs the opponent here (green when they struggled).");
-                                ui.label(RichText::new("Result").strong());
+                                ui.label(RichText::new("W/D/B").strong());
                                 ui.label(RichText::new("Last Faced").strong());
                                 ui.end_row();
 
@@ -16018,10 +16120,12 @@ impl App {
                                             .color(score_color)
                                             .strong(),
                                     );
-                                    ui.label(format!(
-                                        "+{} ={} -{}",
-                                        row.losses, row.draws, row.wins
-                                    ));
+                                    let (w, b) = if facing == Color::White {
+                                        (row.wins, row.losses)
+                                    } else {
+                                        (row.losses, row.wins)
+                                    };
+                                    draw_wdl_bar(ui, w, row.draws, b, 60.0, 10.0);
                                     ui.label(if row.last_date == 0 {
                                         "—".to_string()
                                     } else {
@@ -16141,45 +16245,6 @@ impl App {
                                         .then(a.san.cmp(&b.san)),
                                 )
                         });
-                        ui.horizontal_wrapped(|ui| {
-                            let tip = if self.prior_has_otb_background() {
-                                "Configured reference theory active"
-                            } else {
-                                "Tip: set a Mega reference database or opening-tree file for a stronger OTB background prior."
-                            };
-                            ui.label(RichText::new("Reference:").small().strong()).on_hover_text(tip);
-                            for src in LiveReferenceSource::ALL {
-                                let active =
-                                    LiveReferenceSource::from_config_str(&self.reference_path)
-                                        == Some(src);
-                                if ui.selectable_label(active, src.short_label()).clicked() {
-                                    pending_reference_path = Some(src.config_str().to_string());
-                                }
-                            }
-                            if ui.small_button("Choose…").clicked()
-                                && let Some(path) = open_file_dialog(
-                                    "Choose reference database or book",
-                                    self.last_database_dir.as_deref(),
-                                    "Reference databases and opening books",
-                                    "*.2cbh *.2CBH *.cbh *.CBH *.si4 *.SI4 *.pgn *.PGN *.bin *.BIN *.ctg *.CTG *.abk *.ABK *.bkt *.BKT",
-                                )
-                            {
-                                pending_reference_path = Some(path.display().to_string());
-                            }
-                            ui.separator();
-                            ui.label(RichText::new("Trends:").small().strong());
-                            for src in crate::recent::TrendSource::ALL {
-                                let active = self.trend_source == src;
-                                if ui.selectable_label(active, src.short_label()).clicked() {
-                                    self.trend_source = src;
-                                    self.settings_trend_source = src;
-                                    self.save_display_prefs();
-                                }
-                            }
-                            if self.chessabc_live_rx.is_some() {
-                                ui.spinner();
-                            }
-                        });
                         ui.add_space(2.0);
                         egui::Grid::new("prep-smart-grid")
                             .num_columns(8)
@@ -16246,11 +16311,16 @@ impl App {
                                     };
                                     ui.label(games_text);
 
+                                    let (opp_w, opp_b) = if facing == Color::White {
+                                        (row.player_wins, row.player_losses)
+                                    } else {
+                                        (row.player_losses, row.player_wins)
+                                    };
                                     draw_wdl_bar(
                                         ui,
-                                        row.player_wins,
+                                        opp_w,
                                         row.player_draws,
-                                        row.player_losses,
+                                        opp_b,
                                         60.0,
                                         10.0,
                                     );
@@ -16274,7 +16344,17 @@ impl App {
                                         ui.label("—");
                                     }
 
-                                    draw_points_sparkline(ui, &row.sparkline, prob_color);
+                                    let encoded_mv = position::encode_move(row.mv);
+                                    if let Some(trend) = encoded_mv.and_then(|em| trend_overrides.as_ref().and_then(|m| m.get(&em))) {
+                                        let color = trend_badge_color(trend.badge.unwrap_or(crate::recent::TrendBadge::Steady));
+                                        let label = trend.compact_label().unwrap_or_else(|| "—".to_string());
+                                        ui.horizontal(|ui| {
+                                            draw_trend_sparkline(ui, trend, color).on_hover_text(trend.tooltip(self.trend_config()));
+                                            ui.label(RichText::new(label).small().color(color)).on_hover_text(trend.tooltip(self.trend_config()));
+                                        });
+                                    } else {
+                                        draw_points_sparkline(ui, &row.sparkline, prob_color);
+                                    }
 
                                     prep_eval_cell(
                                         ui,
@@ -16362,7 +16442,7 @@ impl App {
                             .striped(true)
                             .spacing([12.0, 4.0])
                             .show(ui, |ui| {
-                                for heading in ["Move", "Games", "Score", "Result (+/=/-)", "Last Played", "Eval"] {
+                                for heading in ["Move", "Games", "Score", "W/D/B", "Last Played", "Eval"] {
                                     ui.label(RichText::new(heading).strong().small());
                                 }
                                 ui.end_row();
@@ -16415,10 +16495,12 @@ impl App {
                                     };
                                     ui.label(format!("{score_pct:.0}%"));
 
-                                    ui.label(format!(
-                                        "+{} ={} -{}",
-                                        row.player_wins, row.player_draws, row.player_losses
-                                    ));
+                                    let (w, b) = if facing == Color::White {
+                                        (row.player_wins, row.player_losses)
+                                    } else {
+                                        (row.player_losses, row.player_wins)
+                                    };
+                                    draw_wdl_bar(ui, w, row.player_draws, b, 60.0, 10.0);
 
                                     let date_str = if row.last_date > 0 {
                                         short_date(row.last_date)
@@ -16507,44 +16589,6 @@ impl App {
                                 .italics(),
                             );
                         } else {
-                            if let Some(browse) = self
-                                .hovered_game_browse
-                                .as_ref()
-                                .filter(|b| b.id.starts_with("recent"))
-                            {
-                                let moves_san: Vec<String> = browse
-                                    .game
-                                    .nodes
-                                    .iter()
-                                    .skip(1)
-                                    .filter_map(|n| n.san().map(str::to_string))
-                                    .collect();
-                                let text = if moves_san.is_empty() {
-                                    browse.game.result().to_string()
-                                } else {
-                                    moves_san
-                                        .iter()
-                                        .enumerate()
-                                        .fold(String::new(), |mut acc, (idx, san)| {
-                                            if idx % 2 == 0 {
-                                                acc.push_str(&format!("{}. ", idx / 2 + 1));
-                                            }
-                                            acc.push_str(san);
-                                            acc.push(' ');
-                                            acc
-                                        })
-                                };
-                                egui::Frame::new()
-                                    .fill(SURFACE)
-                                    .corner_radius(4.0)
-                                    .inner_margin(4.0)
-                                    .show(ui, |ui| {
-                                        ui.label(
-                                            RichText::new(format!("Preview: {text}")).small().weak(),
-                                        );
-                                    });
-                                ui.add_space(2.0);
-                            }
                             let width = (ui.available_width() - 4.0).max(100.0);
                             let visible: Vec<&PrepRecentRow> = if recent_all {
                                 recent_rows.iter().collect()
@@ -16579,7 +16623,7 @@ impl App {
                                     } else {
                                         format!("recent-lib:{}", row.index)
                                     };
-                                    if !self.is_hovered_game(&browse_id) {
+                                    if !self.touch_hovered_game(&browse_id) {
                                         let game = if let Some(merged) = row.merged_index {
                                             self.prep_merged_games.get(merged).cloned()
                                         } else {
@@ -16611,6 +16655,77 @@ impl App {
                                     .weak()
                                     .small(),
                                 );
+                            }
+                            if let Some(browse) = self
+                                .hovered_game_browse
+                                .as_ref()
+                                .filter(|b| b.id.starts_with("recent"))
+                            {
+                                ui.add_space(4.0);
+                                egui::Frame::new()
+                                    .fill(SURFACE)
+                                    .corner_radius(4.0)
+                                    .inner_margin(6.0)
+                                    .show(ui, |ui| {
+                                        let mut job = LayoutJob::default();
+                                        job.append(
+                                            "Preview: ",
+                                            0.0,
+                                            TextFormat {
+                                                font_id: FontId::proportional(11.0),
+                                                color: MUTED,
+                                                ..Default::default()
+                                            },
+                                        );
+                                        for (idx, node) in browse.game.nodes.iter().enumerate().skip(1) {
+                                            if let Some(san) = node.san() {
+                                                let ply = idx;
+                                                if (ply - 1) % 2 == 0 {
+                                                    job.append(
+                                                        &format!("{}. ", (ply - 1) / 2 + 1),
+                                                        0.0,
+                                                        TextFormat {
+                                                            font_id: FontId::proportional(11.0),
+                                                            color: MUTED,
+                                                            ..Default::default()
+                                                        },
+                                                    );
+                                                }
+                                                let is_cursor = idx == browse.cursor_node;
+                                                let color = if is_cursor { GOLD } else { TEXT };
+                                                job.append(
+                                                    san,
+                                                    0.0,
+                                                    TextFormat {
+                                                        font_id: FontId::proportional(11.0),
+                                                        color,
+                                                        ..Default::default()
+                                                    },
+                                                );
+                                                job.append(
+                                                    " ",
+                                                    0.0,
+                                                    TextFormat {
+                                                        font_id: FontId::proportional(11.0),
+                                                        color: MUTED,
+                                                        ..Default::default()
+                                                    },
+                                                );
+                                            }
+                                        }
+                                        if browse.game.nodes.len() <= 1 {
+                                            job.append(
+                                                browse.game.result(),
+                                                0.0,
+                                                TextFormat {
+                                                    font_id: FontId::proportional(11.0),
+                                                    color: MUTED,
+                                                    ..Default::default()
+                                                },
+                                            );
+                                        }
+                                        ui.label(job);
+                                    });
                             }
                         }
 
@@ -16703,8 +16818,44 @@ impl App {
     }
 
     /// Returns whether the hovered browse game currently matches `id`.
+    #[allow(dead_code)]
     fn is_hovered_game(&self, id: &str) -> bool {
         self.hovered_game_browse.as_ref().is_some_and(|b| b.id == id)
+    }
+
+    /// Keep the hovered game active if `id` matches the current hover browse,
+    /// refreshing the position preview and preserving any keyboard-stepped
+    /// cursor. Returns `true` if already active (avoiding any game load).
+    fn touch_hovered_game(&mut self, id: &str) -> bool {
+        let current_key = self.current.as_ref().and_then(|current| {
+            current
+                .nodes
+                .get(self.node.min(current.nodes.len().saturating_sub(1)))
+                .map(|node| position::position_key(&node.pos))
+        });
+        if let Some(browse) = self.hovered_game_browse.as_mut()
+            && browse.id == id
+        {
+            let anchor_node = current_key
+                .and_then(|key| find_node_for_position_key(&browse.game, key))
+                .unwrap_or(0);
+            if browse.anchor_node != anchor_node {
+                browse.anchor_node = anchor_node;
+                browse.cursor_node = anchor_node;
+            }
+            let cursor = browse.cursor_node.min(browse.game.nodes.len().saturating_sub(1));
+            browse.cursor_node = cursor;
+            let preview = browse.game.nodes.get(cursor).map(|node| HoverPreview {
+                pos: node.pos.clone(),
+                last_move: domain::last_move_squares(node),
+            });
+            self.hovered_game_active_this_frame = true;
+            if let Some(preview) = preview {
+                self.hover_preview = Some(preview);
+            }
+            return true;
+        }
+        false
     }
 
     /// Activate hovered game browsing without repeatedly invoking `load` if
@@ -16714,7 +16865,7 @@ impl App {
         id: String,
         load: impl FnOnce() -> Option<Game>,
     ) {
-        if self.is_hovered_game(&id) {
+        if self.touch_hovered_game(&id) {
             return;
         }
         if let Some(game) = load() {
@@ -18424,7 +18575,11 @@ fn player_strip(
     let name_clip = egui::Rect::from_min_max(rect.min, pos2(right_limit, rect.bottom()));
     let name_painter = ui.painter_at(name_clip);
     let name_galley = name_painter.layout_job(label);
-    let name_y = rect.center().y - name_galley.size().y / 2.0;
+    let name_y = if !has_photo && player.team.as_ref().is_some_and(|t| !t.trim().is_empty()) {
+        rect.top() + 3.0
+    } else {
+        rect.center().y - name_galley.size().y / 2.0
+    };
     let crown_hovered = champion.is_some_and(|champion| {
         crown_hover(
             ui,
@@ -21156,7 +21311,7 @@ fn player_row(
             0.0,
             TextFormat {
                 font_id: FontId::monospace(12.0),
-                color: MUTED,
+                color: GOLD,
                 ..Default::default()
             },
         );
@@ -21172,6 +21327,8 @@ fn player_row(
             },
         );
     }
+    job.wrap.max_width = (rect.width() - text_left + rect.left() - 48.0).max(60.0);
+    job.wrap.max_rows = 1;
     let title_galley = painter.layout_job(job);
     if let Some(champion) = champion {
         crown_hover(
@@ -22984,7 +23141,8 @@ pub fn draw_wdl_bar(
 /// Win/draw/loss bar from the player's perspective.
 fn record_bar(ui: &mut Ui, wins: u32, draws: u32, losses: u32) {
     let width = ui.available_width().max(80.0);
-    draw_wdl_bar(ui, wins, draws, losses, width, 10.0);
+    draw_wdl_bar(ui, wins, draws, losses, width, 10.0)
+        .on_hover_text(format!("Wins: {wins} · Draws: {draws} · Losses: {losses}"));
 }
 
 fn wdl_bar(ui: &mut Ui, stats: &PositionStats) {
@@ -26157,6 +26315,7 @@ mod tests {
                 kept: 1,
                 error: None,
                 games: Arc::new(vec![g]),
+                probe_capped: false,
             },
         );
         app.refresh_prep_account_checks();
@@ -27567,6 +27726,33 @@ mod tests {
             Some(test_game.clone())
         });
         assert_eq!(loads, 1);
+    }
+
+    #[test]
+    fn hovered_game_browse_lazy_persists_across_frames_and_preserves_stepped_cursor() {
+        let mut app = test_app();
+        let pgn = b"[Event \"Test\"]\n\n1. e4 e5 2. Nf3 Nc6 *";
+        let game = domain::parse_pgn(&pgn[..]).unwrap().into_iter().next().unwrap();
+
+        // Frame 1
+        app.hovered_game_active_this_frame = false;
+        app.activate_hovered_game_browse_lazy("test:step".to_string(), || Some(game.clone()));
+        assert!(app.hovered_game_active_this_frame);
+        assert_eq!(app.hovered_game_browse.as_ref().unwrap().cursor_node, 0);
+
+        // Step cursor forward
+        app.step_hovered_game(1);
+        assert_eq!(app.hovered_game_browse.as_ref().unwrap().cursor_node, 1);
+
+        // Frame 2: simulate next frame where hovered_game_active_this_frame is reset at start of frame
+        app.hovered_game_active_this_frame = false;
+        app.activate_hovered_game_browse_lazy("test:step".to_string(), || {
+            panic!("loader must NOT be called on frame 2 for the same hovered game");
+        });
+
+        // Frame 2 must mark hovered_game_active_this_frame as true and preserve cursor_node
+        assert!(app.hovered_game_active_this_frame);
+        assert_eq!(app.hovered_game_browse.as_ref().unwrap().cursor_node, 1);
     }
 
     #[test]

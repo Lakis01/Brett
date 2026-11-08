@@ -1106,18 +1106,15 @@ pub fn classify_headers_category(
     let e = event.unwrap_or("");
     let s = site.unwrap_or("");
     let hay = format!("{e} {s}").to_ascii_lowercase();
-    for needle in [
-        "corr",
-        "iccf",
-        "correspondence",
-        "bdg",
-        "fernschach",
-        "email",
-        "post",
-    ] {
-        if hay.contains(needle) {
-            return GameCategory::Correspondence;
-        }
+    if hay.contains("correspondence") || hay.contains("fernschach") {
+        return GameCategory::Correspondence;
+    }
+    let tokens = ascii_tokens(&hay);
+    if tokens
+        .iter()
+        .any(|t| matches!(t.as_str(), "corr" | "iccf" | "bdg" | "email" | "post" | "postal"))
+    {
+        return GameCategory::Correspondence;
     }
     if event.is_none() && site.is_none() && time_control.is_none() {
         return GameCategory::Unknown;
@@ -5044,5 +5041,29 @@ mod tests {
         assert_eq!(player.latest_otb_elo, Some(2185));
         assert_eq!(player.display_elo(), Some(2185));
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn correspondence_category_requires_whole_token_for_short_keywords() {
+        assert_eq!(
+            classify_headers_category(Some("Open Postojna 2024"), Some("Postojna SLO"), None),
+            GameCategory::OtbClassical
+        );
+        assert_eq!(
+            classify_headers_category(Some("Corrales Memorial"), Some("Havana CUB"), None),
+            GameCategory::OtbClassical
+        );
+        assert_eq!(
+            classify_headers_category(Some("ICCF World Cup"), None, None),
+            GameCategory::Correspondence
+        );
+        assert_eq!(
+            classify_headers_category(Some("Postal Championship"), None, None),
+            GameCategory::Correspondence
+        );
+        assert_eq!(
+            classify_headers_category(Some("World Correspondence Championship"), None, None),
+            GameCategory::Correspondence
+        );
     }
 }
