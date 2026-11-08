@@ -35,7 +35,7 @@ use crate::review::{self, Quality, ReviewConfig, ReviewState};
 use crate::review_book::{self, BookSource};
 use crate::scid::ScidLibrary;
 use crate::settings::{
-    ChampionLineage, CloudPrefs, DisplayPrefs, EnginePrefs, PhotoSize, PreparationPrefs,
+    self, ChampionLineage, CloudPrefs, DisplayPrefs, EnginePrefs, PhotoSize, PreparationPrefs,
     RatingPriority,
 };
 use crate::titles;
@@ -911,27 +911,9 @@ struct DatePicker {
     manual: String,
 }
 
-/// Another database shown in the floating Database views window.
-struct DatabaseView {
-    path: PathBuf,
-    library: Arc<dyn GameLibrary>,
-    session: crate::session::GameList,
-    filter: String,
-}
-
-impl DatabaseView {
-    fn name(&self) -> String {
-        self.path
-            .file_name()
-            .map(|name| name.to_string_lossy().to_string())
-            .unwrap_or_else(|| self.path.display().to_string())
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DropTarget {
     Main,
-    View(usize),
 }
 
 struct PendingGameDrop {
@@ -984,8 +966,6 @@ pub struct App {
     /// away and back does not discard new moves or variations.
     edited: std::collections::HashMap<usize, Game>,
     dirty: bool,
-    views: Vec<DatabaseView>,
-    views_open: bool,
     pending_game_drop: Option<PendingGameDrop>,
     pending_merge: Option<PendingMerge>,
     pending_open_choice: Option<PendingOpenChoice>,
@@ -1133,6 +1113,7 @@ pub struct App {
     prep_merged_games: Vec<Game>,
     prep_load_rx: Option<mpsc::Receiver<PrepLoadMessage>>,
     prep_load_job: Option<String>,
+    prep_load_progress: Option<(usize, usize)>,
     /// Online accounts per prepared player, persisted in preparation prefs.
     prep_saved_accounts: std::collections::HashMap<String, Vec<players::PrepOnlineAccount>>,
     recent_preview: Option<RecentPreview>,
@@ -1202,6 +1183,7 @@ pub struct App {
     photo_size: PhotoSize,
     /// Championship lineage used for the gold crown.
     champion_lineage: ChampionLineage,
+    category_colors: settings::GameCategoryColors,
     /// Player whose portrait is open in the standalone viewer.
     photo_viewer: Option<String>,
     show_nav_buttons: bool,
@@ -1349,6 +1331,7 @@ pub struct App {
     settings_trend_baseline: crate::recent::TrendBaseline,
     settings_trend_min_games: u32,
     settings_trend_source: crate::recent::TrendSource,
+    settings_category_colors: settings::GameCategoryColors,
     settings_token: String,
     settings_token_visible: bool,
     settings_token_from_env: bool,
@@ -1358,18 +1341,30 @@ pub struct App {
     ctx: egui::Context,
 }
 
+fn truncate_status_error(err: &str) -> String {
+    let without_urls: Vec<&str> = err
+        .split_whitespace()
+        .filter(|w| !w.starts_with("http://") && !w.starts_with("https://"))
+        .collect();
+    let text = without_urls.join(" ");
+    let text = text.trim();
+    if text.chars().count() <= 48 {
+        text.to_string()
+    } else {
+        let truncated: String = text.chars().take(47).collect();
+        format!("{truncated}…")
+    }
+}
+
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        let mut args = std::env::args_os().skip(1).map(std::path::PathBuf::from);
-        let start = args.next();
-        let views = args.collect();
-        Self::with_file(cc, start, views)
+        let start = std::env::args_os().nth(1).map(std::path::PathBuf::from);
+        Self::with_file(cc, start)
     }
 
     pub fn with_file(
         cc: &eframe::CreationContext<'_>,
         start: Option<std::path::PathBuf>,
-        views: Vec<std::path::PathBuf>,
     ) -> Self {
         let mut visuals = egui::Visuals::dark();
         visuals.panel_fill = Color32::from_rgb(0x1B, 0x1D, 0x1F);
@@ -1425,8 +1420,6 @@ impl App {
             current: None,
             edited: std::collections::HashMap::new(),
             dirty: false,
-            views: Vec::new(),
-            views_open: false,
             pending_game_drop: None,
             pending_merge: None,
             pending_open_choice: None,
@@ -1543,6 +1536,7 @@ impl App {
             prep_merged_games: Vec::new(),
             prep_load_rx: None,
             prep_load_job: None,
+            prep_load_progress: None,
             prep_saved_accounts: preparation_prefs.prep_online_accounts.clone(),
             recent_preview: None,
             reference_path: reference_path.clone(),
@@ -1606,6 +1600,7 @@ impl App {
             show_player_photos: display_prefs.show_player_photos,
             photo_size: display_prefs.photo_size,
             champion_lineage: display_prefs.champion_lineage,
+            category_colors: display_prefs.category_colors,
             photo_viewer: None,
             show_nav_buttons: display_prefs.show_nav_buttons,
             show_pgn_tags: display_prefs.show_pgn_tags,
@@ -1771,6 +1766,7 @@ impl App {
             settings_trend_baseline: display_prefs.trend_baseline,
             settings_trend_min_games: display_prefs.trend_min_games,
             settings_trend_source: display_prefs.trend_source,
+            settings_category_colors: display_prefs.category_colors,
             settings_token: String::new(),
             settings_token_visible: false,
             settings_token_from_env: false,
@@ -1782,9 +1778,6 @@ impl App {
 
         if let Some(path) = start {
             app.load_file(&path);
-        }
-        for path in views {
-            app.open_database_view(&path);
         }
         if !app.tree_path.trim().is_empty() {
             let path = PathBuf::from(app.tree_path.trim());
@@ -2488,54 +2481,6 @@ impl App {
         }
     }
 
-    fn open_database_view(&mut self, path: &std::path::Path) {
-        let path_buf;
-        let path = if path.is_dir() {
-            match find_database_in_dir(path) {
-                Ok(target) => {
-                    path_buf = target;
-                    path_buf.as_path()
-                }
-                Err(err) => {
-                    self.status = format!("{err}");
-                    return;
-                }
-            }
-        } else {
-            path
-        };
-        if self
-            .library
-            .as_ref()
-            .is_some_and(|library| library.path() == path)
-        {
-            self.status = format!("{} is already open in the main view.", path.display());
-            return;
-        }
-        if self.views.iter().any(|view| view.path == path) {
-            self.views_open = true;
-            self.status = format!("{} is already open in Database views.", path.display());
-            return;
-        }
-        match open_library(path) {
-            Ok(library) => {
-                let count = library.len();
-                let session = crate::session::GameList::from_library(library.clone());
-                self.views.push(DatabaseView {
-                    path: path.to_path_buf(),
-                    library,
-                    session,
-                    filter: String::new(),
-                });
-                self.views_open = true;
-                self.status = format!("Opened {} as a database view.", games_label(count));
-                self.remember_database_dir(path);
-                self.record_recent_file(path);
-            }
-            Err(err) => self.status = format!("Could not open {}: {err}", path.display()),
-        }
-    }
-
     fn handle_dropped_file(&mut self, path: &std::path::Path) {
         let path_buf;
         let path = if path.is_dir() {
@@ -2578,21 +2523,6 @@ impl App {
                     }
                 );
             }
-            DropTarget::View(index) => {
-                if let Some(view) = self.views.get_mut(index) {
-                    view.session.insert_game(pending.game, insert_at);
-                    self.status = format!(
-                        "{} added to {} {}.",
-                        pending.label,
-                        view.name(),
-                        if insert {
-                            "at the drop position"
-                        } else {
-                            "at the end"
-                        }
-                    );
-                }
-            }
         }
     }
 
@@ -2612,28 +2542,6 @@ impl App {
                 }
                 Err(err) => self.status = format!("Merge failed: {err:#}"),
             },
-            DropTarget::View(index) => {
-                let Some(view) = self.views.get_mut(index) else {
-                    self.status = "The target database view is gone.".to_string();
-                    return;
-                };
-                let name = view.name();
-                match view
-                    .session
-                    .merge_library(pending.library, &std::collections::HashMap::new())
-                {
-                    Ok(report) => {
-                        self.status = format!(
-                            "Merged {} into {}: {} added, {} duplicates skipped.",
-                            pending.label,
-                            name,
-                            games_label(report.added),
-                            report.skipped
-                        );
-                    }
-                    Err(err) => self.status = format!("Merge failed: {err:#}"),
-                }
-            }
         }
     }
 
@@ -4786,10 +4694,16 @@ impl App {
             engine_depth: self.engine_depth,
             engine_time_ms: self.engine_time_ms,
             prep_filter_facing_color: self.prep_filter_facing_color,
+            category_colors: self.category_colors,
         };
         if let Err(err) = prefs.save() {
             self.status = format!("Could not save display settings: {err:#}");
         }
+    }
+
+    pub fn game_category_color(&self, cat: players::GameCategory) -> Color32 {
+        let [r, g, b] = self.category_colors.color_for(cat);
+        Color32::from_rgb(r, g, b)
     }
 
     fn record_recent_file(&mut self, path: &Path) {
@@ -4906,6 +4820,7 @@ impl App {
         self.settings_trend_baseline = self.trend_baseline;
         self.settings_trend_min_games = self.trend_min_games;
         self.settings_trend_source = self.trend_source;
+        self.settings_category_colors = self.category_colors;
         self.settings_token_from_env = std::env::var("BRETT_LICHESS_TOKEN")
             .ok()
             .is_some_and(|token| !token.trim().is_empty());
@@ -4962,6 +4877,7 @@ impl App {
         self.trend_baseline = self.settings_trend_baseline;
         self.trend_min_games = self.settings_trend_min_games.clamp(3, 200);
         self.trend_source = self.settings_trend_source;
+        self.category_colors = self.settings_category_colors;
         self.prep_player_names = self
             .settings_my_player_names
             .lines()
@@ -5121,6 +5037,7 @@ impl App {
         self.settings_trend_baseline = self.trend_baseline;
         self.settings_trend_min_games = self.trend_min_games;
         self.settings_trend_source = self.trend_source;
+        self.settings_category_colors = self.category_colors;
         self.settings_token = self.lichess_token.clone().unwrap_or_default();
 
         self.status = "Settings successfully imported.".to_string();
@@ -5718,12 +5635,46 @@ impl App {
                 if moves.is_empty() {
                     return None;
                 }
-                Some(
+                let trends: HashMap<u32, crate::recent::MoveTrend> =
                     crate::recent::position_trends(&moves, self.trend_config())
                         .into_iter()
                         .map(|t| (t.mv, t))
-                        .collect(),
-                )
+                        .collect();
+                if !trends.is_empty() {
+                    return Some(trends);
+                }
+
+                let baseline_stats: Vec<position::MoveStat> = self
+                    .tree_index
+                    .as_ref()
+                    .map(|idx| idx.moves(key))
+                    .or_else(|| self.reference.as_ref().map(|r| r.index.moves(key)))
+                    .or_else(|| self.cached_masters_prior(key))
+                    .unwrap_or_default();
+
+                let mut baseline_map: HashMap<u32, u32> = baseline_stats
+                    .into_iter()
+                    .map(|s| (s.mv, s.games))
+                    .collect();
+
+                let mut counts = Vec::with_capacity(moves.len() + baseline_map.len());
+                for m in &moves {
+                    let baseline_games = baseline_map.remove(&m.mv).unwrap_or(0);
+                    let recent_games = m.games;
+                    let total_games = baseline_games + recent_games;
+                    counts.push((m.mv, recent_games, total_games));
+                }
+                for (mv, baseline_games) in baseline_map {
+                    counts.push((mv, 0, baseline_games));
+                }
+
+                let computed =
+                    crate::recent::trends_from_window_counts(&counts, self.trend_config());
+                if !computed.is_empty() {
+                    Some(computed)
+                } else {
+                    None
+                }
             }
             crate::recent::TrendSource::LichessMasters
             | crate::recent::TrendSource::LichessAll => {
@@ -7149,6 +7100,7 @@ impl App {
     const PREP_ONLINE_MAX: usize = usize::MAX;
     /// ChessABC fetches are uncapped by default.
     const PREP_CHESSABC_MAX: usize = usize::MAX;
+    pub(crate) const PREP_ACCOUNT_PROBE_MAX: usize = 200;
 
     // Temporary minimal stub for the in-progress preparation-setup task.
     fn open_prep_setup(&mut self, as_white: bool) {
@@ -7355,6 +7307,7 @@ impl App {
         let use_current = self.prep_setup_use_current && library.is_some();
         let use_reference_file = self.prep_setup_use_reference;
         let reference_path = self.reference_path.clone();
+        let reference_is_live = LiveReferenceSource::from_config_str(reference_path.trim()).is_some();
         let reference_is_book = is_opening_book_path(Path::new(reference_path.trim()));
         let use_chessabc = self.prep_setup_use_chessabc;
         let chessabc_ids: Vec<String> = self
@@ -7381,6 +7334,7 @@ impl App {
             .map(|(key, check)| (key.clone(), check.games.clone()))
             .collect();
         self.prep_load_job = Some(player.key.clone());
+        self.prep_load_progress = None;
         self.player_book_status = format!("Loading {} games from all sources…", player.name);
         let (tx, rx) = mpsc::channel();
         let ctx = self.ctx.clone();
@@ -7397,6 +7351,7 @@ impl App {
             if use_reference_file
                 && !reference_path.trim().is_empty()
                 && !reference_is_book
+                && !reference_is_live
             {
                 total += 1;
             }
@@ -7479,9 +7434,13 @@ impl App {
             }
             if use_reference_file {
                 let trimmed = reference_path.trim();
+                let reference_is_live =
+                    LiveReferenceSource::from_config_str(trimmed).is_some();
                 if !trimmed.is_empty() {
                     if reference_is_book {
                         notes.push("Reference book prior".to_string());
+                    } else if reference_is_live {
+                        notes.push("Live reference prior".to_string());
                     } else {
                         step += 1;
                         let label = "Loading reference file…";
@@ -7504,7 +7463,9 @@ impl App {
                                 }
                             }
                             Err(err) => {
-                                notes.push(format!("Reference file unreadable: {err:#}"));
+                                notes.push(truncate_status_error(&format!(
+                                    "Reference file unreadable: {err:#}"
+                                )));
                             }
                         }
                         emit_progress(&sources, &notes, step, label);
@@ -7533,7 +7494,7 @@ impl App {
                             chessabc_games.extend(games);
                         }
                         Err(err) => {
-                            notes.push(format!("ChessABC unavailable ({err:#})"));
+                            notes.push(truncate_status_error(&format!("ChessABC unavailable ({err:#})")));
                         }
                     }
                 } else {
@@ -7551,7 +7512,7 @@ impl App {
                                 chessabc_games.extend(games);
                             }
                             Err(err) => {
-                                notes.push(format!("ChessABC {fide_id} unavailable ({err:#})"));
+                                notes.push(truncate_status_error(&format!("ChessABC {fide_id} unavailable ({err:#})")));
                             }
                         }
                     }
@@ -7583,20 +7544,25 @@ impl App {
                 send_status(step, &label, &notes);
                 let as_of_account = as_of;
                 let cache_key = prep_account_check_key(account.source, &account.username);
-                let fetched = if let Some(cached) = cached_checks.get(&cache_key) {
+                let fetched = if let Some(cached) = cached_checks
+                    .get(&cache_key)
+                    .filter(|c| c.len() < Self::PREP_ACCOUNT_PROBE_MAX)
+                {
                     cached.as_ref().clone()
                 } else {
-                    match online::fetch_player_games(
+                    match online::fetch_player_games_filtered(
                         account.source,
                         &account.username,
                         max_games,
+                        Some(&account.filter),
+                        as_of_account,
                     ) {
                         Ok(fetched) => fetched,
                         Err(err) => {
-                            notes.push(format!(
+                            notes.push(truncate_status_error(&format!(
                                 "{} unavailable ({err:#})",
                                 account.source.label()
-                            ));
+                            )));
                             emit_progress(&sources, &notes, step, &label);
                             continue;
                         }
@@ -7638,7 +7604,7 @@ impl App {
                         }
                     }
                     Err(err) => {
-                        notes.push(format!("Extra file unreadable: {err:#}"));
+                        notes.push(truncate_status_error(&format!("Extra file unreadable: {err:#}")));
                     }
                 }
                 emit_progress(&sources, &notes, step, label);
@@ -7717,6 +7683,7 @@ impl App {
                     current_label,
                     completed_notes,
                 }) => {
+                    self.prep_load_progress = Some((step, total));
                     let ready = if completed_notes.is_empty() {
                         String::new()
                     } else {
@@ -7733,6 +7700,7 @@ impl App {
                     book,
                     games,
                 }) => {
+                    self.prep_load_progress = Some((step, total));
                     let key = book.player_key().to_string();
                     if self
                         .prep
@@ -7750,6 +7718,7 @@ impl App {
                     }
                 }
                 Ok(PrepLoadMessage::Done(Ok(result))) => {
+                    self.prep_load_progress = None;
                     let key = result.book.player_key().to_string();
                     let name = result.book.player_name().to_string();
                     let games = result.book.games();
@@ -7773,6 +7742,7 @@ impl App {
                     break;
                 }
                 Ok(PrepLoadMessage::Done(Err(err))) => {
+                    self.prep_load_progress = None;
                     self.prep_load_job = None;
                     self.player_book_status = format!("Preparation load failed: {err}");
                     keep = false;
@@ -7780,6 +7750,7 @@ impl App {
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
+                    self.prep_load_progress = None;
                     self.prep_load_job = None;
                     self.player_book_status =
                         "Preparation load stopped unexpectedly.".to_string();
@@ -7967,7 +7938,10 @@ impl App {
             for request in request_rx {
                 let as_of = players::today();
                 let result = if request.is_chessabc {
-                    match online::fetch_chessabc_games_by_fide_id(&request.username, usize::MAX) {
+                    match online::fetch_chessabc_games_by_fide_id(
+                        &request.username,
+                        App::PREP_ACCOUNT_PROBE_MAX,
+                    ) {
                         Ok(games) => {
                             let total = games.len();
                             AccountCheckResult {
@@ -7989,10 +7963,12 @@ impl App {
                         },
                     }
                 } else {
-                    match online::fetch_player_games(
+                    match online::fetch_player_games_filtered(
                         request.source,
                         &request.username,
-                        usize::MAX,
+                        App::PREP_ACCOUNT_PROBE_MAX,
+                        Some(&request.filter),
+                        as_of,
                     ) {
                         Ok(games) => {
                             let total = games.len();
@@ -10863,7 +10839,6 @@ impl App {
             online_ref,
             players,
             date,
-            views,
         ) = ctx.input(|i| {
             (
                 i.key_pressed(Key::ArrowRight),
@@ -10884,7 +10859,6 @@ impl App {
                 i.key_pressed(Key::O),
                 i.key_pressed(Key::P),
                 i.key_pressed(Key::D),
-                i.key_pressed(Key::V),
             )
         });
 
@@ -10980,9 +10954,6 @@ impl App {
             self.date_picker_anchor = None;
             self.open_date_picker();
         }
-        if views {
-            self.views_open = !self.views_open;
-        }
     }
 
     fn menu_bar(&mut self, root: &mut Ui) {
@@ -10992,12 +10963,6 @@ impl App {
                     if ui.button("Open database…").clicked() {
                         if let Some(path) = open_dialog(self.last_database_dir.as_deref()) {
                             self.load_file(&path);
-                        }
-                        ui.close();
-                    }
-                    if ui.button("Open database view…").clicked() {
-                        if let Some(path) = open_dialog(self.last_database_dir.as_deref()) {
-                            self.open_database_view(&path);
                         }
                         ui.close();
                     }
@@ -11444,13 +11409,6 @@ impl App {
                             .clicked()
                         {
                             self.tournament_browser_open = true;
-                        }
-                        if ui
-                            .small_button("Views")
-                            .on_hover_text("Open additional databases side by side")
-                            .clicked()
-                        {
-                            self.views_open = true;
                         }
                     });
                 });
@@ -11929,8 +11887,6 @@ impl App {
 
         let mut select = None;
         let mut reorder = None;
-        let mut external_drop = None;
-        let mut external_merge = None;
         egui::ScrollArea::vertical()
             .id_salt("game-list")
             .auto_shrink([false, false])
@@ -11998,9 +11954,7 @@ impl App {
                     }
 
                     let pointer = ui.ctx().pointer_interact_pos();
-                    let hovering_drag = response.dnd_hover_payload::<GameRowDrag>().is_some()
-                        || response.dnd_hover_payload::<ViewGameDrag>().is_some()
-                        || response.dnd_hover_payload::<ViewDatabaseDrag>().is_some();
+                    let hovering_drag = response.dnd_hover_payload::<GameRowDrag>().is_some();
                     let drop_before = hovering_drag
                         && pointer.is_some_and(|pos| pos.y < response.rect.center().y);
                     if hovering_drag {
@@ -12026,14 +11980,6 @@ impl App {
                     {
                         reorder = Some((payload.id, insertion));
                     }
-                    if let Some(payload) = response.dnd_release_payload::<ViewGameDrag>()
-                        && let Some(insertion) = insertion
-                    {
-                        external_drop = Some((payload.view, payload.id, insertion));
-                    }
-                    if let Some(payload) = response.dnd_release_payload::<ViewDatabaseDrag>() {
-                        external_merge = Some(payload.view);
-                    }
 
                     if response.clicked() {
                         select = Some(id);
@@ -12045,35 +11991,6 @@ impl App {
         {
             self.session_dirty = true;
             self.status = "Game moved in the current list.".to_string();
-        }
-        if let Some((view_index, game_id, insert_at)) = external_drop
-            && let Some(game) = self.views.get(view_index).and_then(|view| {
-                view.session
-                    .load(game_id, &std::collections::HashMap::new())
-                    .ok()
-            })
-        {
-            self.pending_game_drop = Some(PendingGameDrop {
-                label: format!(
-                    "Game from {}",
-                    self.views
-                        .get(view_index)
-                        .map(DatabaseView::name)
-                        .unwrap_or_else(|| "database view".to_string())
-                ),
-                game,
-                target: DropTarget::Main,
-                insert_at,
-            });
-        }
-        if let Some(view_index) = external_merge
-            && let Some(view) = self.views.get(view_index)
-        {
-            self.pending_merge = Some(PendingMerge {
-                library: view.library.clone(),
-                target: DropTarget::Main,
-                label: view.name(),
-            });
         }
         if let Some(id) = select {
             self.select_slot(id);
@@ -15558,9 +15475,17 @@ impl App {
             });
         });
         if self.prep_load_rx.is_some() {
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label(RichText::new(&self.player_book_status).small().weak());
+            ui.vertical(|ui| {
+                let frac = self
+                    .prep_load_progress
+                    .and_then(|(s, t)| (t > 0).then_some(s as f32 / t as f32))
+                    .unwrap_or(0.0);
+                ui.add(egui::ProgressBar::new(frac.clamp(0.0, 1.0)).animate(frac == 0.0));
+                ui.add(
+                    egui::Label::new(RichText::new(&self.player_book_status).small().weak())
+                        .wrap()
+                        .truncate(),
+                );
             });
         }
         ui.horizontal_wrapped(|ui| {
@@ -16333,7 +16258,7 @@ impl App {
                     }
                 } else {
                     ui.add_space(4.0);
-                    ui.label(RichText::new(&book_status).weak());
+                    ui.add(egui::Label::new(RichText::new(&book_status).weak()).wrap().truncate());
                     if book_loading {
                         ui.spinner();
                     }
@@ -16666,7 +16591,7 @@ impl App {
                         );
                         ui.add_space(3.0);
                         if !book_loaded {
-                            ui.label(RichText::new(&book_status).weak());
+                            ui.add(egui::Label::new(RichText::new(&book_status).weak()).wrap().truncate());
                             if book_loading {
                                 ui.spinner();
                             }
@@ -17201,361 +17126,6 @@ impl App {
         });
     }
 
-    fn database_views_window(&mut self, ctx: &egui::Context) {
-        if !self.views_open {
-            return;
-        }
-        let mut open = self.views_open;
-        let mut open_request = false;
-        let mut close_view = None;
-        let mut preview = None;
-        let mut drop_from_view = None;
-        let mut drop_from_main = None;
-        let mut reorder_view = None;
-        let mut merge_from_view = None;
-        let mut merge_to_main = None;
-
-        egui::Window::new("Database views")
-            .open(&mut open)
-            .default_size([470.0, 620.0])
-            .min_width(360.0)
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    if ui.button("Open database…").clicked() {
-                        open_request = true;
-                    }
-                    ui.label(
-                        RichText::new(
-                            "Drag a game row, or the ⣿ database handle, onto another list.",
-                        )
-                        .small()
-                        .weak(),
-                    );
-                });
-                ui.add_space(4.0);
-                if self.views.is_empty() {
-                    ui.label(
-                        RichText::new(
-                            "No additional databases are open. Open one here, or drop a database onto Brett and choose “Open in database views”.",
-                        )
-                        .weak(),
-                    );
-                    return;
-                }
-
-                egui::ScrollArea::vertical()
-                    .id_salt("database-views-scroll")
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        for view_index in 0..self.views.len() {
-                            let view = &mut self.views[view_index];
-                            let name = view.name();
-                            let count = view.session.len();
-                            ui.horizontal(|ui| {
-                                let can_drag = rows_are_draggable(ui);
-                                let handle = ui
-                                    .add(
-                                        egui::Label::new(
-                                            RichText::new("⣿")
-                                                .color(Color32::from_gray(150))
-                                                .size(14.0),
-                                        )
-                                        .sense(if can_drag {
-                                            Sense::drag()
-                                        } else {
-                                            Sense::hover()
-                                        }),
-                                    )
-                                    .on_hover_text(
-                                        "Drag this database onto the current list or another view to merge",
-                                    );
-                                if can_drag {
-                                    handle.dnd_set_drag_payload(ViewDatabaseDrag { view: view_index });
-                                }
-                                ui.label(RichText::new(name).strong());
-                                ui.label(RichText::new(games_label(count)).small().weak());
-                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                    if ui.small_button("Close").clicked() {
-                                        close_view = Some(view_index);
-                                    }
-                                    if ui
-                                        .small_button("Merge into current")
-                                        .on_hover_text(
-                                            "Append distinct games from this database to the current list",
-                                        )
-                                        .clicked()
-                                    {
-                                        merge_to_main = Some(view_index);
-                                    }
-                                });
-                            });
-                            ui.horizontal(|ui| {
-                                ui.label(RichText::new("Filter").small().weak());
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut view.filter)
-                                        .hint_text("players, event…")
-                                        .desired_width(f32::INFINITY),
-                                );
-                            });
-                            let append_zone = ui
-                                .add(
-                                    egui::Label::new(
-                                        RichText::new("Drop a game here to append")
-                                            .small()
-                                            .weak(),
-                                    )
-                                    .sense(Sense::hover()),
-                                )
-                                .on_hover_text("Append a dragged game to this database view");
-                            if let Some(payload) = append_zone.dnd_release_payload::<GameRowDrag>() {
-                                drop_from_main = Some((payload.id, view_index, count));
-                            }
-                            if let Some(payload) = append_zone.dnd_release_payload::<ViewGameDrag>()
-                                && payload.view != view_index
-                            {
-                                drop_from_view =
-                                    Some((payload.view, payload.id, view_index, count));
-                            }
-
-                            let filter_trimmed = view.filter.trim();
-                            let is_filtered = !filter_trimmed.is_empty();
-                            let rows = if is_filtered {
-                                view.session.filter(filter_trimmed)
-                            } else {
-                                Vec::new()
-                            };
-                            let total_count = if is_filtered {
-                                rows.len()
-                            } else {
-                                view.session.len()
-                            };
-                            if total_count == 0 {
-                                ui.label(RichText::new("No games.").weak());
-                            } else {
-                                let row_h = 42.0;
-                                egui::ScrollArea::vertical()
-                                    .id_salt(("database-view-games", view_index))
-                                    .max_height(230.0)
-                                    .auto_shrink([false, false])
-                                    .show_rows(ui, row_h, total_count, |ui, range| {
-                                        for pos in range {
-                                            let Some(id) = (if is_filtered {
-                                                rows.get(pos).copied()
-                                            } else {
-                                                view.session.id_at(pos)
-                                            }) else {
-                                                continue;
-                                            };
-                                            let Some(_) = view.session.slot(id) else {
-                                                continue;
-                                            };
-                                            let view_headers = view.session.slot_headers(id);
-                                            let view_header = |key: &str| {
-                                                view_headers
-                                                    .and_then(|list| list.iter().find(|(name, _)| name.eq_ignore_ascii_case(key)))
-                                                    .map(|(_, value)| value.as_str())
-                                            };
-                                            let white_title =
-                                                title_from_tag(view_header("WhiteTitle"));
-                                            let black_title =
-                                                title_from_tag(view_header("BlackTitle"));
-                                            let white_country = player_country_from_header(
-                                                view_header("WhiteCountry")
-                                                    .or_else(|| view_header("WhiteFed")),
-                                            );
-                                            let black_country = player_country_from_header(
-                                                view_header("BlackCountry")
-                                                    .or_else(|| view_header("BlackFed")),
-                                            );
-                                            let subtitle =
-                                                format!("{} · {}", view_header("Event").unwrap_or("?"), view_header("Date").unwrap_or("????.??.??"));
-                                            let width = ui.available_width();
-                                            let view_white = view.session.slot_white(id);
-                                            let view_black = view.session.slot_black(id);
-                                            let response = game_row(
-                                                ui,
-                                                false,
-                                                "",
-                                                RowName::new(&view_white, white_title)
-                                                    .with_country(white_country.map(|c| c.badge)),
-                                                Some(
-                                                    RowName::new(&view_black, black_title)
-                                                        .with_country(
-                                                            black_country.map(|c| c.badge),
-                                                        ),
-                                                ),
-                                                "",
-                                                &subtitle,
-                                                width,
-                                                row_h - 2.0,
-                                                None,
-                                            );
-                                            if response.sense.senses_drag() {
-                                                response.dnd_set_drag_payload(ViewGameDrag {
-                                                    view: view_index,
-                                                    id,
-                                                });
-                                            }
-                                            let pointer = ui.ctx().pointer_interact_pos();
-                                            let hovering = response
-                                                .dnd_hover_payload::<GameRowDrag>()
-                                                .is_some()
-                                                || response
-                                                    .dnd_hover_payload::<ViewGameDrag>()
-                                                    .is_some()
-                                                || response
-                                                    .dnd_hover_payload::<ViewDatabaseDrag>()
-                                                    .is_some();
-                                            let drop_before = hovering
-                                                && pointer.is_some_and(|pos| {
-                                                    pos.y < response.rect.center().y
-                                                });
-                                            if hovering {
-                                                let y = if drop_before {
-                                                    response.rect.top()
-                                                } else {
-                                                    response.rect.bottom()
-                                                };
-                                                ui.painter().line_segment(
-                                                    [
-                                                        egui::pos2(
-                                                            response.rect.left() + 4.0,
-                                                            y,
-                                                        ),
-                                                        egui::pos2(
-                                                            response.rect.right() - 4.0,
-                                                            y,
-                                                        ),
-                                                    ],
-                                                    egui::Stroke::new(
-                                                        2.0,
-                                                        ui.visuals().selection.bg_fill,
-                                                    ),
-                                                );
-                                            }
-                                            let Some(position) = view.session.position_of(id) else {
-                                                continue;
-                                            };
-                                            let insertion =
-                                                if drop_before { position } else { position + 1 };
-                                            if let Some(payload) =
-                                                response.dnd_release_payload::<GameRowDrag>()
-                                            {
-                                                drop_from_main =
-                                                    Some((payload.id, view_index, insertion));
-                                            }
-                                            if let Some(payload) =
-                                                response.dnd_release_payload::<ViewGameDrag>()
-                                            {
-                                                if payload.view == view_index {
-                                                    reorder_view =
-                                                        Some((view_index, payload.id, insertion));
-                                                } else {
-                                                    drop_from_view = Some((
-                                                        payload.view,
-                                                        payload.id,
-                                                        view_index,
-                                                        insertion,
-                                                    ));
-                                                }
-                                            }
-                                            if let Some(payload) =
-                                                response.dnd_release_payload::<ViewDatabaseDrag>()
-                                                && payload.view != view_index
-                                            {
-                                                merge_from_view =
-                                                    Some((payload.view, view_index));
-                                            }
-                                            if response.clicked() {
-                                                preview = Some((view_index, id));
-                                            }
-                                        }
-                                    });
-                            }
-                            ui.separator();
-                        }
-                    });
-            });
-
-        self.views_open = open;
-        if open_request && let Some(path) = open_dialog(self.last_database_dir.as_deref()) {
-            self.open_database_view(&path);
-        }
-        if let Some(index) = close_view
-            && index < self.views.len()
-        {
-            let view = self.views.remove(index);
-            self.status = format!("Closed database view {}.", view.name());
-        }
-        if let Some((view_index, id, insertion)) = reorder_view
-            && let Some(view) = self.views.get_mut(view_index)
-        {
-            view.session.move_slot(id, insertion);
-        }
-        if let Some((source, game_id, target, insert_at)) = drop_from_view
-            && let Some(game) = self.views.get(source).and_then(|view| {
-                view.session
-                    .load(game_id, &std::collections::HashMap::new())
-                    .ok()
-            })
-        {
-            self.pending_game_drop = Some(PendingGameDrop {
-                label: format!(
-                    "Game from {}",
-                    self.views
-                        .get(source)
-                        .map(DatabaseView::name)
-                        .unwrap_or_else(|| "database view".to_string())
-                ),
-                game,
-                target: DropTarget::View(target),
-                insert_at,
-            });
-        }
-        if let Some((id, target, insert_at)) = drop_from_main
-            && let Ok(game) = self.session.load(id, &self.edited)
-        {
-            self.pending_game_drop = Some(PendingGameDrop {
-                game,
-                target: DropTarget::View(target),
-                insert_at,
-                label: "Game from the current list".to_string(),
-            });
-        }
-        if let Some(view_index) = merge_to_main
-            && let Some(view) = self.views.get(view_index)
-        {
-            self.pending_merge = Some(PendingMerge {
-                library: view.library.clone(),
-                target: DropTarget::Main,
-                label: view.name(),
-            });
-        }
-        if let Some((source, target)) = merge_from_view
-            && let Some(view) = self.views.get(source)
-        {
-            self.pending_merge = Some(PendingMerge {
-                library: view.library.clone(),
-                target: DropTarget::View(target),
-                label: view.name(),
-            });
-        }
-        if let Some((view_index, id)) = preview
-            && let Some(game) = self.views.get(view_index).and_then(|view| {
-                view.session
-                    .load(id, &std::collections::HashMap::new())
-                    .ok()
-            })
-        {
-            let label = format!(
-                "{} · {} vs {}",
-                self.views[view_index].name(),
-                game.white(),
-                game.black()
-            );
-            self.open_game_preview(game, label);
-        }
-    }
 
     fn pending_game_drop_dialog(&mut self, ctx: &egui::Context) {
         let Some(pending) = self.pending_game_drop.take() else {
@@ -17575,14 +17145,7 @@ impl App {
                     pending.game.white(),
                     pending.game.black()
                 ));
-                let target = match pending.target {
-                    DropTarget::Main => "the current list".to_string(),
-                    DropTarget::View(index) => self
-                        .views
-                        .get(index)
-                        .map(|view| view.name())
-                        .unwrap_or_else(|| "the database view".to_string()),
-                };
+                let target = "the current list";
                 ui.label(format!(
                     "Drop it at position {} in {target}, or append it to the end?",
                     pending.insert_at + 1
@@ -17614,14 +17177,7 @@ impl App {
         let mut window_open = true;
         let mut keep = true;
         let mut action = false;
-        let target = match pending.target {
-            DropTarget::Main => "the current list".to_string(),
-            DropTarget::View(index) => self
-                .views
-                .get(index)
-                .map(|view| view.name())
-                .unwrap_or_else(|| "the database view".to_string()),
-        };
+        let target = "the current list";
         let count = pending.library.len();
         egui::Window::new("Merge database")
             .open(&mut window_open)
@@ -17675,7 +17231,7 @@ impl App {
                 ));
                 ui.label(
                     RichText::new(
-                        "Merge skips duplicates; opening a view keeps the current database on the board.",
+                        "Merge skips duplicates; opening replaces the current database on the board.",
                     )
                     .small()
                     .weak(),
@@ -17687,9 +17243,6 @@ impl App {
                     }
                     if ui.button("Merge into current").clicked() {
                         action = Some(1);
-                    }
-                    if ui.button("Open in database views").clicked() {
-                        action = Some(2);
                     }
                     if ui.button("Cancel").clicked() {
                         keep = false;
@@ -17710,7 +17263,6 @@ impl App {
                     self.status = format!("Could not read {}: {err}", pending.path.display());
                 }
             },
-            Some(2) => self.open_database_view(&pending.path),
             _ => {
                 if window_open && keep {
                     self.pending_open_choice = Some(pending);
@@ -17965,6 +17517,31 @@ impl App {
                     .small()
                     .weak(),
                 );
+                ui.add_space(4.0);
+                ui.label(RichText::new("Game category colors").strong());
+                ui.label(
+                    RichText::new(
+                        "Colors used for game badges and lists across the preparation workspace.",
+                    )
+                    .small()
+                    .weak(),
+                );
+                egui::Grid::new("game_category_colors_grid")
+                    .num_columns(2)
+                    .spacing([12.0, 6.0])
+                    .show(ui, |ui| {
+                        for cat in players::GameCategory::ALL {
+                            ui.label(cat.label());
+                            let mut rgb = self.settings_category_colors.color_for(cat);
+                            if ui.color_edit_button_srgb(&mut rgb).changed() {
+                                self.settings_category_colors.set_color_for(cat, rgb);
+                            }
+                            ui.end_row();
+                        }
+                    });
+                if ui.button("Reset game colors").clicked() {
+                    self.settings_category_colors = settings::GameCategoryColors::default();
+                }
 
                 ui.add_space(8.0);
                 ui.separator();
@@ -18726,7 +18303,6 @@ impl eframe::App for App {
         self.index_confirmation_dialog(&ctx);
         self.branch_choice_dialog(&ctx);
         self.date_picker_dialog(&ctx);
-        self.database_views_window(&ctx);
         self.pending_game_drop_dialog(&ctx);
         self.pending_merge_dialog(&ctx);
         self.pending_open_dialog(&ctx);
@@ -21471,17 +21047,6 @@ fn moves_label(n: usize) -> String {
 #[derive(Clone, Copy)]
 struct GameRowDrag {
     id: usize,
-}
-
-#[derive(Clone, Copy)]
-struct ViewGameDrag {
-    view: usize,
-    id: usize,
-}
-
-#[derive(Clone, Copy)]
-struct ViewDatabaseDrag {
-    view: usize,
 }
 
 /// Two-line, full-width selectable row for the game list.
@@ -24670,8 +24235,6 @@ mod tests {
             current: Some(games.remove(0)),
             edited: std::collections::HashMap::new(),
             dirty: false,
-            views: Vec::new(),
-            views_open: false,
             pending_game_drop: None,
             pending_merge: None,
             pending_open_choice: None,
@@ -24779,6 +24342,7 @@ mod tests {
             prep_merged_games: Vec::new(),
             prep_load_rx: None,
             prep_load_job: None,
+            prep_load_progress: None,
             prep_saved_accounts: std::collections::HashMap::new(),
             recent_preview: None,
             reference_path: String::new(),
@@ -24824,6 +24388,7 @@ mod tests {
             show_player_photos: true,
             photo_size: PhotoSize::Small,
             champion_lineage: ChampionLineage::Fide,
+            category_colors: settings::GameCategoryColors::default(),
             photo_viewer: None,
             show_nav_buttons: false,
             show_pgn_tags: true,
@@ -24940,6 +24505,7 @@ mod tests {
             settings_show_all_ratings: false,
             settings_photo_size: PhotoSize::Small,
             settings_champion_lineage: ChampionLineage::Fide,
+            settings_category_colors: settings::GameCategoryColors::default(),
             settings_show_clocks: true,
             settings_show_annotations: true,
             settings_show_pgn_tags: true,
@@ -27726,5 +27292,79 @@ mod tests {
             browse.cursor_node, 4,
             "cursor must reset to the new anchor when the preparation position changes"
         );
+    }
+
+    #[test]
+    fn chessabc_trend_override_uses_reference_baseline_when_live_tree_is_all_recent() {
+        let mut app = test_app();
+        app.trend_source = crate::recent::TrendSource::ChessAbc;
+
+        let mut temp_path = std::env::temp_dir();
+        temp_path.push(format!("brett-baseline-test-{}.pgn", std::process::id()));
+        let mut pgn_content = String::new();
+        for _ in 0..25 {
+            pgn_content.push_str("[Event \"Old\"]\n[Date \"2020.01.01\"]\n\n1. e4 e5 1-0\n\n");
+        }
+        std::fs::write(&temp_path, &pgn_content).unwrap();
+        let idx = position::PositionIndex::build_cached(
+            &temp_path,
+            position::BuildOptions::default(),
+            |_| {},
+        )
+        .unwrap();
+        app.tree_index = Some(idx);
+
+        let today = players::today();
+        let today_str = format!("{:04}.{:02}.{:02}", today / 10000, (today % 10000) / 100, today % 100);
+        let mut live_pgn = String::new();
+        for _ in 0..15 {
+            live_pgn.push_str(&format!("[Event \"Recent\"]\n[Date \"{today_str}\"]\n\n1. e4 e5 1-0\n\n"));
+        }
+        let live_games = domain::parse_pgn(live_pgn.as_bytes()).unwrap();
+        app.chessabc_live_tree = Some(crate::recent::RecentTree::from_games(&live_games, today, 365));
+
+        let start = Chess::default();
+        let key = position::position_key(&start);
+        let trends = app.current_trend_override(&start, key);
+        assert!(trends.is_some(), "expected trend override, got None");
+        let trends = trends.unwrap();
+        assert!(!trends.is_empty(), "expected non-empty move trends");
+        let _ = std::fs::remove_file(temp_path);
+    }
+
+    #[test]
+    fn app_game_category_color_maps_all_variants() {
+        let mut app = test_app();
+        app.category_colors.otb_classical = [10, 20, 30];
+        app.category_colors.online_blitz = [40, 50, 60];
+        assert_eq!(
+            app.game_category_color(players::GameCategory::OtbClassical),
+            Color32::from_rgb(10, 20, 30)
+        );
+        assert_eq!(
+            app.game_category_color(players::GameCategory::OnlineBlitz),
+            Color32::from_rgb(40, 50, 60)
+        );
+        for &cat in &players::GameCategory::ALL {
+            let [r, g, b] = app.category_colors.color_for(cat);
+            assert_eq!(app.game_category_color(cat), Color32::from_rgb(r, g, b));
+        }
+    }
+
+    #[test]
+    fn truncate_status_error_strips_urls_and_truncates() {
+        let short = "Connection timed out";
+        assert_eq!(truncate_status_error(short), "Connection timed out");
+
+        let with_url = "requesting https://lichess.org/api/games/user/magnus failed: 504 Gateway Timeout";
+        let cleaned = truncate_status_error(with_url);
+        assert!(!cleaned.contains("https://"));
+        assert_eq!(cleaned, "requesting failed: 504 Gateway Timeout");
+
+        let long_err = "requesting https://lichess.org/api/games/user/magnus failed with a very long descriptive error message from the proxy gateway timeout";
+        let truncated = truncate_status_error(long_err);
+        assert!(!truncated.contains("https://"));
+        assert!(truncated.chars().count() <= 48);
+        assert!(truncated.ends_with('…'));
     }
 }

@@ -687,6 +687,81 @@ impl ChampionLineage {
 }
 
 /// Display preferences that do not affect database contents.
+/// Customizable font colors for the 9 game categories.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GameCategoryColors {
+    pub otb_classical: [u8; 3],
+    pub otb_rapid: [u8; 3],
+    pub otb_blitz: [u8; 3],
+    pub online_classical: [u8; 3],
+    pub online_rapid: [u8; 3],
+    pub online_blitz: [u8; 3],
+    pub online_bullet: [u8; 3],
+    pub correspondence: [u8; 3],
+    pub unknown: [u8; 3],
+}
+
+impl Default for GameCategoryColors {
+    fn default() -> Self {
+        Self {
+            otb_classical: [0x7E, 0xD3, 0x8A],
+            otb_rapid: [0x56, 0xB6, 0xC2],
+            otb_blitz: [0x61, 0xAF, 0xEF],
+            online_classical: [0xB4, 0x8E, 0xAD],
+            online_rapid: [0xC6, 0x78, 0xDD],
+            online_blitz: [0xE5, 0xC0, 0x7B],
+            online_bullet: [0xE0, 0x6C, 0x75],
+            correspondence: [0xD1, 0x9A, 0x66],
+            unknown: [0xEC, 0xEF, 0xF4],
+        }
+    }
+}
+
+impl GameCategoryColors {
+    pub fn color_for(&self, cat: crate::players::GameCategory) -> [u8; 3] {
+        match cat {
+            crate::players::GameCategory::OtbClassical => self.otb_classical,
+            crate::players::GameCategory::OtbRapid => self.otb_rapid,
+            crate::players::GameCategory::OtbBlitz => self.otb_blitz,
+            crate::players::GameCategory::OnlineClassical => self.online_classical,
+            crate::players::GameCategory::OnlineRapid => self.online_rapid,
+            crate::players::GameCategory::OnlineBlitz => self.online_blitz,
+            crate::players::GameCategory::OnlineBullet => self.online_bullet,
+            crate::players::GameCategory::Correspondence => self.correspondence,
+            crate::players::GameCategory::Unknown => self.unknown,
+        }
+    }
+
+    pub fn set_color_for(&mut self, cat: crate::players::GameCategory, rgb: [u8; 3]) {
+        match cat {
+            crate::players::GameCategory::OtbClassical => self.otb_classical = rgb,
+            crate::players::GameCategory::OtbRapid => self.otb_rapid = rgb,
+            crate::players::GameCategory::OtbBlitz => self.otb_blitz = rgb,
+            crate::players::GameCategory::OnlineClassical => self.online_classical = rgb,
+            crate::players::GameCategory::OnlineRapid => self.online_rapid = rgb,
+            crate::players::GameCategory::OnlineBlitz => self.online_blitz = rgb,
+            crate::players::GameCategory::OnlineBullet => self.online_bullet = rgb,
+            crate::players::GameCategory::Correspondence => self.correspondence = rgb,
+            crate::players::GameCategory::Unknown => self.unknown = rgb,
+        }
+    }
+}
+
+fn rgb_to_hex(rgb: [u8; 3]) -> String {
+    format!("#{:02X}{:02X}{:02X}", rgb[0], rgb[1], rgb[2])
+}
+
+fn hex_to_rgb(hex: &str) -> Option<[u8; 3]> {
+    let hex = hex.trim().trim_start_matches('#');
+    if hex.len() != 6 {
+        return None;
+    }
+    let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+    Some([r, g, b])
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DisplayPrefs {
     pub rating_priority: RatingPriority,
@@ -762,6 +837,8 @@ pub struct DisplayPrefs {
     /// When preparation is active, restrict the left game list to games where
     /// the opponent plays the facing colour. The chip offers Show all.
     pub prep_filter_facing_color: bool,
+    /// Customizable game category font colors.
+    pub category_colors: GameCategoryColors,
 }
 
 impl Default for DisplayPrefs {
@@ -788,6 +865,7 @@ impl Default for DisplayPrefs {
             show_clocks: true,
             engine_bar: true,
             prep_filter_facing_color: true,
+            category_colors: GameCategoryColors::default(),
             review_skip_book: true,
             review_book_min_games: 3,
             review_book_max_plies: 30,
@@ -976,6 +1054,52 @@ impl DisplayPrefs {
             .get("prep_filter_facing_color")
             .and_then(Value::as_bool)
             .unwrap_or(true);
+        let mut category_colors = GameCategoryColors::default();
+        if let Some(colors_obj) = value.get("category_colors") {
+            let parse = |key: &str| {
+                if let Some(s) = colors_obj.get(key).and_then(Value::as_str) {
+                    hex_to_rgb(s)
+                } else if let Some(arr) = colors_obj.get(key).and_then(Value::as_array) {
+                    if arr.len() == 3 {
+                        let r = arr[0].as_u64()? as u8;
+                        let g = arr[1].as_u64()? as u8;
+                        let b = arr[2].as_u64()? as u8;
+                        Some([r, g, b])
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            };
+            if let Some(c) = parse("otb_classical") {
+                category_colors.otb_classical = c;
+            }
+            if let Some(c) = parse("otb_rapid") {
+                category_colors.otb_rapid = c;
+            }
+            if let Some(c) = parse("otb_blitz") {
+                category_colors.otb_blitz = c;
+            }
+            if let Some(c) = parse("online_classical") {
+                category_colors.online_classical = c;
+            }
+            if let Some(c) = parse("online_rapid") {
+                category_colors.online_rapid = c;
+            }
+            if let Some(c) = parse("online_blitz") {
+                category_colors.online_blitz = c;
+            }
+            if let Some(c) = parse("online_bullet") {
+                category_colors.online_bullet = c;
+            }
+            if let Some(c) = parse("correspondence") {
+                category_colors.correspondence = c;
+            }
+            if let Some(c) = parse("unknown") {
+                category_colors.unknown = c;
+            }
+        }
         Self {
             rating_priority,
             show_all_ratings,
@@ -1008,6 +1132,7 @@ impl DisplayPrefs {
             engine_depth,
             engine_time_ms,
             prep_filter_facing_color,
+            category_colors,
         }
     }
 
@@ -1044,6 +1169,17 @@ impl DisplayPrefs {
             "engine_depth": self.engine_depth,
             "engine_time_ms": self.engine_time_ms,
             "prep_filter_facing_color": self.prep_filter_facing_color,
+            "category_colors": {
+                "otb_classical": rgb_to_hex(self.category_colors.otb_classical),
+                "otb_rapid": rgb_to_hex(self.category_colors.otb_rapid),
+                "otb_blitz": rgb_to_hex(self.category_colors.otb_blitz),
+                "online_classical": rgb_to_hex(self.category_colors.online_classical),
+                "online_rapid": rgb_to_hex(self.category_colors.online_rapid),
+                "online_blitz": rgb_to_hex(self.category_colors.online_blitz),
+                "online_bullet": rgb_to_hex(self.category_colors.online_bullet),
+                "correspondence": rgb_to_hex(self.category_colors.correspondence),
+                "unknown": rgb_to_hex(self.category_colors.unknown),
+            },
         }))
         .unwrap_or_default()
     }
@@ -1521,6 +1657,7 @@ mod tests {
             engine_depth: 30,
             engine_time_ms: 2_500,
             prep_filter_facing_color: true,
+            category_colors: GameCategoryColors::default(),
         };
         assert_eq!(DisplayPrefs::from_json(&prefs.to_json()), prefs);
         assert_eq!(DisplayPrefs::from_json("not json"), DisplayPrefs::default());
@@ -1738,5 +1875,32 @@ mod tests {
             loaded.references.lichess_username,
             Some("grandmaster".to_string())
         );
+    }
+
+    #[test]
+    fn display_prefs_round_trips_game_category_colors() {
+        let mut prefs = DisplayPrefs::default();
+        prefs.category_colors.otb_classical = [0x11, 0x22, 0x33];
+        prefs.category_colors.online_bullet = [0xAA, 0xBB, 0xCC];
+        let json = prefs.to_json();
+        assert!(json.contains("#112233"));
+        assert!(json.contains("#AABBCC"));
+        let loaded = DisplayPrefs::from_json(&json);
+        assert_eq!(loaded.category_colors.otb_classical, [0x11, 0x22, 0x33]);
+        assert_eq!(loaded.category_colors.online_bullet, [0xAA, 0xBB, 0xCC]);
+        assert_eq!(
+            loaded.category_colors.otb_rapid,
+            GameCategoryColors::default().otb_rapid
+        );
+    }
+
+    #[test]
+    fn game_category_colors_color_for_and_set_color_for_all_variants() {
+        let mut colors = GameCategoryColors::default();
+        for (i, &cat) in crate::players::GameCategory::ALL.iter().enumerate() {
+            let rgb = [(i * 10) as u8, (i * 20) as u8, (i * 25) as u8];
+            colors.set_color_for(cat, rgb);
+            assert_eq!(colors.color_for(cat), rgb);
+        }
     }
 }
