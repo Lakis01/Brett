@@ -20299,21 +20299,14 @@ fn map_search_url(site: &str) -> String {
     )
 }
 
-/// Open an external URL in the user's default browser, using the `webbrowser`
-/// crate for desktop environments and falling back to egui's platform bridge.
+/// Open an external URL in the user's default browser via egui.
 fn open_browser_url(ctx: &egui::Context, url: &str) {
-    if webbrowser::open(url).is_err() {
-        ctx.open_url(egui::OpenUrl::new_tab(url));
-    }
+    ctx.open_url(egui::OpenUrl::new_tab(url));
 }
 
-/// Copy text to the clipboard, synchronizing with egui's context and
-/// directly updating the system clipboard with `arboard` as a fallback.
+/// Copy text to the clipboard via egui.
 fn copy_to_clipboard(ctx: &egui::Context, text: &str) {
     ctx.copy_text(text.to_string());
-    if let Ok(mut clipboard) = arboard::Clipboard::new() {
-        let _ = clipboard.set_text(text.to_string());
-    }
 }
 
 /// Header card above the PGN move list. Date sits on the left, the tournament
@@ -24987,6 +24980,8 @@ mod tests {
             elo_sum: 0,
             elo_count: 0,
             elo_max: 0,
+            latest_otb_elo: None,
+            latest_otb_date: 0,
             opponent_elo_sum: 0,
             opponent_elo_count: 0,
             first_year: 0,

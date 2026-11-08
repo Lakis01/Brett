@@ -76,8 +76,8 @@ pub fn import(
     let max_games = max_games.clamp(1, 5000);
     let agent = ureq::AgentBuilder::new()
         .user_agent(USER_AGENT)
-        .timeout_connect(Duration::from_secs(20))
-        .timeout(Duration::from_secs(180))
+        .timeout_connect(Duration::from_secs(15))
+        .timeout_read(Duration::from_secs(30))
         .build();
 
     let (body, games) = download_player_pgn(&agent, source, username, max_games, &mut progress)?;
@@ -134,22 +134,65 @@ pub fn fetch_player_games(
     username: &str,
     max_games: usize,
 ) -> Result<Vec<domain::Game>> {
+    fetch_player_games_filtered(source, username, max_games, None, 0)
+}
+
+/// Download a player's recent public games with optional account filtering.
+pub fn fetch_player_games_filtered(
+    source: OnlineSource,
+    username: &str,
+    max_games: usize,
+    filter: Option<&crate::players::AccountFilter>,
+    as_of: u32,
+) -> Result<Vec<domain::Game>> {
     let username = validate_query(source, username)?;
     let max_games = normalized_max_games(max_games);
     let agent = ureq::AgentBuilder::new()
         .user_agent(USER_AGENT)
-        .timeout_connect(Duration::from_secs(20))
-        .timeout(Duration::from_secs(180))
+        .timeout_connect(Duration::from_secs(15))
+        .timeout_read(Duration::from_secs(30))
         .build();
-    let (body, _) = download_player_pgn(&agent, source, username, max_games, &mut |_message| {})?;
-    let games = domain::parse_pgn(body.as_bytes()).context("parsing downloaded games")?;
-    if games.is_empty() {
-        bail!(
-            "{} returned no parseable games for {username}",
-            source.label()
-        );
+
+    match source {
+        OnlineSource::Lichess => {
+            let url = lichess_export_url_filtered(username, max_games, filter, as_of);
+            let response = agent
+                .get(&url)
+                .set("Accept", "application/x-chess-pgn")
+                .call()
+                .with_context(|| format!("requesting {url}"))?;
+            let reader = std::io::BufReader::new(response.into_reader());
+            let (body, _) = read_pgn_stream_incremental(reader, max_games, |_| {})?;
+            let games = domain::parse_pgn(body.as_bytes()).context("parsing downloaded games")?;
+            if games.is_empty() {
+                bail!("Lichess returned no parseable games for {username}");
+            }
+            Ok(games)
+        }
+        OnlineSource::ChessCom => {
+            let (body, _) = download_player_pgn(&agent, source, username, max_games, &mut |_| {})?;
+            let mut games = domain::parse_pgn(body.as_bytes()).context("parsing downloaded games")?;
+            if let Some(filter) = filter {
+                games.retain(|g| filter.matches_game(g, as_of));
+            }
+            if games.is_empty() {
+                bail!("Chess.com returned no parseable games for {username}");
+            }
+            Ok(games)
+        }
+        OnlineSource::ChessAbc => {
+            let player = resolve_chessabc_player(&agent, username)?;
+            let (body, _) = download_chessabc_games(&agent, &player.fide_id, max_games, &mut |_| {})?;
+            let mut games = domain::parse_pgn(body.as_bytes()).context("parsing downloaded games")?;
+            if let Some(filter) = filter {
+                games.retain(|g| filter.matches_game(g, as_of));
+            }
+            if games.is_empty() {
+                bail!("ChessABC returned no parseable games for {}", player.name);
+            }
+            Ok(games)
+        }
     }
-    Ok(games)
 }
 
 /// Resolve a ChessABC player and download their latest games. The resolved
@@ -163,8 +206,8 @@ pub fn fetch_chessabc_player_games(
     let max_games = normalized_max_games(max_games);
     let agent = ureq::AgentBuilder::new()
         .user_agent(USER_AGENT)
-        .timeout_connect(Duration::from_secs(20))
-        .timeout(Duration::from_secs(180))
+        .timeout_connect(Duration::from_secs(15))
+        .timeout_read(Duration::from_secs(30))
         .build();
     let player = resolve_chessabc_player(&agent, query)?;
     let (body, _) =
@@ -183,41 +226,60 @@ pub fn fetch_recent_chessabc_games(max_games: usize) -> Result<Vec<domain::Game>
     let max_games = max_games.clamp(1, 5_000);
     let agent = ureq::AgentBuilder::new()
         .user_agent(USER_AGENT)
-        .timeout_connect(Duration::from_secs(20))
-        .timeout(Duration::from_secs(180))
+        .timeout_connect(Duration::from_secs(15))
+        .timeout_read(Duration::from_secs(30))
         .build();
-    let mut pgns = Vec::new();
-    let mut page = 0usize;
-    loop {
-        let url = format!("https://api.chessabc.com/games/paginated?page={page}&size={PAGE_SIZE}");
-        let body = get_text(&agent, &url, Some("application/json"))?;
-        let value: Value =
-            serde_json::from_str(&body).context("ChessABC returned invalid game data")?;
-        let content = value
-            .get("content")
-            .and_then(Value::as_array)
-            .context("ChessABC response has no content array")?;
-        if content.is_empty() {
-            break;
+
+    let target_pages = max_games.div_ceil(PAGE_SIZE).min(5);
+    let page_results: Vec<Result<Vec<String>>> = std::thread::scope(|s| {
+        let mut handles = Vec::with_capacity(target_pages);
+        for page in 0..target_pages {
+            let agent = &agent;
+            handles.push(s.spawn(move || {
+                let url = format!(
+                    "https://api.chessabc.com/games/paginated?page={page}&size={PAGE_SIZE}"
+                );
+                let body = get_text(agent, &url, Some("application/json"))?;
+                let value: Value = serde_json::from_str(&body)
+                    .context("ChessABC returned invalid game data")?;
+                let content = value
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .context("ChessABC response has no content array")?;
+                let mut page_pgns = Vec::new();
+                for game in content {
+                    if let Some(pgn) = chessabc_pgn(game) {
+                        page_pgns.push(pgn);
+                    }
+                }
+                Ok(page_pgns)
+            }));
         }
-        for game in content {
-            if let Some(pgn) = chessabc_pgn(game) {
-                pgns.push(pgn);
-                if pgns.len() >= max_games {
-                    break;
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap_or_else(|_| Err(anyhow::anyhow!("thread panic"))))
+            .collect()
+    });
+
+    let mut pgns = Vec::new();
+    for page_res in page_results {
+        match page_res {
+            Ok(page_pgns) => {
+                for pgn in page_pgns {
+                    pgns.push(pgn);
+                    if pgns.len() >= max_games {
+                        break;
+                    }
                 }
             }
+            Err(e) if pgns.is_empty() => return Err(e),
+            Err(_) => break,
         }
         if pgns.len() >= max_games {
             break;
         }
-        let total_pages = value.get("totalPages").and_then(Value::as_u64).unwrap_or(1);
-        if (page as u64) + 1 >= total_pages {
-            break;
-        }
-        page += 1;
-        std::thread::sleep(Duration::from_millis(60));
     }
+
     if pgns.is_empty() {
         bail!("ChessABC returned no recent standard games");
     }
@@ -240,16 +302,152 @@ fn normalized_max_games(max_games: usize) -> usize {
     }
 }
 
-fn lichess_export_url(username: &str, max_games: usize) -> String {
-    if max_games == 0 || max_games > 50_000 {
-        format!(
-            "https://lichess.org/api/games/user/{username}?clocks=false&evals=false&opening=false&tags=true&sort=dateDesc"
-        )
-    } else {
-        format!(
-            "https://lichess.org/api/games/user/{username}?max={max_games}&clocks=false&evals=false&opening=false&tags=true&sort=dateDesc"
-        )
+pub fn lichess_export_url_filtered(
+    username: &str,
+    max_games: usize,
+    filter: Option<&crate::players::AccountFilter>,
+    as_of: u32,
+) -> String {
+    let mut params = Vec::new();
+    if max_games > 0 && max_games <= 50_000 {
+        params.push(format!("max={max_games}"));
     }
+    if let Some(filter) = filter {
+        let mut perfs = Vec::new();
+        if filter.time_controls.classical {
+            perfs.push("classical");
+        }
+        if filter.time_controls.rapid {
+            perfs.push("rapid");
+        }
+        if filter.time_controls.blitz {
+            perfs.push("blitz");
+        }
+        if filter.time_controls.bullet {
+            perfs.push("bullet");
+        }
+        if !perfs.is_empty() && perfs.len() < 4 {
+            params.push(format!("perfType={}", perfs.join(",")));
+        }
+
+        if filter.include_rated && !filter.include_casual {
+            params.push("rated=true".to_string());
+        } else if !filter.include_rated && filter.include_casual {
+            params.push("rated=false".to_string());
+        }
+
+        match filter.date_cutoff {
+            crate::players::DateCutoff::AllTime => {}
+            crate::players::DateCutoff::SinceDate(since) => {
+                if let Some(days) = crate::players::date_to_days(since) {
+                    let unix_ms = (days.max(0) as u64) * 86_400 * 1000;
+                    params.push(format!("since={unix_ms}"));
+                }
+            }
+            crate::players::DateCutoff::Months(months) => {
+                if let Some(as_of_days) = crate::players::date_to_days(as_of) {
+                    let limit_days = (f64::from(months) * 365.25 / 12.0).ceil() as i64;
+                    let since_days = as_of_days - limit_days;
+                    let unix_ms = (since_days.max(0) as u64) * 86_400 * 1000;
+                    params.push(format!("since={unix_ms}"));
+                }
+            }
+        }
+    }
+    params.push("clocks=false".to_string());
+    params.push("evals=false".to_string());
+    params.push("opening=false".to_string());
+    params.push("tags=true".to_string());
+    params.push("sort=dateDesc".to_string());
+
+    format!(
+        "https://lichess.org/api/games/user/{username}?{}",
+        params.join("&")
+    )
+}
+
+fn lichess_export_url(username: &str, max_games: usize) -> String {
+    lichess_export_url_filtered(username, max_games, None, 0)
+}
+
+/// Read a PGN stream incrementally line-by-line, calling `progress` after
+/// each complete game. If a read error or timeout occurs after at least one game
+/// was read, returns the completed games instead of failing.
+pub fn read_pgn_stream_incremental(
+    mut reader: impl std::io::BufRead,
+    max_games: usize,
+    mut progress: impl FnMut(usize),
+) -> Result<(String, usize)> {
+    let mut completed_games = String::new();
+    let mut current_game = String::new();
+    let mut games_count = 0usize;
+    let mut seen_moves = false;
+    let mut line_buf = String::new();
+
+    loop {
+        line_buf.clear();
+        match reader.read_line(&mut line_buf) {
+            Ok(0) => {
+                if seen_moves && !current_game.trim().is_empty() {
+                    completed_games.push_str(&current_game);
+                    if !completed_games.ends_with('\n') {
+                        completed_games.push('\n');
+                    }
+                    games_count += 1;
+                    progress(games_count);
+                }
+                break;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                if games_count >= 1 {
+                    return Ok((completed_games, games_count));
+                }
+                return Err(e).context("reading PGN stream");
+            }
+        };
+
+        let trimmed = line_buf.trim();
+
+        if trimmed.starts_with('[') && seen_moves {
+            completed_games.push_str(&current_game);
+            if !completed_games.ends_with('\n') {
+                completed_games.push('\n');
+            }
+            current_game.clear();
+            seen_moves = false;
+            games_count += 1;
+            progress(games_count);
+            if games_count >= max_games {
+                return Ok((completed_games, games_count));
+            }
+        }
+
+        current_game.push_str(&line_buf);
+
+        if !trimmed.is_empty() && !trimmed.starts_with('[') {
+            seen_moves = true;
+            if trimmed.ends_with("1-0")
+                || trimmed.ends_with("0-1")
+                || trimmed.ends_with("1/2-1/2")
+                || trimmed.ends_with('*')
+            {
+                completed_games.push_str(&current_game);
+                if !completed_games.ends_with('\n') {
+                    completed_games.push('\n');
+                }
+                current_game.clear();
+                seen_moves = false;
+                games_count += 1;
+                progress(games_count);
+                if games_count >= max_games {
+                    return Ok((completed_games, games_count));
+                }
+            }
+        }
+    }
+
+    Ok((completed_games, games_count))
 }
 
 fn download_player_pgn(
@@ -263,11 +461,19 @@ fn download_player_pgn(
         OnlineSource::Lichess => {
             progress(format!("Downloading {username}'s Lichess games…"));
             let url = lichess_export_url(username, max_games);
-            let body = get_text(agent, &url, Some("application/x-chess-pgn"))?;
+            let response = agent
+                .get(&url)
+                .set("Accept", "application/x-chess-pgn")
+                .call()
+                .with_context(|| format!("requesting {url}"))?;
+            let reader = std::io::BufReader::new(response.into_reader());
+            let (body, count) = read_pgn_stream_incremental(reader, max_games, |c| {
+                progress(format!("Downloading {username}'s Lichess games · {c} games…"));
+            })?;
             if body.trim().is_empty() {
                 bail!("Lichess returned no games for {username}");
             }
-            Ok((body, None))
+            Ok((body, Some(count)))
         }
         OnlineSource::ChessCom => {
             progress(format!("Finding {username}'s Chess.com archives…"));
@@ -450,14 +656,20 @@ pub fn candidate_matches_query(query: &str, candidate_name: &str) -> bool {
             .cloned()
             .collect();
 
-        let (cand_surname, cand_given_tokens) = if let Some((head, tail)) = candidate_name.split_once(',') {
+        let (cand_surname, cand_given_tokens) = if let Some((head, tail)) =
+            candidate_name.split_once(',')
+        {
             let s = normalized_name_tokens(head).join("");
             let g: Vec<String> = normalized_name_tokens(tail)
                 .into_iter()
                 .filter(|t| !["dr", "prof", "ing", "mag", "dipl", "jr", "sr"].contains(&t.as_str()))
                 .map(|t| {
                     let clean = t.trim_end_matches(|c: char| c.is_ascii_digit());
-                    if !clean.is_empty() { clean.to_string() } else { t }
+                    if !clean.is_empty() {
+                        clean.to_string()
+                    } else {
+                        t
+                    }
                 })
                 .collect();
             (s, g)
@@ -467,10 +679,16 @@ pub fn candidate_matches_query(query: &str, candidate_name: &str) -> bool {
             let g = if c_tokens.len() > 1 {
                 c_tokens[1..]
                     .iter()
-                    .filter(|t| !["dr", "prof", "ing", "mag", "dipl", "jr", "sr"].contains(&t.as_str()))
+                    .filter(|t| {
+                        !["dr", "prof", "ing", "mag", "dipl", "jr", "sr"].contains(&t.as_str())
+                    })
                     .map(|t| {
                         let clean = t.trim_end_matches(|c: char| c.is_ascii_digit());
-                        if !clean.is_empty() { clean.to_string() } else { t.clone() }
+                        if !clean.is_empty() {
+                            clean.to_string()
+                        } else {
+                            t.clone()
+                        }
                     })
                     .collect()
             } else {
@@ -591,8 +809,8 @@ pub fn search_chessabc_candidates(query: &str) -> Result<Vec<ChessAbcPlayer>> {
     let query = validate_query(OnlineSource::ChessAbc, query)?.to_string();
     let agent = ureq::AgentBuilder::new()
         .user_agent(USER_AGENT)
-        .timeout_connect(Duration::from_secs(20))
-        .timeout(Duration::from_secs(180))
+        .timeout_connect(Duration::from_secs(15))
+        .timeout_read(Duration::from_secs(30))
         .build();
     if query.chars().all(|c| c.is_ascii_digit()) {
         let count = chessabc_player_game_count(&agent, &query);
@@ -766,8 +984,8 @@ pub fn fetch_chessabc_games_by_fide_id(
     let max_games = normalized_max_games(max_games);
     let agent = ureq::AgentBuilder::new()
         .user_agent(USER_AGENT)
-        .timeout_connect(Duration::from_secs(20))
-        .timeout(Duration::from_secs(180))
+        .timeout_connect(Duration::from_secs(15))
+        .timeout_read(Duration::from_secs(30))
         .build();
     let (body, _) = download_chessabc_games(&agent, fide_id, max_games, &mut |_message| {})?;
     let games = domain::parse_pgn(body.as_bytes()).context("parsing downloaded games")?;
@@ -1571,5 +1789,65 @@ mod tests {
             lichess_export_url("DrNykterstein", 300),
             "https://lichess.org/api/games/user/DrNykterstein?max=300&clocks=false&evals=false&opening=false&tags=true&sort=dateDesc"
         );
+    }
+
+    #[test]
+    fn lichess_export_url_includes_perf_type_rated_and_since() {
+        let mut filter = crate::players::AccountFilter::default();
+        let url = lichess_export_url_filtered("Makefrench", usize::MAX, Some(&filter), 20261108);
+        assert!(
+            url.contains("perfType=classical,rapid,blitz"),
+            "url was {url}"
+        );
+        assert!(!url.contains("max="), "url was {url}");
+
+        filter.include_casual = false;
+        filter.date_cutoff = crate::players::DateCutoff::SinceDate(20260101);
+        let url2 = lichess_export_url_filtered("Makefrench", 200, Some(&filter), 20261108);
+        assert!(url2.contains("max=200"), "url was {url2}");
+        assert!(url2.contains("rated=true"), "url was {url2}");
+        assert!(url2.contains("since="), "url was {url2}");
+    }
+
+    struct TimeoutAfterReader {
+        data: Vec<u8>,
+        pos: usize,
+    }
+
+    impl std::io::Read for TimeoutAfterReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.pos < self.data.len() {
+                let bytes_to_copy = (self.data.len() - self.pos).min(buf.len());
+                buf[..bytes_to_copy]
+                    .copy_from_slice(&self.data[self.pos..self.pos + bytes_to_copy]);
+                self.pos += bytes_to_copy;
+                Ok(bytes_to_copy)
+            } else {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "simulated read timeout",
+                ))
+            }
+        }
+    }
+
+    #[test]
+    fn read_pgn_stream_incremental_keeps_complete_games_on_partial_timeout() {
+        let pgn_data = b"[Event \"Game 1\"]\n[Result \"1-0\"]\n\n1. e4 e5 1-0\n\n[Event \"Game 2\"]\n[Result \"0-1\"]\n\n1. d4 d5 0-1\n\n[Event \"Game 3 incomplete\"]\n";
+        let reader = std::io::BufReader::new(TimeoutAfterReader {
+            data: pgn_data.to_vec(),
+            pos: 0,
+        });
+        let mut progress_calls = Vec::new();
+        let result = read_pgn_stream_incremental(reader, 10, |count| {
+            progress_calls.push(count);
+        });
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
+        let (body, count) = result.unwrap();
+        assert_eq!(count, 2);
+        assert!(body.contains("Game 1"));
+        assert!(body.contains("Game 2"));
+        assert!(!body.contains("Game 3"));
+        assert_eq!(progress_calls, vec![1, 2]);
     }
 }

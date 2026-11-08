@@ -92,6 +92,8 @@ pub struct PlayerSummary {
     pub elo_sum: u64,
     pub elo_count: u32,
     pub elo_max: u32,
+    pub latest_otb_elo: Option<u16>,
+    pub latest_otb_date: u32,
     pub opponent_elo_sum: u64,
     pub opponent_elo_count: u32,
     pub first_year: u16,
@@ -153,7 +155,15 @@ impl PlayerSummary {
             (first, last) => format!("{first}–{last}"),
         }
     }
+
+    pub fn display_elo(&self) -> Option<u16> {
+        self.latest_otb_elo
+            .or_else(|| (self.elo_max > 0).then_some(self.elo_max as u16))
+    }
 }
+
+pub type Player = PlayerSummary;
+pub type PlayerIndex = PlayerDirectory;
 
 /// All players found in the database, sorted by activity.
 #[derive(Clone, Debug, Default)]
@@ -201,6 +211,8 @@ impl PlayerDirectory {
                 elo_sum: 0,
                 elo_count: 0,
                 elo_max: accelerated.elo_max,
+                latest_otb_elo: None,
+                latest_otb_date: 0,
                 opponent_elo_sum: 0,
                 opponent_elo_count: 0,
                 first_year: accelerated.first_year,
@@ -263,6 +275,8 @@ impl PlayerDirectory {
                         elo_sum: 0,
                         elo_count: 0,
                         elo_max: 0,
+                        latest_otb_elo: None,
+                        latest_otb_date: 0,
                         opponent_elo_sum: 0,
                         opponent_elo_count: 0,
                         first_year: 0,
@@ -290,6 +304,8 @@ impl PlayerDirectory {
                         elo_sum: 0,
                         elo_count: 0,
                         elo_max: 0,
+                        latest_otb_elo: None,
+                        latest_otb_date: 0,
                         opponent_elo_sum: 0,
                         opponent_elo_count: 0,
                         first_year: 0,
@@ -319,6 +335,8 @@ impl PlayerDirectory {
                         elo_sum: 0,
                         elo_count: 0,
                         elo_max: 0,
+                        latest_otb_elo: None,
+                        latest_otb_date: 0,
                         opponent_elo_sum: 0,
                         opponent_elo_count: 0,
                         first_year: 0,
@@ -341,6 +359,8 @@ impl PlayerDirectory {
                         elo_sum: 0,
                         elo_count: 0,
                         elo_max: 0,
+                        latest_otb_elo: None,
+                        latest_otb_date: 0,
                         opponent_elo_sum: 0,
                         opponent_elo_count: 0,
                         first_year: 0,
@@ -399,6 +419,8 @@ impl PlayerDirectory {
             elo_sum: 0,
             elo_count: 0,
             elo_max: 0,
+            latest_otb_elo: None,
+            latest_otb_date: 0,
             opponent_elo_sum: 0,
             opponent_elo_count: 0,
             first_year: 0,
@@ -420,6 +442,13 @@ impl PlayerDirectory {
             .filter(|(_, player)| player.name.to_lowercase().contains(&needle))
             .map(|(index, _)| index)
             .collect()
+    }
+
+    pub fn find_player(&self, query: &str) -> Option<&PlayerSummary> {
+        let key = player_key(query).unwrap_or_else(|| query.trim().to_lowercase());
+        self.find_key(&key)
+            .and_then(|idx| self.get(idx))
+            .or_else(|| self.players.iter().find(|p| p.name.eq_ignore_ascii_case(query.trim())))
     }
 }
 
@@ -506,6 +535,13 @@ fn add_game(
         summary.elo_sum += u64::from(elo);
         summary.elo_count += 1;
         summary.elo_max = summary.elo_max.max(elo);
+
+        let date_num = parse_date(game.date()).unwrap_or(0);
+        let site = game.header("Site").unwrap_or("?");
+        if !looks_online(game.event(), site) && elo > 0 && date_num >= summary.latest_otb_date {
+            summary.latest_otb_elo = Some(elo as u16);
+            summary.latest_otb_date = date_num;
+        }
     }
     if let Some(elo) = opponent_elo {
         summary.opponent_elo_sum += u64::from(elo);
@@ -770,29 +806,61 @@ pub fn canonicalize_player_tags(game: &mut Game, canonical_name: &str) {
     }
 }
 
-static CHESSCOM_TOURNAMENT_EVENT_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(
-    || {
-        regex::Regex::new(
-        r"(?i)(\btitled\s+tuesday\b|\bpro(?:\s+chess)?\s+league\b|\barena\s+kings\b|\b(?:speed|bullet)\s+chess\s+championship\b)",
-    )
-    .expect("valid regex")
-    },
-);
+fn ascii_tokens(s: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    for c in s.chars() {
+        if c.is_ascii_alphanumeric() {
+            current.push(c.to_ascii_lowercase());
+        } else if !current.is_empty() {
+            tokens.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
 
-/// Chess.com's online tournament site marker (`Site "Chess.com INT"`).
-static CHESSCOM_INT_SITE_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-    regex::Regex::new(r"(?i)\bchess\.?com\b.*\bint\b|\bint\b.*\bchess\.?com\b")
-        .expect("valid regex")
-});
+fn contains_token_subslice(tokens: &[String], sub: &[&str]) -> bool {
+    if sub.is_empty() || tokens.len() < sub.len() {
+        return false;
+    }
+    tokens.windows(sub.len()).any(|window| {
+        window.iter().zip(sub.iter()).all(|(w, s)| w == *s)
+    })
+}
 
-/// Event keywords that mark a Chess.com INT game as a tournament game rather
-/// than an ordinary online account game.
-static TOURNAMENT_KEYWORD_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-    regex::Regex::new(
-        r"(?i)\b(tournament|championship|league|cup|arena|swiss|grand\s*prix|qualifier|playoff|final|open|tuesday|kings)\b",
-    )
-    .expect("valid regex")
-});
+fn is_chesscom_tournament_event_name(event: &str) -> bool {
+    let tokens = ascii_tokens(event);
+    contains_token_subslice(&tokens, &["titled", "tuesday"])
+        || contains_token_subslice(&tokens, &["arena", "kings"])
+        || contains_token_subslice(&tokens, &["pro", "chess", "league"])
+        || contains_token_subslice(&tokens, &["pro", "league"])
+        || contains_token_subslice(&tokens, &["speed", "chess", "championship"])
+        || contains_token_subslice(&tokens, &["bullet", "chess", "championship"])
+}
+
+fn is_chesscom_int_site(site: &str) -> bool {
+    let tokens = ascii_tokens(site);
+    let has_int = tokens.iter().any(|t| t == "int");
+    let has_chesscom = tokens.iter().any(|t| t == "chesscom")
+        || contains_token_subslice(&tokens, &["chess", "com"]);
+    has_int && has_chesscom
+}
+
+fn has_tournament_keyword(event: &str) -> bool {
+    let tokens = ascii_tokens(event);
+    for t in &tokens {
+        match t.as_str() {
+            "tournament" | "championship" | "league" | "cup" | "arena" | "swiss"
+            | "qualifier" | "playoff" | "final" | "open" | "tuesday" | "kings"
+            | "grandprix" => return true,
+            _ => {}
+        }
+    }
+    contains_token_subslice(&tokens, &["grand", "prix"])
+}
 
 /// Determine whether a game belongs to a Chess.com online tournament that
 /// should be excluded from serious opening preparation.
@@ -810,13 +878,12 @@ pub fn is_chesscom_tournament_game(event: &str, site: &str) -> bool {
     let event_trimmed = event.trim();
 
     // 1. Named Chess.com tournament events, wherever they were reported.
-    if CHESSCOM_TOURNAMENT_EVENT_RE.is_match(event_trimmed) {
+    if is_chesscom_tournament_event_name(event_trimmed) {
         return true;
     }
 
     // 2. Chess.com INT site with an event that reads like a tournament.
-    if CHESSCOM_INT_SITE_RE.is_match(site_trimmed) && TOURNAMENT_KEYWORD_RE.is_match(event_trimmed)
-    {
+    if is_chesscom_int_site(site_trimmed) && has_tournament_keyword(event_trimmed) {
         return true;
     }
 
@@ -917,6 +984,8 @@ fn tc_from_event_keywords(event: &str) -> Option<TimeControlClass> {
     } else if lower.contains("titled tuesday") {
         // Titled Tuesday is an 11-round blitz event.
         Some(TimeControlClass::Blitz)
+    } else if lower.contains("classical") {
+        Some(TimeControlClass::Classical)
     } else {
         None
     }
@@ -986,6 +1055,104 @@ pub fn classify_game_metadata(game: &Game) -> (TimeControlClass, bool, bool) {
             TimeControlClass::Classical
         });
     (tc, is_online, is_rated)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum GameCategory {
+    OtbClassical,
+    OtbRapid,
+    OtbBlitz,
+    OnlineClassical,
+    OnlineRapid,
+    OnlineBlitz,
+    OnlineBullet,
+    Correspondence,
+    Unknown,
+}
+
+impl GameCategory {
+    pub const ALL: [Self; 9] = [
+        Self::OtbClassical,
+        Self::OtbRapid,
+        Self::OtbBlitz,
+        Self::OnlineClassical,
+        Self::OnlineRapid,
+        Self::OnlineBlitz,
+        Self::OnlineBullet,
+        Self::Correspondence,
+        Self::Unknown,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::OtbClassical => "OTB Classical",
+            Self::OtbRapid => "OTB Rapid",
+            Self::OtbBlitz => "OTB Blitz",
+            Self::OnlineClassical => "Online Classical",
+            Self::OnlineRapid => "Online Rapid",
+            Self::OnlineBlitz => "Online Blitz",
+            Self::OnlineBullet => "Online Bullet",
+            Self::Correspondence => "Correspondence",
+            Self::Unknown => "Unknown",
+        }
+    }
+}
+
+pub fn classify_headers_category(
+    event: Option<&str>,
+    site: Option<&str>,
+    time_control: Option<&str>,
+) -> GameCategory {
+    let e = event.unwrap_or("");
+    let s = site.unwrap_or("");
+    let hay = format!("{e} {s}").to_ascii_lowercase();
+    for needle in [
+        "corr",
+        "iccf",
+        "correspondence",
+        "bdg",
+        "fernschach",
+        "email",
+        "post",
+    ] {
+        if hay.contains(needle) {
+            return GameCategory::Correspondence;
+        }
+    }
+    if event.is_none() && site.is_none() && time_control.is_none() {
+        return GameCategory::Unknown;
+    }
+    let event_str = event.unwrap_or("?");
+    let site_str = site.unwrap_or("?");
+    let is_online = looks_online(event_str, site_str);
+    let tc = time_control
+        .and_then(parse_time_control_seconds)
+        .map(tc_from_seconds)
+        .or_else(|| tc_from_event_keywords(event_str))
+        .unwrap_or(if is_online {
+            TimeControlClass::Rapid
+        } else {
+            TimeControlClass::Classical
+        });
+
+    match (is_online, tc) {
+        (true, TimeControlClass::Classical) => GameCategory::OnlineClassical,
+        (true, TimeControlClass::Rapid) => GameCategory::OnlineRapid,
+        (true, TimeControlClass::Blitz) => GameCategory::OnlineBlitz,
+        (true, TimeControlClass::Bullet) => GameCategory::OnlineBullet,
+        (false, TimeControlClass::Classical) => GameCategory::OtbClassical,
+        (false, TimeControlClass::Rapid) => GameCategory::OtbRapid,
+        (false, TimeControlClass::Blitz) => GameCategory::OtbBlitz,
+        (false, TimeControlClass::Bullet) => GameCategory::OtbBlitz,
+    }
+}
+
+pub fn classify_game_category(game: &Game) -> GameCategory {
+    classify_headers_category(
+        Some(game.event()),
+        Some(game.site()),
+        game.header("TimeControl"),
+    )
 }
 
 /// Which time controls pass a preparation filter.
@@ -1069,7 +1236,7 @@ impl Default for PrepFilterConfig {
             otb_date_cutoff: DateCutoff::AllTime,
             include_online: true,
             online_time_controls: TimeControlMask::default(),
-            online_date_cutoff: DateCutoff::Months(24),
+            online_date_cutoff: DateCutoff::AllTime,
             include_rated: true,
             include_casual: true,
         }
@@ -1142,7 +1309,7 @@ impl Default for AccountFilter {
             include_casual: true,
             min_elo: None,
             max_elo: None,
-            date_cutoff: DateCutoff::Months(24),
+            date_cutoff: DateCutoff::AllTime,
             time_controls: TimeControlMask::default(),
         }
     }
@@ -4159,9 +4326,14 @@ mod tests {
         };
         assert!(!too_strong.matches_game(&elo_game, as_of));
         assert!(too_strong.matches_game(&rated, as_of));
-        // Stale games fall outside the default 24-month window.
+        // Stale games pass the default all-time cutoff, but fall outside an explicit 24-month window.
         let stale = online_game("Opponent", "Trendy", "2020.03.01", "1. e4 e5 1-0");
-        assert!(!filter.matches_game(&stale, as_of));
+        assert!(filter.matches_game(&stale, as_of));
+        let cutoff_filter = AccountFilter {
+            date_cutoff: DateCutoff::Months(24),
+            ..filter
+        };
+        assert!(!cutoff_filter.matches_game(&stale, as_of));
     }
 
     #[test]
@@ -4272,7 +4444,10 @@ mod tests {
             )
             .unwrap();
         let key = position::position_key(&after_e4);
-        let filter = PrepFilterConfig::default();
+        let filter = PrepFilterConfig {
+            online_date_cutoff: DateCutoff::Months(24),
+            ..PrepFilterConfig::default()
+        };
         assert!(filter.online_time_controls.blitz);
         let moves = book.filtered_moves(key, Color::Black, &filter);
         assert_eq!(moves.len(), 1);
@@ -4745,5 +4920,129 @@ mod tests {
         let (tc, is_online, _) = classify_game_metadata(&g);
         assert_eq!(tc, TimeControlClass::Rapid);
         assert!(!is_online);
+    }
+
+    #[test]
+    fn default_prep_and_account_filters_use_all_time_cutoff() {
+        assert_eq!(
+            PrepFilterConfig::default().online_date_cutoff,
+            DateCutoff::AllTime
+        );
+        assert_eq!(
+            PrepFilterConfig::default().otb_date_cutoff,
+            DateCutoff::AllTime
+        );
+        assert_eq!(AccountFilter::default().date_cutoff, DateCutoff::AllTime);
+    }
+
+    #[test]
+    fn classify_game_category_distinguishes_otb_online_and_correspondence() {
+        let make_game = |event: &str, site: &str, tc: Option<&str>| {
+            let mut g = Game::default();
+            g.set_header("Event", event.to_string());
+            g.set_header("Site", site.to_string());
+            if let Some(tc) = tc {
+                g.set_header("TimeControl", tc.to_string());
+            }
+            g
+        };
+
+        let g_classical = make_game("World Championship Match", "London", Some("7200+30"));
+        assert_eq!(
+            classify_game_category(&g_classical),
+            GameCategory::OtbClassical
+        );
+
+        let g_rapid = make_game("Bezirks-Schnellschachmeisterschaft", "Munich", None);
+        assert_eq!(classify_game_category(&g_rapid), GameCategory::OtbRapid);
+
+        let g_blitz = make_game("World Blitz Championship", "Almaty", Some("180+2"));
+        assert_eq!(classify_game_category(&g_blitz), GameCategory::OtbBlitz);
+
+        let g_on_classical = make_game("Lichess Classical", "lichess.org", Some("5400+30"));
+        assert_eq!(
+            classify_game_category(&g_on_classical),
+            GameCategory::OnlineClassical
+        );
+
+        let g_on_rapid = make_game("Chess.com Rapid", "chess.com", Some("600+0"));
+        assert_eq!(
+            classify_game_category(&g_on_rapid),
+            GameCategory::OnlineRapid
+        );
+
+        let g_on_blitz = make_game("Lichess Blitz", "https://lichess.org", Some("180+0"));
+        assert_eq!(
+            classify_game_category(&g_on_blitz),
+            GameCategory::OnlineBlitz
+        );
+
+        let g_on_bullet = make_game("Lichess Bullet", "lichess.org", Some("60+0"));
+        assert_eq!(
+            classify_game_category(&g_on_bullet),
+            GameCategory::OnlineBullet
+        );
+
+        let g_corr_event = make_game("ICCF World Cup", "Internet", None);
+        assert_eq!(
+            classify_game_category(&g_corr_event),
+            GameCategory::Correspondence
+        );
+
+        let g_corr_site = make_game("Tournament", "ICCF", None);
+        assert_eq!(
+            classify_game_category(&g_corr_site),
+            GameCategory::Correspondence
+        );
+    }
+
+    #[test]
+    fn player_latest_otb_elo_prefers_most_recent_otb_game_over_online() {
+        let pgn = r#"[Event "Older OTB"]
+[Site "Vienna"]
+[Date "2024.05.01"]
+[White "Kern, Johannes"]
+[Black "Opponent, A"]
+[WhiteElo "2110"]
+[Result "1-0"]
+
+1. e4 e5 1-0
+
+[Event "Newer OTB"]
+[Site "Linz"]
+[Date "2026.03.10"]
+[White "Kern, Johannes"]
+[Black "Opponent, B"]
+[WhiteElo "2185"]
+[Result "1-0"]
+
+1. e4 e5 1-0
+
+[Event "Online Blitz"]
+[Site "https://lichess.org/abcd1234"]
+[Date "2026.10.01"]
+[White "Kern, Johannes"]
+[Black "Opponent, C"]
+[WhiteElo "2450"]
+[Result "1-0"]
+
+1. e4 e5 1-0
+"#;
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "brett-otb-elo-test-{}-{}.pgn",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, pgn).unwrap();
+        let library = PgnLibrary::build(&path).unwrap();
+        let directory = PlayerIndex::build(&library);
+        let player = directory.find_player("Kern, Johannes").expect("player exists");
+        assert_eq!(player.latest_otb_elo, Some(2185));
+        assert_eq!(player.display_elo(), Some(2185));
+        std::fs::remove_file(path).unwrap();
     }
 }
