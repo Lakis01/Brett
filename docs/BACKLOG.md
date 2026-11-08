@@ -8,8 +8,16 @@ in `README.md`; this file tracks what is next.
 community-maintained project. Functional correctness, data safety, and clear
 documentation come first; visual polish is queued and may land incrementally.
 
-**Status (2026-11-07 Cycle 2 backlog sync):** items 1–7, 11–14, 17, 39 (largely), and 40 are implemented,
-and the latest moves-panel interaction polish and Cycle 2 preparation/trends features are complete.
+**Status (2026-11-08 Cycle 3 backlog sync):** items 1–7, 11–14, 17, 39 (largely), 40, and 41 are implemented,
+and the modern minimalist UI overhaul (`DESIGN.md`), resilient Lichess streaming, and preparation tables polish are complete.
+Cycle 3 landed 2026-11-08 (resilient incremental PGN streaming with server-side filters for Lichess,
+AllTime date cutoff defaults for prep and accounts, removal of the unused Database Views subsystem and
+trim of bloated dependencies `regex`, `arboard`, and `webbrowser`, 9-category customizable GameCategoryColors
+without text badges, Recent Games score badges, non-destructive Hover-to-Moves overlay across all game lists,
+horizontal stacked W/D/B bars (`draw_wdl_bar`), unified Tree/Reference/Candidate Moves tables, and the full
+`DESIGN.md` visual overhaul featuring carbon-slate workspace `#111317`/`#171A20`, warm wood/stone board `#DFCFB8`/`#9E7B56`,
+board player strips with photos/silhouettes, gold title pill, country flags, and clocks; Database → Players list with flags
+and latest OTB Elo; and top Player Profile Card with left portrait and White/Black square Prepare buttons).
 Cycle 2 landed 2026-11-07 (opponent-search resolution and `bye` placeholder exclusion + honorific
 stripping in `player_key`, ChessABC `>=1`-game profile filtering and collapsed most-probable selection
 with bounded scroll, `F11` fullscreen toggle, unified Recent Games limit ComboBox selector,
@@ -19,7 +27,7 @@ support for `live:lichess-masters`, `live:lichess-all`, and `live:chessabc`, plu
 recent window-count trends, empirical-Bayes shrunk trend badges, and an outdated database warning for
 bases older than 180 days). Item 39's preparation/predictor round-2 batch largely landed
 (repetition indexing, uncapped fetch, composite eval bar, streaming prep, hover browsing); only
-`predict_v2` calibration (adaptive `alpha0` + unseen alpha) and move overlay remain queued.
+`predict_v2` calibration (adaptive `alpha0` + unseen alpha) remains queued.
 Item 8's cloud, opening-tree, reference-source, and native-book parts are done; M2b mega-scale ingest
 remains, with the first safety pass now keeping huge archives responsive and avoiding automatic full
 indexing (Mega open freeze fixes queued). Item 9's editable session, database views,
@@ -1333,3 +1341,23 @@ releases.
 - **Live Trend Sources & Outdated DB warning:** `TrendSource` (`ActiveTree`, `ChessAbc`, `LichessMasters`, `LichessAll`) in settings and inline controls; Lichess explorer `&since=YYYY` and `&since=YYYY-MM` fetching with empirical-Bayes shrunk trend badges; background ChessABC recent tree; and outdated database warning banner when `TrendSource::ActiveTree` is used on a database older than 180 days.
 
 **Depends on:** `src/players.rs`, `src/online.rs`, `src/app.rs`, `src/cloud.rs`, `src/recent.rs`, `src/position.rs`, `src/settings.rs`.
+
+## 41. Functional Rework, Compilation Trim & Modern Minimalist UI Overhaul (Cycle 3)
+
+**Status:** implemented 2026-11-08 (commits `9e381bb`..`de9d3ef`, 427 lib tests green).
+
+**Goal:** fix Lichess export timeouts, ChessABC live trend baselines, and compilation layout overflow; default date cutoffs to all-time; drop the unused Database Views subsystem and bloated crates (`regex`, `arboard`, `webbrowser`); add 9-category customizable game colors without text category labels; add per-game score badges in Recent Games; overlay hovered games into the right-hand Moves section and board player strips across all game lists; unify the Tree/Reference/Preparation tables with horizontal stacked W/D/B bars; and execute the modern minimalist UI overhaul defined in `DESIGN.md`.
+
+**Implemented 2026-11-08 (`docs/superpowers/plans/2026-11-08-functional-rework-and-ui-overhaul.md` and `DESIGN.md`):**
+
+- **Resilient Lichess streaming & server-side filters:** `read_pgn_stream_incremental` in `src/online.rs` parses complete PGN games incrementally and preserves valid games on partial timeouts or unexpected EOF; `lichess_export_url_filtered` applies server-side parameters `perfType=classical,rapid,blitz`, `since`, and `rated=true`; `fetch_recent_chessabc_games` fetches up to 500 games across 5 pages in parallel.
+- **Default `AllTime` date cutoffs:** `PrepFilterConfig::default().online_date_cutoff`, `otb_date_cutoff`, and `AccountFilter::default().date_cutoff` defaulted to `DateCutoff::AllTime` in `src/players.rs`.
+- **Crate bloat trim & Views removal:** removed `regex`, `arboard`, and `webbrowser` from `Cargo.toml`; replaced regex matchers in `src/players.rs` with zero-regex ASCII case-insensitive searchers; ported clipboard and URL actions in `src/app.rs` to native `ctx.copy_text` and `ctx.open_url` (with `xdg-open` fallback); purged `DatabaseView`, `views` windows, drag-and-drop view interactions, and view dialogs.
+- **9-category customizable `GameCategoryColors`:** `GameCategory` enum (`OtbClassical`, `OtbRapid`, `OtbBlitz`, `OnlineClassical`, `OnlineRapid`, `OnlineBlitz`, `OnlineBullet`, `Correspondence`, `Unknown`) with header/game classifiers in `src/players.rs`; RGB configuration in `src/settings.rs` (`DisplayPrefs`); Settings → Appearance color pickers with reset button; game row subtitles render without text category labels (category indicated cleanly via font color).
+- **Recent Games score badges:** green win (`+1`), muted gray draw (`½`), red loss (`0`) score badges for the prepared player in `PrepRecentRow` and `prep_recent_games`.
+- **Hover-to-Moves overlay across all game lists:** `activate_hovered_game_browse_lazy` in `src/app.rs` overlays the hovered game's moves and board player strips in `Games`, `Players`, and `Recent Games` without clearing preparation state or unmounting active trees.
+- **Horizontal stacked W/D/B bars:** `draw_wdl_bar` rendering White (`#E8ECF2`), Grey (`#6C7380`), and Black (`#20242C`) with a crisp border across Tree, Reference, Preparation candidate moves, and player profile card.
+- **Unified Tree / Reference / Candidate Moves tables:** consistent column layouts, horizontal W/D/B bars, inline statistics, and bounded progress rendering to prevent panel overflow.
+- **Modern Minimalist UI overhaul (`DESIGN.md`):** carbon-slate workspace tokens (`#111317`, `#171A20`, `#1E222A`, `#262B35`), warm natural wood/stone board palette (`#DFCFB8` / `#9E7B56`), board player strips with 28x28 photos/silhouettes, gold title pill, country flags, and clocks (`src/ui/board.rs`, `src/app.rs`); Database → Players list with flags and latest OTB Elo (`latest_otb_elo`); top Player Profile Card with left portrait silhouette, rating/W-D-B stats, and White/Black square `Prepare` action buttons (`paint_prepare_color_square`).
+
+**Depends on:** `src/players.rs`, `src/online.rs`, `src/settings.rs`, `src/app.rs`, `src/ui/board.rs`, `src/ui/eval_bar.rs`.
