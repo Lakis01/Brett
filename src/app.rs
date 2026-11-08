@@ -8,8 +8,8 @@ use crate::chess::{
     CastlingMode, Chess, Color, EnPassantMode, Fen, Move, Position, SanPlus, Square, UciMove,
 };
 use eframe::egui::{
-    self, Align, Align2, Color32, FontId, Key, Layout, RichText, Sense, Stroke, StrokeKind, Ui,
-    pos2,
+    self, Align, Align2, Color32, CornerRadius, FontId, Key, Layout, Rect, RichText, Sense, Stroke,
+    StrokeKind, Ui, pos2,
     text::{LayoutJob, TextFormat},
     vec2,
 };
@@ -751,6 +751,8 @@ struct PrepRecentRow {
     /// Game-type pill colour + label from `classify_game_metadata`.
     type_color: Color32,
     type_label: &'static str,
+    result_badge: String,
+    player_outcome: Option<f32>,
 }
 
 /// A game whose moves are being browsed with the keyboard while its row is
@@ -1353,6 +1355,40 @@ fn truncate_status_error(err: &str) -> String {
     } else {
         let truncated: String = text.chars().take(47).collect();
         format!("{truncated}…")
+    }
+}
+
+fn standardize_result_badge(result: &str) -> String {
+    let trimmed = result.trim();
+    if trimmed.contains("1/2") || trimmed.contains('½') {
+        "½-½".to_string()
+    } else if trimmed == "1-0" {
+        "1-0".to_string()
+    } else if trimmed == "0-1" {
+        "0-1".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn calc_player_outcome(result: &str, player_color: Color) -> Option<f32> {
+    let trimmed = result.trim();
+    if trimmed.contains("1/2") || trimmed.contains('½') {
+        Some(0.5)
+    } else if trimmed == "1-0" {
+        if player_color == Color::White {
+            Some(1.0)
+        } else {
+            Some(0.0)
+        }
+    } else if trimmed == "0-1" {
+        if player_color == Color::Black {
+            Some(1.0)
+        } else {
+            Some(0.0)
+        }
+    } else {
+        None
     }
 }
 
@@ -11637,6 +11673,7 @@ impl App {
                                     width,
                                     42.0,
                                     None,
+                                    None,
                                 )
                                 .clicked()
                                 {
@@ -11789,16 +11826,16 @@ impl App {
                         let Some(game) = self.prep_merged_games.get(position) else {
                             continue;
                         };
-                        let (type_color, type_label) = game_type_style(game);
+                        let cat = players::classify_game_category(game);
+                        let type_color = self.game_category_color(cat);
                         let subtitle = format!(
-                            "{} · {} · {} · {}",
-                            type_label,
+                            "{} · {} · {}",
                             game.date(),
                             game.event(),
                             game.result()
                         );
                         let width = ui.available_width();
-                        let response = game_row(
+                        let mut response = game_row(
                             ui,
                             false,
                             "",
@@ -11817,8 +11854,11 @@ impl App {
                             width,
                             row_h - 2.0,
                             Some(type_color),
+                            None,
                         );
+                        response = response.on_hover_text(cat.label());
                         if response.hovered()
+                            && !self.is_hovered_game(&format!("merged:{position}"))
                             && let Some(game) = self.prep_merged_games.get(position).cloned()
                         {
                             self.activate_hovered_game_browse(
@@ -11918,14 +11958,14 @@ impl App {
                     let black_country = player_country_from_header(
                         header("BlackCountry").or_else(|| header("BlackFed")),
                     );
-                    let (type_color, type_label) = slot_game_type_by_headers(
+                    let cat = players::classify_headers_category(
                         header("Event"),
                         header("Site"),
                         header("TimeControl"),
                     );
+                    let type_color = self.game_category_color(cat);
                     let subtitle = format!(
-                        "{} · {} · {}",
-                        type_label,
+                        "{} · {}",
                         header("Event").unwrap_or("?"),
                         header("Date").unwrap_or("????.??.??")
                     );
@@ -11933,7 +11973,7 @@ impl App {
                     let width = ui.available_width();
                     let white_name = self.session.slot_white(id);
                     let black_name = self.session.slot_black(id);
-                    let response = game_row(
+                    let mut response = game_row(
                         ui,
                         selected,
                         "",
@@ -11948,7 +11988,19 @@ impl App {
                         width,
                         row_h - 2.0,
                         Some(type_color),
+                        None,
                     );
+                    response = response.on_hover_text(cat.label());
+                    if response.hovered() && !self.is_hovered_game(&format!("session:{id}")) {
+                        let game = self
+                            .edited
+                            .get(&id)
+                            .cloned()
+                            .or_else(|| self.session.load(id, &self.edited).ok());
+                        if let Some(game) = game {
+                            self.activate_hovered_game_browse(format!("session:{id}"), game);
+                        }
+                    }
                     if response.sense.senses_drag() {
                         response.dnd_set_drag_payload(GameRowDrag { id });
                     }
@@ -12353,7 +12405,8 @@ impl App {
                         } else {
                             (game.white().to_string(), Color::White, "Black")
                         };
-                        let (type_color, _) = game_type_style(game);
+                        let cat = players::classify_game_category(game);
+                        let type_color = self.game_category_color(cat);
                         let subtitle = format!(
                             "{} · {} · {}",
                             game.result(),
@@ -12361,7 +12414,7 @@ impl App {
                             game.date()
                         );
                         let width = ui.available_width();
-                        let response = game_row(
+                        let mut response = game_row(
                             ui,
                             false,
                             "vs ",
@@ -12376,11 +12429,16 @@ impl App {
                             width,
                             row_h - 2.0,
                             Some(type_color),
+                            None,
                         );
-                        if response.hovered() {
+                        response = response.on_hover_text(cat.label());
+                        if response.hovered()
+                            && !self.is_hovered_game(&format!("player:{position}"))
+                            && let Some(game) = self.prep_merged_games.get(position).cloned()
+                        {
                             self.activate_hovered_game_browse(
                                 format!("player:{position}"),
-                                game.clone(),
+                                game,
                             );
                         }
                         if response.clicked() {
@@ -12413,6 +12471,7 @@ impl App {
                             event,
                             date,
                             type_color,
+                            type_label,
                         ) = if let Some(entry) = library.get(idx) {
                             let player_white = players::player_key(entry.white()).as_deref()
                                 == Some(player.key.as_str());
@@ -12444,7 +12503,13 @@ impl App {
                                         })
                                     }),
                             );
-                            let (type_color, _) = indexed_game_type_style(entry);
+                            let cat = players::classify_headers_category(
+                                Some(entry.event()),
+                                entry.header("Site"),
+                                entry.header("TimeControl"),
+                            );
+                            let type_color = self.game_category_color(cat);
+                            let type_label = cat.label();
                             (
                                 opponent,
                                 opponent_title,
@@ -12455,6 +12520,7 @@ impl App {
                                 entry.event().to_string(),
                                 entry.date().to_string(),
                                 type_color,
+                                type_label,
                             )
                         } else {
                             let (white_name, black_name) = library.game_players(idx);
@@ -12496,11 +12562,13 @@ impl App {
                             let result = find_h("Result").unwrap_or("*").to_string();
                             let event = find_h("Event").unwrap_or("?").to_string();
                             let date = find_h("Date").unwrap_or("????.??.??").to_string();
-                            let (type_color, _) = slot_game_type_by_headers(
+                            let cat = players::classify_headers_category(
                                 Some(&event),
                                 find_h("Site"),
                                 find_h("TimeControl"),
                             );
+                            let type_color = self.game_category_color(cat);
+                            let type_label = cat.label();
                             (
                                 opponent,
                                 opponent_title,
@@ -12511,6 +12579,7 @@ impl App {
                                 event,
                                 date,
                                 type_color,
+                                type_label,
                             )
                         };
                         let suffix = format!(" · as {color}");
@@ -12521,7 +12590,7 @@ impl App {
                             .is_some_and(|id| self.current_slot == Some(id))
                             && self.prep.is_none();
                         let width = ui.available_width();
-                        if game_row(
+                        let mut response = game_row(
                             ui,
                             selected,
                             "vs ",
@@ -12534,9 +12603,17 @@ impl App {
                             width,
                             row_h - 2.0,
                             Some(type_color),
-                        )
-                        .clicked()
-                        {
+                            None,
+                        );
+                        response = response.on_hover_text(type_label);
+                        if response.hovered() {
+                            let lib_clone = Arc::clone(library);
+                            self.activate_hovered_game_browse_lazy(
+                                format!("player-lib:{idx}"),
+                                move || lib_clone.load(idx).ok(),
+                            );
+                        }
+                        if response.clicked() {
                             select_game = Some(idx);
                         }
                     }
@@ -12742,7 +12819,20 @@ impl App {
                     }
                 });
                 ui.separator();
-                if self.multi_view {
+                let show_hover_overlay = self
+                    .hovered_game_browse
+                    .as_ref()
+                    .is_some_and(|b| !b.id.starts_with("recent"))
+                    && !self.right_tab_visible(RightTab::Moves);
+                if show_hover_overlay {
+                    egui::ScrollArea::both()
+                        .id_salt("hover-overlay-scroll")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.set_max_width(ui.available_width());
+                            self.moves_content(ui);
+                        });
+                } else if self.multi_view {
                     let visible: Vec<RightTab> = RightTab::ALL
                         .iter()
                         .copied()
@@ -14009,15 +14099,30 @@ impl App {
     }
 
     fn moves_content(&mut self, ui: &mut Ui) {
-        let current_node = self.node;
         let prep = self.prep.clone();
-        let Some(game) = self.current.clone() else {
+        let Some((game, node, is_hover_overlay)) = self
+            .active_display_game_and_node()
+            .map(|(g, n, h)| (g.clone(), n, h))
+        else {
             ui.heading("No game");
             return;
         };
-        let node = current_node.min(game.nodes.len().saturating_sub(1));
-        let editor = self.annotation_editor;
-        let focus_comment = self.annotation_focus && editor == Some(node);
+        if is_hover_overlay {
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("Previewing hovered game · ←/→ to step · click to load")
+                        .small()
+                        .color(ui.visuals().hyperlink_color),
+                );
+            });
+            ui.add_space(4.0);
+        }
+        let editor = if is_hover_overlay {
+            None
+        } else {
+            self.annotation_editor
+        };
+        let focus_comment = !is_hover_overlay && self.annotation_focus && editor == Some(node);
         self.annotation_focus = false;
 
         let mut clicked = None;
@@ -14278,66 +14383,75 @@ impl App {
             });
         }
 
-        if tag_update.is_some()
-            || tag_delete.is_some()
-            || tag_add.is_some()
-            || tag_add_value.is_some()
-        {
-            if let Some(game) = self.current.as_mut() {
-                if let Some((index, value)) = tag_update
-                    && let Some((_, current)) = game.headers.get_mut(index)
-                {
-                    *current = value;
-                }
-                if let Some(index) = tag_delete
-                    && index < game.headers.len()
-                {
-                    let (name, _) = game.headers.remove(index);
-                    self.forced_tag_visibility
-                        .remove(&name.to_ascii_lowercase());
-                    if name.eq_ignore_ascii_case("Round") {
-                        self.board_tag_visible = false;
+        if !is_hover_overlay {
+            if tag_update.is_some()
+                || tag_delete.is_some()
+                || tag_add.is_some()
+                || tag_add_value.is_some()
+            {
+                if let Some(game) = self.current.as_mut() {
+                    if let Some((index, value)) = tag_update
+                        && let Some((_, current)) = game.headers.get_mut(index)
+                    {
+                        *current = value;
                     }
-                }
-                if let Some(key) = tag_add {
-                    if key == "Board" {
-                        if game.header("Round").is_none() {
-                            game.set_header("Round", "?".to_string());
+                    if let Some(index) = tag_delete
+                        && index < game.headers.len()
+                    {
+                        let (name, _) = game.headers.remove(index);
+                        self.forced_tag_visibility
+                            .remove(&name.to_ascii_lowercase());
+                        if name.eq_ignore_ascii_case("Round") {
+                            self.board_tag_visible = false;
                         }
-                        self.board_tag_visible = true;
-                    } else {
-                        game.set_header(key, String::new());
                     }
-                    self.forced_tag_visibility.insert(key.to_ascii_lowercase());
+                    if let Some(key) = tag_add {
+                        if key == "Board" {
+                            if game.header("Round").is_none() {
+                                game.set_header("Round", "?".to_string());
+                            }
+                            self.board_tag_visible = true;
+                        } else {
+                            game.set_header(key, String::new());
+                        }
+                        self.forced_tag_visibility.insert(key.to_ascii_lowercase());
+                    }
+                    if let Some((key, value)) = tag_add_value {
+                        game.set_header(key, value);
+                        self.forced_tag_visibility.insert(key.to_ascii_lowercase());
+                    }
                 }
-                if let Some((key, value)) = tag_add_value {
-                    game.set_header(key, value);
-                    self.forced_tag_visibility.insert(key.to_ascii_lowercase());
+                self.dirty = true;
+            }
+
+            if let Some(action) = nag_action {
+                self.set_nag(action.0, action.1);
+            }
+            if close_editor {
+                self.annotation_editor = None;
+                self.annotation_focus = false;
+            }
+            if let Some((node, text)) = comment_update
+                && let Some(game) = self.current.as_mut()
+                && let Some(node) = game.nodes.get_mut(node)
+            {
+                node.replace_comment(&text);
+                self.dirty = true;
+            }
+        }
+        if let Some(target_node) = open_editor.or(clicked) {
+            if is_hover_overlay {
+                if let Some(browse) = self.hovered_game_browse.as_mut() {
+                    browse.cursor_node = target_node.min(browse.game.nodes.len().saturating_sub(1));
+                    self.hovered_game_active_this_frame = true;
+                }
+            } else {
+                self.goto(target_node);
+                if open_editor.is_some() {
+                    self.annotation_editor = Some(target_node);
+                    self.annotation_focus = true;
                 }
             }
-            self.dirty = true;
-        }
-
-        if let Some(action) = nag_action {
-            self.set_nag(action.0, action.1);
-        }
-        if close_editor {
-            self.annotation_editor = None;
-            self.annotation_focus = false;
-        }
-        if let Some((node, text)) = comment_update
-            && let Some(game) = self.current.as_mut()
-            && let Some(node) = game.nodes.get_mut(node)
-        {
-            node.replace_comment(&text);
-            self.dirty = true;
-        }
-        if let Some(node) = open_editor {
-            self.goto(node);
-            self.annotation_editor = Some(node);
-            self.annotation_focus = true;
-        } else if let Some(node) = clicked {
-            self.goto(node);
         }
         if let Some(anchor) = date_clicked {
             self.date_picker_anchor = Some(anchor);
@@ -14419,7 +14533,6 @@ impl App {
         let mut save_sidecar = None;
         let mut dismiss_prompt = false;
         let book = self.book.clone();
-        let book_status = self.book_status.clone();
 
         egui::ScrollArea::both()
             .id_salt("tree-tab")
@@ -14433,70 +14546,46 @@ impl App {
                     }
                 });
                 ui.horizontal_wrapped(|ui| {
-                    ui.label(RichText::new("Opening book").small().weak());
-                    let width = (ui.available_width() - 176.0).max(80.0);
-                    let path = if self.book_path.trim().is_empty() {
-                        "No opening book selected".to_string()
-                    } else {
-                        self.book_path.clone()
-                    };
-                    ui.add_sized(
-                        [width, 18.0],
-                        egui::Label::new(RichText::new(&path).monospace().small()).truncate(),
-                    )
-                    .on_hover_text(path);
-                    if ui.button("Choose…").clicked() {
-                        choose_book = true;
-                    }
+                    ui.label(RichText::new("Source:").small().strong());
                     if ui
-                        .button("Clear")
-                        .on_hover_text("Stop showing an opening book")
+                        .selectable_label(self.tree_path.trim().is_empty(), "Current DB")
                         .clicked()
                     {
-                        clear_book = true;
+                        use_current_tree = true;
                     }
-                });
-                ui.label(RichText::new(&book_status).small().weak());
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(RichText::new("Live:").small().weak());
                     for src in LiveReferenceSource::ALL {
-                        let active = LiveReferenceSource::from_config_str(&self.book_path) == Some(src);
+                        let active =
+                            LiveReferenceSource::from_config_str(&self.book_path) == Some(src);
                         if ui.selectable_label(active, src.short_label()).clicked() {
                             self.book_path = src.config_str().to_string();
                             self.book = None;
                             self.book_rx = None;
                             self.book_job = None;
-                            self.book_status = format!("Using {} as live opening book.", src.label());
+                            self.book_status =
+                                format!("Using {} as live opening book.", src.label());
+                            self.save_display_prefs();
+                        }
+                    }
+                    if ui.small_button("Choose tree…").clicked() {
+                        choose_tree = true;
+                    }
+                    if ui.small_button("Choose book…").clicked() {
+                        choose_book = true;
+                    }
+                    if !self.book_path.is_empty() && ui.small_button("Clear book").clicked() {
+                        clear_book = true;
+                    }
+                    ui.separator();
+                    ui.label(RichText::new("Trends:").small().strong());
+                    for src in crate::recent::TrendSource::ALL {
+                        let active = self.trend_source == src;
+                        if ui.selectable_label(active, src.short_label()).clicked() {
+                            self.trend_source = src;
+                            self.settings_trend_source = src;
                             self.save_display_prefs();
                         }
                     }
                 });
-                ui.add_space(4.0);
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(RichText::new("Opening tree file").small().weak());
-                    let width = (ui.available_width() - 176.0).max(80.0);
-                    let path = if self.tree_path.trim().is_empty() {
-                        "Using the current database".to_string()
-                    } else {
-                        self.tree_path.clone()
-                    };
-                    ui.add_sized(
-                        [width, 18.0],
-                        egui::Label::new(RichText::new(&path).monospace().small()).truncate(),
-                    )
-                    .on_hover_text(path);
-                    if ui.button("Choose…").clicked() {
-                        choose_tree = true;
-                    }
-                    if ui
-                        .button("Current DB")
-                        .on_hover_text("Use the currently open database for the opening tree")
-                        .clicked()
-                    {
-                        use_current_tree = true;
-                    }
-                });
-                ui.label(RichText::new(&self.tree_status).small().weak());
                 ui.add_space(4.0);
 
                 if let Some(source) = &self.prompt_persist_index {
@@ -15293,7 +15382,13 @@ impl App {
                     type_color,
                     type_label,
                 ) = if let Some(indexed) = library.get(game.index) {
-                    let (type_color, type_label) = indexed_game_type_style(indexed);
+                    let cat = players::classify_headers_category(
+                        Some(indexed.event()),
+                        indexed.header("Site"),
+                        indexed.header("TimeControl"),
+                    );
+                    let type_color = self.game_category_color(cat);
+                    let type_label = cat.label();
                     (
                         indexed.white().to_string(),
                         indexed.black().to_string(),
@@ -15354,11 +15449,13 @@ impl App {
                     let black_fide_id = player_fide_id_from_header(find_h("BlackFideId"));
                     let result = find_h("Result").unwrap_or("*").to_string();
                     let event = find_h("Event").unwrap_or("?").to_string();
-                    let probe = Game {
-                        headers: vec![("Event".to_string(), event.clone())],
-                        ..Game::default()
-                    };
-                    let (type_color, type_label) = game_type_style(&probe);
+                    let cat = players::classify_headers_category(
+                        Some(&event),
+                        find_h("Site"),
+                        find_h("TimeControl"),
+                    );
+                    let type_color = self.game_category_color(cat);
+                    let type_label = cat.label();
                     (
                         white,
                         black,
@@ -15374,6 +15471,8 @@ impl App {
                         type_label,
                     )
                 };
+                let result_badge = standardize_result_badge(&result);
+                let player_outcome = calc_player_outcome(&result, game.color);
                 Some(PrepRecentRow {
                     index: game.index,
                     merged_index: None,
@@ -15386,8 +15485,7 @@ impl App {
                     white_fide_id,
                     black_fide_id,
                     subtitle: format!(
-                        "{} · {} · as {} · {} · {}",
-                        type_label,
+                        "{} · as {} · {} · {}",
                         short_date(game.date),
                         color_name(game.color),
                         outcome_label(&result, game.color),
@@ -15395,6 +15493,8 @@ impl App {
                     ),
                     type_color,
                     type_label,
+                    result_badge,
+                    player_outcome,
                 })
             })
             .collect()
@@ -15422,13 +15522,17 @@ impl App {
             .filter_map(|game_ref| {
                 let position = game_ref.index;
                 let game = self.prep_merged_games.get(position)?;
-                let (type_color, type_label) = game_type_style(game);
+                let cat = players::classify_game_category(game);
+                let type_color = self.game_category_color(cat);
+                let type_label = cat.label();
                 let continuation = continuation_moves_snippet(game, key, None);
                 let continuation_suffix = if continuation.is_empty() {
                     String::new()
                 } else {
                     format!(" · ▶ {continuation}")
                 };
+                let result_badge = standardize_result_badge(game.result());
+                let player_outcome = calc_player_outcome(game.result(), game_ref.color);
                 Some(PrepRecentRow {
                     index: position,
                     merged_index: Some(position),
@@ -15441,8 +15545,7 @@ impl App {
                     white_fide_id: player_fide_id(game, Color::White).map(str::to_string),
                     black_fide_id: player_fide_id(game, Color::Black).map(str::to_string),
                     subtitle: format!(
-                        "{} · {} · as {} · {} · {}{}",
-                        type_label,
+                        "{} · as {} · {} · {}{}",
                         game.date(),
                         color_name(game_ref.color),
                         outcome_label(game.result(), game_ref.color),
@@ -15451,6 +15554,8 @@ impl App {
                     ),
                     type_color,
                     type_label,
+                    result_badge,
+                    player_outcome,
                 })
             })
             .collect()
@@ -15606,21 +15711,6 @@ impl App {
             .is_some_and(|book| book.player_key() == prep.player_key);
         let book_loading = self.player_book_job.as_deref() == Some(prep.player_key.as_str());
         let book_status = self.player_book_status.clone();
-        let reference_status = self.reference_status.clone();
-        // Strict reference tree: rated reference corpus first, standalone
-        // opening-tree file second. The current database index is never used.
-        // The index is borrowed inside the scroll closure below so the
-        // fallback branch can still mutate `self` (choose-reference button).
-        let reference_tree_building = self.reference_rx.is_some() || self.tree_index_rx.is_some();
-        let reference_tree_job = self
-            .reference_job
-            .as_ref()
-            .map(|job| job.path.display().to_string())
-            .or_else(|| {
-                self.tree_index_job
-                    .as_ref()
-                    .map(|path| path.display().to_string())
-            });
         let mut recent_limit = self.prep_recent_limit.clamp(1, 100);
         let mut recent_limit_changed = false;
         let mut recent_all = self.prep_recent_all;
@@ -15661,29 +15751,6 @@ impl App {
                     .collect()
             })
             .unwrap_or_default();
-        // Player-book game counts per move for the reference-tree badge.
-        let book_games_map: HashMap<u32, u32> = self
-            .player_book
-            .as_ref()
-            .filter(|book| book.player_key() == prep.player_key)
-            .map(|book| {
-                book.filtered_moves(key, facing, &prep.filter)
-                    .into_iter()
-                    .map(|stat| (stat.mv, stat.games))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let reference_source_label = if let Some(live) = LiveReferenceSource::from_config_str(&self.reference_path) {
-            live.label()
-        } else if self.reference.is_some() {
-            "Reference database"
-        } else if self.tree_index.is_some() {
-            "Opening tree"
-        } else if self.reference_book.is_some() {
-            "Opening book"
-        } else {
-            "No reference yet"
-        };
         // Cache-only candidate evals for the Smart/Classic Eval column. The
         // in-memory cloud snapshot and local analysis cache are consulted;
         // no network fetch is triggered here.
@@ -15736,6 +15803,26 @@ impl App {
             }
             keys
         };
+
+        let mut ref_stats_map: HashMap<String, (u32, u32, u32, u32)> = HashMap::new();
+        if let Some(ref_tree) = self.reference_tree_index() {
+            for m in ref_tree.moves(key) {
+                if let Some(mv) = position::decode_move(pos, m.mv) {
+                    let san = SanPlus::from_move(pos.clone(), mv).to_string();
+                    ref_stats_map.insert(san, (m.games, m.white, m.draw, m.black));
+                }
+            }
+        } else if let Some(live) = LiveReferenceSource::from_config_str(&self.reference_path)
+            && live == LiveReferenceSource::ChessAbc
+            && let Some(tree) = &self.chessabc_live_tree
+        {
+            for m in tree.moves(key) {
+                if let Some(mv) = position::decode_move(pos, m.mv) {
+                    let san = SanPlus::from_move(pos.clone(), mv).to_string();
+                    ref_stats_map.insert(san, (m.games, m.white, m.draw, m.black));
+                }
+            }
+        }
 
         // Chosen inside the tree below; applied after the scroll area so the
         // `reference_tree` borrow above can end first.
@@ -16007,6 +16094,46 @@ impl App {
                                         .then(a.san.cmp(&b.san)),
                                 )
                         });
+                        ui.horizontal_wrapped(|ui| {
+                            let tip = if self.prior_has_otb_background() {
+                                "Configured reference theory active"
+                            } else {
+                                "Tip: set a Mega reference database or opening-tree file for a stronger OTB background prior."
+                            };
+                            ui.label(RichText::new("Reference:").small().strong()).on_hover_text(tip);
+                            for src in LiveReferenceSource::ALL {
+                                let active =
+                                    LiveReferenceSource::from_config_str(&self.reference_path)
+                                        == Some(src);
+                                if ui.selectable_label(active, src.short_label()).clicked() {
+                                    pending_reference_path = Some(src.config_str().to_string());
+                                }
+                            }
+                            if ui.small_button("Choose…").clicked()
+                                && let Some(path) = open_file_dialog(
+                                    "Choose reference database or book",
+                                    self.last_database_dir.as_deref(),
+                                    "Reference databases and opening books",
+                                    "*.2cbh *.2CBH *.cbh *.CBH *.si4 *.SI4 *.pgn *.PGN *.bin *.BIN *.ctg *.CTG *.abk *.ABK *.bkt *.BKT",
+                                )
+                            {
+                                pending_reference_path = Some(path.display().to_string());
+                            }
+                            ui.separator();
+                            ui.label(RichText::new("Trends:").small().strong());
+                            for src in crate::recent::TrendSource::ALL {
+                                let active = self.trend_source == src;
+                                if ui.selectable_label(active, src.short_label()).clicked() {
+                                    self.trend_source = src;
+                                    self.settings_trend_source = src;
+                                    self.save_display_prefs();
+                                }
+                            }
+                            if self.chessabc_live_rx.is_some() {
+                                ui.spinner();
+                            }
+                        });
+                        ui.add_space(2.0);
                         egui::Grid::new("prep-smart-grid")
                             .num_columns(8)
                             .striped(true)
@@ -16072,22 +16199,35 @@ impl App {
                                     };
                                     ui.label(games_text);
 
-                                    ui.label(format!(
-                                        "+{} ={} -{}",
-                                        row.player_wins, row.player_draws, row.player_losses
-                                    ));
-
-                                    ui.label(
-                                        row.vs_field_pp
-                                            .map(|pp| format!("{pp:+.0}pp"))
-                                            .unwrap_or_else(|| "—".to_string()),
+                                    draw_wdl_bar(
+                                        ui,
+                                        row.player_wins,
+                                        row.player_draws,
+                                        row.player_losses,
+                                        60.0,
+                                        10.0,
                                     );
 
-                                    ui.label(if row.last_date > 0 {
-                                        short_date(row.last_date)
+                                    if let Some(ref_stats) = ref_stats_map.get(&row.san) {
+                                        ui.label(ref_stats.0.to_string());
+                                        draw_wdl_bar(
+                                            ui,
+                                            ref_stats.1,
+                                            ref_stats.2,
+                                            ref_stats.3,
+                                            60.0,
+                                            10.0,
+                                        );
                                     } else {
-                                        "—".to_string()
-                                    });
+                                        ui.label(
+                                            row.vs_field_pp
+                                                .map(|pp| format!("{pp:+.0}pp"))
+                                                .unwrap_or_else(|| "—".to_string()),
+                                        );
+                                        ui.label("—");
+                                    }
+
+                                    draw_points_sparkline(ui, &row.sparkline, prob_color);
 
                                     prep_eval_cell(
                                         ui,
@@ -16095,8 +16235,6 @@ impl App {
                                         prep_eval_best,
                                         pos.turn(),
                                     );
-
-                                    draw_points_sparkline(ui, &row.sparkline, prob_color);
                                     ui.end_row();
                                 }
                             });
@@ -16264,289 +16402,6 @@ impl App {
                     }
                 }
 
-                ui.add_space(8.0);
-                ui.label(RichText::new(&reference_status).small().weak());
-                if !self.prior_has_otb_background() {
-                    ui.label(
-                        RichText::new(
-                            "Tip: set a Mega reference database or opening-tree file (Players → Reference database prior) for a stronger OTB background prior.",
-                        )
-                        .small()
-                        .weak(),
-                    );
-                }
-                egui::CollapsingHeader::new(RichText::new(format!(
-                    "📚 General Reference Tree ({reference_source_label})"
-                )).strong())
-                    .default_open(true)
-                    .show(ui, |ui| {
-                        ui.horizontal_wrapped(|ui| {
-                            ui.label(RichText::new("Trends:").small().strong());
-                            for src in crate::recent::TrendSource::ALL {
-                                let active = self.trend_source == src;
-                                if ui.selectable_label(active, src.short_label()).clicked() {
-                                    self.trend_source = src;
-                                    self.settings_trend_source = src;
-                                    self.save_display_prefs();
-                                }
-                            }
-                        });
-                        if self.trend_source == crate::recent::TrendSource::ActiveTree
-                            && let Some(index) = self.reference_tree_index()
-                            && crate::recent::is_database_outdated(index.latest_date(), players::today(), 180)
-                        {
-                            let latest = index.latest_date();
-                            let date_str = if latest == 0 {
-                                "undated".to_string()
-                            } else {
-                                format!("{:04}.{:02}.{:02}", latest / 10000, (latest % 10000) / 100, latest % 100)
-                            };
-                            ui.label(
-                                RichText::new(format!(
-                                    "⚠ Database may be outdated for trends (latest game: {date_str}). Consider switching Trends to ChessABC or Lichess Masters."
-                                ))
-                                .small()
-                                .color(GOLD),
-                            );
-                        }
-                        let trend_override = self.current_trend_override(pos, key);
-                        if let Some(reference_tree) = self.reference_tree_index() {
-                            clicked = opening_tree_table(
-                                ui,
-                                Some(reference_tree),
-                                key,
-                                pos,
-                                "No reference game reached this position.",
-                                self.trend_config(),
-                                &mut hover_preview,
-                                Some(&book_games_map),
-                                trend_override.as_ref(),
-                            )
-                            .or(clicked);
-                        } else if let Some(live) = LiveReferenceSource::from_config_str(&self.reference_path) {
-                            match live {
-                                LiveReferenceSource::ChessAbc => {
-                                    if let Some(tree) = &self.chessabc_live_tree {
-                                        let moves = tree.moves(key);
-                                        let stats = tree.stats(key);
-                                        if let Some(stats) = stats {
-                                            ui.horizontal(|ui| {
-                                                ui.label(RichText::new(games_label(stats.games as usize)).strong());
-                                                ui.label(RichText::new(format!("W {} · D {} · B {}", stats.white, stats.draw, stats.black)).weak());
-                                            });
-                                            wdl_bar(ui, &stats);
-                                        }
-                                        if !moves.is_empty() {
-                                            egui::Grid::new("prep-chessabc-live-tree-grid")
-                                                .num_columns(6)
-                                                .striped(true)
-                                                .show(ui, |ui| {
-                                                    ui.label(RichText::new("Move").strong());
-                                                    ui.label(RichText::new("Games").strong());
-                                                    ui.label(RichText::new("W").strong());
-                                                    ui.label(RichText::new("D").strong());
-                                                    ui.label(RichText::new("B").strong());
-                                                    ui.label(RichText::new("Score").strong());
-                                                    ui.end_row();
-                                                    for m in &moves {
-                                                        if let Some(decoded) = position::decode_move(pos, m.mv) {
-                                                            let san = SanPlus::from_move(pos.clone(), decoded).to_string();
-                                                            let response = ui.selectable_label(false, RichText::new(&san).strong());
-                                                            if response.hovered() {
-                                                                hover_preview = preview_after_move(pos, decoded);
-                                                            }
-                                                            if response.clicked() {
-                                                                clicked = Some(decoded);
-                                                            }
-                                                            ui.label(m.games.to_string());
-                                                            ui.label(m.white.to_string());
-                                                            ui.label(m.draw.to_string());
-                                                            ui.label(m.black.to_string());
-                                                            let pct = if m.games > 0 {
-                                                                (m.white as f64 + m.draw as f64 * 0.5) / m.games as f64 * 100.0
-                                                            } else {
-                                                                0.0
-                                                            };
-                                                            ui.label(format!("{pct:.0}%"));
-                                                            ui.end_row();
-                                                        }
-                                                    }
-                                                });
-                                        } else {
-                                            ui.label(RichText::new("No ChessABC game reached this position.").weak().italics());
-                                        }
-                                    } else {
-                                        ui.horizontal(|ui| {
-                                            ui.label(RichText::new(&self.chessabc_live_status).weak());
-                                            if self.chessabc_live_rx.is_some() {
-                                                ui.spinner();
-                                            }
-                                        });
-                                    }
-                                }
-                                LiveReferenceSource::LichessMasters | LiveReferenceSource::LichessAll => {
-                                    let source = match live {
-                                        LiveReferenceSource::LichessMasters => cloud::ExplorerSource::Masters,
-                                        _ => cloud::ExplorerSource::Lichess,
-                                    };
-                                    let fen = Fen::from_position(pos, EnPassantMode::Legal).to_string();
-                                    if let Some(snapshot) = self.cloud_cache.get(&(source, fen)) {
-                                        match &snapshot.explorer {
-                                            Ok(explorer) if !explorer.moves.is_empty() => {
-                                                egui::Grid::new("prep-live-explorer-grid")
-                                                    .num_columns(6)
-                                                    .striped(true)
-                                                    .show(ui, |ui| {
-                                                        ui.label(RichText::new("Move").strong());
-                                                        ui.label(RichText::new("Games").strong());
-                                                        ui.label(RichText::new("W").strong());
-                                                        ui.label(RichText::new("D").strong());
-                                                        ui.label(RichText::new("B").strong());
-                                                        ui.label(RichText::new("Score").strong());
-                                                        ui.end_row();
-                                                        for em in &explorer.moves {
-                                                            let Ok(uci) = em.uci.parse::<UciMove>() else { continue };
-                                                            let Ok(mv) = uci.to_move(pos) else { continue };
-                                                            let response = ui.selectable_label(
-                                                                false,
-                                                                RichText::new(&em.san).strong(),
-                                                            );
-                                                            if response.hovered() {
-                                                                hover_preview = preview_after_move(pos, mv);
-                                                            }
-                                                            if response.clicked() {
-                                                                clicked = Some(mv);
-                                                            }
-                                                            ui.label(em.total().to_string());
-                                                            ui.label(em.white.to_string());
-                                                            ui.label(em.draws.to_string());
-                                                            ui.label(em.black.to_string());
-                                                            let pct = if em.total() > 0 {
-                                                                (em.white as f64 + em.draws as f64 * 0.5) / em.total() as f64 * 100.0
-                                                            } else {
-                                                                0.0
-                                                            };
-                                                            ui.label(format!("{pct:.0}%"));
-                                                            ui.end_row();
-                                                        }
-                                                    });
-                                            }
-                                            Ok(_) => {
-                                                ui.label(RichText::new("No moves found in explorer for this position.").weak().italics());
-                                            }
-                                            Err(err) => {
-                                                ui.label(RichText::new(format!("Explorer query failed: {err}")).weak());
-                                            }
-                                        }
-                                    } else {
-                                        ui.label(RichText::new(format!("Loading {}...", live.label())).weak());
-                                    }
-                                }
-                            }
-                        } else if let Some(book) = self.reference_book.as_ref() {
-                            ui.label(
-                                RichText::new(format!(
-                                    "{} · {}",
-                                    book.path().display(),
-                                    book.summary()
-                                ))
-                                .weak()
-                                .small(),
-                            );
-                            match book.moves(pos) {
-                                Ok(moves) if !moves.is_empty() => {
-                                    egui::Grid::new("prep-reference-book-grid")
-                                        .num_columns(6)
-                                        .striped(true)
-                                        .show(ui, |ui| {
-                                            ui.label(RichText::new("Move").strong());
-                                            ui.label(RichText::new("Games").strong());
-                                            ui.label(RichText::new("W").strong());
-                                            ui.label(RichText::new("D").strong());
-                                            ui.label(RichText::new("B").strong());
-                                            ui.label(RichText::new("Score").strong());
-                                            ui.end_row();
-                                            for book_move in &moves {
-                                                let san = SanPlus::from_move(pos.clone(), book_move.mv)
-                                                    .to_string();
-                                                let response = ui.selectable_label(
-                                                    false,
-                                                    RichText::new(&san).strong(),
-                                                );
-                                                if response.hovered() {
-                                                    hover_preview =
-                                                        preview_after_move(pos, book_move.mv);
-                                                }
-                                                if response.clicked() {
-                                                    clicked = Some(book_move.mv);
-                                                }
-                                                let games =
-                                                    book_move.games.max(book_move.weight);
-                                                ui.label(games.to_string());
-                                                ui.label(book_move.white.to_string());
-                                                ui.label(book_move.draw.to_string());
-                                                ui.label(book_move.black.to_string());
-                                                let score = book_move
-                                                    .score_white()
-                                                    .map(|score| format!("{:.0}%", score * 100.0))
-                                                    .unwrap_or_else(|| "—".to_string());
-                                                ui.label(score);
-                                                ui.end_row();
-                                            }
-                                        });
-                                }
-                                Ok(_) => {
-                                    ui.label(
-                                        RichText::new("No book move reached this position.")
-                                            .weak()
-                                            .italics(),
-                                    );
-                                }
-                                Err(err) => {
-                                    ui.label(
-                                        RichText::new(format!(
-                                            "Opening book read failed: {err:#}"
-                                        ))
-                                        .weak(),
-                                    );
-                                }
-                            }
-                            if ui.small_button("Choose reference database or book…").clicked()
-                                && let Some(path) = open_file_dialog(
-                                    "Choose reference database or book",
-                                    self.last_database_dir.as_deref(),
-                                    "Reference databases and opening books",
-                                    "*.2cbh *.2CBH *.cbh *.CBH *.si4 *.SI4 *.pgn *.PGN *.bin *.BIN *.ctg *.CTG *.abk *.ABK *.bkt *.BKT",
-                                )
-                            {
-                                pending_reference_path = Some(path.display().to_string());
-                            }
-                        } else {
-                            ui.label(RichText::new(&reference_status).weak());
-                            if reference_tree_building {
-                                ui.label(
-                                    RichText::new(
-                                        "Building the reference index in the background.",
-                                    )
-                                    .weak()
-                                    .small(),
-                                );
-                            } else if let Some(job) = &reference_tree_job {
-                                ui.label(RichText::new(job).weak().small());
-                            }
-                            if ui.small_button("Choose reference database or book…").clicked()
-                                && let Some(path) = open_file_dialog(
-                                    "Choose reference database or book",
-                                    self.last_database_dir.as_deref(),
-                                    "Reference databases and opening books",
-                                    "*.2cbh *.2CBH *.cbh *.CBH *.si4 *.SI4 *.pgn *.PGN *.bin *.BIN *.ctg *.CTG *.abk *.ABK *.bkt *.BKT",
-                                )
-                            {
-                                pending_reference_path = Some(path.display().to_string());
-                            }
-                        }
-                    });
-
                 ui.add_space(4.0);
                 egui::CollapsingHeader::new(RichText::new("Recent games").strong())
                     .default_open(true)
@@ -16605,6 +16460,44 @@ impl App {
                                 .italics(),
                             );
                         } else {
+                            if let Some(browse) = self
+                                .hovered_game_browse
+                                .as_ref()
+                                .filter(|b| b.id.starts_with("recent"))
+                            {
+                                let moves_san: Vec<String> = browse
+                                    .game
+                                    .nodes
+                                    .iter()
+                                    .skip(1)
+                                    .filter_map(|n| n.san().map(str::to_string))
+                                    .collect();
+                                let text = if moves_san.is_empty() {
+                                    browse.game.result().to_string()
+                                } else {
+                                    moves_san
+                                        .iter()
+                                        .enumerate()
+                                        .fold(String::new(), |mut acc, (idx, san)| {
+                                            if idx % 2 == 0 {
+                                                acc.push_str(&format!("{}. ", idx / 2 + 1));
+                                            }
+                                            acc.push_str(san);
+                                            acc.push(' ');
+                                            acc
+                                        })
+                                };
+                                egui::Frame::new()
+                                    .fill(SURFACE)
+                                    .corner_radius(4.0)
+                                    .inner_margin(4.0)
+                                    .show(ui, |ui| {
+                                        ui.label(
+                                            RichText::new(format!("Preview: {text}")).small().weak(),
+                                        );
+                                    });
+                                ui.add_space(2.0);
+                            }
                             let width = (ui.available_width() - 4.0).max(100.0);
                             let visible: Vec<&PrepRecentRow> = if recent_all {
                                 recent_rows.iter().collect()
@@ -16629,18 +16522,28 @@ impl App {
                                     width,
                                     40.0,
                                     Some(row.type_color),
+                                    Some((&row.result_badge, row.player_outcome)),
                                 );
                                 row_response =
                                     row_response.on_hover_text(row.type_label);
-                                if row_response.hovered()
-                                    && let Some(merged) = row.merged_index
-                                    && let Some(game) =
-                                        self.prep_merged_games.get(merged).cloned()
-                                {
-                                    self.activate_hovered_game_browse(
-                                        format!("recent:{merged}"),
-                                        game,
-                                    );
+                                if row_response.hovered() {
+                                    let browse_id = if let Some(merged) = row.merged_index {
+                                        format!("recent-merged:{merged}")
+                                    } else {
+                                        format!("recent-lib:{}", row.index)
+                                    };
+                                    if !self.is_hovered_game(&browse_id) {
+                                        let game = if let Some(merged) = row.merged_index {
+                                            self.prep_merged_games.get(merged).cloned()
+                                        } else {
+                                            self.library
+                                                .as_ref()
+                                                .and_then(|lib| lib.load(row.index).ok())
+                                        };
+                                        if let Some(game) = game {
+                                            self.activate_hovered_game_browse(browse_id, game);
+                                        }
+                                    }
                                 }
                                 if row_response.clicked()
                                 {
@@ -16734,6 +16637,41 @@ impl App {
             Err(err) => {
                 self.status = format!("Could not open game {}: {err}", index + 1);
             }
+        }
+    }
+
+    /// Returns the currently active game, node index, and whether it is a
+    /// hovered preview overlay (`(game, node, is_hover_overlay)`).
+    /// Prefers any active `hovered_game_browse`, falling back to `current`.
+    fn active_display_game_and_node(&self) -> Option<(&Game, usize, bool)> {
+        if let Some(browse) = &self.hovered_game_browse {
+            let max_node = browse.game.nodes.len().saturating_sub(1);
+            Some((&browse.game, browse.cursor_node.min(max_node), true))
+        } else {
+            self.current.as_ref().map(|g| {
+                let max_node = g.nodes.len().saturating_sub(1);
+                (g, self.node.min(max_node), false)
+            })
+        }
+    }
+
+    /// Returns whether the hovered browse game currently matches `id`.
+    fn is_hovered_game(&self, id: &str) -> bool {
+        self.hovered_game_browse.as_ref().is_some_and(|b| b.id == id)
+    }
+
+    /// Activate hovered game browsing without repeatedly invoking `load` if
+    /// the row with `id` is already active.
+    fn activate_hovered_game_browse_lazy(
+        &mut self,
+        id: String,
+        load: impl FnOnce() -> Option<Game>,
+    ) {
+        if self.is_hovered_game(&id) {
+            return;
+        }
+        if let Some(game) = load() {
+            self.activate_hovered_game_browse(id, game);
         }
     }
 
@@ -18121,8 +18059,10 @@ impl eframe::App for App {
                 ui.add_space(6.0);
                 let hover = self.hover_preview.as_ref();
                 let (board_eval, eval_held) = self.current_board_eval_with_hold();
-                let board_meta = self.game().map(|game| {
-                    let node = &game.nodes[self.node];
+                let (board_meta, move_counter_text) = if let Some((game, disp_node, _)) =
+                    self.active_display_game_and_node()
+                {
+                    let node = &game.nodes[disp_node];
                     let top_color = self.orientation.other();
                     let bottom_color = self.orientation;
                     let show_clocks = self.show_clocks && game.has_clocks();
@@ -18143,13 +18083,13 @@ impl eframe::App for App {
                         ),
                         team: team_for(game, color).map(str::to_string),
                         clock: if show_clocks {
-                            game.clock_for(self.node, color)
+                            game.clock_for(disp_node, color)
                         } else {
                             None
                         },
                         color,
                     };
-                    BoardMeta {
+                    let meta = BoardMeta {
                         pos: hover
                             .map(|preview| preview.pos.clone())
                             .unwrap_or_else(|| node.pos.clone()),
@@ -18162,8 +18102,16 @@ impl eframe::App for App {
                         top: badge(top_color),
                         bottom: badge(bottom_color),
                         show_clocks,
-                    }
-                });
+                    };
+                    let counter = format!(
+                        "move {} / {}",
+                        full_moves(depth_of(game, disp_node)),
+                        full_moves(game.mainline_len())
+                    );
+                    (Some(meta), Some(counter))
+                } else {
+                    (None, None)
+                };
                 if let Some(meta) = board_meta {
                     let ctx = ui.ctx().clone();
                     let top_photo = self.photo_texture(&ctx, &meta.top.name);
@@ -18238,13 +18186,6 @@ impl eframe::App for App {
                         )
                     };
                     ui.add_space(2.0);
-                    let move_counter_text = self.current.as_ref().map(|g| {
-                        format!(
-                            "move {} / {}",
-                            full_moves(depth_of(g, self.node)),
-                            full_moves(g.mainline_len())
-                        )
-                    });
                     let bottom_action = player_strip(
                         ui,
                         side,
@@ -21248,6 +21189,7 @@ fn game_row(
     width: f32,
     height: f32,
     text_color: Option<Color32>,
+    badge: Option<(&str, Option<f32>)>,
 ) -> egui::Response {
     let sense = if rows_are_draggable(ui) {
         Sense::click_and_drag()
@@ -21316,7 +21258,8 @@ fn game_row(
     if !suffix.is_empty() {
         job.append(suffix, 0.0, name_format);
     }
-    job.wrap.max_width = (width - 16.0).max(24.0);
+    let right_pad = if badge.is_some() { 48.0 } else { 16.0 };
+    job.wrap.max_width = (width - right_pad).max(24.0);
     job.wrap.max_rows = 1;
     job.wrap.break_anywhere = true;
     let title_galley = painter.layout_job(job);
@@ -21332,6 +21275,43 @@ fn game_row(
         FontId::proportional(11.0),
         visuals.weak_text_color(),
     );
+    if let Some((badge_text, outcome)) = badge {
+        let (badge_bg, badge_fg) = match outcome {
+            Some(1.0) => (
+                Color32::from_rgb(0x2E, 0x69, 0x30),
+                Color32::from_rgb(0xE8, 0xEC, 0xF2),
+            ),
+            Some(0.5) => (
+                Color32::from_rgb(0x4A, 0x55, 0x68),
+                Color32::from_rgb(0xEB, 0xF8, 0xFF),
+            ),
+            Some(0.0) => (
+                Color32::from_rgb(0x7B, 0x24, 0x24),
+                Color32::from_rgb(0xFF, 0xEB, 0xEB),
+            ),
+            _ => (
+                Color32::from_rgb(0x2D, 0x37, 0x48),
+                Color32::from_rgb(0xCC, 0xD6, 0xE0),
+            ),
+        };
+        let badge_w = 34.0;
+        let badge_h = 16.0;
+        let badge_rect = Rect::from_min_size(
+            pos2(
+                rect.right() - badge_w - 8.0,
+                rect.top() + (rect.height() - badge_h) * 0.5,
+            ),
+            vec2(badge_w, badge_h),
+        );
+        painter.rect_filled(badge_rect, 3.0, badge_bg);
+        painter.text(
+            badge_rect.center(),
+            Align2::CENTER_CENTER,
+            badge_text,
+            FontId::proportional(11.0),
+            badge_fg,
+        );
+    }
     response
 }
 
@@ -22593,61 +22573,6 @@ fn outcome_label(result: &str, color: Color) -> &'static str {
     }
 }
 
-/// Game-type colour coding shared by the game list and preparation rows:
-/// Classical OTB emerald, Rapid/Blitz OTB sky, Online violet.
-fn game_type_style(game: &Game) -> (Color32, &'static str) {
-    let (tc, is_online, _) = players::classify_game_metadata(game);
-    game_type_style_for(tc, is_online)
-}
-
-fn game_type_style_for(tc: players::TimeControlClass, is_online: bool) -> (Color32, &'static str) {
-    if is_online {
-        (Color32::from_rgb(0xC6, 0x8A, 0xE8), "Online")
-    } else {
-        match tc {
-            players::TimeControlClass::Classical => {
-                (Color32::from_rgb(0x7E, 0xD3, 0x8A), "Classical OTB")
-            }
-            _ => (Color32::from_rgb(0x6A, 0xB0, 0xE8), "Rapid/Blitz OTB"),
-        }
-    }
-}
-
-/// Classify an indexed game without loading the full record.
-fn indexed_game_type_style(indexed: &crate::library::IndexedGame) -> (Color32, &'static str) {
-    let game = Game {
-        headers: [
-            ("Event", indexed.event()),
-            ("Site", indexed.header("Site").unwrap_or("?")),
-            ("TimeControl", indexed.header("TimeControl").unwrap_or("?")),
-        ]
-        .into_iter()
-        .map(|(key, value)| (key.to_string(), value.to_string()))
-        .collect(),
-        ..Game::default()
-    };
-    game_type_style(&game)
-}
-
-fn slot_game_type_by_headers(
-    event: Option<&str>,
-    site: Option<&str>,
-    time_control: Option<&str>,
-) -> (Color32, &'static str) {
-    let game = Game {
-        headers: [
-            ("Event", event.unwrap_or("?")),
-            ("Site", site.unwrap_or("?")),
-            ("TimeControl", time_control.unwrap_or("?")),
-        ]
-        .into_iter()
-        .map(|(key, value)| (key.to_string(), value.to_string()))
-        .collect(),
-        ..Game::default()
-    };
-    game_type_style(&game)
-}
-
 /// Load every game naming `canonical_name` from an already-open library
 /// (2CBH/CBH/SCID/PGN all arrive here through [`open_library`]). The
 /// backend's per-player accelerator is preferred; otherwise the headers are
@@ -22810,69 +22735,160 @@ fn probability_bar(ui: &mut Ui, probability: f64, low: f64, high: f64) {
     ));
 }
 
+pub fn draw_wdl_bar(
+    ui: &mut Ui,
+    white: u32,
+    draw: u32,
+    black: u32,
+    width: f32,
+    height: f32,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(vec2(width, height), Sense::hover());
+    let painter = ui.painter_at(rect);
+    let total = white + draw + black;
+    let (w_pct, d_pct, b_pct) = if total > 0 {
+        let tf = total as f32;
+        (
+            ((white as f32 / tf) * 100.0).round() as u32,
+            ((draw as f32 / tf) * 100.0).round() as u32,
+            ((black as f32 / tf) * 100.0).round() as u32,
+        )
+    } else {
+        (0, 0, 0)
+    };
+
+    let tooltip = format!(
+        "White: {white} ({w_pct}%) · Draw: {draw} ({d_pct}%) · Black: {black} ({b_pct}%)"
+    );
+    let response = response.on_hover_text(tooltip);
+
+    if total == 0 {
+        painter.rect_filled(rect, CornerRadius::same(3), Color32::from_rgb(0x20, 0x24, 0x2C));
+        painter.rect_stroke(
+            rect,
+            CornerRadius::same(3),
+            Stroke::new(1.0, Color32::from_rgb(0x38, 0x3E, 0x4C)),
+            StrokeKind::Inside,
+        );
+        return response;
+    }
+
+    let w_ratio = white as f32 / total as f32;
+    let d_ratio = draw as f32 / total as f32;
+
+    let w_width = (rect.width() * w_ratio).round();
+    let d_width = (rect.width() * d_ratio).round();
+    let b_width = (rect.width() - w_width - d_width).max(0.0);
+
+    let w_rect = Rect::from_min_size(rect.min, vec2(w_width, rect.height()));
+    let d_rect = Rect::from_min_size(
+        pos2(rect.left() + w_width, rect.top()),
+        vec2(d_width, rect.height()),
+    );
+    let b_rect = Rect::from_min_size(
+        pos2(rect.left() + w_width + d_width, rect.top()),
+        vec2(b_width, rect.height()),
+    );
+
+    if w_width > 0.0 {
+        let radius = if d_width == 0.0 && b_width == 0.0 {
+            CornerRadius::same(3)
+        } else {
+            CornerRadius {
+                nw: 3,
+                sw: 3,
+                ne: 0,
+                se: 0,
+            }
+        };
+        painter.rect_filled(w_rect, radius, Color32::from_rgb(0xE8, 0xEC, 0xF2));
+        if w_width >= 26.0 {
+            let label = format!("{w_pct}%");
+            painter.text(
+                w_rect.center(),
+                Align2::CENTER_CENTER,
+                label,
+                FontId::proportional(10.0),
+                Color32::from_rgb(0x14, 0x17, 0x1C),
+            );
+        }
+    }
+
+    if d_width > 0.0 {
+        let radius = if w_width == 0.0 && b_width == 0.0 {
+            CornerRadius::same(3)
+        } else if w_width == 0.0 {
+            CornerRadius {
+                nw: 3,
+                sw: 3,
+                ne: 0,
+                se: 0,
+            }
+        } else if b_width == 0.0 {
+            CornerRadius {
+                nw: 0,
+                sw: 0,
+                ne: 3,
+                se: 3,
+            }
+        } else {
+            CornerRadius::ZERO
+        };
+        painter.rect_filled(d_rect, radius, Color32::from_rgb(0x6C, 0x73, 0x80));
+        if d_width >= 26.0 {
+            let label = format!("{d_pct}%");
+            painter.text(
+                d_rect.center(),
+                Align2::CENTER_CENTER,
+                label,
+                FontId::proportional(10.0),
+                Color32::from_rgb(0xEC, 0xEF, 0xF4),
+            );
+        }
+    }
+
+    if b_width > 0.0 {
+        let radius = if w_width == 0.0 && d_width == 0.0 {
+            CornerRadius::same(3)
+        } else {
+            CornerRadius {
+                nw: 0,
+                sw: 0,
+                ne: 3,
+                se: 3,
+            }
+        };
+        painter.rect_filled(b_rect, radius, Color32::from_rgb(0x20, 0x24, 0x2C));
+        painter.rect_stroke(
+            b_rect,
+            radius,
+            Stroke::new(1.0, Color32::from_rgb(0x38, 0x3E, 0x4C)),
+            StrokeKind::Inside,
+        );
+        if b_width >= 26.0 {
+            let label = format!("{b_pct}%");
+            painter.text(
+                b_rect.center(),
+                Align2::CENTER_CENTER,
+                label,
+                FontId::proportional(10.0),
+                Color32::from_rgb(0xEC, 0xEF, 0xF4),
+            );
+        }
+    }
+
+    response
+}
+
 /// Win/draw/loss bar from the player's perspective.
 fn record_bar(ui: &mut Ui, wins: u32, draws: u32, losses: u32) {
     let width = ui.available_width().max(80.0);
-    let (rect, response) = ui.allocate_exact_size(vec2(width, 10.0), Sense::hover());
-    let painter = ui.painter_at(rect);
-    let total = (wins + draws + losses).max(1) as f32;
-    let mut x = rect.left();
-    for (count, color) in [
-        (wins, Color32::from_rgb(0x6F, 0xAE, 0x7A)),
-        (draws, Color32::from_rgb(0x87, 0x8C, 0x91)),
-        (losses, Color32::from_rgb(0xB5, 0x6B, 0x6B)),
-    ] {
-        let segment = rect.width() * count as f32 / total;
-        if segment > 0.0 {
-            painter.rect_filled(
-                egui::Rect::from_min_size(egui::pos2(x, rect.top()), vec2(segment, rect.height())),
-                0.0,
-                color,
-            );
-            x += segment;
-        }
-    }
-    painter.rect_stroke(
-        rect,
-        0.0,
-        Stroke::new(1.0, Color32::from_gray(70)),
-        StrokeKind::Inside,
-    );
-    response.on_hover_text(format!("Wins {wins} · draws {draws} · losses {losses}"));
+    draw_wdl_bar(ui, wins, draws, losses, width, 10.0);
 }
 
 fn wdl_bar(ui: &mut Ui, stats: &PositionStats) {
     let width = ui.available_width().max(80.0);
-    let (rect, response) = ui.allocate_exact_size(vec2(width, 10.0), Sense::hover());
-    let painter = ui.painter_at(rect);
-    let total = stats.games.max(1) as f32;
-    let mut x = rect.left();
-    let segments = [
-        (stats.white, Color32::from_rgb(0xCB, 0xDD, 0xC4)),
-        (stats.draw, Color32::from_rgb(0x87, 0x8C, 0x91)),
-        (stats.black, Color32::from_rgb(0x2A, 0x2D, 0x30)),
-    ];
-    for (count, color) in segments {
-        let segment = rect.width() * count as f32 / total;
-        if segment > 0.0 {
-            painter.rect_filled(
-                egui::Rect::from_min_size(egui::pos2(x, rect.top()), vec2(segment, rect.height())),
-                0.0,
-                color,
-            );
-            x += segment;
-        }
-    }
-    painter.rect_stroke(
-        rect,
-        0.0,
-        egui::Stroke::new(1.0, Color32::from_gray(70)),
-        egui::StrokeKind::Inside,
-    );
-    response.on_hover_text(format!(
-        "White {} · draw {} · Black {}",
-        stats.white, stats.draw, stats.black
-    ));
+    draw_wdl_bar(ui, stats.white, stats.draw, stats.black, width, 10.0);
 }
 
 /// Badge color for the opening-tree Trend column and its sparkline.
@@ -22896,12 +22912,12 @@ fn trend_badge_color(badge: crate::recent::TrendBadge) -> Color32 {
 const PREP_SMART_COLUMNS: [&str; 8] = [
     "Move",
     "Predicted",
-    "Opp Games(Recent)",
-    "Score(+/=/-)",
-    "vs Ref",
-    "Last Played",
+    "Opp",
+    "Opp W/D/B",
+    "Ref",
+    "Ref W/D/B",
+    "Trend",
     "Eval",
-    "",
 ];
 
 /// Prominent probability colour for the Smart predictor table, applied to
@@ -23060,22 +23076,22 @@ fn opening_tree_table(
 
     let mut clicked = None;
     ui.add_space(4.0);
-    let show_book_badge = book_games.is_some_and(|map| !map.is_empty());
+    let total_games = stats
+        .as_ref()
+        .map(|s| s.games.max(1) as f32)
+        .unwrap_or_else(|| rows.iter().map(|r| r.2.games).sum::<u32>().max(1) as f32);
     egui::Grid::new("opening-tree-grid")
-        .num_columns(if show_book_badge { 8 } else { 7 })
+        .num_columns(7)
         .striped(true)
         .spacing([10.0, 4.0])
         .show(ui, |ui| {
             ui.label(RichText::new("Move").strong());
+            ui.label(RichText::new("Share").strong());
             ui.label(RichText::new("Games").strong());
-            ui.label(RichText::new("Score").strong());
             ui.label(RichText::new("W/D/B").strong());
-            ui.label(RichText::new("Elo").strong());
-            ui.label(RichText::new("Years").strong());
+            ui.label(RichText::new("Book / Ref").strong());
             ui.label(RichText::new("Trend").strong());
-            if show_book_badge {
-                ui.label(RichText::new("📖 In PlayerBook").strong());
-            }
+            ui.label(RichText::new("Avg Elo").strong());
             ui.end_row();
 
             for (san, mv, stat) in rows {
@@ -23088,15 +23104,16 @@ fn opening_tree_table(
                 if response.clicked() {
                     clicked = Some(mv);
                 }
+                let share = (stat.games as f32 / total_games * 100.0).clamp(0.0, 100.0);
+                ui.label(format!("{share:.1}%"));
                 ui.label(stat.games.to_string());
-                ui.label(format!("{:.0}%", stat.score_white() * 100.0));
-                ui.label(format!("{}/{}/{}", stat.white, stat.draw, stat.black));
-                ui.label(
-                    stat.elo_avg()
-                        .map(|elo| format!("{elo:.0}"))
-                        .unwrap_or_else(|| "—".to_string()),
-                );
-                ui.label(date_range(stat.first_date, stat.last_date));
+                draw_wdl_bar(ui, stat.white, stat.draw, stat.black, 60.0, 10.0);
+                if let Some(games) = book_games.and_then(|map| map.get(&stat.mv)) {
+                    ui.label(RichText::new(format!("📖 {games}")).small().strong())
+                        .on_hover_text("Present in the reference opening book.");
+                } else {
+                    ui.label(RichText::new("—").weak().small());
+                }
                 match trend_by_move
                     .get(&stat.mv)
                     .and_then(crate::recent::MoveTrend::compact_label)
@@ -23119,17 +23136,11 @@ fn opening_tree_table(
                         );
                     }
                 }
-                if show_book_badge {
-                    match book_games.and_then(|map| map.get(&stat.mv)) {
-                        Some(games) => {
-                            ui.label(RichText::new(format!("📖 {games}")).small().strong())
-                                .on_hover_text("Also present in the prepared player's book.");
-                        }
-                        None => {
-                            ui.label(RichText::new("—").weak().small());
-                        }
-                    }
-                }
+                ui.label(
+                    stat.elo_avg()
+                        .map(|elo| format!("{elo:.0}"))
+                        .unwrap_or_else(|| "—".to_string()),
+                );
                 ui.end_row();
             }
         });
@@ -23986,6 +23997,7 @@ mod tests {
                     "Paris · 1858",
                     300.0,
                     40.0,
+                    None,
                     None,
                 );
                 sense = Some(response.sense);
@@ -26354,21 +26366,19 @@ mod tests {
     fn slot_game_type_site_lichess_colors_online() {
         // `Site` alone must mark Lichess games Online even when the event
         // and time control look OTB-ish.
-        let (color, label) =
-            slot_game_type_by_headers(Some("Rated Blitz"), Some("lichess.org"), Some("180+2"));
-        assert_eq!(label, "Online");
-        assert_eq!(color, Color32::from_rgb(0xC6, 0x8A, 0xE8));
-        let (color, label) =
-            slot_game_type_by_headers(Some("Tata Steel Masters"), Some("lichess.org"), None);
-        assert_eq!(label, "Online");
-        assert_eq!(color, Color32::from_rgb(0xC6, 0x8A, 0xE8));
+        let cat = players::classify_headers_category(Some("Rated Blitz"), Some("lichess.org"), Some("180+2"));
+        assert_eq!(cat, players::GameCategory::OnlineBlitz);
+        let cat2 = players::classify_headers_category(Some("Tata Steel Masters"), Some("lichess.org"), Some("5400+30"));
+        assert_eq!(cat2, players::GameCategory::OnlineClassical);
+        let cat_rapid = players::classify_headers_category(Some("Tata Steel Masters"), Some("lichess.org"), None);
+        assert_eq!(cat_rapid, players::GameCategory::OnlineRapid);
         // A real OTB venue stays Classical OTB.
-        let (_, label) = slot_game_type_by_headers(
+        let cat3 = players::classify_headers_category(
             Some("Tata Steel Masters"),
             Some("Wijk aan Zee"),
             Some("5400+30"),
         );
-        assert_eq!(label, "Classical OTB");
+        assert_eq!(cat3, players::GameCategory::OtbClassical);
     }
 
     #[test]
@@ -26400,8 +26410,8 @@ mod tests {
         assert_eq!(positions, vec![0, 1]);
         assert!(
             positions.iter().any(|&position| {
-                let (_, label) = game_type_style(&app.prep_merged_games[position]);
-                label == "Online"
+                let cat = players::classify_game_category(&app.prep_merged_games[position]);
+                cat.label().starts_with("Online")
             }),
             "the merged list keeps online games"
         );
@@ -27366,5 +27376,95 @@ mod tests {
         assert!(!truncated.contains("https://"));
         assert!(truncated.chars().count() <= 48);
         assert!(truncated.ends_with('…'));
+    }
+
+    #[test]
+    fn hovering_game_row_overlays_game_in_moves_and_board_meta() {
+        let mut app = test_app();
+        let (game, node, is_overlay) = app.active_display_game_and_node().expect("current game");
+        assert!(!is_overlay);
+        assert_eq!(node, app.node);
+        assert_eq!(game.white(), "Paul Morphy");
+
+        let pgn = b"[Event \"Preview\"]\n[White \"Carlsen, Magnus\"]\n[Black \"Nakamura, Hikaru\"]\n[Result \"1-0\"]\n\n1. e4 e5 2. Nf3 1-0\n";
+        let mut hover_games = domain::parse_pgn(&pgn[..]).unwrap();
+        let hover_game = hover_games.remove(0);
+        app.hovered_game_browse = Some(HoveredGameBrowse {
+            id: "session:42".to_string(),
+            game: hover_game,
+            anchor_node: 0,
+            cursor_node: 2,
+        });
+
+        let (disp_game, disp_node, disp_overlay) =
+            app.active_display_game_and_node().expect("hovered game");
+        assert!(disp_overlay);
+        assert_eq!(disp_node, 2);
+        assert_eq!(disp_game.white(), "Carlsen, Magnus");
+    }
+
+    #[test]
+    fn prep_recent_row_computes_individual_game_score_and_omits_category_text() {
+        let pgn = b"[Event \"Super Tournament\"]\n[White \"Prepared\"]\n[Black \"Hero\"]\n[Date \"2024.05.01\"]\n[Result \"1-0\"]\n\n1. e4 e5 1-0\n\n[Event \"Blitz Club\"]\n[White \"Hero\"]\n[Black \"Prepared\"]\n[Date \"2024.06.01\"]\n[Result \"1/2-1/2\"]\n\n1. d4 d5 1/2-1/2\n";
+        let games = domain::parse_pgn(&pgn[..]).unwrap();
+        let book = players::PlayerBook::from_merged_games(
+            "prepared",
+            "Prepared",
+            &games,
+            players::PredictionConfig::default(),
+            players::today(),
+        );
+
+        let mut app = test_app();
+        let mut prep = prep_test_session();
+        prep.player_key = "prepared".to_string();
+        prep.player_name = "Prepared".to_string();
+        prep.our_color = Color::Black; // Opponent is White
+        app.prep_merged_games = games;
+        app.player_book = Some(book);
+
+        let key = position::position_key(&crate::chess::Chess::default());
+        let rows = app.prep_unified_recent_rows(&prep, Color::White, key, 10);
+        assert!(!rows.is_empty(), "expected recent rows");
+        for row in &rows {
+            assert!(
+                !row.subtitle.contains("Classical OTB")
+                    && !row.subtitle.contains("Rapid/Blitz OTB")
+                    && !row.subtitle.contains("Online"),
+                "subtitle must omit category text, got: {}",
+                row.subtitle
+            );
+            assert!(
+                row.result_badge == "1-0"
+                    || row.result_badge == "½-½"
+                    || row.result_badge == "0-1",
+                "expected standardized result badge, got: {}",
+                row.result_badge
+            );
+            assert!(row.player_outcome.is_some(), "expected computed player outcome");
+        }
+        assert_eq!(rows[0].result_badge, "1-0");
+        assert_eq!(rows[0].player_outcome, Some(1.0));
+    }
+
+    #[test]
+    fn activate_hovered_game_browse_lazy_loads_only_once() {
+        let mut app = test_app();
+        let mut loads = 0;
+        let test_game = domain::Game::default();
+
+        app.activate_hovered_game_browse_lazy("test:1".to_string(), || {
+            loads += 1;
+            Some(test_game.clone())
+        });
+        assert_eq!(loads, 1);
+        assert!(app.is_hovered_game("test:1"));
+
+        // Second call with same id should NOT invoke the loader closure.
+        app.activate_hovered_game_browse_lazy("test:1".to_string(), || {
+            loads += 1;
+            Some(test_game.clone())
+        });
+        assert_eq!(loads, 1);
     }
 }
