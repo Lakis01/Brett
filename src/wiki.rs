@@ -14,11 +14,14 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
+use crate::country::{self, Country};
+
 const USER_AGENT: &str =
     "Brett/0.1 (native Linux chess preparation app; Wikipedia player summaries)";
 const SUMMARY_ENDPOINT: &str = "https://en.wikipedia.org/api/rest_v1/page/summary/";
 const SEARCH_ENDPOINT: &str = "https://en.wikipedia.org/w/rest.php/v1/search/page";
 const SEARCH_PAGE: &str = "https://en.wikipedia.org/w/index.php";
+const WIKIDATA_ENDPOINT: &str = "https://www.wikidata.org/wiki/Special:EntityData/";
 const MAX_SUMMARIES: usize = 256;
 const MAX_AMBIGUOUS: usize = 256;
 
@@ -30,6 +33,15 @@ pub struct Summary {
     pub extract: String,
     /// Canonical article URL on Wikipedia.
     pub url: String,
+    /// Canonical 3-letter FIDE codes ordered oldest → latest; last is the
+    /// latest/current federation. Empty when no nationality was detected.
+    pub countries: Vec<String>,
+    /// FIDE id from Wikidata `P1440`, when available.
+    pub fide_id: Option<String>,
+    /// Birth year from Wikidata `P569`, when available.
+    pub birth_year: Option<i32>,
+    /// Peak Elo from Wikidata `P1087`, when available.
+    pub peak_elo: Option<u16>,
 }
 
 impl Summary {
@@ -61,12 +73,32 @@ impl Summary {
         out
     }
 
+    /// Latest (current) federation, i.e. the last entry of
+    /// [`Self::countries`] resolved to a [`Country`].
+    pub fn latest_country(&self) -> Option<Country> {
+        self.countries
+            .last()
+            .and_then(|code| country::normalize(code))
+    }
+
+    /// All resolved federations ordered oldest → latest.
+    pub fn all_countries(&self) -> Vec<Country> {
+        self.countries
+            .iter()
+            .filter_map(|code| country::normalize(code))
+            .collect()
+    }
+
     fn to_value(&self) -> Value {
         json!({
             "title": self.title,
             "description": self.description,
             "extract": self.extract,
             "url": self.url,
+            "countries": self.countries,
+            "fide_id": self.fide_id,
+            "birth_year": self.birth_year,
+            "peak_elo": self.peak_elo,
         })
     }
 
@@ -99,12 +131,594 @@ impl Summary {
             .filter(|url| url.starts_with("https://"))
             .map(str::to_string)
             .unwrap_or_else(|| article_url(title));
+        // Cached entries from before enrichment may lack the new fields;
+        // default them (empty / None) instead of dropping the summary.
+        // Stored countries win; otherwise re-derive from lead text.
+        let stored_countries: Vec<String> = value
+            .get("countries")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::trim)
+                    .filter(|code| country::normalize(code).is_some())
+                    .map(|code| country::normalize(code).unwrap().code.to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let countries = if stored_countries.is_empty() {
+            // Fresh Wikipedia payload: derive from description + lead sentence.
+            // When loading a cache entry without stored countries, the same
+            // derivation runs against the cached description/extract, which
+            // is harmless and keeps old caches enriched.
+            countries_from_texts(&description, &extract)
+        } else {
+            stored_countries
+        };
+        let fide_id = value
+            .get("fide_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(str::to_string);
+        let birth_year = value
+            .get("birth_year")
+            .and_then(Value::as_i64)
+            .filter(|year| *year >= 0 && *year <= 2100)
+            .map(|year| year as i32)
+            .or_else(|| {
+                value
+                    .get("birth_year")
+                    .and_then(Value::as_u64)
+                    .filter(|year| *year <= 2100)
+                    .map(|year| year as i32)
+            });
+        let peak_elo = value
+            .get("peak_elo")
+            .and_then(Value::as_u64)
+            .filter(|elo| *elo > 0 && *elo <= 4000)
+            .map(|elo| elo as u16)
+            .or_else(|| {
+                value
+                    .get("peak_elo")
+                    .and_then(Value::as_i64)
+                    .filter(|elo| *elo > 0 && *elo <= 4000)
+                    .map(|elo| elo as u16)
+            });
         Some(Self {
             title: title.to_string(),
             description,
             extract,
             url,
+            countries,
+            fide_id,
+            birth_year,
+            peak_elo,
         })
+    }
+}
+
+/// Demonym tokens → canonical FIDE code. Multi-word entries are matched
+/// before single words so "south african" wins over "african".
+static DEMONYMS: &[(&str, &str)] = &[
+    ("afghan", "AFG"),
+    ("albanian", "ALB"),
+    ("algerian", "ALG"),
+    ("andorran", "AND"),
+    ("angolan", "ANG"),
+    ("argentine", "ARG"),
+    ("argentinian", "ARG"),
+    ("armenian", "ARM"),
+    ("australian", "AUS"),
+    ("austrian", "AUT"),
+    ("azerbaijani", "AZE"),
+    ("bahamian", "BAH"),
+    ("bahraini", "BRN"),
+    ("bangladeshi", "BAN"),
+    ("barbadian", "BAR"),
+    ("belarusian", "BLR"),
+    ("belgian", "BEL"),
+    ("bermudian", "BER"),
+    ("bhutanese", "BHU"),
+    ("bolivian", "BOL"),
+    ("bosnian", "BIH"),
+    ("botswanan", "BOT"),
+    ("brazilian", "BRA"),
+    ("bulgarian", "BUL"),
+    ("burkinabe", "BUR"),
+    ("burundian", "BDI"),
+    ("cambodian", "CAM"),
+    ("cameroonian", "CMR"),
+    ("canadian", "CAN"),
+    ("cape verdean", "CPV"),
+    ("cayman", "CAY"),
+    ("chadian", "CHA"),
+    ("chilean", "CHI"),
+    ("chinese", "CHN"),
+    ("colombian", "COL"),
+    ("comorian", "COM"),
+    ("congolese", "CGO"),
+    ("costa rican", "CRC"),
+    ("ivorian", "CIV"),
+    ("croatian", "CRO"),
+    ("cuban", "CUB"),
+    ("cypriot", "CYP"),
+    ("czech", "CZE"),
+    ("danish", "DEN"),
+    ("djiboutian", "DJI"),
+    ("dominican", "DOM"),
+    ("ecuadorian", "ECU"),
+    ("egyptian", "EGY"),
+    ("salvadoran", "ESA"),
+    ("british", "GBR"),
+    ("english", "ENG"),
+    ("scottish", "SCO"),
+    ("welsh", "WLS"),
+    ("equatorial guinean", "GEQ"),
+    ("eritrean", "ERI"),
+    ("estonian", "EST"),
+    ("swazi", "SWZ"),
+    ("eswatini", "SWZ"),
+    ("ethiopian", "ETH"),
+    ("faroese", "FAI"),
+    ("fijian", "FIJ"),
+    ("finnish", "FIN"),
+    ("french", "FRA"),
+    ("gabonese", "GAB"),
+    ("gambian", "GAM"),
+    ("georgian", "GEO"),
+    ("german", "GER"),
+    ("ghanaian", "GHA"),
+    ("greek", "GRE"),
+    ("guatemalan", "GUA"),
+    ("guyanese", "GUY"),
+    ("haitian", "HAI"),
+    ("honduran", "HON"),
+    ("hong kong", "HKG"),
+    ("hungarian", "HUN"),
+    ("icelandic", "ISL"),
+    ("indian", "IND"),
+    ("indonesian", "INA"),
+    ("iranian", "IRI"),
+    ("persian", "IRI"),
+    ("iraqi", "IRQ"),
+    ("irish", "IRL"),
+    ("manx", "IMN"),
+    ("israeli", "ISR"),
+    ("italian", "ITA"),
+    ("jamaican", "JAM"),
+    ("japanese", "JPN"),
+    ("jordanian", "JOR"),
+    ("kazakh", "KAZ"),
+    ("kazakhstani", "KAZ"),
+    ("kenyan", "KEN"),
+    ("kosovan", "KOS"),
+    ("kosovar", "KOS"),
+    ("kuwaiti", "KUW"),
+    ("kyrgyz", "KGZ"),
+    ("laotian", "LAO"),
+    ("latvian", "LAT"),
+    ("lebanese", "LBN"),
+    ("liberian", "LBR"),
+    ("libyan", "LBA"),
+    ("liechtenstein", "LIE"),
+    ("lithuanian", "LTU"),
+    ("luxembourgish", "LUX"),
+    ("macanese", "MAC"),
+    ("malagasy", "MAD"),
+    ("malawian", "MAW"),
+    ("malaysian", "MAS"),
+    ("maldivian", "MDV"),
+    ("malian", "MLI"),
+    ("maltese", "MLT"),
+    ("mauritanian", "MTN"),
+    ("mauritian", "MRI"),
+    ("mexican", "MEX"),
+    ("moldovan", "MDA"),
+    ("monacan", "MNC"),
+    ("mongolian", "MGL"),
+    ("montenegrin", "MNE"),
+    ("moroccan", "MAR"),
+    ("mozambican", "MOZ"),
+    ("myanmar", "MYA"),
+    ("burmese", "MYA"),
+    ("namibian", "NAM"),
+    ("nauruan", "NRU"),
+    ("nepali", "NEP"),
+    ("nepalese", "NEP"),
+    ("dutch", "NED"),
+    ("new zealand", "NZL"),
+    ("nicaraguan", "NCA"),
+    ("nigerien", "NIG"),
+    ("nigerian", "NGR"),
+    ("north macedonian", "MKD"),
+    ("macedonian", "MKD"),
+    ("norwegian", "NOR"),
+    ("omani", "OMA"),
+    ("pakistani", "PAK"),
+    ("palauan", "PLW"),
+    ("palestinian", "PLE"),
+    ("panamanian", "PAN"),
+    ("paraguayan", "PAR"),
+    ("peruvian", "PER"),
+    ("filipino", "PHI"),
+    ("Philippine", "PHI"),
+    ("polish", "POL"),
+    ("portuguese", "POR"),
+    ("puerto rican", "PUR"),
+    ("qatari", "QAT"),
+    ("romanian", "ROU"),
+    ("russian", "RUS"),
+    ("rwandan", "RWA"),
+    ("san marinese", "SMR"),
+    ("saudi arabian", "KSA"),
+    ("senegalese", "SEN"),
+    ("serbian", "SRB"),
+    ("seychellois", "SEY"),
+    ("sierra leone", "SLE"),
+    ("singaporean", "SGP"),
+    ("slovak", "SVK"),
+    ("slovenian", "SLO"),
+    ("somali", "SOM"),
+    ("south african", "RSA"),
+    ("south korean", "KOR"),
+    ("korean", "KOR"),
+    ("south sudanese", "SSD"),
+    ("spanish", "ESP"),
+    ("sri lankan", "SRI"),
+    ("sudanese", "SUD"),
+    ("surinamese", "SUR"),
+    ("swedish", "SWE"),
+    ("swiss", "SUI"),
+    ("syrian", "SYR"),
+    ("tajik", "TJK"),
+    ("tanzanian", "TAN"),
+    ("thai", "THA"),
+    ("timorese", "TLS"),
+    ("togolese", "TOG"),
+    ("tongan", "TGA"),
+    ("trinidadian", "TTO"),
+    ("tunisian", "TUN"),
+    ("turkish", "TUR"),
+    ("turkmen", "TKM"),
+    ("ugandan", "UGA"),
+    ("ukrainian", "UKR"),
+    ("emirati", "UAE"),
+    ("american", "USA"),
+    ("uruguayan", "URU"),
+    ("uzbek", "UZB"),
+    ("vanuatu", "VAN"),
+    ("venezuelan", "VEN"),
+    ("vietnamese", "VIE"),
+    ("yemenite", "YEM"),
+    ("zambian", "ZAM"),
+    ("zimbabwean", "ZIM"),
+    ("soviet", "URS"),
+    ("yugoslav", "YUG"),
+    ("east german", "GDR"),
+    ("west german", "FRG"),
+    ("czechoslovak", "TCH"),
+    ("serbia and montenegro", "SCG"),
+];
+
+/// Lowercase alphanumeric tokens in order of appearance.
+fn demonym_tokens(text: &str) -> Vec<String> {
+    text.split(|ch: char| !ch.is_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .map(|token| deunicode::deunicode(token).to_lowercase())
+        .collect()
+}
+
+/// Nationality demonyms in `text`, as canonical FIDE codes ordered by first
+/// appearance (oldest → latest), deduplicated.
+///
+/// Matching prefers multi-word phrases ("south african", "east german")
+/// over single words. Unknown words are ignored.
+pub(crate) fn demonym_countries(text: &str) -> Vec<String> {
+    let tokens = demonym_tokens(text);
+    if tokens.is_empty() {
+        return Vec::new();
+    }
+    // Demonym map keyed by phrase tokens, longest first.
+    let mut phrases: Vec<(Vec<String>, &str)> = DEMONYMS
+        .iter()
+        .map(|(phrase, code)| {
+            (
+                phrase
+                    .split_whitespace()
+                    .map(|word| deunicode::deunicode(word).to_lowercase())
+                    .collect::<Vec<_>>(),
+                *code,
+            )
+        })
+        .collect();
+    phrases.sort_by_key(|(words, _)| std::cmp::Reverse(words.len()));
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0usize;
+    while i < tokens.len() {
+        let mut matched: Option<(&str, usize)> = None;
+        for (words, code) in &phrases {
+            if words.is_empty() || i + words.len() > tokens.len() {
+                continue;
+            }
+            if tokens[i..i + words.len()] == words[..] {
+                matched = Some((code, words.len()));
+                break;
+            }
+        }
+        if let Some((code, len)) = matched {
+            if !out.iter().any(|existing| existing == code) {
+                out.push(code.to_string());
+            }
+            i += len;
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Countries from a Wikipedia description plus the lead sentence of the
+/// extract, oldest → latest. The description order wins; lead-sentence
+/// codes not already seen are appended in order.
+fn countries_from_texts(description: &str, extract: &str) -> Vec<String> {
+    let mut out = demonym_countries(description);
+    let lead = extract.split('.').next().unwrap_or(extract);
+    for code in demonym_countries(lead) {
+        if !out.iter().any(|existing| existing == &code) {
+            out.push(code);
+        }
+    }
+    // Include the remainder of the extract only when neither the
+    // description nor the lead sentence named a nationality — avoids
+    // picking up incidental country mentions later in the article.
+    if out.is_empty() {
+        out = demonym_countries(extract);
+    }
+    out
+}
+
+fn wikibase_item(value: &Value) -> Option<String> {
+    value
+        .get("wikibase_item")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|qid| {
+            qid.len() > 1
+                && (qid.starts_with('Q') || qid.starts_with('q'))
+                && qid[1..].chars().all(|c| c.is_ascii_digit())
+        })
+        .map(str::to_string)
+}
+
+fn wikidata_url(qid: &str) -> String {
+    format!("{WIKIDATA_ENDPOINT}{qid}.json")
+}
+
+/// First entity object inside a Wikidata `Special:EntityData` payload.
+fn wikidata_entity(value: &Value) -> Option<&Value> {
+    if let Some(entity) = value.get("entities").and_then(Value::as_object) {
+        return entity.values().next();
+    }
+    // Bare entity object (fabricated claims payloads used in tests).
+    if value.get("claims").is_some() {
+        return Some(value);
+    }
+    None
+}
+
+fn claim_string_value(claim: &Value) -> Option<String> {
+    // P1440: datavalue.value is a plain string.
+    claim
+        .pointer("/mainsnak/datavalue/value")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            claim
+                .pointer("/mainsnak/datavalue/value")
+                .and_then(Value::as_u64)
+                .map(|n| n.to_string())
+        })
+}
+
+fn claim_entity_qid(claim: &Value) -> Option<String> {
+    claim
+        .pointer("/mainsnak/datavalue/value/id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|qid| !qid.is_empty())
+        .map(str::to_string)
+}
+
+fn claim_has_end_date(claim: &Value) -> bool {
+    claim
+        .pointer("/qualifiers/P582")
+        .and_then(Value::as_array)
+        .is_some_and(|ends| !ends.is_empty())
+}
+
+fn claim_rank(claim: &Value) -> &str {
+    claim
+        .get("rank")
+        .and_then(Value::as_str)
+        .unwrap_or("normal")
+}
+
+fn parse_time_year(claim: &Value) -> Option<i32> {
+    let time = claim.pointer("/mainsnak/datavalue/value/time")?.as_str()?;
+    parse_wikidata_time_year(time)
+}
+
+fn parse_wikidata_time_year(time: &str) -> Option<i32> {
+    let digits: String = time
+        .trim()
+        .trim_start_matches('+')
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    if digits.len() < 4 {
+        return None;
+    }
+    let year: i32 = digits[..4].parse().ok()?;
+    (0..=2100).contains(&year).then_some(year)
+}
+
+fn parse_quantity_elo(claim: &Value) -> Option<u16> {
+    if let Some(amount) = claim
+        .pointer("/mainsnak/datavalue/value/amount")
+        .and_then(Value::as_str)
+    {
+        let cleaned = amount.trim().trim_start_matches('+');
+        if let Ok(elo) = cleaned.parse::<u16>()
+            && elo > 0
+            && elo <= 4000
+        {
+            return Some(elo);
+        }
+    }
+    if let Some(value) = claim
+        .pointer("/mainsnak/datavalue/value")
+        .and_then(Value::as_u64)
+        && value > 0
+        && value <= 4000
+    {
+        return Some(value as u16);
+    }
+    None
+}
+
+/// Wikidata fields extracted from an `EntityData` payload.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct WikidataFields {
+    pub countries: Vec<String>,
+    pub fide_id: Option<String>,
+    pub birth_year: Option<i32>,
+    pub peak_elo: Option<u16>,
+}
+
+/// Parse Wikidata `EntityData` claims: `P1440` → `fide_id`, `P1532`/`P27`
+/// → `countries` (oldest → latest), `P569` → `birth_year`, `P1087` →
+/// `peak_elo`. Malformed payloads yield defaults; this never panics.
+pub(crate) fn parse_wikidata_value(value: &Value) -> WikidataFields {
+    let mut fields = WikidataFields::default();
+    let Some(entity) = wikidata_entity(value) else {
+        return fields;
+    };
+    let Some(claims) = entity.get("claims") else {
+        return fields;
+    };
+    // P1440 → fide_id (first non-deprecated claim wins).
+    if let Some(snatched) = claims.get("P1440").and_then(Value::as_array) {
+        for claim in snatched {
+            if claim_rank(claim) == "deprecated" {
+                continue;
+            }
+            if let Some(id) = claim_string_value(claim)
+                && !id.is_empty()
+            {
+                fields.fide_id = Some(id);
+                break;
+            }
+        }
+    }
+    // P569 → birth_year.
+    if let Some(snatched) = claims.get("P569").and_then(Value::as_array) {
+        for claim in snatched {
+            if claim_rank(claim) == "deprecated" {
+                continue;
+            }
+            if let Some(year) = parse_time_year(claim) {
+                fields.birth_year = Some(year);
+                break;
+            }
+        }
+    }
+    // P1087 → peak_elo (max across non-deprecated claims).
+    if let Some(snatched) = claims.get("P1087").and_then(Value::as_array) {
+        for claim in snatched {
+            if claim_rank(claim) == "deprecated" {
+                continue;
+            }
+            if let Some(elo) = parse_quantity_elo(claim) {
+                fields.peak_elo = Some(match fields.peak_elo {
+                    Some(current) => current.max(elo),
+                    None => elo,
+                });
+            }
+        }
+    }
+    // P1532 / P27 → countries via country::from_wikidata_qid.
+    // Order oldest → latest: terminated claims first, unterminated /
+    // preferred next, so the current federation sorts last.
+    let mut sourced: Vec<(String, bool, bool)> = Vec::new();
+    for prop in ["P1532", "P27"] {
+        if let Some(snatched) = claims.get(prop).and_then(Value::as_array) {
+            for claim in snatched {
+                if claim_rank(claim) == "deprecated" {
+                    continue;
+                }
+                let Some(qid) = claim_entity_qid(claim) else {
+                    continue;
+                };
+                let Some(country) = country::from_wikidata_qid(&qid) else {
+                    continue;
+                };
+                sourced.push((
+                    country.code.to_string(),
+                    claim_has_end_date(claim),
+                    claim_rank(claim) == "preferred",
+                ));
+            }
+        }
+    }
+    sourced.sort_by_key(|(_, has_end, is_preferred)| {
+        if *is_preferred {
+            2
+        } else if !*has_end {
+            1
+        } else {
+            0
+        }
+    });
+    for (code, _, _) in sourced {
+        if !fields.countries.iter().any(|existing| existing == &code) {
+            fields.countries.push(code);
+        }
+    }
+    fields
+}
+
+/// Merge Wikidata fields into a summary. Countries from Wikidata replace
+/// demonym-derived ones when present; the other fields fill when missing
+/// or overwrite with the authoritative value.
+pub(crate) fn apply_wikidata_value(summary: &mut Summary, value: &Value) {
+    let fields = parse_wikidata_value(value);
+    if !fields.countries.is_empty() {
+        summary.countries = fields.countries;
+    }
+    if let Some(fide_id) = fields.fide_id {
+        summary.fide_id = Some(fide_id);
+    }
+    if let Some(birth_year) = fields.birth_year {
+        summary.birth_year = Some(birth_year);
+    }
+    if let Some(peak_elo) = fields.peak_elo {
+        summary.peak_elo = Some(peak_elo);
+    }
+}
+
+/// Fetch the Wikidata entity for `qid` and merge it into `summary`.
+/// Fail-soft: any error leaves the summary untouched.
+fn enrich_with_wikidata(
+    summary: &mut Summary,
+    qid: &str,
+    fetch: &mut impl FnMut(&str) -> std::result::Result<Value, FetchError>,
+) {
+    let url = wikidata_url(qid);
+    if let Ok(value) = fetch(&url) {
+        apply_wikidata_value(summary, &value);
     }
 }
 
@@ -304,9 +918,12 @@ fn lookup_with(
 
     match fetch(&summary_url(name)) {
         Ok(value) => {
-            if let Some(summary) = Summary::from_value(&value) {
+            if let Some(mut summary) = Summary::from_value(&value) {
                 direct_title = Some(summary.title.clone());
                 if is_confident(&summary) && title_matches_name(name, &summary.title) {
+                    if let Some(qid) = wikibase_item(&value) {
+                        enrich_with_wikidata(&mut summary, &qid, &mut fetch);
+                    }
                     return Ok(Lookup::Summary(summary));
                 }
             }
@@ -362,9 +979,12 @@ fn lookup_with(
         }
         match fetch(&summary_url_for_title(&title)) {
             Ok(value) => {
-                if let Some(summary) = Summary::from_value(&value) {
+                if let Some(mut summary) = Summary::from_value(&value) {
                     parsed_any = true;
                     if is_confident(&summary) && title_matches_name(name, &summary.title) {
+                        if let Some(qid) = wikibase_item(&value) {
+                            enrich_with_wikidata(&mut summary, &qid, &mut fetch);
+                        }
                         return Ok(Lookup::Summary(summary));
                     }
                 }
@@ -780,13 +1400,21 @@ fn cache_path() -> Option<PathBuf> {
 mod tests {
     use super::*;
 
-    fn summary(title: &str, description: &str, extract: &str) -> Summary {
+    fn make_summary(title: &str, description: &str, extract: &str) -> Summary {
         Summary {
             title: title.to_string(),
             description: description.to_string(),
             extract: extract.to_string(),
             url: article_url(title),
+            countries: countries_from_texts(description, extract),
+            fide_id: None,
+            birth_year: None,
+            peak_elo: None,
         }
+    }
+
+    fn summary(title: &str, description: &str, extract: &str) -> Summary {
+        make_summary(title, description, extract)
     }
 
     fn summary_json(title: &str, description: &str, extract: &str) -> Value {
@@ -1097,5 +1725,252 @@ mod tests {
         assert_eq!(restored.len(), 1);
         assert!(restored.get("Carlsen, Magnus").is_some());
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn demonym_parsing_orders_oldest_to_latest() {
+        assert_eq!(
+            demonym_countries("Iranian-born French chess grandmaster"),
+            vec!["IRI".to_string(), "FRA".to_string()]
+        );
+        assert_eq!(
+            demonym_countries("Soviet and Russian chess grandmaster"),
+            vec!["URS".to_string(), "RUS".to_string()]
+        );
+        assert_eq!(
+            demonym_countries("Norwegian chess grandmaster"),
+            vec!["NOR".to_string()]
+        );
+        assert_eq!(
+            demonym_countries("American chess player"),
+            vec!["USA".to_string()]
+        );
+        assert!(demonym_countries("chess grandmaster").is_empty());
+        assert!(demonym_countries("").is_empty());
+        // Deduplication preserves first appearance.
+        assert_eq!(
+            demonym_countries("Norwegian chess grandmaster, Norway"),
+            vec!["NOR".to_string()]
+        );
+    }
+
+    #[test]
+    fn demonym_parsing_uses_lead_sentence_when_description_is_generic() {
+        let value = summary_json(
+            "Alireza Firouzja",
+            "chess grandmaster",
+            "Alireza Firouzja is an Iranian-born French chess grandmaster.",
+        );
+        let summary = Summary::from_value(&value).unwrap();
+        assert_eq!(
+            summary.countries,
+            vec!["IRI".to_string(), "FRA".to_string()]
+        );
+        assert_eq!(summary.latest_country().map(|c| c.code), Some("FRA"));
+        assert_eq!(
+            summary.all_countries(),
+            vec![
+                country::normalize("IRI").unwrap(),
+                country::normalize("FRA").unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn wikidata_claim_parsing_extracts_all_fields() {
+        let payload = json!({
+            "entities": {
+                "Q12345": {
+                    "id": "Q12345",
+                    "claims": {
+                        "P1440": [{
+                            "rank": "normal",
+                            "mainsnak": {
+                                "datavalue": { "value": "1503014", "type": "string" },
+                                "datatype": "string",
+                                "snaktype": "value"
+                            }
+                        }],
+                        "P1532": [
+                            {
+                                "rank": "normal",
+                                "mainsnak": {"datavalue": {"value": {"id": "Q15180", "entity-type": "item", "numeric-id": 15180}, "type": "wikibase-entityid"}, "datatype": "wikibase-item", "snaktype": "value"},
+                                "qualifiers": {"P582": [{"mainsnak": {"datavalue": {"value": {"time": "+1991-09-06T00:00:00Z"}, "type": "time"}, "datatype": "time", "snaktype": "value"}}]}
+                            },
+                            {
+                                "rank": "preferred",
+                                "mainsnak": {"datavalue": {"value": {"id": "Q159", "entity-type": "item", "numeric-id": 159}, "type": "wikibase-entityid"}, "datatype": "wikibase-item", "snaktype": "value"}
+                            }
+                        ],
+                        "P569": [{
+                            "rank": "normal",
+                            "mainsnak": {"datavalue": {"value": {"time": "+1963-12-09T00:00:00Z", "type": "time"}, "type": "time"}, "datatype": "time", "snaktype": "value"}
+                        }],
+                        "P1087": [{
+                            "rank": "normal",
+                            "mainsnak": {"datavalue": {"value": {"amount": "+2850"}, "type": "quantity"}, "datatype": "quantity", "snaktype": "value"}
+                        }]
+                    }
+                }
+            }
+        });
+        let fields = parse_wikidata_value(&payload);
+        assert_eq!(fields.fide_id.as_deref(), Some("1503014"));
+        assert_eq!(fields.birth_year, Some(1963));
+        assert_eq!(fields.peak_elo, Some(2850));
+        assert_eq!(
+            fields.countries,
+            vec!["URS".to_string(), "RUS".to_string()],
+            "terminated URS must sort before current RUS"
+        );
+    }
+
+    #[test]
+    fn wikidata_latest_country_ordering_prefers_no_end_date() {
+        // Order in the payload is RUS first, then URS with an end date;
+        // the parser must still emit URS,RUS (oldest → latest).
+        let payload = json!({
+            "entities": {
+                "Q9": {
+                    "claims": {
+                        "P27": [
+                            {"rank": "normal", "mainsnak": {"datavalue": {"value": {"id": "Q159"}}}},
+                            {"rank": "normal", "mainsnak": {"datavalue": {"value": {"id": "Q15180"}}}, "qualifiers": {"P582": [{"mainsnak": {"datavalue": {"value": {"time": "+1991-01-01T00:00:00Z"}}}}]}}
+                        ]
+                    }
+                }
+            }
+        });
+        let fields = parse_wikidata_value(&payload);
+        assert_eq!(fields.countries, vec!["URS".to_string(), "RUS".to_string()]);
+    }
+
+    #[test]
+    fn wikidata_fail_soft_on_malformed_payload() {
+        let fields = parse_wikidata_value(&json!({"entities": {}}));
+        assert!(fields.countries.is_empty());
+        assert!(fields.fide_id.is_none());
+        let mut summary = summary(
+            "Magnus Carlsen",
+            "Norwegian chess grandmaster",
+            "Sven Magnus Øen Carlsen is a Norwegian chess grandmaster.",
+        );
+        apply_wikidata_value(&mut summary, &json!({"foo": "bar"}));
+        assert_eq!(summary.countries, vec!["NOR".to_string()]);
+        assert!(summary.fide_id.is_none());
+    }
+
+    #[test]
+    fn lookup_enriches_from_wikidata_when_wikibase_item_present() {
+        let mut wiki = summary_json(
+            "Magnus Carlsen",
+            "Norwegian chess grandmaster",
+            "Sven Magnus Øen Carlsen is a Norwegian chess grandmaster.",
+        );
+        wiki["wikibase_item"] = Value::String("Q123".to_string());
+        let result = lookup_with("Magnus Carlsen", |url| {
+            if url.contains("/summary/Magnus_Carlsen") {
+                return Ok(wiki.clone());
+            }
+            if url.contains("wikidata") && url.contains("Q123") {
+                return Ok(json!({
+                    "entities": {
+                        "Q123": {
+                            "claims": {
+                                "P1440": [{"mainsnak": {"datavalue": {"value": "1503014", "type": "string"}}}],
+                                "P569": [{"mainsnak": {"datavalue": {"value": {"time": "+1990-11-30T00:00:00Z"}, "type": "time"}}}],
+                                "P1087": [{"mainsnak": {"datavalue": {"value": {"amount": "+2863"}, "type": "quantity"}}}],
+                                "P27": [{"mainsnak": {"datavalue": {"value": {"id": "Q20"}}}}]
+                            }
+                        }
+                    }
+                }));
+            }
+            Err(FetchError::NotFound)
+        })
+        .unwrap();
+        match result {
+            Lookup::Summary(summary) => {
+                assert_eq!(summary.fide_id.as_deref(), Some("1503014"));
+                assert_eq!(summary.birth_year, Some(1990));
+                assert_eq!(summary.peak_elo, Some(2863));
+                assert_eq!(summary.countries, vec!["NOR".to_string()]);
+            }
+            Lookup::Ambiguous { .. } => panic!("expected a confident summary"),
+        }
+    }
+
+    #[test]
+    fn lookup_stays_confident_when_wikidata_is_missing() {
+        let mut wiki = summary_json(
+            "Magnus Carlsen",
+            "Norwegian chess grandmaster",
+            "Sven Magnus Øen Carlsen is a Norwegian chess grandmaster.",
+        );
+        wiki["wikibase_item"] = Value::String("Q123".to_string());
+        let result = lookup_with("Magnus Carlsen", |url| {
+            if url.contains("/summary/Magnus_Carlsen") {
+                return Ok(wiki.clone());
+            }
+            if url.contains("wikidata") {
+                return Err(FetchError::Other("offline".to_string()));
+            }
+            Err(FetchError::NotFound)
+        })
+        .unwrap();
+        match result {
+            Lookup::Summary(summary) => {
+                assert_eq!(summary.countries, vec!["NOR".to_string()]);
+                assert!(summary.fide_id.is_none());
+            }
+            Lookup::Ambiguous { .. } => panic!("expected a confident summary"),
+        }
+    }
+
+    #[test]
+    fn cache_round_trip_preserves_enrichment_and_defaults_old_entries() {
+        // Old-style entry without new fields must still load.
+        let old = json!({
+            "summaries": {
+                "Magnus Carlsen": {
+                    "title": "Magnus Carlsen",
+                    "description": "Norwegian chess grandmaster",
+                    "extract": "Sven Magnus Øen Carlsen is a Norwegian chess grandmaster.",
+                    "url": "https://en.wikipedia.org/wiki/Magnus_Carlsen"
+                }
+            },
+            "queries": {"carlsen magnus": "Magnus Carlsen"},
+            "ambiguous": {}
+        })
+        .to_string();
+        let restored = Cache::from_json(&old);
+        let lookup = restored.get("Magnus Carlsen").unwrap();
+        let Lookup::Summary(summary) = lookup else {
+            panic!("expected summary");
+        };
+        assert_eq!(summary.countries, vec!["NOR".to_string()]);
+        assert!(summary.fide_id.is_none());
+        assert!(summary.birth_year.is_none());
+        assert!(summary.peak_elo.is_none());
+
+        // New entries round-trip the enrichment fields.
+        let mut enriched = make_summary(
+            "Magnus Carlsen",
+            "Norwegian chess grandmaster",
+            "Sven Magnus Øen Carlsen is a Norwegian chess grandmaster.",
+        );
+        enriched.fide_id = Some("1503014".to_string());
+        enriched.birth_year = Some(1990);
+        enriched.peak_elo = Some(2863);
+        let mut cache = Cache::default();
+        cache.insert("Magnus Carlsen", &Lookup::Summary(enriched));
+        let restored = Cache::from_json(&cache.to_json());
+        let Lookup::Summary(round_tripped) = restored.get("Magnus Carlsen").unwrap() else {
+            panic!("expected summary");
+        };
+        assert_eq!(round_tripped.fide_id.as_deref(), Some("1503014"));
+        assert_eq!(round_tripped.birth_year, Some(1990));
+        assert_eq!(round_tripped.peak_elo, Some(2863));
+        assert_eq!(round_tripped.countries, vec!["NOR".to_string()]);
     }
 }

@@ -137,12 +137,176 @@ pub fn normalize_code(raw: &str) -> Option<&'static str> {
     normalize(raw).map(|c| c.code)
 }
 
+/// True for online venues that never carry a physical flag.
+fn is_online_site(site: &str) -> bool {
+    let lower = site.to_ascii_lowercase();
+    for needle in [
+        "lichess",
+        "chess.com",
+        "chessabc",
+        "chesscom",
+        "tornelo",
+        "internet",
+        "online",
+    ] {
+        if lower.contains(needle) {
+            return true;
+        }
+    }
+    // `int` only as a whole token, so "Saint Louis" cannot match.
+    lower
+        .split(|c: char| !(c.is_ascii_alphanumeric()))
+        .any(|token| token == "int")
+}
+
+/// Resolve the venue country from a PGN `Site` tag.
+///
+/// Accepts the whole trimmed tag (e.g. `"Norway"`, `"NED"`) or its trailing
+/// whitespace/comma-separated token(s) (e.g. `"Wijk aan Zee NED"`,
+/// `"Toronto CAN"`, `"Saint Louis, USA"`, `"Stavanger, Norway"`). Only a
+/// 3-letter FIDE/ISO3 code or a full country name resolves; an ambiguous
+/// 2-letter token (a US state abbreviation such as `MO`, `CA`, `DE`) is
+/// rejected because it could name a state rather than a country. Online
+/// sites (`lichess`, `chess.com`, `chessabc`, `int`, `internet`, `online`,
+/// `tornelo`) never yield a venue.
+pub fn from_site_tag(site: Option<&str>) -> Option<Country> {
+    let raw = site?.trim();
+    if is_placeholder(raw) || is_online_site(raw) {
+        return None;
+    }
+    // Whole tag: reject 2-letter states even when they map to a country.
+    if raw.chars().count() == 2 {
+        return None;
+    }
+    if let Some(country) = normalize(raw) {
+        return Some(country);
+    }
+    // Trailing token(s): last 1..=3 whitespace/comma-separated tokens.
+    let tokens: Vec<&str> = raw
+        .split([' ', '\t', '\n', ',', ';'])
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .collect();
+    if tokens.is_empty() {
+        return None;
+    }
+    for take in 1..=tokens.len().min(3) {
+        let candidate = tokens[tokens.len() - take..].join(" ");
+        if candidate.chars().count() == 2 {
+            continue;
+        }
+        // Multi-token candidates (e.g. "United States") must be checked
+        // before single trailing words.
+        if take == 1 {
+            // Single trailing token: only a 3-letter code or full name.
+            let token = candidate.trim_matches(['.', ')', '(']);
+            if token.chars().count() == 2 {
+                continue;
+            }
+            if let Some(country) = normalize(token) {
+                return Some(country);
+            }
+        } else if let Some(country) = normalize(&candidate) {
+            return Some(country);
+        }
+    }
+    None
+}
+
 fn find_by_code(code: &str) -> Option<Country> {
     COUNTRIES
         .iter()
         .find(|c| c.code.eq_ignore_ascii_case(code))
         .copied()
 }
+
+/// Resolve a Wikidata entity id (e.g. `"Q20"`) to a canonical [`Country`].
+///
+/// Used for Wikidata `P1532` (country for sport) / `P27` (country of
+/// citizenship) claims. Accepts a bare `Q…` id case-insensitively, or a URL
+/// ending in that id. Returns `None` for unknown or unmapped ids.
+pub fn from_wikidata_qid(qid: &str) -> Option<Country> {
+    let trimmed = qid.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // Accept full URLs such as `http://www.wikidata.org/wiki/Q20`.
+    let id = trimmed.rsplit('/').next().unwrap_or(trimmed).trim();
+    if !id.starts_with(['Q', 'q']) {
+        return None;
+    }
+    WIKIDATA_QIDS
+        .iter()
+        .find(|(q, _)| q.eq_ignore_ascii_case(id))
+        .and_then(|(_, code)| find_by_code(code))
+}
+
+/// Static map of Wikidata entity id → canonical FIDE code for key
+/// federations. Covers the common chess nations plus historical federations
+/// (URS, YUG) that appear in citizenship/sport claims.
+static WIKIDATA_QIDS: &[(&str, &str)] = &[
+    ("Q20", "NOR"),
+    ("Q34", "SWE"),
+    ("Q33", "FIN"),
+    ("Q35", "DEN"),
+    ("Q142", "FRA"),
+    ("Q183", "GER"),
+    ("Q55", "NED"),
+    ("Q31", "BEL"),
+    ("Q39", "SUI"),
+    ("Q40", "AUT"),
+    ("Q38", "ITA"),
+    ("Q29", "ESP"),
+    ("Q45", "POR"),
+    ("Q36", "POL"),
+    ("Q213", "CZE"),
+    ("Q214", "SVK"),
+    ("Q28", "HUN"),
+    ("Q218", "ROU"),
+    ("Q219", "BUL"),
+    ("Q224", "CRO"),
+    ("Q403", "SRB"),
+    ("Q215", "SLO"),
+    ("Q145", "GBR"),
+    ("Q27", "IRL"),
+    ("Q30", "USA"),
+    ("Q16", "CAN"),
+    ("Q96", "MEX"),
+    ("Q155", "BRA"),
+    ("Q414", "ARG"),
+    ("Q159", "RUS"),
+    ("Q212", "UKR"),
+    ("Q184", "BLR"),
+    ("Q37", "LTU"),
+    ("Q211", "LAT"),
+    ("Q191", "EST"),
+    ("Q230", "GEO"),
+    ("Q237", "ARM"),
+    ("Q227", "AZE"),
+    ("Q232", "KAZ"),
+    ("Q148", "CHN"),
+    ("Q17", "JPN"),
+    ("Q884", "KOR"),
+    ("Q881", "VIE"),
+    ("Q668", "IND"),
+    ("Q408", "AUS"),
+    ("Q794", "IRI"),
+    ("Q43", "TUR"),
+    ("Q41", "GRE"),
+    ("Q241", "CUB"),
+    ("Q801", "ISR"),
+    ("Q259", "RSA"),
+    ("Q15180", "URS"),
+    ("Q409", "YUG"),
+    ("Q298", "CHI"),
+    ("Q77", "URU"),
+    ("Q869", "THA"),
+    ("Q928", "PHI"),
+    ("Q252", "INA"),
+    ("Q79", "EGY"),
+    ("Q49", "KEN"),
+    ("Q103", "NGR"),
+];
 
 static COUNTRIES: &[Country] = &[
     Country::new("AFG", "AF", "Afghanistan", "🇦🇫", "🇦🇫 AFG"),
@@ -557,5 +721,113 @@ mod tests {
         assert_eq!(c.badge, "🇳🇴 NOR");
         let ger = normalize("GER").unwrap();
         assert_eq!(ger.badge, "🇩🇪 GER");
+    }
+
+    #[test]
+    fn from_site_tag_trailing_three_letter_code() {
+        assert_eq!(
+            from_site_tag(Some("Wijk aan Zee NED")).map(|c| c.code),
+            Some("NED")
+        );
+        assert_eq!(
+            from_site_tag(Some("Toronto CAN")).map(|c| c.code),
+            Some("CAN")
+        );
+        assert_eq!(
+            from_site_tag(Some("Wijk aan Zee NLD")).map(|c| c.code),
+            Some("NED"),
+            "ISO3 alias NLD must resolve like NED"
+        );
+    }
+
+    #[test]
+    fn from_site_tag_trailing_full_name() {
+        assert_eq!(
+            from_site_tag(Some("Stavanger Norway")).map(|c| c.code),
+            Some("NOR")
+        );
+        assert_eq!(
+            from_site_tag(Some("Stavanger, Norway")).map(|c| c.code),
+            Some("NOR")
+        );
+        assert_eq!(
+            from_site_tag(Some("Saint Louis USA")).map(|c| c.code),
+            Some("USA")
+        );
+        assert_eq!(
+            from_site_tag(Some("Saint Louis, USA")).map(|c| c.code),
+            Some("USA")
+        );
+    }
+
+    #[test]
+    fn from_site_tag_whole_tag() {
+        assert_eq!(from_site_tag(Some("Norway")).map(|c| c.code), Some("NOR"));
+        assert_eq!(from_site_tag(Some(" NED ")).map(|c| c.code), Some("NED"));
+        assert_eq!(from_site_tag(Some("Toronto")), None);
+        assert_eq!(from_site_tag(Some("Wijk aan Zee")), None);
+        assert_eq!(from_site_tag(None), None);
+        assert_eq!(from_site_tag(Some("")), None);
+        assert_eq!(from_site_tag(Some("?")), None);
+    }
+
+    #[test]
+    fn from_site_tag_rejects_online_sites() {
+        for site in [
+            "lichess",
+            "Lichess",
+            "https://lichess.org/abcd1234",
+            "lichess.org",
+            "https://www.chess.com/member/hikaru",
+            "chess.com",
+            "chessabc",
+            "Internet",
+            "online",
+            "tornelo",
+            "int",
+            "Chess.com INT",
+        ] {
+            assert_eq!(from_site_tag(Some(site)), None, "site {site:?}");
+        }
+    }
+
+    #[test]
+    fn from_site_tag_rejects_two_letter_states() {
+        for site in [
+            "Saint Louis, MO",
+            "Saint Louis MO",
+            "MO",
+            "DE",
+            "Toronto CA",
+            "Houston TX",
+            "Saint Louis, MI",
+            "CA",
+        ] {
+            assert_eq!(from_site_tag(Some(site)), None, "site {site:?}");
+        }
+    }
+
+    #[test]
+    fn from_wikidata_qid_resolves_key_federations() {
+        assert_eq!(from_wikidata_qid("Q20").map(|c| c.code), Some("NOR"));
+        assert_eq!(from_wikidata_qid("Q142").map(|c| c.code), Some("FRA"));
+        assert_eq!(from_wikidata_qid("Q794").map(|c| c.code), Some("IRI"));
+        assert_eq!(from_wikidata_qid("Q159").map(|c| c.code), Some("RUS"));
+        assert_eq!(from_wikidata_qid("Q15180").map(|c| c.code), Some("URS"));
+        assert_eq!(from_wikidata_qid("Q30").map(|c| c.code), Some("USA"));
+        assert_eq!(from_wikidata_qid("Q183").map(|c| c.code), Some("GER"));
+        // Case-insensitive and URL forms.
+        assert_eq!(from_wikidata_qid("q20").map(|c| c.code), Some("NOR"));
+        assert_eq!(
+            from_wikidata_qid("http://www.wikidata.org/wiki/Q20").map(|c| c.code),
+            Some("NOR")
+        );
+        assert_eq!(from_wikidata_qid("Q999999"), None);
+        assert_eq!(from_wikidata_qid(""), None);
+    }
+
+    #[test]
+    fn wikidata_map_covers_at_least_thirty_countries() {
+        assert!(WIKIDATA_QIDS.len() >= 30);
     }
 }

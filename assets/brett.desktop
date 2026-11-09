@@ -8,5 +8,6 @@ Terminal=false
 Type=Application
 Categories=Game;BoardGame;
 MimeType=application/x-chess-pgn;application/x-chess-scid;application/x-chess-cbh;
+StartupWMClass=brett
 Keywords=chess;database;preparation;analysis;pgn;scid;cbh;
 

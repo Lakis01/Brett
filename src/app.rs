@@ -24,6 +24,7 @@ use crate::domain::{self, Clock, Game, Shape, Token};
 use crate::engine::{EngineEvent, EngineHandle, EngineInfo, EngineOptions, Score, SearchLimit};
 use crate::eval::{self, BoardEval};
 use crate::fide;
+use crate::flags;
 use crate::library::{GameLibrary, PgnLibrary};
 use crate::online::{self, ImportResult, OnlineSource};
 use crate::pgn;
@@ -218,11 +219,7 @@ pub enum LiveReferenceSource {
 }
 
 impl LiveReferenceSource {
-    pub const ALL: [Self; 3] = [
-        Self::LichessMasters,
-        Self::LichessAll,
-        Self::ChessAbc,
-    ];
+    pub const ALL: [Self; 3] = [Self::LichessMasters, Self::LichessAll, Self::ChessAbc];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -526,6 +523,12 @@ struct AccountCheckResult {
     /// Whether the probe hit the probe limit (e.g. 200 games), meaning more games
     /// likely exist and full preparation should fetch uncapped.
     pub probe_capped: bool,
+    /// Bullet games among the fetched games (for probe text).
+    pub bullet: usize,
+    /// Games already on disk before the delta check (0 = no cache).
+    pub cached_total: usize,
+    /// New games found by the delta check (total - cached, when cached > 0).
+    pub new_games: usize,
 }
 
 impl AccountCheckResult {
@@ -538,6 +541,26 @@ impl AccountCheckResult {
             error: None,
             games: Arc::new(Vec::new()),
             probe_capped: false,
+            bullet: 0,
+            cached_total: 0,
+            new_games: 0,
+        }
+    }
+
+    /// Test / construction helper: a completed check.
+    #[cfg(test)]
+    fn done(key: String, total: usize, kept: usize, bullet: usize, probe_capped: bool) -> Self {
+        Self {
+            key,
+            fetching: false,
+            total,
+            kept,
+            bullet,
+            error: None,
+            games: Arc::new(Vec::new()),
+            probe_capped,
+            cached_total: 0,
+            new_games: 0,
         }
     }
 }
@@ -557,16 +580,33 @@ struct AccountCheckRequest {
 /// ⏳ while fetching, ✓ with game counts when found, ✗ when not found.
 fn account_check_text(check: &AccountCheckResult) -> RichText {
     if check.fetching {
-        RichText::new("⏳ Fetching…").color(Color32::from_gray(160))
+        if check.cached_total > 0 {
+            RichText::new(format!(
+                "✓ {} games cached · checking for new…",
+                check.cached_total
+            ))
+            .color(Color32::from_gray(160))
+        } else {
+            RichText::new("⏳ Fetching…").color(Color32::from_gray(160))
+        }
     } else if let Some(error) = &check.error {
         RichText::new(format!("✗ Account not found ({error})"))
             .color(Color32::from_rgb(0xE0, 0x6C, 0x6C))
+    } else if check.probe_capped {
+        let mut text = "✓ Found · 200+ games · full history loads on Start".to_string();
+        if check.new_games > 0 {
+            text.push_str(&format!(" ({} new)", check.new_games));
+        }
+        RichText::new(text).color(Color32::from_rgb(0x7E, 0xD3, 0x8A))
     } else {
-        RichText::new(format!(
-            "✓ Found · {} games ({} match filters)",
-            check.total, check.kept
-        ))
-        .color(Color32::from_rgb(0x7E, 0xD3, 0x8A))
+        let mut text = format!(
+            "✓ Found · {} games · {} pass filters ({} bullet)",
+            check.total, check.kept, check.bullet
+        );
+        if check.new_games > 0 {
+            text.push_str(&format!(" ({} new)", check.new_games));
+        }
+        RichText::new(text).color(Color32::from_rgb(0x7E, 0xD3, 0x8A))
     }
 }
 
@@ -576,9 +616,10 @@ fn account_check_badge(check: &AccountCheckResult) -> RichText {
         RichText::new("⏳").color(Color32::from_gray(160))
     } else if check.error.is_some() {
         RichText::new("✗").color(Color32::from_rgb(0xE0, 0x6C, 0x6C))
+    } else if check.probe_capped {
+        RichText::new("✓ 200+ games").color(Color32::from_rgb(0x7E, 0xD3, 0x8A))
     } else {
-        RichText::new(format!("✓ {} games", check.kept))
-            .color(Color32::from_rgb(0x7E, 0xD3, 0x8A))
+        RichText::new(format!("✓ {} games", check.kept)).color(Color32::from_rgb(0x7E, 0xD3, 0x8A))
     }
 }
 
@@ -598,6 +639,9 @@ fn chessabc_aggregate_check(
         error: None,
         games: Arc::new(Vec::new()),
         probe_capped: false,
+        bullet: 0,
+        cached_total: 0,
+        new_games: 0,
     };
     let mut errors = Vec::new();
     for fide_id in selected {
@@ -609,6 +653,9 @@ fn chessabc_aggregate_check(
                 } else {
                     aggregate.total += check.total;
                     aggregate.kept += check.kept;
+                    aggregate.bullet += check.bullet;
+                    aggregate.cached_total += check.cached_total;
+                    aggregate.new_games += check.new_games;
                     if check.probe_capped {
                         aggregate.probe_capped = true;
                     }
@@ -756,10 +803,9 @@ struct PrepRecentRow {
     black: String,
     white_title: Option<&'static str>,
     black_title: Option<&'static str>,
-    white_country: Option<&'static str>,
-    black_country: Option<&'static str>,
-    white_fide_id: Option<String>,
-    black_fide_id: Option<String>,
+    white_country: Option<Country>,
+    black_country: Option<Country>,
+    site: Option<String>,
     subtitle: String,
     /// Game-type pill colour + label from `classify_game_metadata`.
     type_color: Color32,
@@ -1411,10 +1457,7 @@ impl App {
         Self::with_file(cc, start)
     }
 
-    pub fn with_file(
-        cc: &eframe::CreationContext<'_>,
-        start: Option<std::path::PathBuf>,
-    ) -> Self {
+    pub fn with_file(cc: &eframe::CreationContext<'_>, start: Option<std::path::PathBuf>) -> Self {
         let mut visuals = egui::Visuals::dark();
         visuals.panel_fill = PANEL;
         visuals.window_fill = SURFACE;
@@ -2444,6 +2487,13 @@ impl App {
     }
 
     /// Build the player directory in the background for a very large database.
+    ///
+    /// For databases above [`players::PLAYERS_SIDECAR_MIN_GAMES`], the
+    /// `.brettplayers` sidecar under `~/.cache/brett/players/` is consulted
+    /// first (in the worker thread, never on the UI thread): on a fingerprint
+    /// hit it is loaded and installed directly, avoiding the ~50 s rebuild of
+    /// a 476k-player Mega directory; on a miss the directory is built through
+    /// the backend accelerator and then saved best-effort.
     fn start_player_directory(&mut self, library: Arc<dyn GameLibrary>, path: PathBuf) {
         if self.players_job.as_ref() == Some(&path) && self.players_rx.is_some() {
             return;
@@ -2453,9 +2503,34 @@ impl App {
         self.reset_wiki();
         self.players_job = Some(path.clone());
         self.players_status = format!("Indexing players in {}…", path.display());
+        let use_sidecar = library.len() > players::PLAYERS_SIDECAR_MIN_GAMES;
+        let sidecar = use_sidecar.then(|| players::players_cache_path(library.path()));
+        let sidecar_meta = if use_sidecar {
+            library.source_meta().ok()
+        } else {
+            None
+        };
         let (tx, rx) = mpsc::channel();
         let ctx = self.ctx.clone();
         std::thread::spawn(move || {
+            if let (Some(sidecar_path), Some(meta)) = (&sidecar, &sidecar_meta) {
+                let load_started = std::time::Instant::now();
+                if let Ok(Some(directory)) = PlayerDirectory::load_from(sidecar_path, meta) {
+                    tracing::info!(
+                        "PlayerDirectory sidecar hit: {} players loaded from {} in {:.2}s",
+                        directory.len(),
+                        sidecar_path.display(),
+                        load_started.elapsed().as_secs_f64()
+                    );
+                    let _ = tx.send(PlayerDirectoryMessage::Done(directory));
+                    ctx.request_repaint();
+                    return;
+                }
+                tracing::debug!(
+                    "PlayerDirectory sidecar miss for {} (building)",
+                    sidecar_path.display()
+                );
+            }
             let build_started = std::time::Instant::now();
             let directory = PlayerDirectory::build(library.as_ref());
             let elapsed = build_started.elapsed();
@@ -2469,6 +2544,22 @@ impl App {
                     "slow PlayerDirectory build took {:.2}s",
                     elapsed.as_secs_f64()
                 );
+            }
+            if let (Some(sidecar_path), Some(meta)) = (&sidecar, &sidecar_meta) {
+                let save_started = std::time::Instant::now();
+                if let Err(err) = directory.save_to(sidecar_path, meta) {
+                    tracing::debug!(
+                        "could not save player sidecar {}: {err:#}",
+                        sidecar_path.display()
+                    );
+                } else {
+                    tracing::info!(
+                        "PlayerDirectory sidecar saved: {} players to {} in {:.2}s",
+                        directory.len(),
+                        sidecar_path.display(),
+                        save_started.elapsed().as_secs_f64()
+                    );
+                }
             }
             let _ = tx.send(PlayerDirectoryMessage::Done(directory));
             ctx.request_repaint();
@@ -4567,13 +4658,13 @@ impl App {
                 });
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    if ui.button(RichText::new("Save & Close").strong()).clicked() {
+                    if ui.button(RichText::new("Set").strong()).clicked() {
                         save_close = true;
                     }
-                    if ui.button("Not now").clicked() {
+                    if ui.button("Not right now").clicked() {
                         not_now = true;
                     }
-                    if ui.button("No & don't ask again").clicked() {
+                    if ui.button("Never").clicked() {
                         never = true;
                     }
                 });
@@ -4582,7 +4673,8 @@ impl App {
         if save_close {
             if !self.book_path.trim().is_empty() {
                 self.save_display_prefs();
-                if let Some(live_src) = LiveReferenceSource::from_config_str(self.book_path.trim()) {
+                if let Some(live_src) = LiveReferenceSource::from_config_str(self.book_path.trim())
+                {
                     self.book = None;
                     self.book_rx = None;
                     self.book_job = None;
@@ -5502,12 +5594,16 @@ impl App {
                     }
                 }
                 LiveReferenceSource::LichessMasters => {
-                    if let Some(moves) = self.cached_explorer_prior(key, cloud::ExplorerSource::Masters) {
+                    if let Some(moves) =
+                        self.cached_explorer_prior(key, cloud::ExplorerSource::Masters)
+                    {
                         return (moves, players::PriorSource::Reference);
                     }
                 }
                 LiveReferenceSource::LichessAll => {
-                    if let Some(moves) = self.cached_explorer_prior(key, cloud::ExplorerSource::Lichess) {
+                    if let Some(moves) =
+                        self.cached_explorer_prior(key, cloud::ExplorerSource::Lichess)
+                    {
                         return (moves, players::PriorSource::Reference);
                     }
                 }
@@ -5614,10 +5710,8 @@ impl App {
         };
         match rx.try_recv() {
             Ok(Ok(tree)) => {
-                self.chessabc_live_status = format!(
-                    "Live ChessABC tree ready ({} games).",
-                    tree.games()
-                );
+                self.chessabc_live_status =
+                    format!("Live ChessABC tree ready ({} games).", tree.games());
                 self.chessabc_live_tree = Some(tree);
             }
             Ok(Err(err)) => {
@@ -5733,8 +5827,7 @@ impl App {
                     None
                 }
             }
-            crate::recent::TrendSource::LichessMasters
-            | crate::recent::TrendSource::LichessAll => {
+            crate::recent::TrendSource::LichessMasters | crate::recent::TrendSource::LichessAll => {
                 let explorer_source = match self.trend_source {
                     crate::recent::TrendSource::LichessMasters => cloud::ExplorerSource::Masters,
                     _ => cloud::ExplorerSource::Lichess,
@@ -5762,7 +5855,12 @@ impl App {
                 let recent_explorer = if let Some(e) = self.explorer_since_cache.get(&since_key) {
                     e
                 } else {
-                    self.trigger_explorer_since_fetch(explorer_source, fen.clone(), since_year, since_month);
+                    self.trigger_explorer_since_fetch(
+                        explorer_source,
+                        fen.clone(),
+                        since_year,
+                        since_month,
+                    );
                     return None;
                 };
 
@@ -5774,9 +5872,13 @@ impl App {
 
                 let mut counts = Vec::new();
                 for em in &total_exp.moves {
-                    let Ok(uci) = em.uci.parse::<UciMove>() else { continue };
+                    let Ok(uci) = em.uci.parse::<UciMove>() else {
+                        continue;
+                    };
                     let Ok(mv) = uci.to_move(pos) else { continue };
-                    let Some(code) = position::encode_move(mv) else { continue };
+                    let Some(code) = position::encode_move(mv) else {
+                        continue;
+                    };
                     let total_games = em.total().min(u64::from(u32::MAX)) as u32;
                     let recent_games = recent_explorer
                         .moves
@@ -5787,7 +5889,10 @@ impl App {
                     counts.push((code, recent_games, total_games));
                 }
 
-                Some(crate::recent::trends_from_window_counts(&counts, self.trend_config()))
+                Some(crate::recent::trends_from_window_counts(
+                    &counts,
+                    self.trend_config(),
+                ))
             }
         }
     }
@@ -6946,6 +7051,35 @@ impl App {
         if let Ok(lookup) = &result {
             self.wiki_cache.insert(&player_key, lookup);
         }
+        // Wikidata enrichment (§12): fold federations, FIDE id, birth year
+        // and peak Elo into the matching PlayerSummary so the profile card
+        // and player list show the latest federation flag.
+        if let Ok(crate::wiki::Lookup::Summary(summary)) = &result
+            && let Some(index) = self.players.find_key(&player_key)
+            && let Some(player) = self.players.get_mut(index)
+        {
+            let resolved = summary.all_countries();
+            if !resolved.is_empty() {
+                if let Some(latest) = resolved.last().copied() {
+                    player.country = Some(latest);
+                }
+                player.wiki_countries = resolved;
+            } else if let Some(latest) = summary.latest_country() {
+                player.wiki_countries = vec![latest];
+                player.country = Some(latest);
+            }
+            if player.fide_id.is_none()
+                && let Some(fide_id) = summary.fide_id.clone()
+            {
+                player.fide_id = Some(fide_id);
+            }
+            if summary.birth_year.is_some() {
+                player.birth_year = summary.birth_year;
+            }
+            if summary.peak_elo.is_some() {
+                player.peak_elo = summary.peak_elo;
+            }
+        }
         if self.wiki_for.as_deref() == Some(player_key.as_str()) {
             self.wiki_state = match result {
                 Ok(lookup) => WikiState::Ready(lookup),
@@ -7267,12 +7401,15 @@ impl App {
                     self.prep_setup_chessabc_status =
                         format!("No ChessABC profiles found for {query}.");
                     self.prep_setup_chessabc_selected.clear();
-                } else if self.prep_setup_chessabc_selected.iter().any(|id| {
-                    candidates.iter().any(|candidate| &candidate.fide_id == id)
-                }) {
+                } else if self
+                    .prep_setup_chessabc_selected
+                    .iter()
+                    .any(|id| candidates.iter().any(|candidate| &candidate.fide_id == id))
+                {
                     self.prep_setup_chessabc_selected
                         .retain(|id| candidates.iter().any(|c| &c.fide_id == id));
-                } else if let Some(best) = online::best_chessabc_candidate(&candidates, &query, elo) {
+                } else if let Some(best) = online::best_chessabc_candidate(&candidates, &query, elo)
+                {
                     self.prep_setup_chessabc_selected = vec![best.fide_id.clone()];
                     self.prep_setup_chessabc_status = format!(
                         "Selected {} · Elo {} · FIDE {}{}",
@@ -7369,7 +7506,8 @@ impl App {
         let use_current = self.prep_setup_use_current && library.is_some();
         let use_reference_file = self.prep_setup_use_reference;
         let reference_path = self.reference_path.clone();
-        let reference_is_live = LiveReferenceSource::from_config_str(reference_path.trim()).is_some();
+        let reference_is_live =
+            LiveReferenceSource::from_config_str(reference_path.trim()).is_some();
         let reference_is_book = is_opening_book_path(Path::new(reference_path.trim()));
         let use_chessabc = self.prep_setup_use_chessabc;
         let chessabc_ids: Vec<String> = self
@@ -7452,8 +7590,7 @@ impl App {
                 let mut merged = players::deduplicate_and_merge_games(cloned);
                 merged.retain(|(_, game)| {
                     players::player_key(game.white()).as_deref() == Some(player.key.as_str())
-                        || players::player_key(game.black()).as_deref()
-                            == Some(player.key.as_str())
+                        || players::player_key(game.black()).as_deref() == Some(player.key.as_str())
                 });
                 let games: Vec<Game> = merged.into_iter().map(|(_, game)| game).collect();
                 let book = PlayerBook::from_merged_games(
@@ -7496,8 +7633,7 @@ impl App {
             }
             if use_reference_file {
                 let trimmed = reference_path.trim();
-                let reference_is_live =
-                    LiveReferenceSource::from_config_str(trimmed).is_some();
+                let reference_is_live = LiveReferenceSource::from_config_str(trimmed).is_some();
                 if !trimmed.is_empty() {
                     if reference_is_book {
                         notes.push("Reference book prior".to_string());
@@ -7556,7 +7692,9 @@ impl App {
                             chessabc_games.extend(games);
                         }
                         Err(err) => {
-                            notes.push(truncate_status_error(&format!("ChessABC unavailable ({err:#})")));
+                            notes.push(truncate_status_error(&format!(
+                                "ChessABC unavailable ({err:#})"
+                            )));
                         }
                     }
                 } else {
@@ -7574,7 +7712,9 @@ impl App {
                                 chessabc_games.extend(games);
                             }
                             Err(err) => {
-                                notes.push(truncate_status_error(&format!("ChessABC {fide_id} unavailable ({err:#})")));
+                                notes.push(truncate_status_error(&format!(
+                                    "ChessABC {fide_id} unavailable ({err:#})"
+                                )));
                             }
                         }
                     }
@@ -7598,11 +7738,7 @@ impl App {
                     continue;
                 }
                 step += 1;
-                let label = format!(
-                    "Loading {} · {}…",
-                    account.source.label(),
-                    account.username
-                );
+                let label = format!("Loading {} · {}…", account.source.label(), account.username);
                 send_status(step, &label, &notes);
                 let as_of_account = as_of;
                 let cache_key = prep_account_check_key(account.source, &account.username);
@@ -7633,11 +7769,7 @@ impl App {
                 };
                 let total = fetched.len();
                 let mut games = fetched;
-                players::canonicalize_account_games(
-                    &mut games,
-                    &account.username,
-                    &canonical_name,
-                );
+                players::canonicalize_account_games(&mut games, &account.username, &canonical_name);
                 let kept: Vec<Game> = games
                     .into_iter()
                     .filter(|game| account.filter.matches_game(game, as_of_account))
@@ -7667,7 +7799,9 @@ impl App {
                         }
                     }
                     Err(err) => {
-                        notes.push(truncate_status_error(&format!("Extra file unreadable: {err:#}")));
+                        notes.push(truncate_status_error(&format!(
+                            "Extra file unreadable: {err:#}"
+                        )));
                     }
                 }
                 emit_progress(&sources, &notes, step, label);
@@ -7815,8 +7949,7 @@ impl App {
                 Err(TryRecvError::Disconnected) => {
                     self.prep_load_progress = None;
                     self.prep_load_job = None;
-                    self.player_book_status =
-                        "Preparation load stopped unexpectedly.".to_string();
+                    self.player_book_status = "Preparation load stopped unexpectedly.".to_string();
                     keep = false;
                     break;
                 }
@@ -7843,9 +7976,9 @@ impl App {
         if !typed.is_empty() {
             let matches = self.players.filter(&typed);
             if let Some(&exact) = matches.iter().find(|&&idx| {
-                self.players.get(idx).is_some_and(|p| {
-                    players::player_key(&p.name) == players::player_key(&typed)
-                })
+                self.players
+                    .get(idx)
+                    .is_some_and(|p| players::player_key(&p.name) == players::player_key(&typed))
             }) {
                 return Some(exact);
             }
@@ -7969,10 +8102,13 @@ impl App {
             if cached {
                 continue;
             }
-            self.prep_setup_account_checks.insert(
-                request.key.clone(),
-                AccountCheckResult::fetching(request.key.clone()),
-            );
+            let mut fetching = AccountCheckResult::fetching(request.key.clone());
+            if !request.is_chessabc {
+                fetching.cached_total =
+                    online::cached_game_count(request.source, &request.username);
+            }
+            self.prep_setup_account_checks
+                .insert(request.key.clone(), fetching);
             queued.push(request);
         }
         if queued.is_empty() {
@@ -8008,6 +8144,7 @@ impl App {
                         Ok(games) => {
                             let total = games.len();
                             let probe_capped = total >= App::PREP_ACCOUNT_PROBE_MAX;
+                            let bullet = request.filter.exclusion_breakdown(&games, as_of).bullet;
                             AccountCheckResult {
                                 key: request.key.clone(),
                                 fetching: false,
@@ -8016,6 +8153,9 @@ impl App {
                                 error: None,
                                 games: Arc::new(games),
                                 probe_capped,
+                                bullet,
+                                cached_total: 0,
+                                new_games: 0,
                             }
                         }
                         Err(err) => AccountCheckResult {
@@ -8026,9 +8166,14 @@ impl App {
                             error: Some(format!("{err:#}")),
                             games: Arc::new(Vec::new()),
                             probe_capped: false,
+                            bullet: 0,
+                            cached_total: 0,
+                            new_games: 0,
                         },
                     }
                 } else {
+                    let cached_before =
+                        online::cached_game_count(request.source, &request.username);
                     match online::fetch_player_games(
                         request.source,
                         &request.username,
@@ -8037,10 +8182,11 @@ impl App {
                         Ok(games) => {
                             let total = games.len();
                             let probe_capped = total >= App::PREP_ACCOUNT_PROBE_MAX;
-                            let kept = games
-                                .iter()
-                                .filter(|game| request.filter.matches_game(game, as_of))
-                                .count();
+                            let breakdown = request.filter.exclusion_breakdown(&games, as_of);
+                            let kept = breakdown.kept;
+                            let cached_after =
+                                online::cached_game_count(request.source, &request.username);
+                            let new_games = cached_after.saturating_sub(cached_before);
                             AccountCheckResult {
                                 key: request.key.clone(),
                                 fetching: false,
@@ -8049,6 +8195,9 @@ impl App {
                                 error: None,
                                 games: Arc::new(games),
                                 probe_capped,
+                                bullet: breakdown.bullet,
+                                cached_total: cached_before,
+                                new_games,
                             }
                         }
                         Err(err) => AccountCheckResult {
@@ -8059,6 +8208,9 @@ impl App {
                             error: Some(format!("{err:#}")),
                             games: Arc::new(Vec::new()),
                             probe_capped: false,
+                            bullet: 0,
+                            cached_total: cached_before,
+                            new_games: 0,
                         },
                     }
                 };
@@ -8150,6 +8302,7 @@ impl App {
         let mut choose_player = None;
         let mut change_opponent = false;
         let mut refresh_checks = false;
+        let mut search_chessabc = false;
         let title = if player_name.is_empty() {
             "Start preparation".to_string()
         } else {
@@ -8249,7 +8402,9 @@ impl App {
                                         self.prep_setup_chessabc_status.clone()
                                     };
                                     ui.label(RichText::new(status).small());
-                                    if ui.small_button("Confirm").clicked() {
+                                    if !self.prep_setup_chessabc_candidates.is_empty()
+                                        && ui.small_button("Confirm").clicked()
+                                    {
                                         self.prep_setup_chessabc_expanded = false;
                                         if self.prep_setup_chessabc_selected.len() == 1
                                             && let Some(cand) = self
@@ -8324,11 +8479,51 @@ impl App {
                         }
                 if show_search {
                     ui.label(RichText::new("Opponent").strong());
-                    ui.add(
+                    let search_response = ui.add(
                         egui::TextEdit::singleline(&mut self.prep_setup_search)
                             .hint_text("Search opponent… (min 2 chars)")
                             .desired_width(f32::INFINITY),
                     );
+                    // Auto-detect pasted profile URLs (and raw FIDE ids) into
+                    // the opponent search field.
+                    if search_response.changed() {
+                        let (source, extracted) =
+                            online::parse_account_or_profile_input(&self.prep_setup_search);
+                        if let Some(source) = source {
+                            if source == OnlineSource::ChessAbc && !extracted.is_empty() {
+                                self.prep_setup_chessabc_selected = vec![extracted.clone()];
+                                self.prep_setup_chessabc_expanded = false;
+                                self.prep_setup_search = extracted;
+                                refresh_checks = true;
+                            } else if !extracted.is_empty() {
+                                self.prep_setup_search = extracted;
+                            }
+                        } else {
+                            let trimmed_search = self.prep_setup_search.trim().to_string();
+                            if !trimmed_search.is_empty()
+                                && trimmed_search.chars().all(|c| c.is_ascii_digit())
+                            {
+                                self.prep_setup_chessabc_selected = vec![trimmed_search];
+                                refresh_checks = true;
+                            }
+                        }
+                    }
+                    let search_enter = search_response.has_focus()
+                        && ui.input(|i| i.key_pressed(Key::Enter));
+                    ui.horizontal(|ui| {
+                        if ui
+                            .small_button("Search ChessABC")
+                            .on_hover_text(
+                                "Search ChessABC profiles for the typed name (works with no database open)",
+                            )
+                            .clicked()
+                        {
+                            search_chessabc = true;
+                        }
+                        if search_enter {
+                            search_chessabc = true;
+                        }
+                    });
                     let query = self.prep_setup_search.trim().to_string();
                     if query.len() >= 2 {
                         let matches = self.players.filter(&query);
@@ -8372,6 +8567,64 @@ impl App {
                                 .strong()
                                 .small(),
                         );
+                    }
+                    // ChessABC picker directly below the search input (no-DB
+                    // path): expanded on "Search ChessABC" / Enter.
+                    if self.prep_setup_chessabc_expanded
+                        || !self.prep_setup_chessabc_candidates.is_empty()
+                    {
+                        if !self.prep_setup_chessabc_status.is_empty() {
+                            ui.label(
+                                RichText::new(&self.prep_setup_chessabc_status).small(),
+                            );
+                        }
+                        let candidates = self.prep_setup_chessabc_candidates.clone();
+                        egui::ScrollArea::vertical()
+                            .id_salt("prep-chessabc-search-candidates-scroll")
+                            .max_height(140.0)
+                            .show(ui, |ui| {
+                                for candidate in &candidates {
+                                    let mut selected = self
+                                        .prep_setup_chessabc_selected
+                                        .contains(&candidate.fide_id);
+                                    let games_suffix = candidate
+                                        .games
+                                        .map(|g| format!(" ({g} games)"))
+                                        .unwrap_or_default();
+                                    let label = format!(
+                                        "{} · Elo {} · FIDE {}{}",
+                                        candidate.name,
+                                        candidate.rating,
+                                        candidate.fide_id,
+                                        games_suffix,
+                                    );
+                                    if ui.checkbox(&mut selected, label).changed() {
+                                        if selected {
+                                            if !self
+                                                .prep_setup_chessabc_selected
+                                                .contains(&candidate.fide_id)
+                                            {
+                                                self.prep_setup_chessabc_selected
+                                                    .push(candidate.fide_id.clone());
+                                            }
+                                        } else {
+                                            self.prep_setup_chessabc_selected
+                                                .retain(|id| id != &candidate.fide_id);
+                                        }
+                                        refresh_checks = true;
+                                    }
+                                    let key =
+                                        format!("chessabc:{}", candidate.fide_id);
+                                    if let Some(check) = account_checks.get(&key) {
+                                        ui.label(account_check_text(check).small());
+                                    }
+                                }
+                            });
+                        if !self.prep_setup_chessabc_candidates.is_empty()
+                            && ui.small_button("Confirm").clicked()
+                        {
+                            self.prep_setup_chessabc_expanded = false;
+                        }
                     }
                     ui.separator();
                 }
@@ -8505,11 +8758,26 @@ impl App {
                                 );
                             }
                         });
-                    ui.add(
+                    let account_response = ui.add(
                         egui::TextEdit::singleline(&mut self.prep_setup_account_name)
                             .hint_text(self.prep_setup_account_service.input_hint())
                             .desired_width(180.0),
                     );
+                    if account_response.changed() {
+                        let (source, extracted) =
+                            online::parse_account_or_profile_input(&self.prep_setup_account_name);
+                        if let Some(source) = source {
+                            if matches!(
+                                source,
+                                OnlineSource::Lichess | OnlineSource::ChessCom
+                            ) {
+                                self.prep_setup_account_service = source;
+                            }
+                            if !extracted.is_empty() {
+                                self.prep_setup_account_name = extracted;
+                            }
+                        }
+                    }
                     if ui.small_button("Add account").clicked() {
                         add_account = true;
                     }
@@ -8591,6 +8859,22 @@ impl App {
         if choose_extra && let Some(path) = open_dialog(None) {
             self.prep_setup_extra_path = path.display().to_string();
         }
+        if search_chessabc {
+            let typed = self.prep_setup_search.trim().to_string();
+            if !typed.is_empty() {
+                let elo = chosen
+                    .and_then(|index| self.players.get(index))
+                    .and_then(|player| {
+                        player
+                            .elo_avg()
+                            .map(|elo| elo as u32)
+                            .filter(|elo| *elo > 0)
+                            .or_else(|| (player.elo_max > 0).then_some(player.elo_max))
+                    });
+                self.prep_setup_chessabc_expanded = true;
+                self.refresh_chessabc_candidates(typed, elo);
+            }
+        }
         if find_profiles
             && let Some(player) = chosen.and_then(|index| self.players.get(index)).cloned()
         {
@@ -8614,6 +8898,7 @@ impl App {
                     username: name,
                     enabled: true,
                     filter: players::AccountFilter::default(),
+                    filter_version: 2,
                 });
                 self.prep_saved_accounts
                     .insert(player_key.clone(), self.prep_setup_accounts.clone());
@@ -9554,7 +9839,10 @@ impl App {
                 } else {
                     continue;
                 };
-                keep_deeper(&mut best, BoardEval::from_local(score, turn, analysis.depth));
+                keep_deeper(
+                    &mut best,
+                    BoardEval::from_local(score, turn, analysis.depth),
+                );
             }
             best
         };
@@ -11142,6 +11430,20 @@ impl App {
                         self.open_prep_setup_any();
                         ui.close();
                     }
+                    if ui
+                        .button("Sample DB")
+                        .on_hover_text(
+                            "Load the bundled grandmaster showcase sample database",
+                        )
+                        .clicked()
+                    {
+                        if let Some(path) = sample_db_path() {
+                            self.load_file(&path);
+                        } else {
+                            self.status = "Sample DB not found.".to_string();
+                        }
+                        ui.close();
+                    }
                     ui.separator();
                     if ui.button("Import from Lichess…").clicked() {
                         self.online_source = OnlineSource::Lichess;
@@ -11424,6 +11726,18 @@ impl App {
                     }
                 });
 
+                if ui
+                    .button("Sample DB")
+                    .on_hover_text("Load the bundled grandmaster showcase sample database")
+                    .clicked()
+                {
+                    if let Some(path) = sample_db_path() {
+                        self.load_file(&path);
+                    } else {
+                        self.status = "Sample DB not found.".to_string();
+                    }
+                }
+
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     let is_err = self.status.starts_with("Could not")
                         || self.status.contains("failed")
@@ -11644,63 +11958,63 @@ impl App {
                                 let game = &self.online_ref_games[index];
                                 let is_white = game.white().to_lowercase() == username;
                                 let is_black = game.black().to_lowercase() == username;
-                                let (prefix, white, black, suffix, subtitle) = if is_white || is_black {
-                                    let (opponent, opponent_color, color) = if is_white {
-                                        (game.black(), Color::Black, "White")
+                                let prefix = if is_white || is_black {
+                                    format!("as {} against ", if is_white { "White" } else { "Black" })
+                                } else {
+                                    String::new()
+                                };
+                                let (white, black, suffix, subtitle) = if is_white || is_black {
+                                    let (opponent, opponent_color) = if is_white {
+                                        (game.black(), Color::Black)
                                     } else {
-                                        (game.white(), Color::White, "Black")
+                                        (game.white(), Color::White)
                                     };
                                     (
-                                        "vs ",
                                         RowName::new(opponent, player_title(game, opponent_color))
-                                            .with_country(
-                                                player_country(game, opponent_color)
-                                                    .map(|c| c.badge),
-                                            )
-                                            .with_fide_id(player_fide_id(game, opponent_color)),
+                                            .with_country(player_country(game, opponent_color)),
                                         None,
-                                        format!(" · as {color}"),
+                                        String::new(),
                                         format!(
                                             "{} · {} · {}",
-                                            game.result(),
                                             game.event(),
-                                            game.date()
+                                            game.date(),
+                                            game.result()
                                         ),
                                     )
                                 } else {
                                     (
-                                        "",
                                         RowName::new(
                                             game.white(),
                                             player_title(game, Color::White),
                                         )
-                                        .with_country(
-                                            player_country(game, Color::White).map(|c| c.badge),
-                                        )
-                                        .with_fide_id(player_fide_id(game, Color::White)),
+                                        .with_country(player_country(game, Color::White)),
                                         Some(
                                             RowName::new(
                                                 game.black(),
                                                 player_title(game, Color::Black),
                                             )
-                                            .with_country(
-                                                player_country(game, Color::Black).map(|c| c.badge),
-                                            )
-                                            .with_fide_id(player_fide_id(game, Color::Black)),
+                                            .with_country(player_country(game, Color::Black)),
                                         ),
                                         String::new(),
-                                        format!("{} · {}", game.result(), game.date()),
+                                        format!(
+                                            "{} · {} · {}",
+                                            game.event(),
+                                            game.date(),
+                                            game.result()
+                                        ),
                                     )
                                 };
+                                let site_owned = game.header("Site").map(str::to_string);
                                 let width = ui.available_width();
                                 if game_row(
                                     ui,
                                     false,
-                                    prefix,
+                                    &prefix,
                                     white,
                                     black,
                                     &suffix,
                                     &subtitle,
+                                    site_owned.as_deref(),
                                     width,
                                     42.0,
                                     None,
@@ -11859,29 +12173,23 @@ impl App {
                         };
                         let cat = players::classify_game_category(game);
                         let type_color = self.game_category_color(cat);
-                        let subtitle = format!(
-                            "{} · {} · {}",
-                            game.date(),
-                            game.event(),
-                            game.result()
-                        );
+                        let subtitle =
+                            format!("{} · {} · {}", game.event(), game.date(), game.result());
+                        let site_owned = game.header("Site").map(str::to_string);
                         let width = ui.available_width();
                         let mut response = game_row(
                             ui,
                             false,
                             "",
                             RowName::new(game.white(), player_title(game, Color::White))
-                                .with_country(player_country(game, Color::White).map(|c| c.badge))
-                                .with_fide_id(player_fide_id(game, Color::White)),
+                                .with_country(player_country(game, Color::White)),
                             Some(
                                 RowName::new(game.black(), player_title(game, Color::Black))
-                                    .with_country(
-                                        player_country(game, Color::Black).map(|c| c.badge),
-                                    )
-                                    .with_fide_id(player_fide_id(game, Color::Black)),
+                                    .with_country(player_country(game, Color::Black)),
                             ),
                             "",
                             &subtitle,
+                            site_owned.as_deref(),
                             width,
                             row_h - 2.0,
                             Some(type_color),
@@ -11995,10 +12303,12 @@ impl App {
                     );
                     let type_color = self.game_category_color(cat);
                     let subtitle = format!(
-                        "{} · {}",
+                        "{} · {} · {}",
                         header("Event").unwrap_or("?"),
-                        header("Date").unwrap_or("????.??.??")
+                        header("Date").unwrap_or("????.??.??"),
+                        header("Result").unwrap_or("*")
                     );
+                    let site_owned = header("Site").map(str::to_string);
                     let selected = self.current_slot == Some(id) && self.prep.is_none();
                     let width = ui.available_width();
                     let white_name = self.session.slot_white(id);
@@ -12007,14 +12317,11 @@ impl App {
                         ui,
                         selected,
                         "",
-                        RowName::new(&white_name, white_title)
-                            .with_country(white_country.map(|c| c.badge)),
-                        Some(
-                            RowName::new(&black_name, black_title)
-                                .with_country(black_country.map(|c| c.badge)),
-                        ),
+                        RowName::new(&white_name, white_title).with_country(white_country),
+                        Some(RowName::new(&black_name, black_title).with_country(black_country)),
                         "",
                         &subtitle,
+                        site_owned.as_deref(),
                         width,
                         row_h - 2.0,
                         Some(type_color),
@@ -12140,19 +12447,10 @@ impl App {
             .stroke(Stroke::new(1.0, BORDER))
             .inner_margin(10.0)
             .show(ui, |ui| {
-                // Header row: ← All players, FIDE profile, You badge, Exit prep
+                // Header row: ← All players left; compact Prepare + FIDE pill right.
                 ui.horizontal(|ui| {
                     if ui.small_button("← All players").clicked() {
                         back = true;
-                    }
-                    if let Some(id) = player.fide_id.as_deref()
-                        && let Some(url) = fide::profile_url(id)
-                        && ui
-                            .link(RichText::new(format!("FIDE {id} ↗")).small().weak())
-                            .on_hover_text("Open this player's FIDE rating profile in your browser")
-                            .clicked()
-                    {
-                        open_browser_url(ui.ctx(), &url);
                     }
                     if top_priority_player_key(&self.prep_player_names).as_deref()
                         == Some(player.key.as_str())
@@ -12160,14 +12458,56 @@ impl App {
                         ui.label(RichText::new("You").small().strong().color(GOLD))
                             .on_hover_text("First name in the player-priority list");
                     }
-                    if self
-                        .prep
-                        .as_ref()
-                        .is_some_and(|prep| prep.player_key == player.key)
-                        && ui.small_button("Exit prep").clicked()
-                    {
-                        exit = true;
-                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if self
+                            .prep
+                            .as_ref()
+                            .is_some_and(|prep| prep.player_key == player.key)
+                            && ui.small_button("Exit prep").clicked()
+                        {
+                            exit = true;
+                        }
+                        if let Some(id) = player.fide_id.clone() {
+                            paint_fide_pill(ui, &id);
+                        }
+                        egui::Frame::new()
+                            .fill(SURFACE_ALT)
+                            .corner_radius(11.0)
+                            .stroke(Stroke::new(1.0, BORDER))
+                            .inner_margin(egui::Margin::symmetric(8, 3))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        RichText::new("Prepare").small().strong().color(MUTED),
+                                    );
+                                    let natural = natural_player_name(&player.name);
+                                    if paint_prepare_color_square(
+                                        ui,
+                                        Color32::from_rgb(0xE8, 0xEC, 0xF2),
+                                        &format!(
+                                            "You play White — prepare against {natural}'s Black games"
+                                        ),
+                                    )
+                                    .clicked()
+                                    {
+                                        // White square = the colour YOU play; the
+                                        // opponent therefore plays Black.
+                                        color_action = Some(Color::Black);
+                                    }
+                                    if paint_prepare_color_square(
+                                        ui,
+                                        Color32::from_rgb(0x20, 0x24, 0x2C),
+                                        &format!(
+                                            "You play Black — prepare against {natural}'s White games"
+                                        ),
+                                    )
+                                    .clicked()
+                                    {
+                                        color_action = Some(Color::White);
+                                    }
+                                });
+                            });
+                    });
                 });
                 ui.add_space(4.0);
 
@@ -12200,7 +12540,7 @@ impl App {
                     }
 
                     ui.vertical(|ui| {
-                        // Line 1: Title pill + Name + Country flag
+                        // Line 1: Title pill + Name
                         ui.horizontal_wrapped(|ui| {
                             if let Some(title) = player.title {
                                 ui.label(
@@ -12216,24 +12556,61 @@ impl App {
                                 ui.label(RichText::new("👑").size(16.0).color(GOLD))
                                     .on_hover_text(champion.tooltip());
                             }
-                            if let Some(country) = player.country {
-                                ui.label(RichText::new(country.badge).small().weak())
-                                    .on_hover_text(format!("{} ({})", country.name, country.code));
-                            }
                         });
 
-                        // Line 2: FIDE Rating label on the left, prominent tabular rating
+                        // Line 2: prominent rating + peak, muted Born when known
                         ui.horizontal(|ui| {
-                            ui.label(RichText::new("FIDE Rating").small().weak());
                             let elo_display = player
                                 .display_elo()
                                 .map(|elo| elo.to_string())
                                 .unwrap_or_else(|| "—".to_string());
                             ui.label(RichText::new(elo_display).monospace().strong());
-                            if let Some(peak) = (player.elo_max > 0).then_some(player.elo_max) {
-                                ui.label(RichText::new(format!("(peak {peak})")).small().weak());
+                            let db_peak = (player.elo_max > 0).then_some(player.elo_max);
+                            let peak = player
+                                .peak_elo
+                                .map(u32::from)
+                                .or(db_peak);
+                            if let Some(peak) = peak {
+                                ui.label(RichText::new(format!("peak {peak}")).small().weak());
+                            }
+                            if let Some(born) = player.birth_year {
+                                ui.label(RichText::new(format!("Born {born}")).small().weak());
                             }
                         });
+
+                        // Line 2b: federation line — every known country, current first.
+                        // Wikidata supplies `wiki_countries` (§12); until then the
+                        // single database federation is shown.
+                        let federations: Vec<Country> = if player.wiki_countries.is_empty() {
+                            player.country.into_iter().collect()
+                        } else {
+                            player.wiki_countries.clone()
+                        };
+                        if !federations.is_empty() {
+                            ui.horizontal_wrapped(|ui| {
+                                for (index, country) in
+                                    federations.iter().rev().enumerate()
+                                {
+                                    if index > 0 {
+                                        ui.label(RichText::new("·").small().weak());
+                                    }
+                                    flags::flag_response(
+                                        ui,
+                                        *country,
+                                        flags::PROFILE_SIZE,
+                                    );
+                                    ui.label(
+                                        RichText::new(country.name)
+                                            .small()
+                                            .weak(),
+                                    )
+                                    .on_hover_text(format!(
+                                        "{} ({})",
+                                        country.name, country.code
+                                    ));
+                                }
+                            });
+                        }
 
                         // Line 3: Games / Score (N games · score X%) and W / D / L counts
                         ui.horizontal(|ui| {
@@ -12256,43 +12633,6 @@ impl App {
                     });
                 });
 
-                ui.add_space(6.0);
-                // Bottom action bar: Sleek Prepare bar with White and Black square buttons
-                egui::Frame::new()
-                    .fill(SURFACE_ALT)
-                    .corner_radius(6.0)
-                    .inner_margin(egui::Margin::symmetric(8, 4))
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            if ui
-                                .selectable_label(false, RichText::new("PREPARE").strong().small())
-                                .on_hover_text("Open preparation setup dialog")
-                                .clicked()
-                            {
-                                color_action = Some(Color::Black);
-                            }
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                if paint_prepare_color_square(
-                                    ui,
-                                    Color32::from_rgb(0x20, 0x24, 0x2C),
-                                    "Opponent plays Black (you play White)",
-                                )
-                                .clicked()
-                                {
-                                    color_action = Some(Color::Black);
-                                }
-                                if paint_prepare_color_square(
-                                    ui,
-                                    Color32::from_rgb(0xE8, 0xEC, 0xF2),
-                                    "Opponent plays White (you play Black)",
-                                )
-                                .clicked()
-                                {
-                                    color_action = Some(Color::White);
-                                }
-                            });
-                        });
-                    });
             });
 
         if let Some(opp_color) = color_action {
@@ -12419,10 +12759,10 @@ impl App {
         let merged_positions: Vec<usize> = if merged_active {
             let mut out = Vec::new();
             for (position, game) in self.prep_merged_games.iter().enumerate() {
-                let player_white = players::player_key(game.white()).as_deref()
-                    == Some(player.key.as_str());
-                let player_black = players::player_key(game.black()).as_deref()
-                    == Some(player.key.as_str());
+                let player_white =
+                    players::player_key(game.white()).as_deref() == Some(player.key.as_str());
+                let player_black =
+                    players::player_key(game.black()).as_deref() == Some(player.key.as_str());
                 if !player_white && !player_black {
                     continue;
                 }
@@ -12479,25 +12819,20 @@ impl App {
                         };
                         let cat = players::classify_game_category(game);
                         let type_color = self.game_category_color(cat);
-                        let subtitle = format!(
-                            "{} · {} · {}",
-                            game.result(),
-                            game.event(),
-                            game.date()
-                        );
+                        let subtitle =
+                            format!("{} · {} · {}", game.event(), game.date(), game.result());
+                        let site_owned = game.header("Site").map(str::to_string);
                         let width = ui.available_width();
                         let mut response = game_row(
                             ui,
                             false,
-                            "vs ",
+                            &format!("as {color} against "),
                             RowName::new(&opponent, player_title(game, opponent_color))
-                                .with_country(
-                                    player_country(game, opponent_color).map(|c| c.badge),
-                                )
-                                .with_fide_id(player_fide_id(game, opponent_color)),
+                                .with_country(player_country(game, opponent_color)),
                             None,
-                            &format!(" · as {color}"),
+                            "",
                             &subtitle,
+                            site_owned.as_deref(),
                             width,
                             row_h - 2.0,
                             Some(type_color),
@@ -12535,8 +12870,8 @@ impl App {
                         let (
                             opponent,
                             opponent_title,
-                            opponent_fide_id,
                             opponent_country,
+                            opponent_site,
                             color,
                             result,
                             event,
@@ -12556,11 +12891,6 @@ impl App {
                                     Color::White => "WhiteTitle",
                                     Color::Black => "BlackTitle",
                                 }));
-                            let opponent_fide_id =
-                                player_fide_id_from_header(entry.header(match opponent_color {
-                                    Color::White => "WhiteFideId",
-                                    Color::Black => "BlackFideId",
-                                }));
                             let opponent_country = player_country_from_header(
                                 entry
                                     .header(match opponent_color {
@@ -12574,6 +12904,7 @@ impl App {
                                         })
                                     }),
                             );
+                            let opponent_site = entry.header("Site").map(str::to_string);
                             let cat = players::classify_headers_category(
                                 Some(entry.event()),
                                 entry.header("Site"),
@@ -12584,8 +12915,8 @@ impl App {
                             (
                                 opponent,
                                 opponent_title,
-                                opponent_fide_id,
                                 opponent_country,
+                                opponent_site,
                                 color,
                                 entry.result().to_string(),
                                 entry.event().to_string(),
@@ -12613,11 +12944,6 @@ impl App {
                                 Color::White => "WhiteTitle",
                                 Color::Black => "BlackTitle",
                             }));
-                            let opponent_fide_id =
-                                player_fide_id_from_header(find_h(match opponent_color {
-                                    Color::White => "WhiteFideId",
-                                    Color::Black => "BlackFideId",
-                                }));
                             let opponent_country = player_country_from_header(
                                 find_h(match opponent_color {
                                     Color::White => "WhiteCountry",
@@ -12633,6 +12959,7 @@ impl App {
                             let result = find_h("Result").unwrap_or("*").to_string();
                             let event = find_h("Event").unwrap_or("?").to_string();
                             let date = find_h("Date").unwrap_or("????.??.??").to_string();
+                            let opponent_site = find_h("Site").map(str::to_string);
                             let cat = players::classify_headers_category(
                                 Some(&event),
                                 find_h("Site"),
@@ -12643,8 +12970,8 @@ impl App {
                             (
                                 opponent,
                                 opponent_title,
-                                opponent_fide_id,
                                 opponent_country,
+                                opponent_site,
                                 color,
                                 result,
                                 event,
@@ -12653,8 +12980,7 @@ impl App {
                                 type_label,
                             )
                         };
-                        let suffix = format!(" · as {color}");
-                        let subtitle = format!("{result} · {event} · {date}");
+                        let subtitle = format!("{event} · {date} · {result}");
                         let selected = self
                             .session
                             .source_slot(idx)
@@ -12664,13 +12990,12 @@ impl App {
                         let mut response = game_row(
                             ui,
                             selected,
-                            "vs ",
-                            RowName::new(&opponent, opponent_title)
-                                .with_country(opponent_country.map(|c| c.badge))
-                                .with_fide_id(opponent_fide_id.as_deref()),
+                            &format!("as {color} against "),
+                            RowName::new(&opponent, opponent_title).with_country(opponent_country),
                             None,
-                            &suffix,
+                            "",
                             &subtitle,
+                            opponent_site.as_deref(),
                             width,
                             row_h - 2.0,
                             Some(type_color),
@@ -12754,7 +13079,6 @@ impl App {
                     let name = player.name.clone();
                     let key = player.key.clone();
                     let (player_title, player_elo, player_country) = player_list_row_meta(player);
-                    let player_fide_id = player.fide_id.clone();
                     let is_you = you_key.as_deref() == Some(key.as_str());
                     let title = if is_you {
                         "You".to_string()
@@ -12782,7 +13106,6 @@ impl App {
                         &title,
                         player_title,
                         player_country,
-                        player_fide_id.as_deref(),
                         player_elo,
                         &subtitle,
                         width,
@@ -13160,7 +13483,8 @@ impl App {
                 self.reference_status = if use_current_reference {
                     "Using the current database as the reference source.".to_string()
                 } else {
-                    "No reference database configured — using the current database prior.".to_string()
+                    "No reference database configured — using the current database prior."
+                        .to_string()
                 };
                 self.save_reference_prefs();
             }
@@ -15435,8 +15759,7 @@ impl App {
                     black_title,
                     white_country,
                     black_country,
-                    white_fide_id,
-                    black_fide_id,
+                    site,
                     result,
                     event,
                     type_color,
@@ -15458,16 +15781,13 @@ impl App {
                             indexed
                                 .header("WhiteCountry")
                                 .or_else(|| indexed.header("WhiteFed")),
-                        )
-                        .map(|c| c.badge),
+                        ),
                         player_country_from_header(
                             indexed
                                 .header("BlackCountry")
                                 .or_else(|| indexed.header("BlackFed")),
-                        )
-                        .map(|c| c.badge),
-                        player_fide_id_from_header(indexed.header("WhiteFideId")),
-                        player_fide_id_from_header(indexed.header("BlackFideId")),
+                        ),
+                        indexed.header("Site").map(str::to_string),
                         indexed.result().to_string(),
                         indexed.event().to_string(),
                         type_color,
@@ -15499,14 +15819,11 @@ impl App {
                     let black_title = title_from_tag(find_h("BlackTitle"));
                     let white_country = player_country_from_header(
                         find_h("WhiteCountry").or_else(|| find_h("WhiteFed")),
-                    )
-                    .map(|c| c.badge);
+                    );
                     let black_country = player_country_from_header(
                         find_h("BlackCountry").or_else(|| find_h("BlackFed")),
-                    )
-                    .map(|c| c.badge);
-                    let white_fide_id = player_fide_id_from_header(find_h("WhiteFideId"));
-                    let black_fide_id = player_fide_id_from_header(find_h("BlackFideId"));
+                    );
+                    let site = find_h("Site").map(str::to_string);
                     let result = find_h("Result").unwrap_or("*").to_string();
                     let event = find_h("Event").unwrap_or("?").to_string();
                     let cat = players::classify_headers_category(
@@ -15523,8 +15840,7 @@ impl App {
                         black_title,
                         white_country,
                         black_country,
-                        white_fide_id,
-                        black_fide_id,
+                        site,
                         result,
                         event,
                         type_color,
@@ -15542,15 +15858,8 @@ impl App {
                     black_title,
                     white_country,
                     black_country,
-                    white_fide_id,
-                    black_fide_id,
-                    subtitle: format!(
-                        "{} · as {} · {} · {}",
-                        short_date(game.date),
-                        color_name(game.color),
-                        outcome_label(&result, game.color),
-                        event
-                    ),
+                    site,
+                    subtitle: format!("{} · {} · {}", event, short_date(game.date), result),
                     type_color,
                     type_label,
                     result_badge,
@@ -15585,12 +15894,6 @@ impl App {
                 let cat = players::classify_game_category(game);
                 let type_color = self.game_category_color(cat);
                 let type_label = cat.label();
-                let continuation = continuation_moves_snippet(game, key, None);
-                let continuation_suffix = if continuation.is_empty() {
-                    String::new()
-                } else {
-                    format!(" · ▶ {continuation}")
-                };
                 let result_badge = standardize_result_badge(game.result());
                 let player_outcome = calc_player_outcome(game.result(), game_ref.color);
                 Some(PrepRecentRow {
@@ -15600,18 +15903,10 @@ impl App {
                     black: game.black().to_string(),
                     white_title: player_title(game, Color::White),
                     black_title: player_title(game, Color::Black),
-                    white_country: player_country(game, Color::White).map(|c| c.badge),
-                    black_country: player_country(game, Color::Black).map(|c| c.badge),
-                    white_fide_id: player_fide_id(game, Color::White).map(str::to_string),
-                    black_fide_id: player_fide_id(game, Color::Black).map(str::to_string),
-                    subtitle: format!(
-                        "{} · as {} · {} · {}{}",
-                        game.date(),
-                        color_name(game_ref.color),
-                        outcome_label(game.result(), game_ref.color),
-                        game.event(),
-                        continuation_suffix
-                    ),
+                    white_country: player_country(game, Color::White),
+                    black_country: player_country(game, Color::Black),
+                    site: game.header("Site").map(str::to_string),
+                    subtitle: format!("{} · {} · {}", game.event(), game.date(), game.result()),
                     type_color,
                     type_label,
                     result_badge,
@@ -16601,15 +16896,14 @@ impl App {
                                     false,
                                     "",
                                     RowName::new(&row.white, row.white_title)
-                                        .with_country(row.white_country)
-                                        .with_fide_id(row.white_fide_id.as_deref()),
+                                        .with_country(row.white_country),
                                     Some(
                                         RowName::new(&row.black, row.black_title)
-                                            .with_country(row.black_country)
-                                            .with_fide_id(row.black_fide_id.as_deref()),
+                                            .with_country(row.black_country),
                                     ),
                                     "",
                                     &row.subtitle,
+                                    row.site.as_deref(),
                                     width,
                                     40.0,
                                     Some(row.type_color),
@@ -16655,77 +16949,6 @@ impl App {
                                     .weak()
                                     .small(),
                                 );
-                            }
-                            if let Some(browse) = self
-                                .hovered_game_browse
-                                .as_ref()
-                                .filter(|b| b.id.starts_with("recent"))
-                            {
-                                ui.add_space(4.0);
-                                egui::Frame::new()
-                                    .fill(SURFACE)
-                                    .corner_radius(4.0)
-                                    .inner_margin(6.0)
-                                    .show(ui, |ui| {
-                                        let mut job = LayoutJob::default();
-                                        job.append(
-                                            "Preview: ",
-                                            0.0,
-                                            TextFormat {
-                                                font_id: FontId::proportional(11.0),
-                                                color: MUTED,
-                                                ..Default::default()
-                                            },
-                                        );
-                                        for (idx, node) in browse.game.nodes.iter().enumerate().skip(1) {
-                                            if let Some(san) = node.san() {
-                                                let ply = idx;
-                                                if (ply - 1) % 2 == 0 {
-                                                    job.append(
-                                                        &format!("{}. ", (ply - 1) / 2 + 1),
-                                                        0.0,
-                                                        TextFormat {
-                                                            font_id: FontId::proportional(11.0),
-                                                            color: MUTED,
-                                                            ..Default::default()
-                                                        },
-                                                    );
-                                                }
-                                                let is_cursor = idx == browse.cursor_node;
-                                                let color = if is_cursor { GOLD } else { TEXT };
-                                                job.append(
-                                                    san,
-                                                    0.0,
-                                                    TextFormat {
-                                                        font_id: FontId::proportional(11.0),
-                                                        color,
-                                                        ..Default::default()
-                                                    },
-                                                );
-                                                job.append(
-                                                    " ",
-                                                    0.0,
-                                                    TextFormat {
-                                                        font_id: FontId::proportional(11.0),
-                                                        color: MUTED,
-                                                        ..Default::default()
-                                                    },
-                                                );
-                                            }
-                                        }
-                                        if browse.game.nodes.len() <= 1 {
-                                            job.append(
-                                                browse.game.result(),
-                                                0.0,
-                                                TextFormat {
-                                                    font_id: FontId::proportional(11.0),
-                                                    color: MUTED,
-                                                    ..Default::default()
-                                                },
-                                            );
-                                        }
-                                        ui.label(job);
-                                    });
                             }
                         }
 
@@ -16820,7 +17043,9 @@ impl App {
     /// Returns whether the hovered browse game currently matches `id`.
     #[allow(dead_code)]
     fn is_hovered_game(&self, id: &str) -> bool {
-        self.hovered_game_browse.as_ref().is_some_and(|b| b.id == id)
+        self.hovered_game_browse
+            .as_ref()
+            .is_some_and(|b| b.id == id)
     }
 
     /// Keep the hovered game active if `id` matches the current hover browse,
@@ -16843,7 +17068,9 @@ impl App {
                 browse.anchor_node = anchor_node;
                 browse.cursor_node = anchor_node;
             }
-            let cursor = browse.cursor_node.min(browse.game.nodes.len().saturating_sub(1));
+            let cursor = browse
+                .cursor_node
+                .min(browse.game.nodes.len().saturating_sub(1));
             browse.cursor_node = cursor;
             let preview = browse.game.nodes.get(cursor).map(|node| HoverPreview {
                 pos: node.pos.clone(),
@@ -16886,13 +17113,17 @@ impl App {
         let anchor_node = current_key
             .and_then(|key| find_node_for_position_key(&game, key))
             .unwrap_or(0);
-        if self.hovered_game_browse.as_ref().is_some_and(|browse| {
-            browse.id == id && browse.anchor_node == anchor_node
-        }) {
+        if self
+            .hovered_game_browse
+            .as_ref()
+            .is_some_and(|browse| browse.id == id && browse.anchor_node == anchor_node)
+        {
             let preview = {
                 let browse = self.hovered_game_browse.as_mut().unwrap();
                 browse.game = game;
-                let cursor = browse.cursor_node.min(browse.game.nodes.len().saturating_sub(1));
+                let cursor = browse
+                    .cursor_node
+                    .min(browse.game.nodes.len().saturating_sub(1));
                 browse.cursor_node = cursor;
                 browse.game.nodes.get(cursor).map(|node| HoverPreview {
                     pos: node.pos.clone(),
@@ -16944,11 +17175,7 @@ impl App {
                 }
             } else {
                 for _ in 0..delta.unsigned_abs() {
-                    let Some(parent) = browse
-                        .game
-                        .nodes
-                        .get(node)
-                        .and_then(|node| node.parent)
+                    let Some(parent) = browse.game.nodes.get(node).and_then(|node| node.parent)
                     else {
                         break;
                     };
@@ -17262,7 +17489,6 @@ impl App {
         });
     }
 
-
     fn pending_game_drop_dialog(&mut self, ctx: &egui::Context) {
         let Some(pending) = self.pending_game_drop.take() else {
             return;
@@ -17555,6 +17781,7 @@ impl App {
         let mut close = false;
         let mut choose_correspondence = false;
         let mut use_default_correspondence = false;
+        let mut clear_online_cache = false;
         let mut choose_engine_idx = None;
 
         egui::Window::new("Settings")
@@ -17876,6 +18103,28 @@ impl App {
 
                 ui.add_space(8.0);
                 ui.separator();
+                ui.heading("Online game cache");
+                {
+                    let bytes = online::online_cache_size_bytes();
+                    let mb = bytes as f64 / 1_000_000.0;
+                    let label = if bytes == 0 {
+                        "Clear online game cache (0 MB)".to_string()
+                    } else {
+                        format!("Clear online game cache ({mb:.0} MB)")
+                    };
+                    if ui
+                        .button(label)
+                        .on_hover_text(
+                            "Remove cached Lichess and Chess.com games (ChessABC is uncached)",
+                        )
+                        .clicked()
+                    {
+                        clear_online_cache = true;
+                    }
+                }
+
+                ui.add_space(8.0);
+                ui.separator();
                 ui.heading("Player profiles");
                 ui.checkbox(
                     &mut self.settings_wiki_enabled,
@@ -17980,6 +18229,14 @@ impl App {
             self.engine_slots[idx].path = path.display().to_string();
             if idx == 0 {
                 self.engine_path = path.display().to_string();
+            }
+        }
+        if clear_online_cache {
+            match online::clear_online_cache() {
+                Ok(()) => self.settings_status = "Online game cache cleared.".to_string(),
+                Err(err) => {
+                    self.settings_status = format!("Could not clear online game cache: {err:#}")
+                }
             }
         }
         if choose_correspondence && let Some(path) = open_dialog(None) {
@@ -18249,59 +18506,58 @@ impl eframe::App for App {
                 ui.add_space(6.0);
                 let hover = self.hover_preview.as_ref();
                 let (board_eval, eval_held) = self.current_board_eval_with_hold();
-                let (board_meta, move_counter_text) = if let Some((game, disp_node, _)) =
-                    self.active_display_game_and_node()
-                {
-                    let node = &game.nodes[disp_node];
-                    let top_color = self.orientation.other();
-                    let bottom_color = self.orientation;
-                    let show_clocks = self.show_clocks && game.has_clocks();
-                    let badge = |color: Color| PlayerBadge {
-                        name: if color == Color::White {
-                            game.white().to_string()
-                        } else {
-                            game.black().to_string()
-                        },
-                        title: player_title(game, color).map(str::to_string),
-                        country: player_country(game, color).map(|c| c.badge),
-                        fide_id: player_fide_id(game, color).map(str::to_string),
-                        rating: player_rating(
-                            game,
+                let (board_meta, move_counter_text) =
+                    if let Some((game, disp_node, _)) = self.active_display_game_and_node() {
+                        let node = &game.nodes[disp_node];
+                        let top_color = self.orientation.other();
+                        let bottom_color = self.orientation;
+                        let show_clocks = self.show_clocks && game.has_clocks();
+                        let badge = |color: Color| PlayerBadge {
+                            name: if color == Color::White {
+                                game.white().to_string()
+                            } else {
+                                game.black().to_string()
+                            },
+                            title: player_title(game, color).map(str::to_string),
+                            country: player_country(game, color).map(|c| c.badge),
+                            fide_id: player_fide_id(game, color).map(str::to_string),
+                            rating: player_rating(
+                                game,
+                                color,
+                                self.rating_priority,
+                                self.show_all_ratings,
+                            ),
+                            team: team_for(game, color).map(str::to_string),
+                            clock: if show_clocks {
+                                game.clock_for(disp_node, color)
+                            } else {
+                                None
+                            },
                             color,
-                            self.rating_priority,
-                            self.show_all_ratings,
-                        ),
-                        team: team_for(game, color).map(str::to_string),
-                        clock: if show_clocks {
-                            game.clock_for(disp_node, color)
-                        } else {
-                            None
-                        },
-                        color,
+                        };
+                        let meta = BoardMeta {
+                            pos: hover
+                                .map(|preview| preview.pos.clone())
+                                .unwrap_or_else(|| node.pos.clone()),
+                            last_move: hover
+                                .map(|preview| preview.last_move)
+                                .unwrap_or_else(|| domain::last_move_squares(node)),
+                            shapes: hover
+                                .map(|_| Vec::new())
+                                .unwrap_or_else(|| node.shapes.clone()),
+                            top: badge(top_color),
+                            bottom: badge(bottom_color),
+                            show_clocks,
+                        };
+                        let counter = format!(
+                            "move {} / {}",
+                            full_moves(depth_of(game, disp_node)),
+                            full_moves(game.mainline_len())
+                        );
+                        (Some(meta), Some(counter))
+                    } else {
+                        (None, None)
                     };
-                    let meta = BoardMeta {
-                        pos: hover
-                            .map(|preview| preview.pos.clone())
-                            .unwrap_or_else(|| node.pos.clone()),
-                        last_move: hover
-                            .map(|preview| preview.last_move)
-                            .unwrap_or_else(|| domain::last_move_squares(node)),
-                        shapes: hover
-                            .map(|_| Vec::new())
-                            .unwrap_or_else(|| node.shapes.clone()),
-                        top: badge(top_color),
-                        bottom: badge(bottom_color),
-                        show_clocks,
-                    };
-                    let counter = format!(
-                        "move {} / {}",
-                        full_moves(depth_of(game, disp_node)),
-                        full_moves(game.mainline_len())
-                    );
-                    (Some(meta), Some(counter))
-                } else {
-                    (None, None)
-                };
                 if let Some(meta) = board_meta {
                     let ctx = ui.ctx().clone();
                     let top_photo = self.photo_texture(&ctx, &meta.top.name);
@@ -18328,9 +18584,8 @@ impl eframe::App for App {
                             Layout::left_to_right(Align::Center),
                             |ui| {
                                 ui.spacing_mut().item_spacing.x = eval_bar::GAP;
-                                bar_response = Some(eval_bar::draw_with_hold(
-                                    ui, board_eval, eval_held, side,
-                                ));
+                                bar_response =
+                                    Some(eval_bar::draw_with_hold(ui, board_eval, eval_held, side));
                                 event = board::draw(
                                     ui,
                                     &self.textures,
@@ -18487,12 +18742,7 @@ fn player_strip(
             egui::Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
             Color32::WHITE,
         );
-        painter.rect_stroke(
-            avatar,
-            4.0,
-            Stroke::new(1.0, BORDER),
-            StrokeKind::Inside,
-        );
+        painter.rect_stroke(avatar, 4.0, Stroke::new(1.0, BORDER), StrokeKind::Inside);
         let photo_response = ui.interact(avatar, response.id.with("photo"), Sense::click());
         if photo_response.hovered() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -18589,11 +18839,7 @@ fn player_strip(
             champion,
         )
     });
-    name_painter.galley(
-        pos2(text_left, name_y),
-        name_galley.clone(),
-        TEXT,
-    );
+    name_painter.galley(pos2(text_left, name_y), name_galley.clone(), TEXT);
     let name_hit_rect = egui::Rect::from_min_size(pos2(text_left, name_y), name_galley.size());
     let name_response = ui.interact(
         name_hit_rect.expand2(vec2(2.0, 2.0)),
@@ -18609,29 +18855,19 @@ fn player_strip(
     let name_clicked = name_response.clicked();
 
     if let Some(team) = player.team.as_ref().filter(|team| !team.trim().is_empty()) {
-        let team_galley = name_painter.layout_no_wrap(
-            team.trim().to_string(),
-            FontId::proportional(10.5),
-            MUTED,
-        );
+        let team_galley =
+            name_painter.layout_no_wrap(team.trim().to_string(), FontId::proportional(10.5), MUTED);
         let team_y = if has_photo {
             name_y + 18.0
         } else {
             rect.top() + 18.0
         };
-        name_painter.galley(
-            pos2(text_left, team_y),
-            team_galley,
-            MUTED,
-        );
+        name_painter.galley(pos2(text_left, team_y), team_galley, MUTED);
     }
 
     if let Some(counter) = move_counter {
-        let counter_galley = painter.layout_no_wrap(
-            counter.to_string(),
-            FontId::proportional(11.5),
-            MUTED,
-        );
+        let counter_galley =
+            painter.layout_no_wrap(counter.to_string(), FontId::proportional(11.5), MUTED);
         let counter_pos = pos2(
             rect.center().x - counter_galley.size().x / 2.0,
             rect.center().y - counter_galley.size().y / 2.0,
@@ -18657,11 +18893,7 @@ fn player_strip(
             ),
             clock_galley.size(),
         );
-        painter.rect_filled(
-            clock_rect.expand2(vec2(8.0, 4.0)),
-            4.0,
-            SURFACE_ALT,
-        );
+        painter.rect_filled(clock_rect.expand2(vec2(8.0, 4.0)), 4.0, SURFACE_ALT);
         painter.rect_stroke(
             clock_rect.expand2(vec2(8.0, 4.0)),
             4.0,
@@ -18772,6 +19004,7 @@ fn same_game(a: &Game, b: &Game) -> bool {
 
 /// Up to six mainline plies from the node matching `key` (or `cursor_node`),
 /// formatted for a compact recent-game row (`3. Bb5 a6 4. Ba4 Nf6`).
+#[allow(dead_code)]
 fn continuation_moves_snippet(game: &Game, key: u64, cursor_node: Option<usize>) -> String {
     let Some(start) = cursor_node
         .filter(|&node| {
@@ -20394,6 +20627,7 @@ fn player_title(game: &Game, color: Color) -> Option<&'static str> {
     }))
 }
 
+#[allow(dead_code)]
 fn player_fide_id_from_header(raw: Option<&str>) -> Option<String> {
     fide::from_tag(raw).map(str::to_string)
 }
@@ -21171,10 +21405,10 @@ struct GameRowDrag {
 
 pub(crate) fn player_list_row_meta(
     player: &players::PlayerSummary,
-) -> (Option<&'static str>, Option<u16>, Option<&'static str>) {
+) -> (Option<&'static str>, Option<u16>, Option<Country>) {
     let title = player.title.map(titles::PlayerTitle::short);
     let elo = player.display_elo();
-    let country = player.country.map(|c| c.badge);
+    let country = player.country;
     (title, elo, country)
 }
 
@@ -21190,9 +21424,16 @@ fn paint_player_silhouette(painter: &egui::Painter, rect: Rect) {
     let center_x = rect.center().x;
     let head_radius = (rect.height() * 0.18).clamp(3.0, 14.0);
     let head_center = pos2(center_x, rect.top() + rect.height() * 0.35);
-    painter.circle_filled(head_center, head_radius, Color32::from_rgb(0x4A, 0x55, 0x68));
+    painter.circle_filled(
+        head_center,
+        head_radius,
+        Color32::from_rgb(0x4A, 0x55, 0x68),
+    );
     let torso_rect = Rect::from_min_max(
-        pos2(center_x - rect.width() * 0.30, rect.top() + rect.height() * 0.58),
+        pos2(
+            center_x - rect.width() * 0.30,
+            rect.top() + rect.height() * 0.58,
+        ),
         pos2(center_x + rect.width() * 0.30, rect.bottom() - 2.0),
     );
     painter.rect_filled(
@@ -21208,9 +21449,9 @@ fn paint_player_silhouette(painter: &egui::Painter, rect: Rect) {
 }
 
 fn paint_prepare_color_square(ui: &mut Ui, fill: Color32, tooltip: &str) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(vec2(22.0, 22.0), Sense::click());
+    let (rect, response) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::click());
     let painter = ui.painter_at(rect);
-    let radius = CornerRadius::same(4);
+    let radius = CornerRadius::same(3);
     painter.rect_filled(rect, radius, fill);
     painter.rect_stroke(
         rect,
@@ -21224,6 +21465,84 @@ fn paint_prepare_color_square(ui: &mut Ui, fill: Color32, tooltip: &str) -> egui
     response.on_hover_text(tooltip)
 }
 
+/// Painted globe emblem for the FIDE pill (circle + meridians + equator).
+fn paint_globe_glyph(painter: &egui::Painter, center: egui::Pos2, radius: f32, color: Color32) {
+    let stroke = Stroke::new(1.0, color);
+    painter.circle_stroke(center, radius, stroke);
+    // Equator.
+    painter.line_segment(
+        [
+            pos2(center.x - radius, center.y),
+            pos2(center.x + radius, center.y),
+        ],
+        stroke,
+    );
+    // Central meridian.
+    painter.line_segment(
+        [
+            pos2(center.x, center.y - radius),
+            pos2(center.x, center.y + radius),
+        ],
+        stroke,
+    );
+    // Side meridians as ellipses (approximated with polylines).
+    for sign in [-1.0, 1.0] {
+        let half = radius * 0.55;
+        let mut points = Vec::new();
+        for step in 0..=12 {
+            let theta = (step as f32 / 12.0) * std::f32::consts::PI;
+            points.push(pos2(
+                center.x + sign * half * theta.sin(),
+                center.y - radius * theta.cos(),
+            ));
+        }
+        if points.len() > 1 {
+            painter.add(egui::Shape::line(points, stroke));
+        }
+    }
+}
+
+/// Gold-hairline FIDE pill button opening the FIDE profile. Returns true
+/// when clicked.
+fn paint_fide_pill(ui: &mut Ui, id: &str) -> bool {
+    let Some(url) = fide::profile_url(id) else {
+        return false;
+    };
+    let label = format!("FIDE · {id} ↗");
+    let font = FontId::proportional(11.0);
+    // Measure the label to size the pill.
+    let painter_probe = ui.painter();
+    let text_w = painter_probe
+        .layout_no_wrap(label.clone(), font.clone(), GOLD)
+        .size()
+        .x;
+    let w = text_w + 32.0;
+    let (rect, response) = ui.allocate_exact_size(vec2(w, 22.0), Sense::click());
+    let painter = ui.painter_at(rect);
+    let radius = CornerRadius::same(11);
+    painter.rect_filled(rect, radius, Color32::from_rgb(0x1E, 0x22, 0x2A));
+    painter.rect_stroke(rect, radius, Stroke::new(1.0, GOLD), StrokeKind::Inside);
+    let globe_center = pos2(rect.left() + 13.0, rect.center().y);
+    paint_globe_glyph(&painter, globe_center, 6.0, GOLD);
+    painter.text(
+        pos2(globe_center.x + 10.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        label,
+        font,
+        GOLD,
+    );
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    let response = response.on_hover_text("Open this player's FIDE rating profile in your browser");
+    if response.clicked() {
+        open_browser_url(ui.ctx(), &url);
+        true
+    } else {
+        false
+    }
+}
+
 /// Two-line, full-width selectable row for the game list.
 #[allow(clippy::too_many_arguments)]
 fn player_row(
@@ -21231,8 +21550,7 @@ fn player_row(
     selected: bool,
     name: &str,
     title: Option<&str>,
-    country: Option<&str>,
-    fide_id: Option<&str>,
+    country: Option<Country>,
     elo: Option<u16>,
     subtitle: &str,
     width: f32,
@@ -21290,24 +21608,10 @@ fn player_row(
         background: GOLD,
         ..Default::default()
     };
-    let fide_format = TextFormat {
-        font_id: FontId::proportional(10.5),
-        color: visuals.weak_text_color(),
-        ..Default::default()
-    };
-    append_player_name(
-        &mut job,
-        name,
-        title,
-        None,
-        fide_id,
-        &title_format,
-        &name_format,
-        &fide_format,
-    );
+    append_player_name(&mut job, name, title, &title_format, &name_format);
     if let Some(elo) = elo {
         job.append(
-            &format!("  Elo {elo}"),
+            &format!("  {elo}"),
             0.0,
             TextFormat {
                 font_id: FontId::monospace(12.0),
@@ -21345,13 +21649,15 @@ fn player_row(
         visuals.strong_text_color(),
     );
     if let Some(country) = country {
-        painter.text(
-            pos2(rect.right() - 8.0, rect.top() + 6.0),
-            Align2::RIGHT_TOP,
-            country,
-            FontId::proportional(11.0),
-            MUTED,
+        let flag_w = if flags::has_flag(country) { 16.0 } else { 30.0 };
+        let flag_rect = Rect::from_min_size(
+            pos2(rect.right() - 8.0 - flag_w, rect.top() + 5.0),
+            vec2(flag_w, flags::LIST_SIZE.y),
         );
+        flags::paint_flag(&painter, country, flag_rect);
+        let flag_response =
+            ui.interact(flag_rect, response.id.with("country-flag"), Sense::hover());
+        flag_response.on_hover_text(format!("{} ({})", country.name, country.code));
     }
     painter.text(
         pos2(text_left, rect.top() + 24.0),
@@ -21367,8 +21673,7 @@ fn player_row(
 struct RowName<'a> {
     name: &'a str,
     title: Option<&'a str>,
-    country: Option<&'a str>,
-    fide_id: Option<&'a str>,
+    country: Option<Country>,
 }
 
 impl<'a> RowName<'a> {
@@ -21377,45 +21682,27 @@ impl<'a> RowName<'a> {
             name,
             title,
             country: None,
-            fide_id: None,
         }
     }
 
-    fn with_country(mut self, country: Option<&'a str>) -> Self {
+    fn with_country(mut self, country: Option<Country>) -> Self {
         self.country = country;
-        self
-    }
-
-    fn with_fide_id(mut self, fide_id: Option<&'a str>) -> Self {
-        self.fide_id = fide_id;
         self
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn append_player_name(
     job: &mut LayoutJob,
     name: &str,
     title: Option<&str>,
-    country: Option<&str>,
-    fide_id: Option<&str>,
     title_format: &TextFormat,
     name_format: &TextFormat,
-    fide_format: &TextFormat,
 ) {
     if let Some(title) = title {
         job.append(title, 0.0, title_format.clone());
         job.append(" ", 0.0, name_format.clone());
     }
     job.append(name, 0.0, name_format.clone());
-    if let Some(country) = country {
-        job.append(" · ", 0.0, fide_format.clone());
-        job.append(country, 0.0, fide_format.clone());
-    }
-    if let Some(id) = fide_id {
-        job.append(" · ", 0.0, fide_format.clone());
-        job.append(id, 0.0, fide_format.clone());
-    }
 }
 
 /// Keep the deepest local evaluation; equal depths keep the earlier source.
@@ -21435,6 +21722,81 @@ fn rows_are_draggable(ui: &Ui) -> bool {
     !ui.input(|input| input.any_touches())
 }
 
+/// Paint the venue flag for `site` into `rect`; returns the width consumed
+/// (flag width plus 4 px gap), or 0 when there is no conclusive venue.
+fn paint_venue_flag(painter: &egui::Painter, site: Option<&str>, rect: Rect) -> f32 {
+    let Some(country) = country::from_site_tag(site) else {
+        return 0.0;
+    };
+    let w = flags::paint_flag(painter, country, rect);
+    w + 4.0
+}
+
+/// Lay out one `[title+name]` / prefix / separator segment, advancing `x`.
+/// Returns the new `x` and whether the segment fit entirely. When it does
+/// not fit, the segment is truncated and an ellipsis is painted.
+#[allow(clippy::too_many_arguments)]
+fn draw_game_row_segment(
+    painter: &egui::Painter,
+    parts: &[(String, TextFormat)],
+    x: f32,
+    max_x: f32,
+    y: f32,
+    fallback_color: Color32,
+) -> (f32, bool) {
+    if parts.is_empty() {
+        return (x, true);
+    }
+    let remaining = (max_x - x).max(0.0);
+    if remaining < 1.0 {
+        return (x, false);
+    }
+    let font_id = parts[0].1.font_id.clone();
+    // Measure the full single-line width first so we can truncate cleanly.
+    let mut measure = LayoutJob::default();
+    for (text, format) in parts {
+        measure.append(text, 0.0, format.clone());
+    }
+    measure.wrap.max_width = f32::INFINITY;
+    measure.wrap.max_rows = 1;
+    measure.wrap.break_anywhere = false;
+    let full_w = painter.layout_job(measure).size().x;
+    if full_w <= remaining {
+        let mut job = LayoutJob::default();
+        for (text, format) in parts {
+            job.append(text, 0.0, format.clone());
+        }
+        job.wrap.max_width = remaining;
+        job.wrap.max_rows = 1;
+        job.wrap.break_anywhere = true;
+        let galley = painter.layout_job(job);
+        let w = galley.size().x;
+        painter.galley(pos2(x, y), galley, fallback_color);
+        (x + w, true)
+    } else {
+        let ellipsis_g = painter.layout_no_wrap("…".to_string(), font_id.clone(), fallback_color);
+        let ell_w = ellipsis_g.size().x;
+        let avail = (remaining - ell_w - 2.0).max(0.0);
+        if avail < 1.0 {
+            painter.galley(pos2(x, y), ellipsis_g, fallback_color);
+            return (max_x, false);
+        }
+        let mut job = LayoutJob::default();
+        for (text, format) in parts {
+            job.append(text, 0.0, format.clone());
+        }
+        job.wrap.max_width = avail;
+        job.wrap.max_rows = 1;
+        job.wrap.break_anywhere = true;
+        let galley = painter.layout_job(job);
+        let w = galley.size().x;
+        painter.galley(pos2(x, y), galley, fallback_color);
+        let ellipsis_g = painter.layout_no_wrap("…".to_string(), font_id, fallback_color);
+        painter.galley(pos2(x + w, y), ellipsis_g, fallback_color);
+        (max_x, false)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn game_row(
     ui: &mut Ui,
@@ -21444,6 +21806,7 @@ fn game_row(
     black: Option<RowName<'_>>,
     suffix: &str,
     subtitle: &str,
+    site: Option<&str>,
     width: f32,
     height: f32,
     text_color: Option<Color32>,
@@ -21481,53 +21844,135 @@ fn game_row(
         color: visuals.weak_text_color(),
         ..Default::default()
     };
-    let fide_format = TextFormat {
-        font_id: FontId::proportional(10.5),
-        color: visuals.weak_text_color(),
-        ..Default::default()
-    };
-    let mut job = LayoutJob::default();
+    // A LayoutJob cannot embed images, so the title line is laid out as
+    // consecutive segments: [prefix][title+name][flag][" – "][title+name][flag].
+    let right_pad = if badge.is_some() { 48.0 } else { 16.0 };
+    let max_x = rect.right() - right_pad;
+    let line_y = rect.top() + 5.0;
+    let mut x = rect.left() + 8.0;
+    let mut stopped = false;
     if !prefix.is_empty() {
-        job.append(prefix, 0.0, name_format.clone());
+        let parts = vec![(prefix.to_string(), name_format.clone())];
+        let (nx, fits) = draw_game_row_segment(
+            &painter,
+            &parts,
+            x,
+            max_x,
+            line_y,
+            visuals.strong_text_color(),
+        );
+        x = nx;
+        stopped = !fits;
     }
-    append_player_name(
-        &mut job,
-        white.name,
-        white.title,
-        white.country,
-        white.fide_id,
-        &title_format,
-        &name_format,
-        &fide_format,
-    );
-    if let Some(black) = black {
-        job.append(" – ", 0.0, weak_format);
-        append_player_name(
-            &mut job,
-            black.name,
-            black.title,
-            black.country,
-            black.fide_id,
-            &title_format,
-            &name_format,
-            &fide_format,
+    if !stopped {
+        let mut parts = Vec::new();
+        if let Some(title) = white.title {
+            parts.push((title.to_string(), title_format.clone()));
+            parts.push((" ".to_string(), name_format.clone()));
+        }
+        parts.push((white.name.to_string(), name_format.clone()));
+        let (nx, fits) = draw_game_row_segment(
+            &painter,
+            &parts,
+            x,
+            max_x,
+            line_y,
+            visuals.strong_text_color(),
+        );
+        x = nx;
+        stopped = !fits;
+    }
+    if !stopped && let Some(country) = white.country {
+        let gap = 4.0;
+        let flag_w = if flags::has_flag(country) { 16.0 } else { 30.0 };
+        if x + gap + flag_w > max_x {
+            let galley = painter.layout_no_wrap(
+                "…".to_string(),
+                name_format.font_id.clone(),
+                visuals.strong_text_color(),
+            );
+            painter.galley(pos2(x, line_y), galley, visuals.strong_text_color());
+            stopped = true;
+        } else {
+            let flag_rect = Rect::from_min_size(
+                pos2(x + gap, line_y + 1.0),
+                vec2(flag_w, flags::LIST_SIZE.y),
+            );
+            flags::paint_flag(&painter, country, flag_rect);
+            x = flag_rect.right();
+        }
+    }
+    if !stopped && black.is_some() {
+        let parts = vec![(" – ".to_string(), weak_format.clone())];
+        let (nx, fits) = draw_game_row_segment(
+            &painter,
+            &parts,
+            x,
+            max_x,
+            line_y,
+            visuals.strong_text_color(),
+        );
+        x = nx;
+        stopped = !fits;
+    }
+    if !stopped && let Some(black) = black {
+        let mut parts = Vec::new();
+        if let Some(title) = black.title {
+            parts.push((title.to_string(), title_format.clone()));
+            parts.push((" ".to_string(), name_format.clone()));
+        }
+        parts.push((black.name.to_string(), name_format.clone()));
+        let (nx, fits) = draw_game_row_segment(
+            &painter,
+            &parts,
+            x,
+            max_x,
+            line_y,
+            visuals.strong_text_color(),
+        );
+        x = nx;
+        stopped = !fits;
+    }
+    if !stopped
+        && let Some(black) = black
+        && let Some(country) = black.country
+    {
+        let gap = 4.0;
+        let flag_w = if flags::has_flag(country) { 16.0 } else { 30.0 };
+        if x + gap + flag_w > max_x {
+            let galley = painter.layout_no_wrap(
+                "…".to_string(),
+                name_format.font_id.clone(),
+                visuals.strong_text_color(),
+            );
+            painter.galley(pos2(x, line_y), galley, visuals.strong_text_color());
+            stopped = true;
+        } else {
+            let flag_rect = Rect::from_min_size(
+                pos2(x + gap, line_y + 1.0),
+                vec2(flag_w, flags::LIST_SIZE.y),
+            );
+            flags::paint_flag(&painter, country, flag_rect);
+            x = flag_rect.right();
+        }
+    }
+    if !stopped && !suffix.is_empty() {
+        let parts = vec![(suffix.to_string(), name_format.clone())];
+        let (_nx, _fits) = draw_game_row_segment(
+            &painter,
+            &parts,
+            x,
+            max_x,
+            line_y,
+            visuals.strong_text_color(),
         );
     }
-    if !suffix.is_empty() {
-        job.append(suffix, 0.0, name_format);
-    }
-    let right_pad = if badge.is_some() { 48.0 } else { 16.0 };
-    job.wrap.max_width = (width - right_pad).max(24.0);
-    job.wrap.max_rows = 1;
-    job.wrap.break_anywhere = true;
-    let title_galley = painter.layout_job(job);
-    painter.galley(
-        rect.left_top() + vec2(8.0, 5.0),
-        title_galley,
-        visuals.strong_text_color(),
-    );
+    // Subtitle: [venue flag] {event} · {date} · {result}
+    let subtitle_pos = rect.left_top() + vec2(8.0, 23.0);
+    let venue_rect = Rect::from_min_size(subtitle_pos, flags::LIST_SIZE);
+    let venue_w = paint_venue_flag(&painter, site, venue_rect);
     painter.text(
-        rect.left_top() + vec2(8.0, 23.0),
+        subtitle_pos + vec2(venue_w, 0.0),
         Align2::LEFT_TOP,
         subtitle,
         FontId::proportional(11.0),
@@ -22660,7 +23105,10 @@ fn cloud_compact_row_ui(
         .unwrap_or_else(|| "—".to_string());
     let label = format!("{eval} {line}");
     let response = ui
-        .selectable_label(false, RichText::new(label).monospace().size(11.0).color(color))
+        .selectable_label(
+            false,
+            RichText::new(label).monospace().size(11.0).color(color),
+        )
         .on_hover_text(cloud_eval_hint(row, delta));
     if response.hovered() {
         *hover_preview = steps
@@ -22822,6 +23270,7 @@ fn color_name(color: Color) -> &'static str {
 }
 
 /// Result from the prepared player's perspective.
+#[allow(dead_code)]
 fn outcome_label(result: &str, color: Color) -> &'static str {
     match (result, color) {
         ("1-0", Color::White) | ("0-1", Color::Black) => "won",
@@ -23015,13 +23464,16 @@ pub fn draw_wdl_bar(
         (0, 0, 0)
     };
 
-    let tooltip = format!(
-        "White: {white} ({w_pct}%) · Draw: {draw} ({d_pct}%) · Black: {black} ({b_pct}%)"
-    );
+    let tooltip =
+        format!("White: {white} ({w_pct}%) · Draw: {draw} ({d_pct}%) · Black: {black} ({b_pct}%)");
     let response = response.on_hover_text(tooltip);
 
     if total == 0 {
-        painter.rect_filled(rect, CornerRadius::same(3), Color32::from_rgb(0x20, 0x24, 0x2C));
+        painter.rect_filled(
+            rect,
+            CornerRadius::same(3),
+            Color32::from_rgb(0x20, 0x24, 0x2C),
+        );
         painter.rect_stroke(
             rect,
             CornerRadius::same(3),
@@ -23526,8 +23978,7 @@ fn reference_path_is_mega(path: &Path) -> bool {
             std::fs::metadata(&two_cbh)
                 .map(|metadata| metadata.len() / 192 >= MEGA_GAMES)
                 .or_else(|_| {
-                    std::fs::metadata(&cbh)
-                        .map(|metadata| metadata.len() / 46 >= MEGA_GAMES)
+                    std::fs::metadata(&cbh).map(|metadata| metadata.len() / 46 >= MEGA_GAMES)
                 })
                 .unwrap_or(false)
         }
@@ -23564,6 +24015,26 @@ fn xdg_data_dir() -> Option<PathBuf> {
     std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
+}
+
+/// Bundled sample database (`databases/samples/grandmaster_showcase.pgn`).
+pub fn sample_db_path() -> Option<PathBuf> {
+    let env = std::env::var_os("BRETT_SAMPLE_DB")
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty());
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("databases/samples");
+    let executable = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf));
+    let candidates = [
+        Some(PathBuf::from("databases/samples/grandmaster_showcase.pgn")),
+        Some(manifest.join("grandmaster_showcase.pgn")),
+        executable.map(|dir| dir.join("databases/samples/grandmaster_showcase.pgn")),
+        xdg_data_dir().map(|dir| dir.join("brett/databases/samples/grandmaster_showcase.pgn")),
+    ];
+    env.into_iter()
+        .chain(candidates.into_iter().flatten())
+        .find(|path| path.exists())
 }
 
 fn download_and_unpack_correspondence(
@@ -24135,22 +24606,14 @@ mod tests {
             color: GOLD,
             ..Default::default()
         };
-        let fide_format = TextFormat {
-            font_id: FontId::proportional(10.5),
-            color: Color32::from_gray(150),
-            ..Default::default()
-        };
 
         let mut job = LayoutJob::default();
         append_player_name(
             &mut job,
             "Kasparov, Garry",
             Some("GM"),
-            None,
-            None,
             &title_format,
             &name_format,
-            &fide_format,
         );
         assert_eq!(job.text, "GM Kasparov, Garry");
         assert_eq!(job.sections[0].format.color, GOLD);
@@ -24161,18 +24624,15 @@ mod tests {
             &mut plain,
             "Kasparov, Garry",
             None,
-            None,
-            None,
             &title_format,
             &name_format,
-            &fide_format,
         );
         assert_eq!(plain.text, "Kasparov, Garry");
         assert_eq!(plain.sections.len(), 1);
     }
 
     #[test]
-    fn row_fide_id_is_a_muted_suffix_after_the_name() {
+    fn row_never_shows_fide_id() {
         let name_format = TextFormat {
             font_id: FontId::proportional(14.0),
             color: Color32::WHITE,
@@ -24183,27 +24643,20 @@ mod tests {
             color: GOLD,
             ..Default::default()
         };
-        let fide_format = TextFormat {
-            font_id: FontId::proportional(10.5),
-            color: Color32::from_gray(150),
-            ..Default::default()
-        };
 
         let mut job = LayoutJob::default();
         append_player_name(
             &mut job,
             "Carlsen, Magnus",
             Some("GM"),
-            None,
-            Some("1503014"),
             &title_format,
             &name_format,
-            &fide_format,
         );
-        assert_eq!(job.text, "GM Carlsen, Magnus · 1503014");
-        let suffix = job.sections.last().unwrap();
-        assert_eq!(suffix.format.color, Color32::from_gray(150));
-        assert_eq!(suffix.format.font_id.size, 10.5);
+        assert_eq!(
+            job.text, "GM Carlsen, Magnus",
+            "FIDE ids must not appear in any list"
+        );
+        assert!(!job.text.contains("1503014"));
     }
 
     #[test]
@@ -24254,6 +24707,7 @@ mod tests {
                     Some(RowName::new("Duke Karl", None)),
                     "",
                     "Paris · 1858",
+                    None,
                     300.0,
                     40.0,
                     None,
@@ -24284,7 +24738,7 @@ mod tests {
     }
 
     #[test]
-    fn row_country_and_fide_id_are_muted_suffixes_after_the_name() {
+    fn row_country_is_a_flag_not_a_text_suffix() {
         let name_format = TextFormat {
             font_id: FontId::proportional(14.0),
             color: Color32::WHITE,
@@ -24295,39 +24749,34 @@ mod tests {
             color: GOLD,
             ..Default::default()
         };
-        let fide_format = TextFormat {
-            font_id: FontId::proportional(10.5),
-            color: Color32::from_gray(150),
-            ..Default::default()
-        };
 
-        // Both country and FIDE ID
+        // The flag is painted as an image, so the name galley must contain
+        // neither the emoji badge nor any FIDE id.
         let mut both = LayoutJob::default();
         append_player_name(
             &mut both,
             "Carlsen, Magnus",
             Some("GM"),
-            Some("🇳🇴 NOR"),
-            Some("1503014"),
             &title_format,
             &name_format,
-            &fide_format,
         );
-        assert_eq!(both.text, "GM Carlsen, Magnus · 🇳🇴 NOR · 1503014");
+        assert_eq!(both.text, "GM Carlsen, Magnus");
+        assert!(!both.text.contains("1503014"));
+        assert!(!both.text.contains("NOR"));
 
-        // Only country
+        let row =
+            RowName::new("Nakamura, Hikaru", Some("GM")).with_country(country::normalize("USA"));
+        assert_eq!(row.country.map(|c| c.code), Some("USA"));
+
         let mut only_country = LayoutJob::default();
         append_player_name(
             &mut only_country,
             "Nakamura, Hikaru",
             Some("GM"),
-            Some("🇺🇸 USA"),
-            None,
             &title_format,
             &name_format,
-            &fide_format,
         );
-        assert_eq!(only_country.text, "GM Nakamura, Hikaru · 🇺🇸 USA");
+        assert_eq!(only_country.text, "GM Nakamura, Hikaru");
     }
 
     fn live_engine_info(score: Score, depth: u32) -> EngineInfo {
@@ -24443,11 +24892,21 @@ mod tests {
             game: Game,
         }
         impl GameLibrary for TargetedLib {
-            fn path(&self) -> &Path { Path::new("targeted.2cbh") }
-            fn file_len(&self) -> u64 { 1 }
-            fn len(&self) -> usize { 1 }
-            fn indexed_in(&self) -> Duration { Duration::ZERO }
-            fn games(&self) -> &[crate::library::IndexedGame] { &[] }
+            fn path(&self) -> &Path {
+                Path::new("targeted.2cbh")
+            }
+            fn file_len(&self) -> u64 {
+                1
+            }
+            fn len(&self) -> usize {
+                1
+            }
+            fn indexed_in(&self) -> Duration {
+                Duration::ZERO
+            }
+            fn games(&self) -> &[crate::library::IndexedGame] {
+                &[]
+            }
             fn source_meta(&self) -> anyhow::Result<crate::library::SourceMeta> {
                 Ok(crate::library::SourceMeta {
                     len: 1,
@@ -24455,12 +24914,16 @@ mod tests {
                     mtime_nanos: 0,
                 })
             }
-            fn get(&self, _: usize) -> Option<&crate::library::IndexedGame> { None }
+            fn get(&self, _: usize) -> Option<&crate::library::IndexedGame> {
+                None
+            }
             fn load(&self, index: usize) -> anyhow::Result<Game> {
                 assert_eq!(index, 0);
                 Ok(self.game.clone())
             }
-            fn filter(&self, _: &str) -> Vec<usize> { vec![0] }
+            fn filter(&self, _: &str) -> Vec<usize> {
+                vec![0]
+            }
             fn accelerated_player_games(&self) -> Option<Vec<crate::library::AcceleratedPlayer>> {
                 panic!("must not scan all players when targeted lookup is available");
             }
@@ -24812,6 +25275,9 @@ mod tests {
             title: None,
             fide_id: None,
             country: None,
+            wiki_countries: Vec::new(),
+            birth_year: None,
+            peak_elo: None,
             white: players::PlayerRecord::default(),
             black: players::PlayerRecord::default(),
             elo_sum: 0,
@@ -24976,6 +25442,10 @@ mod tests {
             description: "Norwegian chess grandmaster".to_string(),
             extract: format!("{title} is a Norwegian chess grandmaster."),
             url: format!("https://en.wikipedia.org/wiki/{}", title.replace(' ', "_")),
+            countries: vec!["NOR".to_string()],
+            fide_id: None,
+            birth_year: None,
+            peak_elo: None,
         }
     }
 
@@ -26301,6 +26771,7 @@ mod tests {
             username: "existing_user".to_string(),
             enabled: true,
             filter: players::AccountFilter::default(),
+            filter_version: 2,
         });
         let key = prep_account_check_key(OnlineSource::Lichess, "existing_user");
         let mut g = Game::default();
@@ -26316,6 +26787,9 @@ mod tests {
                 error: None,
                 games: Arc::new(vec![g]),
                 probe_capped: false,
+                bullet: 0,
+                cached_total: 0,
+                new_games: 0,
             },
         );
         app.refresh_prep_account_checks();
@@ -26626,11 +27100,23 @@ mod tests {
     fn slot_game_type_site_lichess_colors_online() {
         // `Site` alone must mark Lichess games Online even when the event
         // and time control look OTB-ish.
-        let cat = players::classify_headers_category(Some("Rated Blitz"), Some("lichess.org"), Some("180+2"));
+        let cat = players::classify_headers_category(
+            Some("Rated Blitz"),
+            Some("lichess.org"),
+            Some("180+2"),
+        );
         assert_eq!(cat, players::GameCategory::OnlineBlitz);
-        let cat2 = players::classify_headers_category(Some("Tata Steel Masters"), Some("lichess.org"), Some("5400+30"));
+        let cat2 = players::classify_headers_category(
+            Some("Tata Steel Masters"),
+            Some("lichess.org"),
+            Some("5400+30"),
+        );
         assert_eq!(cat2, players::GameCategory::OnlineClassical);
-        let cat_rapid = players::classify_headers_category(Some("Tata Steel Masters"), Some("lichess.org"), None);
+        let cat_rapid = players::classify_headers_category(
+            Some("Tata Steel Masters"),
+            Some("lichess.org"),
+            None,
+        );
         assert_eq!(cat_rapid, players::GameCategory::OnlineRapid);
         // A real OTB venue stays Classical OTB.
         let cat3 = players::classify_headers_category(
@@ -27522,18 +28008,23 @@ mod tests {
     #[test]
     fn hovered_game_arrow_keys_step_hovered_game_and_update_preview() {
         let mut app = test_app();
-        let prep_pgn = b"[Event \"Preparation\"]\n[White \"You\"]\n[Black \"Kern, Johannes\"]\n\n1. e4 e5 *\n";
+        let prep_pgn =
+            b"[Event \"Preparation\"]\n[White \"You\"]\n[Black \"Kern, Johannes\"]\n\n1. e4 e5 *\n";
         app.current = Some(crate::domain::parse_pgn(prep_pgn).unwrap().remove(0));
         app.goto(2); // after 1. e4 e5
 
-        let hovered_pgn = b"[White \"X\"]\n[Black \"Kern, Johannes\"]\n\n1. e4 e5 2. Nf3 Nc6 3. Bc4 *\n";
+        let hovered_pgn =
+            b"[White \"X\"]\n[Black \"Kern, Johannes\"]\n\n1. e4 e5 2. Nf3 Nc6 3. Bc4 *\n";
         let hovered_game = crate::domain::parse_pgn(hovered_pgn).unwrap().remove(0);
         app.activate_hovered_game_browse("merged:0".to_string(), hovered_game);
         assert_eq!(app.hovered_game_browse.as_ref().unwrap().cursor_node, 2);
 
         app.step_hovered_game(1);
         assert_eq!(app.hovered_game_browse.as_ref().unwrap().cursor_node, 3);
-        assert_eq!(app.node, 2, "preparation node must not move while stepping hovered game");
+        assert_eq!(
+            app.node, 2,
+            "preparation node must not move while stepping hovered game"
+        );
     }
 
     #[test]
@@ -27543,7 +28034,8 @@ mod tests {
         app.current = Some(crate::domain::parse_pgn(prep_pgn).unwrap().remove(0));
         app.goto(2); // after 1. e4 e5
 
-        let hovered_pgn = b"[White \"X\"]\n[Black \"Kern, Johannes\"]\n\n1. e4 e5 2. Nf3 Nc6 3. Bc4 *\n";
+        let hovered_pgn =
+            b"[White \"X\"]\n[Black \"Kern, Johannes\"]\n\n1. e4 e5 2. Nf3 Nc6 3. Bc4 *\n";
         let hovered_game = crate::domain::parse_pgn(hovered_pgn).unwrap().remove(0);
         app.activate_hovered_game_browse("merged:0".to_string(), hovered_game);
         assert_eq!(app.hovered_game_browse.as_ref().unwrap().cursor_node, 2);
@@ -27585,13 +28077,24 @@ mod tests {
         app.tree_index = Some(idx);
 
         let today = players::today();
-        let today_str = format!("{:04}.{:02}.{:02}", today / 10000, (today % 10000) / 100, today % 100);
+        let today_str = format!(
+            "{:04}.{:02}.{:02}",
+            today / 10000,
+            (today % 10000) / 100,
+            today % 100
+        );
         let mut live_pgn = String::new();
         for _ in 0..15 {
-            live_pgn.push_str(&format!("[Event \"Recent\"]\n[Date \"{today_str}\"]\n\n1. e4 e5 1-0\n\n"));
+            live_pgn.push_str(&format!(
+                "[Event \"Recent\"]\n[Date \"{today_str}\"]\n\n1. e4 e5 1-0\n\n"
+            ));
         }
         let live_games = domain::parse_pgn(live_pgn.as_bytes()).unwrap();
-        app.chessabc_live_tree = Some(crate::recent::RecentTree::from_games(&live_games, today, 365));
+        app.chessabc_live_tree = Some(crate::recent::RecentTree::from_games(
+            &live_games,
+            today,
+            365,
+        ));
 
         let start = Chess::default();
         let key = position::position_key(&start);
@@ -27626,7 +28129,8 @@ mod tests {
         let short = "Connection timed out";
         assert_eq!(truncate_status_error(short), "Connection timed out");
 
-        let with_url = "requesting https://lichess.org/api/games/user/magnus failed: 504 Gateway Timeout";
+        let with_url =
+            "requesting https://lichess.org/api/games/user/magnus failed: 504 Gateway Timeout";
         let cleaned = truncate_status_error(with_url);
         assert!(!cleaned.contains("https://"));
         assert_eq!(cleaned, "requesting failed: 504 Gateway Timeout");
@@ -27695,13 +28199,14 @@ mod tests {
                 row.subtitle
             );
             assert!(
-                row.result_badge == "1-0"
-                    || row.result_badge == "½-½"
-                    || row.result_badge == "0-1",
+                row.result_badge == "1-0" || row.result_badge == "½-½" || row.result_badge == "0-1",
                 "expected standardized result badge, got: {}",
                 row.result_badge
             );
-            assert!(row.player_outcome.is_some(), "expected computed player outcome");
+            assert!(
+                row.player_outcome.is_some(),
+                "expected computed player outcome"
+            );
         }
         assert_eq!(rows[0].result_badge, "1-0");
         assert_eq!(rows[0].player_outcome, Some(1.0));
@@ -27732,7 +28237,11 @@ mod tests {
     fn hovered_game_browse_lazy_persists_across_frames_and_preserves_stepped_cursor() {
         let mut app = test_app();
         let pgn = b"[Event \"Test\"]\n\n1. e4 e5 2. Nf3 Nc6 *";
-        let game = domain::parse_pgn(&pgn[..]).unwrap().into_iter().next().unwrap();
+        let game = domain::parse_pgn(&pgn[..])
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
 
         // Frame 1
         app.hovered_game_active_this_frame = false;
@@ -27763,6 +28272,9 @@ mod tests {
             title: Some(titles::PlayerTitle::Gm),
             fide_id: Some("1503014".to_string()),
             country: country::normalize("NOR"),
+            wiki_countries: Vec::new(),
+            birth_year: None,
+            peak_elo: None,
             white: Default::default(),
             black: Default::default(),
             elo_sum: 0,
@@ -27777,10 +28289,10 @@ mod tests {
             game_indices: Vec::new(),
         };
 
-        let (title, elo, country_badge) = player_list_row_meta(&player);
+        let (title, elo, country) = player_list_row_meta(&player);
         assert_eq!(title, Some("GM"));
         assert_eq!(elo, Some(2882));
-        assert_eq!(country_badge, Some("🇳🇴 NOR"));
+        assert_eq!(country.map(|c| c.code), Some("NOR"));
     }
 
     #[test]
@@ -27792,11 +28304,50 @@ mod tests {
         // Clicking White square (opponent plays White): our prep is as Black (prep_setup_as_white = false)
         app.handle_prepare_color_action(Color::White);
         assert!(app.prep_setup_open);
-        assert!(!app.prep_setup_as_white, "opponent White means our_color = Black");
+        assert!(
+            !app.prep_setup_as_white,
+            "opponent White means our_color = Black"
+        );
 
         // Clicking Black square (opponent plays Black): our prep is as White (prep_setup_as_white = true)
         app.handle_prepare_color_action(Color::Black);
         assert!(app.prep_setup_open);
-        assert!(app.prep_setup_as_white, "opponent Black means our_color = White");
+        assert!(
+            app.prep_setup_as_white,
+            "opponent Black means our_color = White"
+        );
+    }
+
+    #[test]
+    fn probe_text_capped_and_uncapped() {
+        let capped = AccountCheckResult::done("lichess:user".to_string(), 200, 180, 20, true);
+        assert_eq!(
+            account_check_text(&capped).text(),
+            "✓ Found · 200+ games · full history loads on Start"
+        );
+        assert_eq!(account_check_badge(&capped).text(), "✓ 200+ games");
+        let uncapped = AccountCheckResult::done("lichess:user".to_string(), 143, 120, 23, false);
+        assert_eq!(
+            account_check_text(&uncapped).text(),
+            "✓ Found · 143 games · 120 pass filters (23 bullet)"
+        );
+        assert_eq!(account_check_badge(&uncapped).text(), "✓ 120 games");
+    }
+
+    #[test]
+    fn probe_text_cached_checking_and_new() {
+        let mut fetching = AccountCheckResult::fetching("lichess:user".to_string());
+        fetching.cached_total = 10_000;
+        assert_eq!(
+            account_check_text(&fetching).text(),
+            "✓ 10000 games cached · checking for new…"
+        );
+        let mut done = AccountCheckResult::done("lichess:user".to_string(), 10012, 10012, 0, false);
+        done.new_games = 12;
+        done.cached_total = 10_000;
+        assert_eq!(
+            account_check_text(&done).text(),
+            "✓ Found · 10012 games · 10012 pass filters (0 bullet) (12 new)"
+        );
     }
 }

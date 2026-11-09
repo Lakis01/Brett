@@ -55,6 +55,103 @@ impl OnlineSource {
     }
 }
 
+/// Parse a pasted account/profile URL (or plain username) into a source and
+/// clean username/FIDE id.
+///
+/// Returns `(Some(source), username)` for recognized profile URLs
+/// (`lichess.org/@/user[/all]`, `chess.com/member|players/name`,
+/// `chessabc.com/player/<id>`, `ratings.fide.com/profile/<id>`), and
+/// `(None, trimmed)` for plain input.
+pub fn parse_account_or_profile_input(raw: &str) -> (Option<OnlineSource>, String) {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return (None, String::new());
+    }
+    // Strip scheme if present.
+    let without_scheme = match trimmed.split_once("://") {
+        Some((_, rest)) => rest,
+        None => trimmed,
+    };
+    let lower_no_scheme = without_scheme.to_ascii_lowercase();
+    let (host, path) = match without_scheme.find('/') {
+        Some(pos) => (&without_scheme[..pos], &without_scheme[pos + 1..]),
+        None => (without_scheme, ""),
+    };
+    let host_lower = host.to_ascii_lowercase();
+    let host_no_www = host_lower.strip_prefix("www.").unwrap_or(&host_lower);
+    // Drop query/fragment from path.
+    let path_clean = path.split(['?', '#']).next().unwrap_or(path);
+    let segments: Vec<&str> = path_clean.split('/').filter(|s| !s.is_empty()).collect();
+    let known_host = matches!(
+        host_no_www,
+        "lichess.org" | "chess.com" | "chessabc.com" | "ratings.fide.com"
+    );
+    if !known_host {
+        // Not a URL we recognize; keep plain input as-is.
+        // Guard against treating a plain username containing dots as host.
+        let looks_like_url = lower_no_scheme.contains("://")
+            || trimmed.starts_with("http")
+            || host_no_www.contains('.');
+        if !looks_like_url {
+            return (None, trimmed.to_string());
+        }
+        // Unknown URL host: return trimmed without source.
+        return (None, trimmed.to_string());
+    }
+    match host_no_www {
+        "lichess.org" => {
+            // /@/user or /@/user/all or /user
+            let user = if segments.first() == Some(&"@") {
+                segments.get(1).copied()
+            } else if segments.len() == 1 && !segments[0].is_empty() {
+                // lichess.org/<user> (no @) – accept as username
+                Some(segments[0])
+            } else {
+                None
+            };
+            match user {
+                Some(u) if !u.is_empty() => (Some(OnlineSource::Lichess), u.trim().to_string()),
+                _ => (Some(OnlineSource::Lichess), String::new()),
+            }
+        }
+        "chess.com" => {
+            let user = match segments.first().map(|s| s.to_ascii_lowercase()).as_deref() {
+                Some("member") | Some("players") => segments.get(1).copied(),
+                _ => None,
+            };
+            match user {
+                Some(u) if !u.is_empty() => (Some(OnlineSource::ChessCom), u.trim().to_string()),
+                _ => (Some(OnlineSource::ChessCom), String::new()),
+            }
+        }
+        "chessabc.com" => {
+            let id =
+                if segments.first().map(|s| s.to_ascii_lowercase()).as_deref() == Some("player") {
+                    segments.get(1).copied()
+                } else {
+                    None
+                };
+            match id {
+                Some(u) if !u.is_empty() => (Some(OnlineSource::ChessAbc), u.trim().to_string()),
+                _ => (Some(OnlineSource::ChessAbc), String::new()),
+            }
+        }
+        "ratings.fide.com" => {
+            let id =
+                if segments.first().map(|s| s.to_ascii_lowercase()).as_deref() == Some("profile") {
+                    segments.get(1).copied()
+                } else {
+                    None
+                };
+            match id {
+                Some(u) if !u.is_empty() => (Some(OnlineSource::ChessAbc), u.trim().to_string()),
+                _ => (Some(OnlineSource::ChessAbc), String::new()),
+            }
+        }
+        _ => (None, trimmed.to_string()),
+    }
+}
+
 /// Result of a completed online import.
 #[derive(Clone, Debug)]
 pub struct ImportResult {
@@ -155,23 +252,75 @@ pub fn fetch_player_games_filtered(
 
     match source {
         OnlineSource::Lichess => {
-            let url = lichess_export_url_filtered(username, max_games, filter, as_of);
-            let response = agent
-                .get(&url)
-                .set("Accept", "application/x-chess-pgn")
-                .call()
-                .with_context(|| format!("requesting {url}"))?;
-            let reader = std::io::BufReader::new(response.into_reader());
-            let (body, _) = read_pgn_stream_incremental(reader, max_games, |_| {})?;
-            let games = domain::parse_pgn(body.as_bytes()).context("parsing downloaded games")?;
+            let cache_path = lichess_cache_path(username);
+            let cached = read_games_cache(&cache_path);
+            let mut games: Vec<domain::Game> = if let Some(cached_games) = cached {
+                // Incremental delta: newest cached UTCDate/UTCTime + 1000ms,
+                // unfiltered (no perfType/rated), prepend + dedupe.
+                let newest_ms = cached_games.first().and_then(game_timestamp_ms);
+                let mut merged = cached_games.clone();
+                if let Some(newest) = newest_ms {
+                    match fetch_lichess_games_paged(
+                        &agent,
+                        username,
+                        usize::MAX,
+                        Some(newest + 1000),
+                    ) {
+                        Ok(delta) if !delta.is_empty() => {
+                            let mut seen: std::collections::HashSet<String> =
+                                cached_games.iter().filter_map(lichess_game_id).collect();
+                            let mut fresh = Vec::new();
+                            for game in delta {
+                                if let Some(id) = lichess_game_id(&game)
+                                    && !seen.insert(id)
+                                {
+                                    continue;
+                                }
+                                fresh.push(game);
+                            }
+                            if !fresh.is_empty() {
+                                fresh.extend(merged);
+                                merged = fresh;
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(err) => {
+                            tracing::warn!("Lichess delta fetch failed, using cache: {err:#}");
+                        }
+                    }
+                }
+                write_games_cache(&cache_path, &merged)
+                    .unwrap_or_else(|err| tracing::warn!("writing Lichess cache: {err:#}"));
+                merged
+            } else if max_games == usize::MAX || max_games > 500 {
+                // Full unfiltered history (paged at 10000) populates cache.
+                let full = fetch_lichess_games_paged(&agent, username, usize::MAX, None)?;
+                if full.is_empty() {
+                    bail!("Lichess returned no parseable games for {username}");
+                }
+                write_games_cache(&cache_path, &full)
+                    .unwrap_or_else(|err| tracing::warn!("writing Lichess cache: {err:#}"));
+                full
+            } else {
+                // Probe (<=500, no cache yet): capped unfiltered fetch, no
+                // partial cache is written (Start will populate the full one).
+                fetch_lichess_games_paged(&agent, username, max_games, None)?
+            };
             if games.is_empty() {
                 bail!("Lichess returned no parseable games for {username}");
+            }
+            if let Some(filter) = filter {
+                games.retain(|g| filter.matches_game(g, as_of));
+            }
+            if max_games != usize::MAX && games.len() > max_games {
+                games.truncate(max_games);
             }
             Ok(games)
         }
         OnlineSource::ChessCom => {
             let (body, _) = download_player_pgn(&agent, source, username, max_games, &mut |_| {})?;
-            let mut games = domain::parse_pgn(body.as_bytes()).context("parsing downloaded games")?;
+            let mut games =
+                domain::parse_pgn(body.as_bytes()).context("parsing downloaded games")?;
             if let Some(filter) = filter {
                 games.retain(|g| filter.matches_game(g, as_of));
             }
@@ -182,8 +331,10 @@ pub fn fetch_player_games_filtered(
         }
         OnlineSource::ChessAbc => {
             let player = resolve_chessabc_player(&agent, username)?;
-            let (body, _) = download_chessabc_games(&agent, &player.fide_id, max_games, &mut |_| {})?;
-            let mut games = domain::parse_pgn(body.as_bytes()).context("parsing downloaded games")?;
+            let (body, _) =
+                download_chessabc_games(&agent, &player.fide_id, max_games, &mut |_| {})?;
+            let mut games =
+                domain::parse_pgn(body.as_bytes()).context("parsing downloaded games")?;
             if let Some(filter) = filter {
                 games.retain(|g| filter.matches_game(g, as_of));
             }
@@ -240,8 +391,8 @@ pub fn fetch_recent_chessabc_games(max_games: usize) -> Result<Vec<domain::Game>
                     "https://api.chessabc.com/games/paginated?page={page}&size={PAGE_SIZE}"
                 );
                 let body = get_text(agent, &url, Some("application/json"))?;
-                let value: Value = serde_json::from_str(&body)
-                    .context("ChessABC returned invalid game data")?;
+                let value: Value =
+                    serde_json::from_str(&body).context("ChessABC returned invalid game data")?;
                 let content = value
                     .get("content")
                     .and_then(Value::as_array)
@@ -257,7 +408,10 @@ pub fn fetch_recent_chessabc_games(max_games: usize) -> Result<Vec<domain::Game>
         }
         handles
             .into_iter()
-            .map(|h| h.join().unwrap_or_else(|_| Err(anyhow::anyhow!("thread panic"))))
+            .map(|h| {
+                h.join()
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!("thread panic")))
+            })
             .collect()
     });
 
@@ -468,7 +622,9 @@ fn download_player_pgn(
                 .with_context(|| format!("requesting {url}"))?;
             let reader = std::io::BufReader::new(response.into_reader());
             let (body, count) = read_pgn_stream_incremental(reader, max_games, |c| {
-                progress(format!("Downloading {username}'s Lichess games · {c} games…"));
+                progress(format!(
+                    "Downloading {username}'s Lichess games · {c} games…"
+                ));
             })?;
             if body.trim().is_empty() {
                 bail!("Lichess returned no games for {username}");
@@ -493,7 +649,34 @@ fn download_player_pgn(
             } else {
                 urls.len().min(MAX_ARCHIVES)
             };
+            let (current_month, previous_month) = chesscom_current_and_previous();
             for (number, archive_url) in urls.iter().rev().take(archives_to_fetch).enumerate() {
+                let year_month = chesscom_year_month_from_url(archive_url);
+                let cache_path = year_month
+                    .as_deref()
+                    .map(|ym| chesscom_cache_path(username, ym));
+                let is_immutable = year_month
+                    .as_deref()
+                    .is_some_and(|ym| ym != current_month && ym != previous_month);
+                if is_immutable
+                    && let Some(path) = &cache_path
+                    && let Ok(cached_text) = fs::read_to_string(path)
+                    && !cached_text.trim().is_empty()
+                {
+                    // Immutable past-month archive: reuse disk cache.
+                    let cached_games =
+                        domain::parse_pgn(cached_text.as_bytes()).unwrap_or_default();
+                    for game in cached_games {
+                        pgns.push(crate::pgn::game_to_pgn(&game));
+                        if pgns.len() >= max_games {
+                            break;
+                        }
+                    }
+                    if pgns.len() >= max_games {
+                        break;
+                    }
+                    continue;
+                }
                 progress(format!(
                     "Downloading Chess.com archive {} · {} games so far…",
                     number + 1,
@@ -503,7 +686,24 @@ fn download_player_pgn(
                 let archive: Value = serde_json::from_str(&body).with_context(|| {
                     format!("Chess.com archive {archive_url} was not valid JSON")
                 })?;
-                pgns.extend(chesscom_pgns(&archive, max_games - pgns.len()));
+                let month_pgns = chesscom_pgns(&archive, usize::MAX);
+                if let (Some(path), Some(_ym)) = (&cache_path, &year_month) {
+                    // Cache the full month (not truncated by remaining) so
+                    // future runs can reuse it whole.
+                    if let Some(parent) = path.parent() {
+                        let _ = fs::create_dir_all(parent);
+                    }
+                    let mut text = month_pgns.join("\n\n");
+                    if !text.is_empty() {
+                        text.push('\n');
+                        let _ = fs::write(path, text.as_bytes());
+                    }
+                }
+                pgns.extend(
+                    month_pgns
+                        .into_iter()
+                        .take(max_games - pgns.len().min(max_games)),
+                );
                 if pgns.len() >= max_games {
                     break;
                 }
@@ -1496,6 +1696,327 @@ fn escape_tag(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
+/// Directory holding per-account online caches.
+pub fn online_cache_dir() -> PathBuf {
+    cache_root().join("online")
+}
+
+/// Lichess incremental cache: unfiltered full history, newest first.
+pub fn lichess_cache_path(username: &str) -> PathBuf {
+    online_cache_dir()
+        .join("lichess")
+        .join(format!("{}.pgn", username.trim().to_lowercase()))
+}
+
+/// Chess.com per-month cache directory for one user.
+pub fn chesscom_cache_dir(username: &str) -> PathBuf {
+    online_cache_dir()
+        .join("chesscom")
+        .join(username.trim().to_lowercase())
+}
+
+/// One immutable (or current/previous) month archive file.
+pub fn chesscom_cache_path(username: &str, year_month: &str) -> PathBuf {
+    chesscom_cache_dir(username).join(format!("{year_month}.pgn"))
+}
+
+/// Total bytes used by the online game cache.
+pub fn online_cache_size_bytes() -> u64 {
+    fn walk(dir: &std::path::Path, total: &mut u64) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, total);
+            } else if let Ok(meta) = path.metadata() {
+                *total += meta.len();
+            }
+        }
+    }
+    let mut total = 0u64;
+    walk(&online_cache_dir(), &mut total);
+    total
+}
+
+/// Remove every cached online game file.
+pub fn clear_online_cache() -> Result<()> {
+    let dir = online_cache_dir();
+    if dir.exists() {
+        fs::remove_dir_all(&dir).with_context(|| format!("removing {}", dir.display()))?;
+    }
+    Ok(())
+}
+
+/// Quick cached game count for probe display (counts `[Event ` tags).
+pub fn cached_game_count(source: OnlineSource, username: &str) -> usize {
+    fn count_pgn_file(path: &std::path::Path) -> usize {
+        let Ok(text) = fs::read_to_string(path) else {
+            return 0;
+        };
+        // `[Event ` starts every game in our caches.
+        text.matches("[Event ").count()
+    }
+    match source {
+        OnlineSource::Lichess => count_pgn_file(&lichess_cache_path(username)),
+        OnlineSource::ChessCom => {
+            let dir = chesscom_cache_dir(username);
+            let mut total = 0usize;
+            if let Ok(entries) = fs::read_dir(&dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.extension().is_some_and(|e| e == "pgn") {
+                        total += count_pgn_file(&path);
+                    }
+                }
+            }
+            total
+        }
+        OnlineSource::ChessAbc => 0,
+    }
+}
+
+/// Extract a Lichess game id from `Site` (`https://lichess.org/<id>`) or `GameId`.
+pub fn lichess_game_id(game: &domain::Game) -> Option<String> {
+    if let Some(site) = game.header("Site") {
+        let site = site.trim();
+        if let Some(pos) = site.rfind("lichess.org/") {
+            let id = &site[pos + "lichess.org/".len()..];
+            let id = id.split(['?', '#', '/', ' ']).next().unwrap_or(id).trim();
+            if !id.is_empty() {
+                return Some(id.to_string());
+            }
+        }
+    }
+    if let Some(id) = game.header("GameId")
+        && !id.trim().is_empty()
+    {
+        return Some(id.trim().to_string());
+    }
+    if let Some(id) = game.header("ID")
+        && !id.trim().is_empty()
+    {
+        return Some(id.trim().to_string());
+    }
+    None
+}
+
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = if m > 2 { m - 3 } else { m + 9 } as i64;
+    let doy = (153 * mp + 2) / 5 + d as i64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
+fn parse_ymd(text: &str) -> Option<(i64, u32, u32)> {
+    let text = text.trim();
+    let parts: Vec<&str> = text
+        .split(['.', '-', '/'])
+        .filter(|p| !p.is_empty())
+        .collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    Some((
+        parts[0].parse().ok()?,
+        parts[1].parse().ok()?,
+        parts[2].parse().ok()?,
+    ))
+}
+
+fn parse_hms(text: &str) -> Option<(u32, u32, u32)> {
+    let text = text.trim();
+    let parts: Vec<&str> = text.split(':').filter(|p| !p.is_empty()).collect();
+    if parts.is_empty() {
+        return Some((0, 0, 0));
+    }
+    let h = parts.first().and_then(|p| p.parse().ok()).unwrap_or(0);
+    let m = parts.get(1).and_then(|p| p.parse().ok()).unwrap_or(0);
+    let s = parts.get(2).and_then(|p| p.parse().ok()).unwrap_or(0);
+    Some((h, m, s))
+}
+
+/// Unix milliseconds for a game from `UTCDate`/`UTCTime` (falling back to `Date`).
+pub fn game_timestamp_ms(game: &domain::Game) -> Option<u64> {
+    let (y, m, d) = if let Some(utc) = game.header("UTCDate").and_then(parse_ymd) {
+        utc
+    } else {
+        parse_ymd(game.header("Date")?)?
+    };
+    let (hh, mm, ss) = game
+        .header("UTCTime")
+        .and_then(parse_hms)
+        .unwrap_or((0, 0, 0));
+    let days = days_from_civil(y, m, d);
+    let secs = days * 86_400 + hh as i64 * 3600 + mm as i64 * 60 + ss as i64;
+    if secs < 0 {
+        None
+    } else {
+        Some((secs as u64) * 1000)
+    }
+}
+
+fn lichess_url_unfiltered(
+    username: &str,
+    max: Option<usize>,
+    since_ms: Option<u64>,
+    until_ms: Option<u64>,
+) -> String {
+    let mut params = Vec::new();
+    if let Some(max) = max {
+        params.push(format!("max={max}"));
+    }
+    if let Some(since) = since_ms {
+        params.push(format!("since={since}"));
+    }
+    if let Some(until) = until_ms {
+        params.push(format!("until={until}"));
+    }
+    params.push("clocks=false".to_string());
+    params.push("evals=false".to_string());
+    params.push("opening=false".to_string());
+    params.push("tags=true".to_string());
+    params.push("sort=dateDesc".to_string());
+    format!(
+        "https://lichess.org/api/games/user/{username}?{}",
+        params.join("&")
+    )
+}
+
+/// Paged Lichess export (unfiltered). Pages backwards with
+/// `until=<oldest ms>` until a page returns no new games, deduping by id.
+/// `max_games == usize::MAX` means uncapped (page size 10000).
+fn fetch_lichess_games_paged(
+    agent: &ureq::Agent,
+    username: &str,
+    max_games: usize,
+    since_ms: Option<u64>,
+) -> Result<Vec<domain::Game>> {
+    const PAGE: usize = 10_000;
+    let mut collected: Vec<domain::Game> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut until_ms: Option<u64> = None;
+    loop {
+        let remaining = if max_games == usize::MAX {
+            PAGE
+        } else {
+            max_games.saturating_sub(collected.len()).min(PAGE)
+        };
+        if remaining == 0 {
+            break;
+        }
+        let url = lichess_url_unfiltered(username, Some(remaining), since_ms, until_ms);
+        let response = agent
+            .get(&url)
+            .set("Accept", "application/x-chess-pgn")
+            .call()
+            .with_context(|| format!("requesting {url}"))?;
+        let reader = std::io::BufReader::new(response.into_reader());
+        let (body, _) = read_pgn_stream_incremental(reader, remaining, |_| {})?;
+        if body.trim().is_empty() {
+            break;
+        }
+        let page_games = domain::parse_pgn(body.as_bytes()).context("parsing downloaded games")?;
+        if page_games.is_empty() {
+            break;
+        }
+        let page_len = page_games.len();
+        let mut new_in_page = 0usize;
+        for game in page_games {
+            let id = lichess_game_id(&game);
+            if let Some(id) = &id
+                && !seen.insert(id.clone())
+            {
+                continue;
+            }
+            new_in_page += 1;
+            collected.push(game);
+            if max_games != usize::MAX && collected.len() >= max_games {
+                break;
+            }
+        }
+        if new_in_page == 0 {
+            break;
+        }
+        if max_games != usize::MAX && collected.len() >= max_games {
+            break;
+        }
+        // If this page was not full, there is nothing older to page to
+        // (except the exact-10000 case, which is full and falls through).
+        if page_len < remaining {
+            break;
+        }
+        let oldest_ms = collected.last().and_then(game_timestamp_ms);
+        let Some(oldest) = oldest_ms else {
+            break;
+        };
+        if until_ms == Some(oldest) {
+            break;
+        }
+        until_ms = Some(oldest);
+    }
+    Ok(collected)
+}
+
+fn write_games_cache(path: &std::path::Path, games: &[domain::Game]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("creating online cache {}", parent.display()))?;
+    }
+    let mut text = String::new();
+    for game in games {
+        text.push_str(&crate::pgn::game_to_pgn(game));
+    }
+    fs::write(path, text.as_bytes())
+        .with_context(|| format!("writing online cache to {}", path.display()))?;
+    Ok(())
+}
+
+fn read_games_cache(path: &std::path::Path) -> Option<Vec<domain::Game>> {
+    let text = fs::read_to_string(path).ok()?;
+    if text.trim().is_empty() {
+        return None;
+    }
+    domain::parse_pgn(text.as_bytes())
+        .ok()
+        .filter(|g| !g.is_empty())
+}
+
+fn chesscom_current_and_previous() -> (String, String) {
+    let today = crate::players::today();
+    let year = today / 10_000;
+    let month = (today / 100) % 100;
+    let current = format!("{year:04}-{month:02}");
+    let (py, pm) = if month == 1 {
+        (year - 1, 12)
+    } else {
+        (year, month - 1)
+    };
+    let previous = format!("{py:04}-{pm:02}");
+    (current, previous)
+}
+
+fn chesscom_year_month_from_url(url: &str) -> Option<String> {
+    // https://api.chess.com/pub/player/<user>/games/2024/01
+    let segments: Vec<&str> = url.split('/').filter(|s| !s.is_empty()).collect();
+    if segments.len() >= 2 {
+        let year = segments[segments.len() - 2];
+        let month = segments[segments.len() - 1];
+        if year.len() == 4
+            && year.chars().all(|c| c.is_ascii_digit())
+            && let Ok(m) = month.parse::<u32>()
+            && (1..=12).contains(&m)
+        {
+            return Some(format!("{year}-{m:02}"));
+        }
+    }
+    None
+}
+
 fn output_path(source: OnlineSource, username: &str) -> PathBuf {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1794,12 +2315,16 @@ mod tests {
     #[test]
     fn lichess_export_url_includes_perf_type_rated_and_since() {
         let mut filter = crate::players::AccountFilter::default();
+        // Default now includes bullet, so all four perfs = no perfType param.
+        let url = lichess_export_url_filtered("Makefrench", usize::MAX, Some(&filter), 20261108);
+        assert!(!url.contains("perfType="), "url was {url}");
+        assert!(!url.contains("max="), "url was {url}");
+        filter.time_controls.bullet = false;
         let url = lichess_export_url_filtered("Makefrench", usize::MAX, Some(&filter), 20261108);
         assert!(
             url.contains("perfType=classical,rapid,blitz"),
             "url was {url}"
         );
-        assert!(!url.contains("max="), "url was {url}");
 
         filter.include_casual = false;
         filter.date_cutoff = crate::players::DateCutoff::SinceDate(20260101);
@@ -1849,5 +2374,61 @@ mod tests {
         assert!(body.contains("Game 2"));
         assert!(!body.contains("Game 3"));
         assert_eq!(progress_calls, vec![1, 2]);
+    }
+
+    #[test]
+    fn parse_account_or_profile_input_cases() {
+        assert_eq!(
+            parse_account_or_profile_input("https://lichess.org/@/Makefrench"),
+            (Some(OnlineSource::Lichess), "Makefrench".to_string())
+        );
+        assert_eq!(
+            parse_account_or_profile_input("https://lichess.org/@/Makefrench/all"),
+            (Some(OnlineSource::Lichess), "Makefrench".to_string())
+        );
+        assert_eq!(
+            parse_account_or_profile_input("https://www.chess.com/member/hikaru"),
+            (Some(OnlineSource::ChessCom), "hikaru".to_string())
+        );
+        assert_eq!(
+            parse_account_or_profile_input("https://chess.com/players/hikaru"),
+            (Some(OnlineSource::ChessCom), "hikaru".to_string())
+        );
+        assert_eq!(
+            parse_account_or_profile_input("https://www.chessabc.com/player/4604776"),
+            (Some(OnlineSource::ChessAbc), "4604776".to_string())
+        );
+        assert_eq!(
+            parse_account_or_profile_input("https://ratings.fide.com/profile/4604776"),
+            (Some(OnlineSource::ChessAbc), "4604776".to_string())
+        );
+        assert_eq!(
+            parse_account_or_profile_input("Makefrench"),
+            (None, "Makefrench".to_string())
+        );
+        assert_eq!(parse_account_or_profile_input("  "), (None, String::new()));
+    }
+
+    #[test]
+    fn cache_paths_use_spec_layout() {
+        let lichess = lichess_cache_path("MakeFRENCH");
+        assert!(lichess.ends_with("online/lichess/makefrench.pgn"));
+        let chesscom = chesscom_cache_path("Hikaru", "2024-01");
+        assert!(chesscom.ends_with("online/chesscom/hikaru/2024-01.pgn"));
+        assert_eq!(
+            chesscom_year_month_from_url("https://api.chess.com/pub/player/hikaru/games/2024/01"),
+            Some("2024-01".to_string())
+        );
+    }
+
+    #[test]
+    fn lichess_game_id_and_timestamp() {
+        let pgn = "[Event \"Rated Blitz\"]\n[Site \"https://lichess.org/abcd1234\"]\n[Date \"2024.01.15\"]\n[UTCDate \"2024.01.15\"]\n[UTCTime \"12:00:00\"]\n[White \"A\"]\n[Black \"B\"]\n[Result \"1-0\"]\n\n1. e4 e5 1-0\n";
+        let games = domain::parse_pgn(pgn.as_bytes()).unwrap();
+        assert_eq!(lichess_game_id(&games[0]).as_deref(), Some("abcd1234"));
+        // 2024-01-15 12:00 UTC
+        assert!(game_timestamp_ms(&games[0]).is_some());
+        // Days-from-civil sanity: 1970-01-01 is 0
+        assert_eq!(days_from_civil(1970, 1, 1), 0);
     }
 }

@@ -17,17 +17,19 @@
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::chess::{Color, Position, UciMove};
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 
 use crate::country::{self, Country};
 use crate::domain::Game;
 use crate::fide;
-use crate::library::GameLibrary;
 #[cfg(test)]
 use crate::library::PgnLibrary;
+use crate::library::{GameLibrary, SourceMeta};
 use crate::online::OnlineSource;
 use crate::position::{self, MoveStat, TREND_BUCKETS};
 use crate::titles::{self, PlayerTitle};
@@ -87,6 +89,14 @@ pub struct PlayerSummary {
     /// First recognized country or federation seen in this player's games.
     /// The raw tag stays untouched; this is only a display aggregate.
     pub country: Option<Country>,
+    /// All federations resolved from Wikipedia/Wikidata enrichment, ordered
+    /// oldest → latest (last is the latest/current federation). Empty until
+    /// a wiki lookup enriches this player.
+    pub wiki_countries: Vec<Country>,
+    /// Birth year from Wikidata `P569`, when enrichment has supplied it.
+    pub birth_year: Option<i32>,
+    /// Peak Elo from Wikidata `P1087`, when enrichment has supplied it.
+    pub peak_elo: Option<u16>,
     pub white: PlayerRecord,
     pub black: PlayerRecord,
     pub elo_sum: u64,
@@ -169,6 +179,8 @@ pub type PlayerIndex = PlayerDirectory;
 #[derive(Clone, Debug, Default)]
 pub struct PlayerDirectory {
     players: Vec<PlayerSummary>,
+    /// One-entry memo for `filter`: (normalized query, result).
+    memo: std::cell::RefCell<Option<(String, Vec<usize>)>>,
 }
 
 impl PlayerDirectory {
@@ -206,6 +218,9 @@ impl PlayerDirectory {
                 title: None,
                 fide_id: None,
                 country: None,
+                wiki_countries: Vec::new(),
+                birth_year: None,
+                peak_elo: None,
                 white: PlayerRecord::default(),
                 black: PlayerRecord::default(),
                 elo_sum: 0,
@@ -251,7 +266,10 @@ impl PlayerDirectory {
                 .cmp(&a.games())
                 .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
         });
-        Self { players }
+        Self {
+            players,
+            memo: std::cell::RefCell::new(None),
+        }
     }
 
     fn from_scan(library: &dyn GameLibrary) -> Self {
@@ -270,6 +288,9 @@ impl PlayerDirectory {
                         title: None,
                         fide_id: None,
                         country: None,
+                        wiki_countries: Vec::new(),
+                        birth_year: None,
+                        peak_elo: None,
                         white: PlayerRecord::default(),
                         black: PlayerRecord::default(),
                         elo_sum: 0,
@@ -299,6 +320,9 @@ impl PlayerDirectory {
                         title: None,
                         fide_id: None,
                         country: None,
+                        wiki_countries: Vec::new(),
+                        birth_year: None,
+                        peak_elo: None,
                         white: PlayerRecord::default(),
                         black: PlayerRecord::default(),
                         elo_sum: 0,
@@ -330,6 +354,9 @@ impl PlayerDirectory {
                         title: None,
                         fide_id: None,
                         country: None,
+                        wiki_countries: Vec::new(),
+                        birth_year: None,
+                        peak_elo: None,
                         white: PlayerRecord::default(),
                         black: PlayerRecord::default(),
                         elo_sum: 0,
@@ -354,6 +381,9 @@ impl PlayerDirectory {
                         title: None,
                         fide_id: None,
                         country: None,
+                        wiki_countries: Vec::new(),
+                        birth_year: None,
+                        peak_elo: None,
                         white: PlayerRecord::default(),
                         black: PlayerRecord::default(),
                         elo_sum: 0,
@@ -379,7 +409,10 @@ impl PlayerDirectory {
                 .cmp(&a.games())
                 .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
         });
-        Self { players }
+        Self {
+            players,
+            memo: std::cell::RefCell::new(None),
+        }
     }
 
     pub fn players(&self) -> &[PlayerSummary] {
@@ -398,6 +431,14 @@ impl PlayerDirectory {
         self.players.get(index)
     }
 
+    pub fn get_mut(&mut self, index: usize) -> Option<&mut PlayerSummary> {
+        self.players.get_mut(index)
+    }
+
+    pub fn players_mut(&mut self) -> &mut [PlayerSummary] {
+        &mut self.players
+    }
+
     pub fn find_key(&self, key: &str) -> Option<usize> {
         self.players.iter().position(|player| player.key == key)
     }
@@ -414,6 +455,9 @@ impl PlayerDirectory {
             title: None,
             fide_id: None,
             country: None,
+            wiki_countries: Vec::new(),
+            birth_year: None,
+            peak_elo: None,
             white: PlayerRecord::default(),
             black: PlayerRecord::default(),
             elo_sum: 0,
@@ -432,24 +476,795 @@ impl PlayerDirectory {
     }
 
     pub fn filter(&self, query: &str) -> Vec<usize> {
-        let needle = query.trim().to_lowercase();
-        if needle.is_empty() {
+        // On huge directories fuzzy only runs on Enter: `filter` is the
+        // per-frame path, so it stays exact/substring-only above 150k.
+        let allow_fuzzy = self.players.len() <= 150_000;
+        self.filter_impl(query, allow_fuzzy)
+    }
+
+    /// Fuzzy-capable filter used on Enter (large directories) and in tests.
+    pub fn filter_on_enter(&self, query: &str) -> Vec<usize> {
+        self.filter_impl(query, true)
+    }
+
+    /// Filter with an explicit fuzzy allowance (25 ms budget when fuzzy).
+    pub fn filter_with_fuzzy(&self, query: &str, allow_fuzzy: bool) -> Vec<usize> {
+        self.filter_impl(query, allow_fuzzy)
+    }
+
+    fn filter_impl(&self, query: &str, allow_fuzzy: bool) -> Vec<usize> {
+        let q_norm = normalize_search_text(query);
+        if q_norm.is_empty() {
             return (0..self.players.len()).collect();
         }
-        self.players
-            .iter()
-            .enumerate()
-            .filter(|(_, player)| player.name.to_lowercase().contains(&needle))
-            .map(|(index, _)| index)
-            .collect()
+        let memo_key = format!("{q_norm}|{allow_fuzzy}");
+        {
+            let memo = self.memo.borrow();
+            if let Some((cached_key, cached)) = memo.as_ref()
+                && cached_key == &memo_key
+            {
+                return cached.clone();
+            }
+        }
+        let q_tokens: Vec<String> = q_norm.split_whitespace().map(str::to_string).collect();
+        let q_collapsed: String = q_tokens.join("");
+        let q_len = q_collapsed.chars().count();
+        let started = std::time::Instant::now();
+        let mut exact: Vec<(u8, usize)> = Vec::new(); // tier 0=exact 1=substring
+        for (index, player) in self.players.iter().enumerate() {
+            let p_norm = normalize_search_text(&player.name);
+            if p_norm.is_empty() {
+                continue;
+            }
+            let p_tokens: Vec<String> = p_norm.split_whitespace().map(str::to_string).collect();
+            let p_collapsed: String = p_tokens.join("");
+            if p_norm == q_norm || p_collapsed == q_collapsed {
+                exact.push((0, index));
+                continue;
+            }
+            // Substring: whole normalized string, collapsed string, or every
+            // query token (or its prefix) appears in the player name.
+            let substring = p_norm.contains(&q_norm)
+                || p_collapsed.contains(&q_collapsed)
+                || (!q_tokens.is_empty()
+                    && q_tokens.iter().all(|qt| {
+                        p_tokens.iter().any(|pt| pt.contains(qt.as_str()))
+                            || p_collapsed.contains(qt.as_str())
+                    }));
+            if substring {
+                exact.push((1, index));
+            }
+        }
+        exact.sort_by_key(|(tier, idx)| (*tier, *idx));
+        let mut result: Vec<usize> = exact.iter().map(|(_, idx)| *idx).collect();
+
+        let do_fuzzy = allow_fuzzy && result.len() < 8 && q_len >= 4;
+        if do_fuzzy {
+            let mut matched: std::collections::HashSet<usize> = result.iter().copied().collect();
+            let mut fuzzy: Vec<(usize, usize)> = Vec::new(); // (distance, index)
+            for (index, player) in self.players.iter().enumerate() {
+                if matched.contains(&index) {
+                    continue;
+                }
+                if index % 1024 == 0 && started.elapsed() > std::time::Duration::from_millis(25) {
+                    break;
+                }
+                let p_norm = normalize_search_text(&player.name);
+                let p_tokens: Vec<String> = p_norm.split_whitespace().map(str::to_string).collect();
+                if p_tokens.is_empty() {
+                    continue;
+                }
+                // Bounded edit distance: <=1 for len 4..=6, <=2 for >=7.
+                let mut total_dist = 0usize;
+                let mut all_matched = true;
+                for qt in &q_tokens {
+                    let qt_len = qt.chars().count();
+                    let max_dist = if qt_len >= 7 {
+                        2
+                    } else if qt_len >= 4 {
+                        1
+                    } else {
+                        0
+                    };
+                    if max_dist == 0 {
+                        all_matched = false;
+                        break;
+                    }
+                    let best = p_tokens
+                        .iter()
+                        .map(|pt| levenshtein(qt, pt))
+                        .min()
+                        .unwrap_or(usize::MAX);
+                    // Also consider collapsed player string for single-token
+                    // queries spanning a space (e.g. makefrenhc vs make french).
+                    let collapsed_best = if q_tokens.len() == 1 {
+                        let pc: String = p_tokens.join("");
+                        levenshtein(qt, &pc)
+                    } else {
+                        usize::MAX
+                    };
+                    let best = best.min(collapsed_best);
+                    if best > max_dist {
+                        all_matched = false;
+                        break;
+                    }
+                    total_dist += best;
+                }
+                if all_matched {
+                    matched.insert(index);
+                    fuzzy.push((total_dist, index));
+                }
+            }
+            fuzzy.sort();
+            result.extend(fuzzy.into_iter().map(|(_, idx)| idx));
+        }
+        *self.memo.borrow_mut() = Some((memo_key, result.clone()));
+        result
     }
 
     pub fn find_player(&self, query: &str) -> Option<&PlayerSummary> {
         let key = player_key(query).unwrap_or_else(|| query.trim().to_lowercase());
         self.find_key(&key)
             .and_then(|idx| self.get(idx))
-            .or_else(|| self.players.iter().find(|p| p.name.eq_ignore_ascii_case(query.trim())))
+            .or_else(|| {
+                self.players
+                    .iter()
+                    .find(|p| p.name.eq_ignore_ascii_case(query.trim()))
+            })
     }
+}
+
+// ---------------------------------------------------------------------------
+// PlayerDirectory sidecar (`.brettplayers`)
+// ---------------------------------------------------------------------------
+
+/// On-disk format version for [`PlayerDirectory`] sidecars.
+///
+/// Bump this (and the loader's expected version) whenever the layout changes;
+/// older files are ignored so a stale sidecar is rebuilt instead of decoded.
+pub const BRETT_PLAYERS_V: u32 = 1;
+
+/// Minimum library size (games) for which the sidecar is used.
+///
+/// Below this threshold the directory is built in memory and never cached; the
+/// build cost is negligible and a sidecar adds only overhead. The app checks
+/// this cap before consulting the sidecar; the helpers here are usable at any
+/// size (tests exercise them with tiny directories).
+pub const PLAYERS_SIDECAR_MIN_GAMES: usize = 100_000;
+
+const PLAYERS_MAGIC: &[u8; 8] = b"BRETTPLY";
+const PLAYERS_HEADER_LEN: usize = 80;
+
+/// Cache location for the player directory of `source`.
+///
+/// The index is never written next to a database or PGN file in the cache
+/// layout: the file is `<hash>.brettplayers` under `~/.cache/brett/players/`
+/// (or `$XDG_CACHE_HOME/brett/players/`) where `<hash>` is the same FNV-1a of
+/// the canonical source path used for position indexes. The `SourceMeta`
+/// fingerprint (len + mtime) inside the file still decides freshness.
+pub fn players_cache_path(source: &Path) -> PathBuf {
+    players_cache_dir().join(format!("{:016x}.brettplayers", fnv_path_hash(source)))
+}
+
+/// Sidecar location next to `source` (e.g. `mega.brettplayers`).
+///
+/// Kept as an alternative to the hashed cache path for the same database.
+/// The app currently prefers [`players_cache_path`]; both layouts are
+/// recognised by the format and either may be used by tests.
+pub fn players_sidecar_path(source: &Path) -> PathBuf {
+    source.with_extension("brettplayers")
+}
+
+fn players_cache_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("XDG_CACHE_HOME") {
+        return PathBuf::from(dir).join("brett").join("players");
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        return PathBuf::from(home)
+            .join(".cache")
+            .join("brett")
+            .join("players");
+    }
+    std::env::temp_dir().join("brett-players")
+}
+
+fn fnv_path_hash(source: &Path) -> u64 {
+    let canonical = std::fs::canonicalize(source).unwrap_or_else(|_| source.to_path_buf());
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in canonical.to_string_lossy().as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100_0000_01b3);
+    }
+    hash
+}
+
+/// FNV-1a hash of the source path plus its [`SourceMeta`] fingerprint.
+///
+/// Convenience fingerprint for logging; the canonical freshness check in the
+/// sidecar is exact equality of `len`/`mtime_secs`/`mtime_nanos` against the
+/// header, not this hash, so a hash collision can never admit a stale file.
+pub fn players_fingerprint(source: &Path, meta: &SourceMeta) -> u64 {
+    let mut hash = fnv_path_hash(source);
+    for value in [meta.len, meta.mtime_secs] {
+        for byte in value.to_le_bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x100_0000_01b3);
+        }
+    }
+    for byte in meta.mtime_nanos.to_le_bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100_0000_01b3);
+    }
+    hash
+}
+
+/// Binary sidecar format (`BRETT_PLAYERS_V = 1`).
+///
+/// All integers are little-endian unless noted.
+///
+/// Header, 80 bytes:
+/// ```text
+///  0..8   magic `BRETTPLY`
+///  8..12  version u32 == BRETT_PLAYERS_V
+/// 12..16  reserved (0)
+/// 16..24  source_len u64 (SourceMeta.len)
+/// 24..32  source_mtime_secs u64
+/// 32..36  source_mtime_nanos u32
+/// 36..40  reserved (0)
+/// 40..48  player_count u64
+/// 48..56  total_game_indices u64 (informational sum)
+/// 56..64  reserved (0)
+/// 64..72  build_millis u64 (informational, 0 from save_to)
+/// 72..80  reserved (0)
+/// ```
+///
+/// Then `player_count` records in directory order, each:
+/// ```text
+/// name_len u32, name bytes (UTF-8)
+/// key_len u32, key bytes
+/// title u8 (0=None, 1=Gm, 2=Igm, 3=Cgm, 4=Im, 5=Sim, 6=Ccm,
+///           7=Fm, 8=Cm, 9=Wgm, 10=Wim, 11=Wfm, 12=Wcm, 13=Nm, 14=Lm)
+/// country_present u8; if 1: code_len u8, code bytes (FIDE 3-letter code)
+/// fide_present u8; if 1: fide_len u32, fide bytes
+/// wiki_count u32; then wiki_count entries, each: code_len u8, code bytes
+/// birth_present u8; if 1: birth_year i32 LE
+/// peak_present u8; if 1: peak_elo u16 LE
+/// white games/wins/draws/losses: u32 LE x 4
+/// black games/wins/draws/losses: u32 LE x 4
+/// elo_sum u64, elo_count u32, elo_max u32
+/// latest_otb_elo_present u8; if 1: u16 LE
+/// latest_otb_date u32
+/// opponent_elo_sum u64, opponent_elo_count u32
+/// first_year u16, last_year u16
+/// indices_count u32; then indices_count varints
+/// ```
+///
+/// `game_indices` are unsigned LEB128 varints of zigzag-encoded deltas: the
+/// first delta is `indices[0] - 0`, each later delta is
+/// `indices[i] - indices[i-1]`, zigzag mapped as `(n << 1) ^ (n >> 63)`
+/// (decoded as `(v >> 1) ^ -(v & 1)`). Sorted postings — the common case for
+/// both accelerator and scan builds — cost roughly 2-3 bytes per index, so a
+/// 476k-player / 11M-game directory (about 22M indices) stays in the tens of
+/// megabytes and decodes in well under the ~50 s rebuild cost. Unsorted
+/// postings stay lossless. Country/wiki codes are resolved on load through
+/// [`crate::country::normalize`], so an unknown code degrades to `None`
+/// instead of failing the whole file.
+impl PlayerDirectory {
+    /// Serialize this directory to `path`, fingerprinted by `meta`.
+    ///
+    /// The write is atomic: data goes to a temporary sibling and is renamed
+    /// over `path`. Parent directories are created best-effort. Callers
+    /// should treat errors as non-fatal (best-effort cache) — the app always
+    /// has the in-memory directory to install.
+    pub fn save_to(&self, path: &Path, meta: &SourceMeta) -> Result<()> {
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating player cache {}", parent.display()))?;
+        }
+        let mut header = [0u8; PLAYERS_HEADER_LEN];
+        header[0..8].copy_from_slice(PLAYERS_MAGIC);
+        header[8..12].copy_from_slice(&BRETT_PLAYERS_V.to_le_bytes());
+        header[16..24].copy_from_slice(&meta.len.to_le_bytes());
+        header[24..32].copy_from_slice(&meta.mtime_secs.to_le_bytes());
+        header[32..36].copy_from_slice(&meta.mtime_nanos.to_le_bytes());
+        header[40..48].copy_from_slice(&(self.players.len() as u64).to_le_bytes());
+        let total_indices: u64 = self
+            .players
+            .iter()
+            .map(|player| player.game_indices.len() as u64)
+            .sum();
+        header[48..56].copy_from_slice(&total_indices.to_le_bytes());
+        // build_millis at 64..72 left 0: the build time is logged by the
+        // caller and is not needed for validation.
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let tmp = path.with_file_name(format!(
+            "{}.tmp-{}-{}",
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "players".to_string()),
+            std::process::id(),
+            unique
+        ));
+        {
+            let file = std::fs::File::create(&tmp)
+                .with_context(|| format!("creating player sidecar {}", tmp.display()))?;
+            let mut writer = std::io::BufWriter::with_capacity(64 * 1024, file);
+            writer
+                .write_all(&header)
+                .with_context(|| format!("writing player sidecar {}", path.display()))?;
+            let mut scratch: Vec<u8> = Vec::with_capacity(4096);
+            for player in &self.players {
+                scratch.clear();
+                encode_player(&mut scratch, player)
+                    .with_context(|| format!("encoding player {}", player.key))?;
+                writer
+                    .write_all(&scratch)
+                    .with_context(|| format!("writing player sidecar {}", path.display()))?;
+            }
+            writer
+                .flush()
+                .with_context(|| format!("writing player sidecar {}", path.display()))?;
+        }
+        std::fs::rename(&tmp, path)
+            .with_context(|| format!("renaming player sidecar {}", path.display()))?;
+        Ok(())
+    }
+
+    /// Load a directory from `path` iff its fingerprint matches `expected`.
+    ///
+    /// Returns `Ok(None)` for a missing, stale (fingerprint mismatch),
+    /// version-mismatched or truncated/corrupt file — the caller should
+    /// rebuild. Only unexpected I/O failures are also mapped to `Ok(None)`
+    /// (with a warning) because the sidecar is a pure cache: a failed load
+    /// must never block database opening.
+    pub fn load_from(path: &Path, expected: &SourceMeta) -> Result<Option<Self>> {
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => {
+                tracing::warn!(
+                    "ignoring unreadable player cache {}: {err:#}",
+                    path.display()
+                );
+                return Ok(None);
+            }
+        };
+        match Self::decode_bytes(&bytes, expected) {
+            Ok(directory) => Ok(Some(directory)),
+            Err(err) => {
+                tracing::warn!(
+                    "ignoring stale or invalid player cache {}: {err:#}",
+                    path.display()
+                );
+                Ok(None)
+            }
+        }
+    }
+
+    fn decode_bytes(bytes: &[u8], expected: &SourceMeta) -> Result<Self> {
+        let mut pos = 0usize;
+        decode_header(bytes, &mut pos, expected)?;
+        let player_count = decode_u64_le(bytes, &mut pos)?;
+        // Header reserved fields are ignored; total_game_indices is
+        // informational and not re-validated.
+        let _total_indices = decode_u64_le(bytes, &mut pos)?;
+        let _reserved = decode_u64_le(bytes, &mut pos)?;
+        let _build_millis = decode_u64_le(bytes, &mut pos)?;
+        let _reserved = decode_u64_le(bytes, &mut pos)?;
+        if pos != PLAYERS_HEADER_LEN {
+            bail!("corrupt player sidecar header");
+        }
+        let mut players = Vec::with_capacity(player_count.min(1_000_000) as usize);
+        for _ in 0..player_count {
+            players.push(decode_player(bytes, &mut pos)?);
+        }
+        if pos != bytes.len() {
+            bail!("trailing bytes in player sidecar");
+        }
+        Ok(Self {
+            players,
+            memo: std::cell::RefCell::new(None),
+        })
+    }
+}
+
+fn title_to_byte(title: Option<PlayerTitle>) -> u8 {
+    match title {
+        None => 0,
+        Some(PlayerTitle::Gm) => 1,
+        Some(PlayerTitle::Igm) => 2,
+        Some(PlayerTitle::Cgm) => 3,
+        Some(PlayerTitle::Im) => 4,
+        Some(PlayerTitle::Sim) => 5,
+        Some(PlayerTitle::Ccm) => 6,
+        Some(PlayerTitle::Fm) => 7,
+        Some(PlayerTitle::Cm) => 8,
+        Some(PlayerTitle::Wgm) => 9,
+        Some(PlayerTitle::Wim) => 10,
+        Some(PlayerTitle::Wfm) => 11,
+        Some(PlayerTitle::Wcm) => 12,
+        Some(PlayerTitle::Nm) => 13,
+        Some(PlayerTitle::Lm) => 14,
+    }
+}
+
+fn title_from_byte(value: u8) -> Result<Option<PlayerTitle>> {
+    Ok(match value {
+        0 => None,
+        1 => Some(PlayerTitle::Gm),
+        2 => Some(PlayerTitle::Igm),
+        3 => Some(PlayerTitle::Cgm),
+        4 => Some(PlayerTitle::Im),
+        5 => Some(PlayerTitle::Sim),
+        6 => Some(PlayerTitle::Ccm),
+        7 => Some(PlayerTitle::Fm),
+        8 => Some(PlayerTitle::Cm),
+        9 => Some(PlayerTitle::Wgm),
+        10 => Some(PlayerTitle::Wim),
+        11 => Some(PlayerTitle::Wfm),
+        12 => Some(PlayerTitle::Wcm),
+        13 => Some(PlayerTitle::Nm),
+        14 => Some(PlayerTitle::Lm),
+        _ => bail!("unknown player title code {value}"),
+    })
+}
+
+fn zigzag_encode(delta: i64) -> u64 {
+    ((delta << 1) ^ (delta >> 63)) as u64
+}
+
+fn zigzag_decode(value: u64) -> i64 {
+    ((value >> 1) as i64) ^ (-((value & 1) as i64))
+}
+
+fn write_varint(buf: &mut Vec<u8>, mut value: u64) {
+    loop {
+        let mut byte = (value & 0x7f) as u8;
+        value >>= 7;
+        if value != 0 {
+            byte |= 0x80;
+        }
+        buf.push(byte);
+        if value == 0 {
+            break;
+        }
+    }
+}
+
+fn encode_player(buf: &mut Vec<u8>, player: &PlayerSummary) -> Result<()> {
+    write_string(buf, &player.name)?;
+    write_string(buf, &player.key)?;
+    buf.push(title_to_byte(player.title));
+    match player.country {
+        Some(country) => {
+            buf.push(1);
+            write_code(buf, country.code());
+        }
+        None => buf.push(0),
+    }
+    match &player.fide_id {
+        Some(fide_id) => {
+            buf.push(1);
+            write_string(buf, fide_id)?;
+        }
+        None => buf.push(0),
+    }
+    let wiki_count = u32::try_from(player.wiki_countries.len())
+        .map_err(|_| anyhow::anyhow!("too many wiki countries for one player"))?;
+    buf.extend_from_slice(&wiki_count.to_le_bytes());
+    for country in &player.wiki_countries {
+        write_code(buf, country.code());
+    }
+    match player.birth_year {
+        Some(year) => {
+            buf.push(1);
+            buf.extend_from_slice(&year.to_le_bytes());
+        }
+        None => buf.push(0),
+    }
+    match player.peak_elo {
+        Some(elo) => {
+            buf.push(1);
+            buf.extend_from_slice(&elo.to_le_bytes());
+        }
+        None => buf.push(0),
+    }
+    encode_record(buf, &player.white);
+    encode_record(buf, &player.black);
+    buf.extend_from_slice(&player.elo_sum.to_le_bytes());
+    buf.extend_from_slice(&player.elo_count.to_le_bytes());
+    buf.extend_from_slice(&player.elo_max.to_le_bytes());
+    match player.latest_otb_elo {
+        Some(elo) => {
+            buf.push(1);
+            buf.extend_from_slice(&elo.to_le_bytes());
+        }
+        None => buf.push(0),
+    }
+    buf.extend_from_slice(&player.latest_otb_date.to_le_bytes());
+    buf.extend_from_slice(&player.opponent_elo_sum.to_le_bytes());
+    buf.extend_from_slice(&player.opponent_elo_count.to_le_bytes());
+    buf.extend_from_slice(&player.first_year.to_le_bytes());
+    buf.extend_from_slice(&player.last_year.to_le_bytes());
+    let count = u32::try_from(player.game_indices.len())
+        .map_err(|_| anyhow::anyhow!("too many game indices for one player"))?;
+    buf.extend_from_slice(&count.to_le_bytes());
+    let mut prev: i64 = 0;
+    for &index in &player.game_indices {
+        let delta = index as i64 - prev;
+        write_varint(buf, zigzag_encode(delta));
+        prev = index as i64;
+    }
+    Ok(())
+}
+
+fn encode_record(buf: &mut Vec<u8>, record: &PlayerRecord) {
+    buf.extend_from_slice(&record.games.to_le_bytes());
+    buf.extend_from_slice(&record.wins.to_le_bytes());
+    buf.extend_from_slice(&record.draws.to_le_bytes());
+    buf.extend_from_slice(&record.losses.to_le_bytes());
+}
+
+fn write_string(buf: &mut Vec<u8>, value: &str) -> Result<()> {
+    let len = u32::try_from(value.len())
+        .map_err(|_| anyhow::anyhow!("string too long for player sidecar"))?;
+    buf.extend_from_slice(&len.to_le_bytes());
+    buf.extend_from_slice(value.as_bytes());
+    Ok(())
+}
+
+fn write_code(buf: &mut Vec<u8>, code: &str) {
+    let bytes = code.as_bytes();
+    let len = bytes.len().min(u8::MAX as usize) as u8;
+    buf.push(len);
+    buf.extend_from_slice(&bytes[..len as usize]);
+}
+
+fn decode_header(bytes: &[u8], pos: &mut usize, expected: &SourceMeta) -> Result<()> {
+    if bytes.len() < PLAYERS_HEADER_LEN {
+        bail!("player sidecar is shorter than {PLAYERS_HEADER_LEN} bytes");
+    }
+    if &bytes[0..8] != PLAYERS_MAGIC {
+        bail!("not a Brett player sidecar");
+    }
+    let version = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+    if version != BRETT_PLAYERS_V {
+        bail!("unsupported player sidecar version {version} (expected {BRETT_PLAYERS_V})");
+    }
+    *pos = 16;
+    let source_len = decode_u64_le(bytes, pos)?;
+    let source_mtime_secs = decode_u64_le(bytes, pos)?;
+    let source_mtime_nanos = decode_u32_le(bytes, pos)?;
+    let _reserved = decode_u32_le(bytes, pos)?;
+    if source_len != expected.len
+        || source_mtime_secs != expected.mtime_secs
+        || source_mtime_nanos != expected.mtime_nanos
+    {
+        bail!(
+            "player sidecar fingerprint mismatch (sidecar len={source_len} mtime={source_mtime_secs}, expected len={} mtime={})",
+            expected.len,
+            expected.mtime_secs
+        );
+    }
+    Ok(())
+}
+
+fn need(bytes: &[u8], pos: &mut usize, count: usize) -> Result<()> {
+    if bytes.len().saturating_sub(*pos) < count {
+        bail!("truncated player sidecar");
+    }
+    *pos += count;
+    Ok(())
+}
+
+fn decode_u8(bytes: &[u8], pos: &mut usize) -> Result<u8> {
+    need(bytes, pos, 1)?;
+    Ok(bytes[*pos - 1])
+}
+
+fn decode_u16_le(bytes: &[u8], pos: &mut usize) -> Result<u16> {
+    need(bytes, pos, 2)?;
+    let value = u16::from_le_bytes(bytes[*pos - 2..*pos].try_into().unwrap());
+    Ok(value)
+}
+
+fn decode_u32_le(bytes: &[u8], pos: &mut usize) -> Result<u32> {
+    need(bytes, pos, 4)?;
+    let value = u32::from_le_bytes(bytes[*pos - 4..*pos].try_into().unwrap());
+    Ok(value)
+}
+
+fn decode_u64_le(bytes: &[u8], pos: &mut usize) -> Result<u64> {
+    need(bytes, pos, 8)?;
+    let value = u64::from_le_bytes(bytes[*pos - 8..*pos].try_into().unwrap());
+    Ok(value)
+}
+
+fn decode_i32_le(bytes: &[u8], pos: &mut usize) -> Result<i32> {
+    need(bytes, pos, 4)?;
+    let value = i32::from_le_bytes(bytes[*pos - 4..*pos].try_into().unwrap());
+    Ok(value)
+}
+
+fn decode_string(bytes: &[u8], pos: &mut usize) -> Result<String> {
+    let len = decode_u32_le(bytes, pos)? as usize;
+    need(bytes, pos, len)?;
+    let str_bytes = &bytes[*pos - len..*pos];
+    String::from_utf8(str_bytes.to_vec())
+        .map_err(|_| anyhow::anyhow!("invalid UTF-8 in player sidecar string"))
+}
+
+fn decode_code(bytes: &[u8], pos: &mut usize) -> Result<String> {
+    let len = decode_u8(bytes, pos)? as usize;
+    need(bytes, pos, len)?;
+    let str_bytes = &bytes[*pos - len..*pos];
+    String::from_utf8(str_bytes.to_vec())
+        .map_err(|_| anyhow::anyhow!("invalid UTF-8 in player sidecar code"))
+}
+
+fn decode_varint(bytes: &[u8], pos: &mut usize) -> Result<u64> {
+    let mut result: u64 = 0;
+    let mut shift = 0u32;
+    for _ in 0..10 {
+        if *pos >= bytes.len() {
+            bail!("truncated varint in player sidecar");
+        }
+        let byte = bytes[*pos];
+        *pos += 1;
+        let low = u64::from(byte & 0x7f);
+        result |= low.checked_shl(shift).unwrap_or(0);
+        if byte & 0x80 == 0 {
+            return Ok(result);
+        }
+        shift += 7;
+    }
+    bail!("varint overflow in player sidecar")
+}
+
+fn decode_record(bytes: &[u8], pos: &mut usize) -> Result<PlayerRecord> {
+    Ok(PlayerRecord {
+        games: decode_u32_le(bytes, pos)?,
+        wins: decode_u32_le(bytes, pos)?,
+        draws: decode_u32_le(bytes, pos)?,
+        losses: decode_u32_le(bytes, pos)?,
+    })
+}
+
+fn decode_player(bytes: &[u8], pos: &mut usize) -> Result<PlayerSummary> {
+    let name = decode_string(bytes, pos)?;
+    let key = decode_string(bytes, pos)?;
+    let title = title_from_byte(decode_u8(bytes, pos)?)?;
+    let country_present = decode_u8(bytes, pos)?;
+    let country = match country_present {
+        0 => None,
+        1 => {
+            let code = decode_code(bytes, pos)?;
+            country::normalize(&code)
+        }
+        other => bail!("unknown country flag {other}"),
+    };
+    let fide_present = decode_u8(bytes, pos)?;
+    let fide_id = match fide_present {
+        0 => None,
+        1 => Some(decode_string(bytes, pos)?),
+        other => bail!("unknown fide flag {other}"),
+    };
+    let wiki_count = decode_u32_le(bytes, pos)?;
+    let mut wiki_countries = Vec::with_capacity(wiki_count as usize);
+    for _ in 0..wiki_count {
+        let code = decode_code(bytes, pos)?;
+        if let Some(country) = country::normalize(&code) {
+            wiki_countries.push(country);
+        }
+    }
+    let birth_present = decode_u8(bytes, pos)?;
+    let birth_year = match birth_present {
+        0 => None,
+        1 => Some(decode_i32_le(bytes, pos)?),
+        other => bail!("unknown birth flag {other}"),
+    };
+    let peak_present = decode_u8(bytes, pos)?;
+    let peak_elo = match peak_present {
+        0 => None,
+        1 => Some(decode_u16_le(bytes, pos)?),
+        other => bail!("unknown peak flag {other}"),
+    };
+    let white = decode_record(bytes, pos)?;
+    let black = decode_record(bytes, pos)?;
+    let elo_sum = decode_u64_le(bytes, pos)?;
+    let elo_count = decode_u32_le(bytes, pos)?;
+    let elo_max = decode_u32_le(bytes, pos)?;
+    let latest_present = decode_u8(bytes, pos)?;
+    let latest_otb_elo = match latest_present {
+        0 => None,
+        1 => Some(decode_u16_le(bytes, pos)?),
+        other => bail!("unknown latest_otb_elo flag {other}"),
+    };
+    let latest_otb_date = decode_u32_le(bytes, pos)?;
+    let opponent_elo_sum = decode_u64_le(bytes, pos)?;
+    let opponent_elo_count = decode_u32_le(bytes, pos)?;
+    let first_year = decode_u16_le(bytes, pos)?;
+    let last_year = decode_u16_le(bytes, pos)?;
+    let indices_count = decode_u32_le(bytes, pos)?;
+    let mut game_indices = Vec::with_capacity(indices_count as usize);
+    let mut prev: i64 = 0;
+    for _ in 0..indices_count {
+        let delta = zigzag_decode(decode_varint(bytes, pos)?);
+        let index = prev + delta;
+        if index < 0 {
+            bail!("negative game index in player sidecar");
+        }
+        game_indices.push(index as usize);
+        prev = index;
+    }
+    Ok(PlayerSummary {
+        name,
+        key,
+        title,
+        fide_id,
+        country,
+        wiki_countries,
+        birth_year,
+        peak_elo,
+        white,
+        black,
+        elo_sum,
+        elo_count,
+        elo_max,
+        latest_otb_elo,
+        latest_otb_date,
+        opponent_elo_sum,
+        opponent_elo_count,
+        first_year,
+        last_year,
+        game_indices,
+    })
+}
+
+/// Normalize for player search: deunicode diacritics, lowercase, and turn
+/// `_`, `-`, `,`, `.` (and any other punctuation) into spaces/tokens.
+pub fn normalize_search_text(raw: &str) -> String {
+    let deuni = deunicode::deunicode(raw);
+    let mut out = String::with_capacity(deuni.len());
+    for ch in deuni.chars() {
+        if ch.is_alphanumeric() {
+            for lower in ch.to_lowercase() {
+                out.push(lower);
+            }
+        } else {
+            // Covers `_`, `-`, `,`, `.` and other punctuation as separators.
+            out.push(' ');
+        }
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn levenshtein(left: &str, right: &str) -> usize {
+    let left: Vec<char> = left.chars().collect();
+    let right: Vec<char> = right.chars().collect();
+    if left.is_empty() {
+        return right.len();
+    }
+    if right.is_empty() {
+        return left.len();
+    }
+    let mut previous: Vec<usize> = (0..=right.len()).collect();
+    let mut current = vec![0usize; right.len() + 1];
+    for (i, left_char) in left.iter().enumerate() {
+        current[0] = i + 1;
+        for (j, right_char) in right.iter().enumerate() {
+            let substitution = previous[j] + usize::from(left_char != right_char);
+            current[j + 1] = (previous[j + 1] + 1).min(current[j] + 1).min(substitution);
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    previous[right.len()]
 }
 
 /// Fill a summary from pre-aggregated accelerator counts when headers are
@@ -624,7 +1439,16 @@ fn is_recent_date(date: u32, as_of: u32, config: PredictionConfig) -> bool {
 
 const HONORIFICS: &[&str] = &["dr", "prof", "ing", "mag", "dipl", "jr", "sr"];
 const PLACEHOLDERS: &[&str] = &[
-    "bye", "forfeit", "unpaired", "vacant", "unknown", "none", "n/a", "na", "tbd", "anonymous",
+    "bye",
+    "forfeit",
+    "unpaired",
+    "vacant",
+    "unknown",
+    "none",
+    "n/a",
+    "na",
+    "tbd",
+    "anonymous",
     "?",
 ];
 
@@ -658,12 +1482,10 @@ pub fn player_key(name: &str) -> Option<String> {
             }
             if *word == "jr" || *word == "sr" {
                 let lower = name.to_ascii_lowercase();
-                let is_suffixed = lower
-                    .match_indices(word.as_str())
-                    .any(|(idx, _)| {
-                        let prefix = name[..idx].trim_end();
-                        prefix.ends_with(',') || prefix.ends_with('.')
-                    });
+                let is_suffixed = lower.match_indices(word.as_str()).any(|(idx, _)| {
+                    let prefix = name[..idx].trim_end();
+                    prefix.ends_with(',') || prefix.ends_with('.')
+                });
                 !is_suffixed
             } else {
                 false
@@ -826,9 +1648,9 @@ fn contains_token_subslice(tokens: &[String], sub: &[&str]) -> bool {
     if sub.is_empty() || tokens.len() < sub.len() {
         return false;
     }
-    tokens.windows(sub.len()).any(|window| {
-        window.iter().zip(sub.iter()).all(|(w, s)| w == *s)
-    })
+    tokens
+        .windows(sub.len())
+        .any(|window| window.iter().zip(sub.iter()).all(|(w, s)| w == *s))
 }
 
 fn is_chesscom_tournament_event_name(event: &str) -> bool {
@@ -853,9 +1675,8 @@ fn has_tournament_keyword(event: &str) -> bool {
     let tokens = ascii_tokens(event);
     for t in &tokens {
         match t.as_str() {
-            "tournament" | "championship" | "league" | "cup" | "arena" | "swiss"
-            | "qualifier" | "playoff" | "final" | "open" | "tuesday" | "kings"
-            | "grandprix" => return true,
+            "tournament" | "championship" | "league" | "cup" | "arena" | "swiss" | "qualifier"
+            | "playoff" | "final" | "open" | "tuesday" | "kings" | "grandprix" => return true,
             _ => {}
         }
     }
@@ -1110,10 +1931,12 @@ pub fn classify_headers_category(
         return GameCategory::Correspondence;
     }
     let tokens = ascii_tokens(&hay);
-    if tokens
-        .iter()
-        .any(|t| matches!(t.as_str(), "corr" | "iccf" | "bdg" | "email" | "post" | "postal"))
-    {
+    if tokens.iter().any(|t| {
+        matches!(
+            t.as_str(),
+            "corr" | "iccf" | "bdg" | "email" | "post" | "postal"
+        )
+    }) {
         return GameCategory::Correspondence;
     }
     if event.is_none() && site.is_none() && time_control.is_none() {
@@ -1167,7 +1990,7 @@ impl Default for TimeControlMask {
             classical: true,
             rapid: true,
             blitz: true,
-            bullet: false,
+            bullet: true,
         }
     }
 }
@@ -1312,6 +2135,27 @@ impl Default for AccountFilter {
     }
 }
 
+/// Per-filter counts showing exactly which filter removed games.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ExclusionBreakdown {
+    pub total: usize,
+    pub kept: usize,
+    /// Number of games classified as bullet among `total`.
+    pub bullet: usize,
+    pub classical: usize,
+    pub rapid: usize,
+    pub blitz: usize,
+    /// Games excluded by each individual reason (a game may count in
+    /// several buckets).
+    pub excluded_rated: usize,
+    pub excluded_casual: usize,
+    pub excluded_time_control: usize,
+    pub excluded_date: usize,
+    pub excluded_elo: usize,
+    /// Games excluded by bullet specifically.
+    pub excluded_bullet: usize,
+}
+
 impl AccountFilter {
     /// Reason this filter cannot match any game, if any. Used for the
     /// zero-overlap warning badge on the account row.
@@ -1374,6 +2218,63 @@ impl AccountFilter {
         }
         true
     }
+
+    /// Per-filter counts for `games` under this filter.
+    pub fn exclusion_breakdown(&self, games: &[Game], as_of: u32) -> ExclusionBreakdown {
+        let mut breakdown = ExclusionBreakdown {
+            total: games.len(),
+            ..Default::default()
+        };
+        for game in games {
+            let (tc, _is_online, is_rated) = classify_game_metadata(game);
+            match tc {
+                TimeControlClass::Classical => breakdown.classical += 1,
+                TimeControlClass::Rapid => breakdown.rapid += 1,
+                TimeControlClass::Blitz => breakdown.blitz += 1,
+                TimeControlClass::Bullet => breakdown.bullet += 1,
+            }
+            if self.matches_game(game, as_of) {
+                breakdown.kept += 1;
+                continue;
+            }
+            if is_rated && !self.include_rated {
+                breakdown.excluded_rated += 1;
+            }
+            if !is_rated && !self.include_casual {
+                breakdown.excluded_casual += 1;
+            }
+            if !self.time_controls.matches(tc) {
+                breakdown.excluded_time_control += 1;
+                if tc == TimeControlClass::Bullet {
+                    breakdown.excluded_bullet += 1;
+                }
+            }
+            if !self
+                .date_cutoff
+                .matches(parse_date(game.date()).unwrap_or(0), as_of)
+            {
+                breakdown.excluded_date += 1;
+            }
+            if self.min_elo.is_some() || self.max_elo.is_some() {
+                let min = self.min_elo.unwrap_or(0);
+                let max = self.max_elo.unwrap_or(u16::MAX);
+                let mut found = false;
+                let mut in_range = false;
+                for tag in [game.header("WhiteElo"), game.header("BlackElo")] {
+                    if let Some(elo) = tag.and_then(|text| text.trim().parse::<u16>().ok()) {
+                        found = true;
+                        if elo >= min && elo <= max {
+                            in_range = true;
+                        }
+                    }
+                }
+                if found && !in_range {
+                    breakdown.excluded_elo += 1;
+                }
+            }
+        }
+        breakdown
+    }
 }
 
 /// One linked online account used for preparation imports.
@@ -1383,6 +2284,21 @@ pub struct PrepOnlineAccount {
     pub username: String,
     pub enabled: bool,
     pub filter: AccountFilter,
+    /// Filter schema version. Old JSON without this key defaults to 1;
+    /// loading version < 2 enables bullet once and writes 2.
+    pub filter_version: u32,
+}
+
+impl Default for PrepOnlineAccount {
+    fn default() -> Self {
+        Self {
+            source: OnlineSource::Lichess,
+            username: String::new(),
+            enabled: true,
+            filter: AccountFilter::default(),
+            filter_version: 2,
+        }
+    }
 }
 
 impl PrepOnlineAccount {
@@ -1408,6 +2324,7 @@ impl PrepOnlineAccount {
             "service": Self::service_slug(self.source),
             "username": self.username,
             "enabled": self.enabled,
+            "filter_version": self.filter_version,
             "filter": {
                 "include_rated": self.filter.include_rated,
                 "include_casual": self.filter.include_casual,
@@ -1488,6 +2405,22 @@ impl PrepOnlineAccount {
             .and_then(serde_json::Value::as_str)
             .and_then(Self::service_from_slug)
             .unwrap_or(OnlineSource::Lichess);
+        // Old JSON (pre-bullet default) has no `filter_version`; serde
+        // default would be 1. Anything < 2 migrates bullet on once.
+        let raw_version = value
+            .get("filter_version")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(1) as u32;
+        let mut filter = value
+            .get("filter")
+            .map(Self::account_filter_from_value)
+            .unwrap_or_default();
+        let filter_version = if raw_version < 2 {
+            filter.time_controls.bullet = true;
+            2
+        } else {
+            raw_version
+        };
         Some(Self {
             source,
             username,
@@ -1495,10 +2428,8 @@ impl PrepOnlineAccount {
                 .get("enabled")
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(true),
-            filter: value
-                .get("filter")
-                .map(Self::account_filter_from_value)
-                .unwrap_or_default(),
+            filter,
+            filter_version,
         })
     }
 }
@@ -4346,6 +5277,7 @@ mod tests {
                 date_cutoff: DateCutoff::Months(12),
                 ..AccountFilter::default()
             },
+            filter_version: 2,
         };
         let restored = PrepOnlineAccount::from_value(&account.to_value()).expect("round trip");
         assert_eq!(restored, account);
@@ -4899,17 +5831,35 @@ mod tests {
             .filter_map(|m| crate::position::decode_move(&start, m.mv))
             .map(|mv| crate::chess::SanPlus::from_move(start.clone(), mv).to_string())
             .collect();
-        assert!(sans.contains(&"Nf3".to_string()), "expected Nf3 in {sans:?}");
-        assert!(sans.contains(&"e4".to_string()), "expected post-repetition e4 in {sans:?}");
+        assert!(
+            sans.contains(&"Nf3".to_string()),
+            "expected Nf3 in {sans:?}"
+        );
+        assert!(
+            sans.contains(&"e4".to_string()),
+            "expected post-repetition e4 in {sans:?}"
+        );
         let refs = book.recent_games_for_filtered(key, Color::White, &filter, 10);
-        assert!(refs.len() <= 1, "same game must not be duplicated in game_refs");
+        assert!(
+            refs.len() <= 1,
+            "same game must not be duplicated in game_refs"
+        );
     }
 
     #[test]
     fn truncated_name_matches_attached_enumeration_digits_and_schnellschach_is_otb_rapid() {
-        assert!(matches_truncated_or_enumerated_name("Kern, Johannes", "Kern, J1"));
-        assert!(matches_truncated_or_enumerated_name("Kern, Johannes", "Kern, J2"));
-        assert!(matches_truncated_or_enumerated_name("Hinterreiter, Martin", "Hinterreiter,M1"));
+        assert!(matches_truncated_or_enumerated_name(
+            "Kern, Johannes",
+            "Kern, J1"
+        ));
+        assert!(matches_truncated_or_enumerated_name(
+            "Kern, Johannes",
+            "Kern, J2"
+        ));
+        assert!(matches_truncated_or_enumerated_name(
+            "Hinterreiter, Martin",
+            "Hinterreiter,M1"
+        ));
 
         let mut g = Game::default();
         g.set_header("Event", "Bezirks-Schnellschachmeisterschaft".to_string());
@@ -5037,7 +5987,9 @@ mod tests {
         std::fs::write(&path, pgn).unwrap();
         let library = PgnLibrary::build(&path).unwrap();
         let directory = PlayerIndex::build(&library);
-        let player = directory.find_player("Kern, Johannes").expect("player exists");
+        let player = directory
+            .find_player("Kern, Johannes")
+            .expect("player exists");
         assert_eq!(player.latest_otb_elo, Some(2185));
         assert_eq!(player.display_elo(), Some(2185));
         std::fs::remove_file(path).unwrap();
@@ -5064,6 +6016,394 @@ mod tests {
         assert_eq!(
             classify_headers_category(Some("World Correspondence Championship"), None, None),
             GameCategory::Correspondence
+        );
+    }
+
+    #[test]
+    fn bullet_defaults_true_and_migration() {
+        assert!(TimeControlMask::default().bullet);
+        assert!(AccountFilter::default().time_controls.bullet);
+        // Old JSON (no filter_version, bullet:false) migrates to bullet:true v2.
+        let old = serde_json::json!({
+            "service": "lichess",
+            "username": "olduser",
+            "enabled": true,
+            "filter": {
+                "include_rated": true,
+                "include_casual": true,
+                "min_elo": null,
+                "max_elo": null,
+                "date_cutoff": "all",
+                "time_controls": {"classical": true, "rapid": true, "blitz": true, "bullet": false}
+            }
+        });
+        let restored = PrepOnlineAccount::from_value(&old).unwrap();
+        assert!(
+            restored.filter.time_controls.bullet,
+            "migration enables bullet"
+        );
+        assert_eq!(restored.filter_version, 2);
+        // Round-trip writes filter_version 2.
+        let value = restored.to_value();
+        assert_eq!(
+            value.get("filter_version").and_then(|v| v.as_u64()),
+            Some(2)
+        );
+        // New entries default to version 2.
+        assert_eq!(PrepOnlineAccount::default().filter_version, 2);
+    }
+
+    #[test]
+    fn exclusion_breakdown_counts_bullet_and_kept() {
+        let as_of = 2026_1108;
+        // Bullet online game: TimeControl 60+0 (<180s => bullet)
+        let bullet = online_game("Opponent", "Trendy", "2026.01.01", "1. e4 e5 1-0");
+        // online_game helper uses default TC? Ensure bullet via header override below.
+        let mut bullet = bullet;
+        bullet.set_header("TimeControl", "60+0".to_string());
+        bullet.set_header("Site", "lichess.org".to_string());
+        let rapid = online_game("Opponent", "Trendy", "2026.02.01", "1. e4 e5 1-0");
+        let filter = AccountFilter::default();
+        let breakdown = filter.exclusion_breakdown(&[bullet, rapid.clone()], as_of);
+        assert_eq!(breakdown.total, 2);
+        assert_eq!(breakdown.kept, 2);
+        assert_eq!(breakdown.bullet, 1);
+        // With bullet off, bullet game is excluded.
+        let mut no_bullet = filter;
+        no_bullet.time_controls.bullet = false;
+        let breakdown = no_bullet.exclusion_breakdown(
+            &[
+                {
+                    let mut b = online_game("Opponent", "Trendy", "2026.01.01", "1. e4 e5 1-0");
+                    b.set_header("TimeControl", "60+0".to_string());
+                    b.set_header("Site", "lichess.org".to_string());
+                    b
+                },
+                rapid,
+            ],
+            as_of,
+        );
+        assert_eq!(breakdown.kept, 1);
+        assert_eq!(breakdown.excluded_bullet, 1);
+        assert_eq!(breakdown.excluded_time_control, 1);
+    }
+
+    fn directory_with_names(names: &[&str]) -> PlayerDirectory {
+        // Build via ensure_player on a default directory.
+        let mut dir = PlayerDirectory::default();
+        for name in names {
+            dir.ensure_player(name);
+        }
+        dir
+    }
+
+    #[test]
+    fn fuzzy_search_normalizes_punctuation_and_diacritics() {
+        let dir = directory_with_names(&[
+            "Make_french",
+            "Carlsen, Magnus",
+            "José Müller",
+            "Other Player",
+        ]);
+        // Underscore/hyphen equivalence.
+        let hits = dir.filter("Makefrench");
+        assert!(
+            hits.iter()
+                .any(|&i| dir.get(i).unwrap().name == "Make_french")
+        );
+        let hits = dir.filter("make-french");
+        assert!(
+            hits.iter()
+                .any(|&i| dir.get(i).unwrap().name == "Make_french")
+        );
+        // Diacritics via deunicode.
+        let hits = dir.filter("jose");
+        assert!(
+            hits.iter()
+                .any(|&i| dir.get(i).unwrap().name == "José Müller")
+        );
+        let hits = dir.filter("muller");
+        assert!(
+            hits.iter()
+                .any(|&i| dir.get(i).unwrap().name == "José Müller")
+        );
+    }
+
+    #[test]
+    fn fuzzy_search_edit_distance_bounds() {
+        let dir = directory_with_names(&["Magnus Carlsen", "Hikaru Nakamura"]);
+        // len 6 token, distance 1 => match
+        let hits = dir.filter("Magnux");
+        assert!(
+            hits.iter()
+                .any(|&i| dir.get(i).unwrap().name.contains("Carlsen")),
+            "distance-1 len-6 should fuzzy match: {hits:?}"
+        );
+        // len >=7, distance 2 => match (carlsen -> carlsne transposition-ish distance 2? use carlson)
+        let hits = dir.filter("Carlson");
+        assert!(
+            hits.iter()
+                .any(|&i| dir.get(i).unwrap().name.contains("Carlsen")),
+            "distance-1 len-7 should fuzzy match"
+        );
+        // Short query <4 chars: no fuzzy (exact/substring only) – "mag" substring matches anyway.
+        // Memo: same query twice returns same.
+        let a = dir.filter("Magnux");
+        let b = dir.filter("Magnux");
+        assert_eq!(a, b);
+        // Exact/substring ranks before fuzzy: exact player first.
+        let hits = dir.filter("Carlsen");
+        assert_eq!(dir.get(hits[0]).unwrap().name, "Magnus Carlsen");
+    }
+
+    fn sidecar_temp_path(tag: &str) -> std::path::PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "brett-players-test-{tag}-{}-{}.brettplayers",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        path
+    }
+
+    fn synthetic_sidecar_directory() -> PlayerDirectory {
+        let mut dir = PlayerDirectory::default();
+        let carlsen = dir.ensure_player("Carlsen, Magnus");
+        {
+            let player = dir.get_mut(carlsen).unwrap();
+            player.title = Some(crate::titles::PlayerTitle::Gm);
+            player.fide_id = Some("1503014".to_string());
+            player.country = crate::country::normalize("NOR");
+            player.wiki_countries = vec![
+                crate::country::normalize("NOR").unwrap(),
+                crate::country::normalize("USA").unwrap(),
+            ];
+            player.birth_year = Some(1990);
+            player.peak_elo = Some(2882);
+            player.white = PlayerRecord {
+                games: 10,
+                wins: 6,
+                draws: 2,
+                losses: 2,
+            };
+            player.black = PlayerRecord {
+                games: 8,
+                wins: 3,
+                draws: 4,
+                losses: 1,
+            };
+            player.elo_sum = 50_000;
+            player.elo_count = 18;
+            player.elo_max = 2830;
+            player.latest_otb_elo = Some(2830);
+            player.latest_otb_date = 20240101;
+            player.opponent_elo_sum = 46_000;
+            player.opponent_elo_count = 17;
+            player.first_year = 2009;
+            player.last_year = 2024;
+            player.game_indices = vec![0, 5, 10, 10_000, 200_000];
+        }
+        let jose = dir.ensure_player("José Müller");
+        {
+            let player = dir.get_mut(jose).unwrap();
+            player.title = Some(crate::titles::PlayerTitle::Im);
+            player.fide_id = None;
+            player.country = crate::country::normalize("GER");
+            player.wiki_countries = Vec::new();
+            player.birth_year = None;
+            player.peak_elo = None;
+            player.white = PlayerRecord {
+                games: 1,
+                wins: 0,
+                draws: 1,
+                losses: 0,
+            };
+            player.black = PlayerRecord::default();
+            player.elo_sum = 2100;
+            player.elo_count = 1;
+            player.elo_max = 2100;
+            player.latest_otb_elo = None;
+            player.latest_otb_date = 0;
+            player.opponent_elo_sum = 0;
+            player.opponent_elo_count = 0;
+            player.first_year = 2020;
+            player.last_year = 2020;
+            player.game_indices = Vec::new();
+        }
+        let odd = dir.ensure_player("Odd Order");
+        {
+            let player = dir.get_mut(odd).unwrap();
+            player.title = None;
+            player.game_indices = vec![10, 2, 7, 3_500_000_000];
+        }
+        dir
+    }
+
+    fn assert_player_matches(expected: &PlayerSummary, actual: &PlayerSummary) {
+        assert_eq!(expected.name, actual.name);
+        assert_eq!(expected.key, actual.key);
+        assert_eq!(expected.title, actual.title);
+        assert_eq!(expected.fide_id, actual.fide_id);
+        assert_eq!(
+            expected.country.map(|country| country.code),
+            actual.country.map(|country| country.code)
+        );
+        assert_eq!(
+            expected
+                .wiki_countries
+                .iter()
+                .map(|country| country.code)
+                .collect::<Vec<_>>(),
+            actual
+                .wiki_countries
+                .iter()
+                .map(|country| country.code)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(expected.birth_year, actual.birth_year);
+        assert_eq!(expected.peak_elo, actual.peak_elo);
+        assert_eq!(expected.white, actual.white);
+        assert_eq!(expected.black, actual.black);
+        assert_eq!(expected.elo_sum, actual.elo_sum);
+        assert_eq!(expected.elo_count, actual.elo_count);
+        assert_eq!(expected.elo_max, actual.elo_max);
+        assert_eq!(expected.latest_otb_elo, actual.latest_otb_elo);
+        assert_eq!(expected.latest_otb_date, actual.latest_otb_date);
+        assert_eq!(expected.opponent_elo_sum, actual.opponent_elo_sum);
+        assert_eq!(expected.opponent_elo_count, actual.opponent_elo_count);
+        assert_eq!(expected.first_year, actual.first_year);
+        assert_eq!(expected.last_year, actual.last_year);
+        assert_eq!(expected.game_indices, actual.game_indices);
+    }
+
+    #[test]
+    fn sidecar_round_trip_preserves_all_player_fields() {
+        let dir = synthetic_sidecar_directory();
+        let meta = SourceMeta {
+            len: 123_456_789,
+            mtime_secs: 1_700_000_000,
+            mtime_nanos: 42,
+        };
+        let path = sidecar_temp_path("roundtrip");
+        dir.save_to(&path, &meta).unwrap();
+        let loaded = PlayerDirectory::load_from(&path, &meta)
+            .unwrap()
+            .expect("sidecar with matching fingerprint must load");
+        assert_eq!(dir.len(), loaded.len());
+        for (expected, actual) in dir.players().iter().zip(loaded.players().iter()) {
+            assert_player_matches(expected, actual);
+        }
+        // The loaded directory stays searchable (memo reset, lookup works).
+        assert!(
+            loaded
+                .find_player("Carlsen, Magnus")
+                .is_some_and(|player| player.name == "Carlsen, Magnus")
+        );
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn sidecar_fingerprint_invalidation_on_mtime_or_len_change() {
+        let dir = synthetic_sidecar_directory();
+        let meta = SourceMeta {
+            len: 987_654_321,
+            mtime_secs: 1_800_000_000,
+            mtime_nanos: 123_456_789,
+        };
+        let path = sidecar_temp_path("fingerprint");
+        dir.save_to(&path, &meta).unwrap();
+        // Exact fingerprint loads.
+        assert!(
+            PlayerDirectory::load_from(&path, &meta).unwrap().is_some(),
+            "matching fingerprint must load"
+        );
+        // Any change in len, mtime_secs or mtime_nanos invalidates.
+        let stale_len = SourceMeta {
+            len: meta.len + 1,
+            ..meta
+        };
+        assert!(
+            PlayerDirectory::load_from(&path, &stale_len)
+                .unwrap()
+                .is_none(),
+            "len change must invalidate the sidecar"
+        );
+        let stale_mtime = SourceMeta {
+            mtime_secs: meta.mtime_secs + 1,
+            ..meta
+        };
+        assert!(
+            PlayerDirectory::load_from(&path, &stale_mtime)
+                .unwrap()
+                .is_none(),
+            "mtime_secs change must invalidate the sidecar"
+        );
+        let stale_nanos = SourceMeta {
+            mtime_nanos: meta.mtime_nanos + 1,
+            ..meta
+        };
+        assert!(
+            PlayerDirectory::load_from(&path, &stale_nanos)
+                .unwrap()
+                .is_none(),
+            "mtime_nanos change must invalidate the sidecar"
+        );
+        // Missing file is a miss, not an error.
+        let missing = sidecar_temp_path("missing");
+        assert!(
+            PlayerDirectory::load_from(&missing, &meta)
+                .unwrap()
+                .is_none()
+        );
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn sidecar_paths_are_hashed_and_stable() {
+        let source = std::path::Path::new("/tmp/brett-synthetic-mega.cbh");
+        let cache = players_cache_path(source);
+        assert_eq!(
+            cache.extension().and_then(|ext| ext.to_str()),
+            Some("brettplayers")
+        );
+        assert!(
+            cache
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name.ends_with(".brettplayers"))
+                .unwrap_or(false)
+        );
+        // Same source maps to the same cache file; a different source does not.
+        assert_eq!(players_cache_path(source), cache);
+        assert_ne!(
+            players_cache_path(std::path::Path::new("/tmp/brett-other.pgn")),
+            cache
+        );
+        // Sidecar next to the database replaces the extension.
+        assert_eq!(
+            players_sidecar_path(std::path::Path::new("/tmp/mega.cbh")),
+            std::path::Path::new("/tmp/mega.brettplayers")
+        );
+        // Fingerprint distinguishes databases and fingerprints.
+        let meta = SourceMeta {
+            len: 100,
+            mtime_secs: 200,
+            mtime_nanos: 300,
+        };
+        let other_meta = SourceMeta {
+            mtime_secs: 201,
+            ..meta
+        };
+        assert_ne!(
+            players_fingerprint(source, &meta),
+            players_fingerprint(source, &other_meta)
+        );
+        assert_eq!(
+            players_fingerprint(source, &meta),
+            players_fingerprint(source, &meta)
         );
     }
 }
