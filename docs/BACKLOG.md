@@ -8,8 +8,8 @@ in `README.md`; this file tracks what is next.
 community-maintained project. Functional correctness, data safety, and clear
 documentation come first; visual polish is queued and may land incrementally.
 
-**Status (2026-11-08 Cycle 3 backlog sync):** items 1–7, 11–14, 17, 39 (largely), 40, and 41 are implemented,
-and the modern minimalist UI overhaul (`DESIGN.md`), resilient Lichess streaming, and preparation tables polish are complete.
+**Status (2026-11-09 Cycle 4 backlog sync):** items 1–7, 11–17, 20–21, 25–29, 31, 34–35, 37, 39 (largely), 40, and 41 are implemented.
+Cycle 4 landed 2026-11-09 (commit 9c540f0, v0.1.7+): flag atlas rendering (`src/flags.rs`, `assets/flags_4x3.webp`); Wikidata enrichment for countries/FIDE ID/birth/peak (`src/wiki.rs`, `src/country.rs`, `src/players.rs`, `src/app.rs`); online incremental cache at `~/.cache/brett/online` (Lichess delta via `since`, Chess.com monthly cache, clear-cache button); prep/account UX polish (200+ probe wording, Bullet default, `filter_version` migration, URL paste via `parse_account_or_profile_input`, as-White-against rows); search/UI polish (fuzzy search memo, no-DB ChessABC Search, welcome labels `Set` / `Not right now` / `Never`, preview notation removal, FIDE pill moved to profile-only, bare Elo, Site venue flags, `Prepare` pill); sample database button + `databases/samples/grandmaster_showcase.pgn`; app icon `assets/brett.webp` with `with_app_id`; `PlayerDirectory` `.brettplayers` sidecar; and disk cleanup (obsolete 69 GB rating-band indexes deleted, `~/.cache/brett/index` reduced 71 G → 1.3 G).
 Cycle 3 landed 2026-11-08 (resilient incremental PGN streaming with server-side filters for Lichess,
 AllTime date cutoff defaults for prep and accounts, removal of the unused Database Views subsystem and
 trim of bloated dependencies `regex`, `arboard`, and `webbrowser`, 9-category customizable GameCategoryColors
@@ -30,19 +30,19 @@ bases older than 180 days). Item 39's preparation/predictor round-2 batch largel
 `predict_v2` calibration (adaptive `alpha0` + unseen alpha) remains queued.
 Item 8's cloud, opening-tree, reference-source, and native-book parts are done; M2b mega-scale ingest
 remains, with the first safety pass now keeping huge archives responsive and avoiding automatic full
-indexing (Mega open freeze fixes queued). Item 9's editable session, database views,
+indexing (Mega open freeze fixes queued). **Cycle 4 delta:** `PlayerDirectory` `.brettplayers` sidecar added and local index cache cleaned (obsolete 69 GB rating-band indexes deleted, `~/.cache/brett/index` 71 G → 1.3 G). Item 9's editable session,
 reorder/merge, PGN export, native SCID writer, classic CBH writer, 2CBH writer,
-and unified **Save database** / **Save database as…** flow are done. Item 10 is
+and unified **Save database** / **Save database as…** flow are done; the earlier floating Database Views window was removed in Cycle 3. Item 10 is
 no longer blocked: the current ICCF SCID source is available and the automatic
 correspondence reference is integrated; only an optional
-refresh remains. Deferred predictor refinements are recorded under item 6, and
-native player-title display is queued as item 15. Item 18's trend backend,
-Tree badge column, and Settings controls are implemented; the sparkline and
-moves-panel display remain. Items
-20 and 21 add native ECO classification and Wikipedia player summaries; item 16
-now includes the FIDE-profile link. Item 22 records the player clock-usage
+refresh remains. Deferred predictor refinements are recorded under item 6. Item 15
+(native player titles) is implemented. Item 18's trend backend,
+Tree badge column, Settings controls, badge, and sparkline are implemented; moves-panel
+trend rendering remains planned. Items
+20 and 21 add native ECO classification, Wikipedia summaries, and **Cycle 4 Wikidata enrichment** (countries/FIDE ID/birth/peak). Item 16
+now includes the FIDE-profile link, and Cycle 4 moved the FIDE pill to profile-only display. Item 22 records the player clock-usage
 analysis idea for the player profile/preparation view. Item 23 adds the
-clickable Site → OpenStreetMap search (settled provider); item 24
+clickable Site → OpenStreetMap search (settled provider); Cycle 4 adds Site venue flags. Item 24
 records the Open-vs-Load audit: the bottom-bar database picker was removed, so
 **File → Open database…** and drag-and-drop are the only ways to open a
 database, and the Tree-tab path rows are read-only labels with **Choose…**,
@@ -53,7 +53,7 @@ replaced the separate PGN/SCID/CBH save entries with **Save database** and
 closing a modified database. Item 25's Typst target is implemented, including
 the `White - Black` default filename and remembered export folder. Item 26
 (Set up position) is implemented with board setup, real-time FEN editing, and
-legality validation. Item 27 adds country-flag display to the backlog.
+legality validation. Item 27 adds country-flag display and **Cycle 4 flag atlas rendering**. Item 37 adds Chess.com/Lichess import and **Cycle 4 online incremental cache** (`~/.cache/brett/online`, Lichess delta `since`, Chess.com monthly cache, clear button). Cycle 4 also adds no-DB ChessABC Search, fuzzy search memo, sample DB button (`databases/samples/grandmaster_showcase.pgn`), welcome/setup labels, and app icon (`assets/brett.webp`, `with_app_id`).
 
 **Decision log (2026-10-28):**
 
@@ -386,7 +386,7 @@ part of the roadmap.
   strings, keeps primary/external session slots lazy, moves the player
   directory off the UI thread above 500,000 games, and refuses automatic full
   indexing above 250,000 games (manual full indexing is disabled above
-  1,000,000). **Queued (design done, scheduled):** Mega open freeze fixes — mmap `.2lgd`; entity-bounded accelerator loops; `OnceLock` tournament cache; background `open_library`; custom-start stream skip for game `503255`; terminal tracing diagnostics (`RUST_LOG` phase timings, `>100ms` slow-op warns). The remaining work is a true on-disk header table, external-sort
+  1,000,000). **Cycle 4 (2026-11-09, 9c540f0):** added `PlayerDirectory` `.brettplayers` sidecar persistence and cleaned local index cache (obsolete 69 GB rating-band indexes deleted, `~/.cache/brett/index` 71 G → 1.3 G). **Queued (design done, scheduled):** Mega open freeze fixes — mmap `.2lgd`; entity-bounded accelerator loops; `OnceLock` tournament cache; background `open_library`; custom-start stream skip for game `503255`; terminal tracing diagnostics (`RUST_LOG` phase timings, `>100ms` slow-op warns). The remaining work is a true on-disk header table, external-sort
   position index, and incremental updates so a multi-million-game archive can
   be indexed without a multi-gigabyte RAM spike.
 - **Cloud references (done):** chessdb.cn `queryall`, the Lichess opening
@@ -416,14 +416,11 @@ part of the roadmap.
 
 **Status:** the editable ordered session (`src/session.rs`) provides stable row
 IDs, lazy primary/external/local slots, reordering, duplicate matching, and
-merging. Games can be reordered by dragging rows in the **Games** list;
-dropping on the upper or lower half of a row inserts before or after it. Extra
-databases open in the floating **Database views** window. Games can be dragged
-between the main list and a view, with an **Insert here** / **Append** prompt;
-dragging a database handle onto another database merges it. Merge rejects
-duplicates with order-insensitive, transliterated player-name matching plus
-first-move verification. External file drops ask whether to open, merge into
-the current database, or open in a view.
+merging. Games can be reordered by dragging rows in the **Games** list.
+Merge rejects duplicates with order-insensitive, transliterated player-name
+matching plus first-move verification. The earlier floating **Database views**
+window (multi-view drag/drop/merge UI) was removed in Cycle 3 (2026-11-08); the
+editable session, reordering, and merge/export foundations remain.
 
 **File → Save database** writes the session in its current format and reuses
 the current writable target; a new database asks for PGN, SCID4, classic CBH,
@@ -541,6 +538,7 @@ and honorifics stripped. Live reference tree/book sources (`live:lichess-masters
 `live:chessabc`) and live trend sources are supported. Recent-game
 rows remain read-only previews and preserve the preparation node, tab, and
 orientation.
+**Cycle 4 (2026-11-09, 9c540f0) prep UX deltas:** 200+ probe wording, Bullet default, `filter_version` migration, URL paste/account/profile parsing via `parse_account_or_profile_input`, and as-White-against rows.
 
 **Queued evolution:** Smart Preparation v2 extends this with multi-source merge/dedup, dual Classic Stats vs Smart Predictor modes, OTB vs Online pre-filters (instant `<1ms` refilter), facing-color/Last X filters, swapped-color smart threshold + Show N games view, and profile badges. **Preparation UX (queued — design done, scheduled):** File->Prepare menu with opponent picker; board orientation pinned to user side; online accounts exclude ChessABC service; per-account expandable filters with separate Rated+Casual ticks (both default ON) and zero-overlap ⚠️ badge; Chess.com tournament-games-only exclusion; clear prep panel (Predicted-first color-coded sorted Smart table, Played vs Inferred sections, Your-move Times-Faced view, 📖 In PlayerBook badges, ply>=4 swapped gate); game-type color coding (Classical emerald / Rapid-Blitz sky / Online violet) in left + recent lists; hover game move overlay in moves section. See item 6 (next-gen evolution) for the full spec. Design pass done; scheduled for implementation — do not mark done.
   - **Round-2 UX/fixes (largely landed 2026-11-07):** opponent banner top; search hidden when selected; ChessABC all-games label; live account `✓`/`✗` confirmations; fresh-start File → Prepare without open DB (`open_library` for reference + extra incl `2cbh`/`cbh`/`si4`, accelerated extraction); merged left + recent lists; Site/TimeControl color fix; `🟢` glyph fix; Your-Move line-grid removal. See items 39 and 40.
@@ -573,7 +571,7 @@ orientation.
 **Status:** Lichess depth/full-line display, ChessABC import/reference search,
 the ChessABC preparation list (with `>=1`-game filtering, candidate relevance pruning, and collapsed
 most-probable selection), and compact folded chessdb-only candidate moves in the Cloud
-Engine table are implemented.
+Engine table are implemented. **Cycle 4 (2026-11-09, 9c540f0):** no-DB ChessABC Search path added.
 
 - **Lichess depth:** show the Lichess cloud-evaluation depth as part of the
   analysis itself, not only as a separate caption. Include it in the Cloud
@@ -874,6 +872,7 @@ filtering, preparation, and opening reports.
 **Status:** implemented in `src/wiki.rs` and the player profile. Summaries load
 automatically when a profile opens; opening a database or building the player
 directory never contacts Wikipedia. The Settings toggle defaults to on.
+**Cycle 4 (2026-11-09, 9c540f0):** Wikidata enrichment added for countries/FIDE ID/birth/peak (`src/wiki.rs`, `src/country.rs`, `src/players.rs`, `src/app.rs`).
 
 **Goal:** show a short introductory Wikipedia summary in the player profile
 beside the photo, similar to Navidrome's MusicBrainz artist biography, without
@@ -1083,7 +1082,7 @@ hand-editing a PGN `FEN` tag, the way a board-setup dialog works in ChessBase.
 
 ## 27. Country flags in player views
 
-**Status:** implemented 2026-11-02 in `src/country.rs`, `src/players.rs`, and `src/app.rs`.
+**Status:** implemented 2026-11-02 in `src/country.rs`, `src/players.rs`, and `src/app.rs`; **Cycle 4 (2026-11-09, 9c540f0)** added flag atlas rendering via `src/flags.rs` and `assets/flags_4x3.webp`, with Wikidata-assisted country enrichment and Site venue flags.
 
 **Goal:** show a small country flag beside player names in the player profile
 and database views when a real country or federation is known, without
@@ -1280,12 +1279,14 @@ releases.
 
 **Goal:** Allow users to directly import game archives from Chess.com and Lichess into their active database or player preparation dossier.
 
-- **Chess.com Public API:** Fully implemented in `src/online.rs:252-289` and `src/app.rs:7388, 12500-12580`.
+- **Chess.com Public API:** Fully implemented in `src/online.rs` and `src/app.rs`.
   - Queries player archives via `https://api.chess.com/pub/player/{username}/games/archives`.
   - Downloads monthly archives with polite 120ms delays between months.
   - Automatically filters rules for standard chess and extracts PGNs.
   - Custom User-Agent header `Brett/0.1 (native Linux chess preparation app)`.
-- **Lichess API:** Implemented in `src/online.rs:241-251` with direct PGN streaming.
+  - **Cycle 4 (2026-11-09, 9c540f0):** monthly incremental cache under `~/.cache/brett/online` with clear-cache button.
+- **Lichess API:** Implemented in `src/online.rs` with direct PGN streaming.
+  - **Cycle 4 (2026-11-09, 9c540f0):** incremental cache/delta fetch via `since` under `~/.cache/brett/online` with clear-cache button.
 
 
 **Depends on:** `src/cloud.rs` and `src/app.rs`.
