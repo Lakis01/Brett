@@ -4134,7 +4134,10 @@ impl App {
             let progress_ctx = ctx.clone();
             let result = PositionIndex::build_cached_for(
                 library,
-                BuildOptions::default(),
+                BuildOptions {
+                    max_plies: 40,
+                    ..BuildOptions::default()
+                },
                 move |progress| {
                     let _ = progress_tx.send(IndexMessage::Progress(progress));
                     progress_ctx.request_repaint();
@@ -8688,7 +8691,8 @@ impl App {
                         ui.label(account_check_text(check).small());
                     }
                     let before = account.filter;
-                    egui::CollapsingHeader::new(format!("Filters##prep-account-{position}"))
+                    egui::CollapsingHeader::new("Filters")
+                        .id_salt(format!("prep-account-{position}"))
                         .default_open(false)
                         .show(ui, |ui| {
                             let filter = &mut account.filter;
@@ -12290,10 +12294,10 @@ impl App {
                     };
                     let white_title = title_from_tag(header("WhiteTitle"));
                     let black_title = title_from_tag(header("BlackTitle"));
-                    let white_country = player_country_from_header(
+                    let _white_country = player_country_from_header(
                         header("WhiteCountry").or_else(|| header("WhiteFed")),
                     );
-                    let black_country = player_country_from_header(
+                    let _black_country = player_country_from_header(
                         header("BlackCountry").or_else(|| header("BlackFed")),
                     );
                     let cat = players::classify_headers_category(
@@ -12317,8 +12321,8 @@ impl App {
                         ui,
                         selected,
                         "",
-                        RowName::new(&white_name, white_title).with_country(white_country),
-                        Some(RowName::new(&black_name, black_title).with_country(black_country)),
+                        RowName::new(&white_name, white_title),
+                        Some(RowName::new(&black_name, black_title)),
                         "",
                         &subtitle,
                         site_owned.as_deref(),
@@ -13209,7 +13213,7 @@ impl App {
                     .is_some_and(|b| !b.id.starts_with("recent"))
                     && !self.right_tab_visible(RightTab::Moves);
                 if show_hover_overlay {
-                    egui::ScrollArea::both()
+                    egui::ScrollArea::vertical()
                         .id_salt("hover-overlay-scroll")
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
@@ -15971,8 +15975,8 @@ impl App {
         ui.horizontal(|ui| {
             let mut exclude = self.prep_exclude_chesscom;
             if ui
-                .checkbox(&mut exclude, "Exclude Chess.com tournament games")
-                .on_hover_text("Filter out Chess.com tournament games (Titled Tuesday, Arena Kings, Speed Chess, Pro Chess League) from this preparation")
+                .checkbox(&mut exclude, "Exclude online games")
+                .on_hover_text("Filter out all online games (Lichess, Chess.com, Lichess/ Chess.com tournaments, Tornelo) from this preparation")
                 .changed()
             {
                 self.prep_exclude_chesscom = exclude;
@@ -17738,6 +17742,14 @@ impl App {
             .resizable(false)
             .show(ctx, |ui| {
                 ui.label(format!("This database contains {}.", games_label(count)));
+                let est_gb = (count as f64 * 120.0 * 40.0 / 1_000_000_000.0).max(0.5);
+                let est_min = (count as f64 / 3_500.0 / 60.0).max(1.0);
+                ui.label(
+                    RichText::new(format!(
+                        "Estimated storage: ~{est_gb:.1}–{:.1} GB · build time: ~{est_min:.0} min (parallel streaming, capped at 40 plies per game)."
+                    , est_gb * 1.5))
+                    .small(),
+                );
                 ui.add_space(4.0);
                 ui.label(
                     RichText::new(

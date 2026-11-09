@@ -184,7 +184,8 @@ impl Summary {
                     .and_then(Value::as_i64)
                     .filter(|elo| *elo > 0 && *elo <= 4000)
                     .map(|elo| elo as u16)
-            });
+            })
+            .or_else(|| peak_elo_from_text(value.get("extract").and_then(Value::as_str).unwrap_or("")));
         Some(Self {
             title: title.to_string(),
             description,
@@ -696,7 +697,23 @@ pub(crate) fn parse_wikidata_value(value: &Value) -> WikidataFields {
 pub(crate) fn apply_wikidata_value(summary: &mut Summary, value: &Value) {
     let fields = parse_wikidata_value(value);
     if !fields.countries.is_empty() {
-        summary.countries = fields.countries;
+        // Lead-sentence / description demonyms are the most representative
+        // nationality (Armenian-American, Estonian). Wikidata residency
+        // claims (P27) list current home countries (GER for Aronian) which
+        // mislead as a latest federation, so text codes win for first/last
+        // when present; Wikidata data is appended only for unseen codes.
+        let text_codes = summary.countries.clone();
+        if text_codes.is_empty() {
+            summary.countries = fields.countries;
+        } else {
+            let mut merged = text_codes.clone();
+            for code in fields.countries {
+                if !merged.iter().any(|existing| existing == &code) {
+                    merged.push(code);
+                }
+            }
+            summary.countries = merged;
+        }
     }
     if let Some(fide_id) = fields.fide_id {
         summary.fide_id = Some(fide_id);
@@ -706,7 +723,39 @@ pub(crate) fn apply_wikidata_value(summary: &mut Summary, value: &Value) {
     }
     if let Some(peak_elo) = fields.peak_elo {
         summary.peak_elo = Some(peak_elo);
+    } else if summary.peak_elo.is_none() {
+        // Fallback: "with a rating of 2830" / "No. 2 ... March 2014 ...
+        // rating of 2830" style claims in the lead extract.
+        if let Some(elo) = peak_elo_from_text(&summary.extract) {
+            summary.peak_elo = Some(elo);
+        }
     }
+}
+
+/// Extract a peak/highest rating claim from lead text
+/// (e.g. "with a rating of 2830").
+pub(crate) fn peak_elo_from_text(text: &str) -> Option<u16> {
+    let lower = text.to_lowercase();
+    let mut best: Option<u16> = None;
+    for marker in ["with a rating of ", "rating of ", "peak rating "] {
+        let mut search_from = 0usize;
+        while let Some(pos) = lower[search_from..].find(marker) {
+            let start = search_from + pos + marker.len();
+            let rest = &lower[start..];
+            let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if digits.len() == 4
+                && let Ok(elo) = digits.parse::<u16>()
+                && (2000..=4000).contains(&elo)
+            {
+                    best = Some(match best {
+                        Some(current) => current.max(elo),
+                        None => elo,
+                    });
+                }
+            search_from = start;
+        }
+    }
+    best
 }
 
 /// Fetch the Wikidata entity for `qid` and merge it into `summary`.

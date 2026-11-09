@@ -175,9 +175,55 @@ pub fn paint_flag(painter: &Painter, country: Country, rect: Rect) -> f32 {
         painter.rect_stroke(rect, 0.0, Stroke::new(1.0, hairline()), StrokeKind::Inside);
         return rect.width();
     }
+    if paint_former_flag(painter, country.code, rect) {
+        painter.rect_stroke(rect, 0.0, Stroke::new(1.0, hairline()), StrokeKind::Inside);
+        return rect.width();
+    }
     // Historical federation without an atlas image: muted text pill,
     // same height as the flag image.
     paint_pill(painter, country, rect)
+}
+
+/// Simplified tricolor paintings for dissolved federations, drawn at the
+/// same display size so they appear as real flags rather than text pills.
+fn paint_former_flag(painter: &Painter, code: &str, rect: Rect) -> bool {
+    let colors: &[Color32] = match code {
+        "URS" => &[
+            Color32::from_rgb(0xDA, 0x29, 0x1C),
+            Color32::from_rgb(0xDA, 0x29, 0x1C),
+            Color32::from_rgb(0xDA, 0x29, 0x1C),
+        ],
+        "YUG" => &[
+            Color32::from_rgb(0x0C, 0x3C, 0x7C),
+            Color32::from_rgb(0xF1, 0xF1, 0xF1),
+            Color32::from_rgb(0xE6, 0x3E, 0x2A),
+        ],
+        "GDR" => &[
+            Color32::from_rgb(0x00, 0x00, 0x00),
+            Color32::from_rgb(0xDD, 0x00, 0x00),
+            Color32::from_rgb(0xFF, 0xCC, 0x00),
+        ],
+        "TCH" => &[
+            Color32::from_rgb(0xF1, 0xF1, 0xF1),
+            Color32::from_rgb(0xD9, 0x14, 0x4C),
+            Color32::from_rgb(0x11, 0x40, 0x74),
+        ],
+        "SCG" => &[
+            Color32::from_rgb(0x0C, 0x3C, 0x7C),
+            Color32::from_rgb(0xF1, 0xF1, 0xF1),
+            Color32::from_rgb(0xE6, 0x3E, 0x2A),
+        ],
+        _ => return false,
+    };
+    let h = rect.height() / 3.0;
+    for (i, color) in colors.iter().enumerate() {
+        let r = Rect::from_min_size(
+            egui::pos2(rect.min.x, rect.min.y + h * i as f32),
+            vec2(rect.width(), h),
+        );
+        painter.rect_filled(r, 0.0, *color);
+    }
+    true
 }
 
 /// Alias of [`paint_flag`].

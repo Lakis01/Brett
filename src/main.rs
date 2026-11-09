@@ -11,7 +11,7 @@ fn main() -> eframe::Result<()> {
         )
         .init();
 
-    let icon: Arc<egui::IconData> = image::load_from_memory(include_bytes!("../assets/brett.webp"))
+    let icon: Arc<egui::IconData> = image::load_from_memory(include_bytes!("../assets/brett.png"))
         .map(|img| {
             Arc::new(egui::IconData {
                 rgba: img.to_rgba8().into_raw(),

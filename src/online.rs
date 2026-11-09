@@ -1779,20 +1779,25 @@ pub fn cached_game_count(source: OnlineSource, username: &str) -> usize {
 
 /// Extract a Lichess game id from `Site` (`https://lichess.org/<id>`) or `GameId`.
 pub fn lichess_game_id(game: &domain::Game) -> Option<String> {
+    if let Some(id) = game.header("GameId")
+        && !id.trim().is_empty()
+    {
+        return Some(id.trim().to_string());
+    }
     if let Some(site) = game.header("Site") {
         let site = site.trim();
         if let Some(pos) = site.rfind("lichess.org/") {
-            let id = &site[pos + "lichess.org/".len()..];
+            let raw = &site[pos + "lichess.org/".len()..];
+            let id = if let Some(rest) = raw.strip_prefix("game/") {
+                rest
+            } else {
+                raw
+            };
             let id = id.split(['?', '#', '/', ' ']).next().unwrap_or(id).trim();
             if !id.is_empty() {
                 return Some(id.to_string());
             }
         }
-    }
-    if let Some(id) = game.header("GameId")
-        && !id.trim().is_empty()
-    {
-        return Some(id.trim().to_string());
     }
     if let Some(id) = game.header("ID")
         && !id.trim().is_empty()

@@ -1683,9 +1683,20 @@ fn has_tournament_keyword(event: &str) -> bool {
     contains_token_subslice(&tokens, &["grand", "prix"])
 }
 
+/// Determine whether a game is an online (internet) game.
+///
+/// Covers Lichess/Chess.com servers, Tornelo, and generic online markers
+/// (`lichess`, `chess.com`, `chessabc`, `int`, `internet`, `online`). Used by
+/// the "Exclude online games" prep toggle and by time-control classification.
+pub fn is_online_game(event: &str, site: &str) -> bool {
+    looks_online(event, site)
+}
+
 /// Determine whether a game belongs to a Chess.com online tournament that
 /// should be excluded from serious opening preparation.
 ///
+/// Kept for backwards compatibility; preparation filtering now uses
+/// [`is_online_game`] so every online game can be excluded with one toggle.
 /// Returns `true` only for Chess.com tournament events (Titled Tuesday, Arena
 /// Kings, Speed/Bullet Chess Championship, Pro Chess League, or `Site`
 /// `Chess.com INT` games whose event carries tournament keywords). Ordinary
@@ -2897,7 +2908,7 @@ impl PlayerBook {
     }
 
     fn add_game(&mut self, game: &Game, game_index: Option<usize>) {
-        if self.config.exclude_chesscom && is_chesscom_tournament_game(game.event(), game.site()) {
+        if self.config.exclude_chesscom && is_online_game(game.event(), game.site()) {
             return;
         }
         let white_key = player_key(game.white());

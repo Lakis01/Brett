@@ -281,7 +281,7 @@ static WIKIDATA_QIDS: &[(&str, &str)] = &[
     ("Q211", "LAT"),
     ("Q191", "EST"),
     ("Q230", "GEO"),
-    ("Q237", "ARM"),
+    ("Q399", "ARM"),
     ("Q227", "AZE"),
     ("Q232", "KAZ"),
     ("Q148", "CHN"),
