@@ -2,6 +2,7 @@
 *.log
 .DS_Store
 *.brettpos
+*.brettacc
 
 # Local test data: never redistributed, may be copyrighted
 fixtures/local/
@@ -11,10 +12,22 @@ databases/iccf/*.si4
 databases/iccf/*.sg4
 databases/iccf/*.sn4
 
-# Optional player-photo pack derived from Scid's Player_photos.zip. It has no
-# explicit redistribution licence and is not part of Brett's MIT source.
-# See docs/PHOTOS.md. The libwebp helper is a build artifact of the converter.
+# Optional player-photo pack derived from Scid's Player_photos.zip (or any
+# analogous compiled player portrait database/archive). Strict copyright &
+# privacy rule: NEVER commit, push, or bundle player photo databases unless
+# explicitly instructed by the user. See docs/PHOTOS.md.
 assets/photos.bin
+photos.bin
+*photos*.bin
+*photo_pack*
+*player*photo*
+*.spf
+Player_photos.zip
+assets/photos/
+assets/portraits/
+databases/*photo*
+*photos*.db
+*photos*.sqlite*
 scripts/libwebp_helper.so
 scripts/__pycache__/
 
@@ -39,7 +52,17 @@ lip_*
 *.pem
 *.key
 
-# Editor and agent scratch files
+# Editor and agent scratch files (local-only; never push to GitHub)
 .opencode/
+opencode.json
+opencode.jsonc
+instructions.md
+AGENTS.md
+CLAUDE.md
+GEMINI.md
+.gemini/
+.impeccable/
+.superpowers/
+docs/superpowers/
 .idea/
 .vscode/
