@@ -622,7 +622,7 @@ impl PlayerDirectory {
 ///
 /// Bump this (and the loader's expected version) whenever the layout changes;
 /// older files are ignored so a stale sidecar is rebuilt instead of decoded.
-pub const BRETT_PLAYERS_V: u32 = 2;
+pub const BRETT_PLAYERS_V: u32 = 3;
 
 /// Minimum library size (games) for which the sidecar is used.
 ///

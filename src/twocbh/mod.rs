@@ -833,6 +833,100 @@ impl TwoCbhLibrary {
     /// Each entity id with a non-empty player posting list contributes one
     /// entry named from the `.2lid`; record ids map to game indices.
     pub fn accelerated_players(&self) -> Option<Vec<crate::library::AcceleratedPlayer>> {
+        if self.games.is_empty() && !self.entries.is_empty() {
+            let bound = self.names.entity_count();
+            if bound > 0 {
+                let mut by_entity: Vec<Option<crate::library::AcceleratedPlayer>> =
+                    (0..bound).map(|_| None).collect();
+                for (index, entry) in self.entries.iter().enumerate() {
+                    let Ok(record) = self.file.record(entry.id) else {
+                        continue;
+                    };
+                    if record.len() < 0xc0 {
+                        continue;
+                    }
+                    let white = le_u32(&record[0x18..0x1c]) as usize;
+                    let black = le_u32(&record[0x20..0x24]) as usize;
+                    let result = (le_u32(&record[0x58..0x5c]) & 0xffff) as u16;
+                    let white_elo = le_u16(&record[0x60..0x62]) as u32;
+                    let black_elo = le_u16(&record[0x70..0x72]) as u32;
+                    let year = ((le_u32(&record[0xbc..0xc0]) >> 9) & 0xfff) as u16;
+
+                    let mut update =
+                        |entity: usize, is_white: bool, own_elo: u32, push_idx: bool| {
+                            let Some(slot) = by_entity.get_mut(entity) else {
+                                return;
+                            };
+                            let agg =
+                                slot.get_or_insert_with(|| crate::library::AcceleratedPlayer {
+                                    name: String::new(),
+                                    indices: Vec::new(),
+                                    white_games: 0,
+                                    black_games: 0,
+                                    wins: 0,
+                                    draws: 0,
+                                    losses: 0,
+                                    elo_max: 0,
+                                    elo_sum: 0,
+                                    elo_count: 0,
+                                    first_year: 0,
+                                    last_year: 0,
+                                });
+                            if push_idx {
+                                agg.indices.push(index);
+                            }
+                            if is_white {
+                                agg.white_games += 1;
+                            } else {
+                                agg.black_games += 1;
+                            }
+                            if result == 1 {
+                                agg.draws += 1;
+                            } else if (is_white && result == 2) || (!is_white && result == 0) {
+                                agg.wins += 1;
+                            } else if (is_white && result == 0) || (!is_white && result == 2) {
+                                agg.losses += 1;
+                            }
+                            if own_elo > 0 {
+                                agg.elo_sum += u64::from(own_elo);
+                                agg.elo_count += 1;
+                                agg.elo_max = agg.elo_max.max(own_elo);
+                            }
+                            if year > 0 {
+                                if agg.first_year == 0 || year < agg.first_year {
+                                    agg.first_year = year;
+                                }
+                                agg.last_year = agg.last_year.max(year);
+                            }
+                        };
+
+                    if white == black {
+                        update(white, true, white_elo, true);
+                    } else {
+                        update(white, true, white_elo, true);
+                        update(black, false, black_elo, true);
+                    }
+                }
+                let mut out = Vec::new();
+                for (entity, slot) in by_entity.into_iter().enumerate() {
+                    let Some(mut agg) = slot else {
+                        continue;
+                    };
+                    if agg.indices.is_empty() {
+                        continue;
+                    }
+                    let player = self.names.player(entity as u32);
+                    if player.name == "?" {
+                        continue;
+                    }
+                    agg.name = player.name;
+                    out.push(agg);
+                }
+                if !out.is_empty() {
+                    return Some(out);
+                }
+            }
+        }
         let acc = self.accelerator.as_ref()?;
         let bound = self.entity_bound();
         let mut out = Vec::new();

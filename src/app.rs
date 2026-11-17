@@ -13367,6 +13367,16 @@ impl App {
                         self.open_settings_window();
                         ui.close();
                     }
+                    if ui
+                        .button("Enrich player metadata…")
+                        .on_hover_text(
+                            "Batch-enrich player titles, federations, FIDE IDs, birth years, and peak ratings from Wikipedia & Wikidata",
+                        )
+                        .clicked()
+                    {
+                        self.open_settings_window();
+                        ui.close();
+                    }
                     ui.separator();
                     if ui
                         .button("Export all settings…")
@@ -15252,11 +15262,52 @@ impl App {
     }
 
     fn player_list(&mut self, ui: &mut Ui) {
-        ui.add(
-            egui::TextEdit::singleline(&mut self.player_filter)
-                .hint_text("search players…")
-                .desired_width(f32::INFINITY),
-        );
+        let mut open_enrich_settings = false;
+        let mut cancel_batch = false;
+        ui.horizontal(|ui| {
+            let button_reserve = if self.wiki_batch_rx.is_some() {
+                120.0
+            } else {
+                68.0
+            };
+            let edit_width = (ui.available_width() - button_reserve).max(100.0);
+            ui.add(
+                egui::TextEdit::singleline(&mut self.player_filter)
+                    .hint_text("search players…")
+                    .desired_width(edit_width),
+            );
+            if self.wiki_batch_rx.is_some() {
+                ui.label(
+                    RichText::new(format!(
+                        "{}/{}",
+                        self.wiki_batch_done, self.wiki_batch_total
+                    ))
+                    .small()
+                    .weak(),
+                );
+                if ui
+                    .small_button("Cancel")
+                    .on_hover_text("Stop Wikipedia/Wikidata batch enrichment")
+                    .clicked()
+                {
+                    cancel_batch = true;
+                }
+            } else if ui
+                .small_button("Enrich…")
+                .on_hover_text(
+                    "Open Settings → Player profiles to batch-enrich titles, federations, FIDE IDs, birth years, and peak ratings from Wikipedia & Wikidata",
+                )
+                .clicked()
+            {
+                open_enrich_settings = true;
+            }
+        });
+        if open_enrich_settings {
+            self.open_settings_window();
+        }
+        if cancel_batch {
+            self.cancel_wiki_batch();
+        }
         ui.add_space(4.0);
 
         if self.players.is_empty() {

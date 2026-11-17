@@ -41,6 +41,7 @@ pub const LGD_HEADER_LEN: usize = 12;
 pub const LGD_BLOCK_LEN: usize = 512;
 pub const LGD_MAX_VALUES_PER_BLOCK: usize = 30;
 pub const RANGE_FLAG: u64 = 1 << 61;
+pub const INLINE_PAIR_FLAG: u64 = 1 << 62;
 pub const ID_MASK: u64 = (1 << 61) - 1;
 
 /// Role ids used by the `.2lgd` directory slots.
@@ -216,10 +217,16 @@ impl TwoCbhAccelerator {
             bail!("2LGD role {role} is outside 1..=4");
         }
         let block = self.block(u64::from(entity_id))?;
+        let count_u64 = le_u64(&block[160 + role * 8..160 + role * 8 + 8]);
+        let count = if count_u64 != 0 {
+            u32::try_from(count_u64).unwrap_or(u32::MAX)
+        } else {
+            le_u32(&block[160 + role * 4..160 + role * 4 + 4])
+        };
         Ok(DirEntry {
             start: le_u64(&block[role * 8..role * 8 + 8]),
             end: le_u64(&block[80 + role * 8..80 + role * 8 + 8]),
-            count: le_u32(&block[160 + role * 4..160 + role * 4 + 4]),
+            count,
         })
     }
 
@@ -232,6 +239,14 @@ impl TwoCbhAccelerator {
         let entry = self.entry(entity_id, role)?;
         if entry.count == 0 || entry.start == u64::MAX {
             return Ok(Vec::new());
+        }
+        if entry.start & INLINE_PAIR_FLAG != 0 {
+            let first = (entry.start & ID_MASK) as u32;
+            if entry.count == 1 || entry.end == u64::MAX {
+                return Ok(vec![first]);
+            }
+            let second = (entry.end & ID_MASK) as u32;
+            return Ok(vec![first, second]);
         }
         if entry.start & RANGE_FLAG != 0 {
             let first = (entry.start & ID_MASK) as u32;

@@ -14,6 +14,34 @@ preparation, game review, database management, and deep position analysis.
 > workflows are firmly in place. Expect rough edges and evolving features in
 > this phase. Back up important databases before editing them in place.
 
+## Screenshots
+
+### Opponent preparation & Smart Predictor
+
+![Opponent preparation workspace](assets/screenshots/opponent-preparation.webp)
+
+Preparing as Black against Hikaru Nakamura across **79,360 merged games** (Current DB + ChessABC + Chess.com). The left panel shows the **Player Profile** card (portrait with **Change…** / **Remove**, quick White/Black **Prepare** squares, Wikipedia/Wikidata biography with CC BY-SA attribution, and filtered opponent games). The right **Prep** tab shows the **Smart Predictor** table with Dirichlet-smoothed move probabilities and 90% credible intervals, opponent vs. reference horizontal W/D/B bars, move-popularity trend sparklines, engine evaluations, and virtualized **Recent games**.
+
+### Multi-source preparation setup
+
+<p align="center">
+  <img src="assets/screenshots/preparation-setup.webp" alt="Preparation setup dialog" width="480">
+</p>
+
+The **Start preparation** dialog combines over-the-board and online sources in one place: the active database, the configured reference database (`Mega + prior`), live **ChessABC** games, any number of extra database files, and linked **Lichess** / **Chess.com** accounts with live incremental cache probes, independent OTB and online time-control/date filters, and **Classic Stats** vs. **Smart Predictor** modes.
+
+### Stacked Tree workspace
+
+![Tree workspace](assets/screenshots/tree-workspace.webp)
+
+The **Tree** tab stacks all three human-reference layers in a single scrollable view: the **Local opening tree** (current database or separate opening-tree file), the configured **Opening book** (native `.bin`/`.ctg`/`.abk`/`.bkt` or live ChessABC with horizontal W/D/B bars), and the **Lichess reference** explorer (**Masters**, **Lichess**, or **Both**) with clickable **Lichess top games** at the bottom.
+
+### Engine workspace, Cloud Eval & Game Review
+
+![Engine and Game Review workspace](assets/screenshots/engine-review-workspace.webp)
+
+The **Engine** tab places **Game review** directly at the top (reusing Lichess Cloud Eval up to the target depth before invoking a dedicated local review engine), followed by up to three hot-swappable local UCI engine slots (`1`, `2`, `3`), the unified **Cloud Engine** table (`chessdb.cn` + Lichess Cloud Eval + local `analysis.db` cache with trailing chessdb-only moves collapsed behind `+ N chessdb-only moves`), and the automatic local **Correspondence** reference.
+
 ## Licensing
 
 * **Source Code:** Licensed under the [MIT License](LICENSE).
@@ -413,13 +441,15 @@ ICCF server games under ICCF's terms, and comply with ICCF's terms. See
   default). Photo data is not redistributed with Brett; see
   [docs/PHOTOS.md](docs/PHOTOS.md) and
   [docs/CHAMPIONS.md](docs/CHAMPIONS.md).
-- **Player profiles** — load Wikipedia summaries on demand, or run **Enrich
-  metadata** for top players by game count, players with 10+/3+ games, or every
-  player. The batch UI shows the selected and pending counts, an estimated time,
-  progress, and cancellation. Wikidata `P2962` title claims and `P580` award
-  years feed current profile badges and dated historical game rows. Compact
-  title histories are stored separately from the bounded article cache and
-  restored to player lists at indexing time without another lookup.
+- **Player profiles** — load Wikipedia summaries on demand, or click **Enrich…**
+  in the **Players** tab (or **Settings → Enrich player metadata…** / **Settings
+  → Player profiles → Enrich metadata**) to batch-enrich top players by game
+  count, players with 10+/3+ games, or every player. The batch UI shows the
+  selected and pending counts, an estimated time, progress, and cancellation.
+  Wikidata `P2962` title claims and `P580` award years feed current profile
+  badges and dated historical game rows. Compact title histories are stored
+  separately from the bounded article cache and restored to player lists at
+  indexing time without another lookup.
 - **Correspondence database** — include or exclude the local correspondence
   database in the Engine tab, choose its file, or restore the conventional
   location. The database appears as a dedicated human-game reference section in
