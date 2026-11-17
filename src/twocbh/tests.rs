@@ -693,6 +693,37 @@ fn tournament_categories_are_cached_and_entity_bound_holds() {
 }
 
 #[test]
+fn accelerated_players_carry_wdl_and_elo_from_headers() {
+    let path =
+        Path::new("/home/gratis01/Downloads/Brett Resources/Testing/Testing_for_Markus.2cbh");
+    if !path.exists() {
+        return;
+    }
+    let library = TwoCbhLibrary::open(path).expect("open Testing_for_Markus.2cbh");
+    let players = match library.accelerated_players() {
+        Some(p) => p,
+        None => return, // no .2lgd accelerator present
+    };
+    assert!(!players.is_empty());
+    let with_games: Vec<_> = players
+        .iter()
+        .filter(|p| p.white_games + p.black_games > 0)
+        .collect();
+    assert!(!with_games.is_empty());
+    let total_decided: u32 = with_games.iter().map(|p| p.wins + p.draws + p.losses).sum();
+    assert!(
+        total_decided > 0,
+        "accelerated players must carry W/D/L from the 2CBH headers"
+    );
+    let rated: Vec<_> = with_games.iter().filter(|p| p.elo_count > 0).collect();
+    assert!(
+        !rated.is_empty(),
+        "accelerated players must carry Elo from the 2CBH headers"
+    );
+    assert!(rated.iter().all(|p| p.elo_max > 0));
+}
+
+#[test]
 fn board_helper_is_rank_major() {
     assert_eq!(square(0, 0), Square::A1);
     assert_eq!(square(4, 3), Square::E4);

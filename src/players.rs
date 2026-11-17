@@ -622,7 +622,7 @@ impl PlayerDirectory {
 ///
 /// Bump this (and the loader's expected version) whenever the layout changes;
 /// older files are ignored so a stale sidecar is rebuilt instead of decoded.
-pub const BRETT_PLAYERS_V: u32 = 1;
+pub const BRETT_PLAYERS_V: u32 = 2;
 
 /// Minimum library size (games) for which the sidecar is used.
 ///
@@ -698,7 +698,7 @@ pub fn players_fingerprint(source: &Path, meta: &SourceMeta) -> u64 {
     hash
 }
 
-/// Binary sidecar format (`BRETT_PLAYERS_V = 1`).
+/// Binary sidecar format (`BRETT_PLAYERS_V = 2`).
 ///
 /// All integers are little-endian unless noted.
 ///
@@ -1279,6 +1279,11 @@ fn apply_accelerated_counts(
     summary.white.games = accelerated.white_games;
     summary.black.games = accelerated.black_games;
     summary.game_indices = accelerated.indices.clone();
+    summary.elo_sum = accelerated.elo_sum;
+    summary.elo_count = accelerated.elo_count;
+    summary.elo_max = accelerated.elo_max;
+    summary.first_year = accelerated.first_year;
+    summary.last_year = accelerated.last_year;
     if accelerated.white_games >= accelerated.black_games {
         summary.white.wins = accelerated.wins;
         summary.white.draws = accelerated.draws;
@@ -2834,7 +2839,9 @@ impl PlayerBook {
             match library.load(index) {
                 Ok(game) => book.add_game(&game, Some(index)),
                 Err(err) => {
-                    tracing::warn!("player book skipped game {index}: {err:#}");
+                    // Non-standard/exercise records are common in large Mega
+                    // databases; logging each one as a warning floods stderr.
+                    tracing::debug!("player book skipped game {index}: {err:#}");
                 }
             }
             if position % 200 == 0 || position + 1 == total {

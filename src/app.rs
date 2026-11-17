@@ -55,6 +55,10 @@ const TEXT: Color32 = Color32::from_rgb(0xEC, 0xEF, 0xF4);
 const MUTED: Color32 = Color32::from_rgb(0x9A, 0xA3, 0xB2);
 const GOLD: Color32 = Color32::from_rgb(0xE6, 0xB4, 0x50);
 const GOLD_SOFT: Color32 = Color32::from_rgb(0x4A, 0x3F, 0x24);
+/// Selected rows use a dark slate fill with a gold accent so the label text
+/// stays high-contrast instead of sitting on a saturated blue block.
+const SELECT_BG: Color32 = Color32::from_rgb(0x33, 0x3B, 0x47);
+const SELECT_ACCENT: Color32 = Color32::from_rgb(0xE6, 0xB4, 0x50);
 const VARIATION_BG: Color32 = Color32::from_rgb(0x14, 0x17, 0x1C);
 const COMMENT_TEXT: Color32 = Color32::from_rgb(0x9E, 0xB0, 0xA9);
 /// Warn before writing a PGN larger than this. Plain-text exports are much
@@ -93,7 +97,7 @@ fn read_only_roots() -> Vec<PathBuf> {
 struct PlayerBadge {
     name: String,
     title: Option<String>,
-    country: Option<&'static str>,
+    country: Option<Country>,
     fide_id: Option<String>,
     rating: Option<String>,
     team: Option<String>,
@@ -149,7 +153,8 @@ enum RightTab {
     Moves,
     Tree,
     Engine,
-    References,
+    /// Only shown while a preparation session is active.
+    Preparation,
 }
 
 impl RightTab {
@@ -157,7 +162,7 @@ impl RightTab {
         RightTab::Moves,
         RightTab::Tree,
         RightTab::Engine,
-        RightTab::References,
+        RightTab::Preparation,
     ];
 
     fn index(self) -> usize {
@@ -165,7 +170,7 @@ impl RightTab {
             Self::Moves => 0,
             Self::Tree => 1,
             Self::Engine => 2,
-            Self::References => 3,
+            Self::Preparation => 3,
         }
     }
 
@@ -174,7 +179,7 @@ impl RightTab {
             Self::Moves => "Moves",
             Self::Tree => "Tree",
             Self::Engine => "Engine",
-            Self::References => "Refs",
+            Self::Preparation => "Prep",
         }
     }
 }
@@ -253,6 +258,89 @@ impl LiveReferenceSource {
             _ => None,
         }
     }
+
+    fn explorer_source(self) -> Option<cloud::ExplorerSource> {
+        match self {
+            Self::LichessMasters => Some(cloud::ExplorerSource::Masters),
+            Self::LichessAll => Some(cloud::ExplorerSource::Lichess),
+            Self::ChessAbc => None,
+        }
+    }
+}
+
+/// The active human/reference data source in the old Reference workspace.
+/// Kept for persisted settings and focused unit tests.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ReferenceMode {
+    #[default]
+    Database,
+    Lichess,
+    ChessAbc,
+    Book,
+}
+
+#[allow(dead_code)]
+impl ReferenceMode {
+    const ALL: [Self; 4] = [Self::Database, Self::Lichess, Self::ChessAbc, Self::Book];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Database => "Database",
+            Self::Lichess => "Lichess",
+            Self::ChessAbc => "ChessABC",
+            Self::Book => "Book",
+        }
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum RefGamesSort {
+    #[default]
+    TopRated,
+    Recent,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+struct RefGameEntry {
+    lib_index: usize,
+    white: String,
+    black: String,
+    white_title: Option<&'static str>,
+    black_title: Option<&'static str>,
+    white_elo: Option<u32>,
+    black_elo: Option<u32>,
+    event: String,
+    site: Option<String>,
+    date: String,
+    date_sort: u32,
+    result: String,
+    cat: players::GameCategory,
+}
+
+#[allow(dead_code)]
+impl RefGameEntry {
+    fn avg_elo(&self) -> u32 {
+        match (self.white_elo, self.black_elo) {
+            (Some(w), Some(b)) => (w + b) / 2,
+            (Some(w), None) => w,
+            (None, Some(b)) => b,
+            (None, None) => 0,
+        }
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, Default)]
+struct RefPositionGames {
+    source_path: PathBuf,
+    key: u64,
+    total_matched: usize,
+    top_players: Vec<(String, u32)>,
+    by_rating: Vec<RefGameEntry>,
+    by_recent: Vec<RefGameEntry>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -457,6 +545,78 @@ enum WikiMessage {
         player_key: String,
         result: Result<crate::wiki::Lookup, String>,
     },
+}
+
+/// Reply from the review cloud-eval worker: `(fen, lookup result)`.
+type ReviewCloudMessage = (String, Result<Option<cloud::CloudEval>, String>);
+
+/// First two Lichess PVs converted to review parts. Cloud scores remain
+/// White-POV here; `ReviewState::seed_from_cloud` converts them to UCI's
+/// side-to-move convention for the position.
+type CloudEvalParts = (
+    Option<Score>,
+    Option<String>,
+    Vec<String>,
+    Option<Score>,
+    Option<u32>,
+);
+
+enum WikiBatchMessage {
+    Result {
+        player_index: usize,
+        player_key: String,
+        result: Box<Result<crate::wiki::Lookup, String>>,
+    },
+    Finished,
+}
+
+/// Which slice of the player directory a batch metadata run enriches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+enum WikiBatchScope {
+    #[default]
+    Top100,
+    Top500,
+    Top1000,
+    Games10,
+    Games3,
+    All,
+}
+
+impl WikiBatchScope {
+    const ALL: [Self; 6] = [
+        Self::Top100,
+        Self::Top500,
+        Self::Top1000,
+        Self::Games10,
+        Self::Games3,
+        Self::All,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Top100 => "Top 100 players by games",
+            Self::Top500 => "Top 500 players by games",
+            Self::Top1000 => "Top 1,000 players by games",
+            Self::Games10 => "Players with 10+ games",
+            Self::Games3 => "Players with 3+ games",
+            Self::All => "All players",
+        }
+    }
+
+    fn select(self, players: &[PlayerSummary]) -> Vec<usize> {
+        match self {
+            Self::Top100 => (0..players.len().min(100)).collect(),
+            Self::Top500 => (0..players.len().min(500)).collect(),
+            Self::Top1000 => (0..players.len().min(1_000)).collect(),
+            Self::Games10 => (0..players.len())
+                .filter(|&index| players[index].games() >= 10)
+                .collect(),
+            Self::Games3 => (0..players.len())
+                .filter(|&index| players[index].games() >= 3)
+                .collect(),
+            Self::All => (0..players.len()).collect(),
+        }
+    }
 }
 
 /// State of the Wikipedia card for the profile currently on screen.
@@ -792,6 +952,20 @@ struct YourTurnRow {
     last_date: u32,
 }
 
+/// Cached, position-keyed recent-game rows for the preparation panel. Rebuilt
+/// only when the player, position, facing colour, or loaded sources change, so
+/// navigating moves with thousands of games does not re-scan the whole book.
+#[derive(Clone, Debug)]
+struct PrepRecentRowsCache {
+    player_key: String,
+    key: u64,
+    facing: Color,
+    use_unified: bool,
+    include_online: bool,
+    merged_len: usize,
+    rows: Vec<PrepRecentRow>,
+}
+
 /// One clickable recent-game row.
 #[derive(Clone, Debug)]
 struct PrepRecentRow {
@@ -803,8 +977,6 @@ struct PrepRecentRow {
     black: String,
     white_title: Option<&'static str>,
     black_title: Option<&'static str>,
-    white_country: Option<Country>,
-    black_country: Option<Country>,
     site: Option<String>,
     subtitle: String,
     /// Game-type pill colour + label from `classify_game_metadata`.
@@ -994,13 +1166,60 @@ struct PendingOpenChoice {
     path: PathBuf,
 }
 
+struct ParkedDatabase {
+    library: Option<Arc<dyn GameLibrary>>,
+    session: crate::session::GameList,
+    current: Option<Game>,
+    edited: std::collections::HashMap<usize, Game>,
+    dirty: bool,
+    session_dirty: bool,
+    database_save_path: Option<PathBuf>,
+    current_slot: Option<usize>,
+    selected_slots: BTreeSet<usize>,
+    selection_anchor: Option<usize>,
+    node: usize,
+    players: PlayerDirectory,
+    players_status: String,
+    index: Option<PositionIndex>,
+    index_status: String,
+}
+
+enum ShelfMergeSource {
+    Library(Arc<dyn GameLibrary>),
+    ShelfEntry(usize),
+}
+
+struct PendingShelfMerge {
+    source: ShelfMergeSource,
+    target_shelf_index: usize,
+    source_label: String,
+    source_count: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ShelfDbDrag {
+    shelf_index: usize,
+}
+
+#[derive(Clone)]
+enum GameDragSource {
+    SessionSlots {
+        shelf_index: usize,
+        slot_ids: Vec<usize>,
+    },
+    LibraryGame {
+        library: Arc<dyn GameLibrary>,
+        index: usize,
+    },
+    OwnedGame(Arc<Game>),
+}
+
 #[derive(Clone, Default)]
 pub(crate) struct CloudEngineRow {
     uci: String,
     san: String,
     chessdb: Option<i32>,
     lichess: Option<(Option<i32>, Option<i32>)>,
-    lichess_depth: Option<u32>,
     stockfish: Option<(Option<i32>, Option<i32>)>,
     stockfish_depth: Option<u32>,
     stockfish_name: Option<String>,
@@ -1029,8 +1248,16 @@ pub struct App {
     dirty: bool,
     pending_game_drop: Option<PendingGameDrop>,
     pending_merge: Option<PendingMerge>,
+    pending_shelf_merge: Option<PendingShelfMerge>,
     pending_open_choice: Option<PendingOpenChoice>,
+    shelf_entries: Vec<Option<ParkedDatabase>>,
+    active_db_index: usize,
+    shelf_hover_switch: Option<(usize, Instant)>,
+    open_into_new_shelf: bool,
     current_slot: Option<usize>,
+    selected_slots: BTreeSet<usize>,
+    selection_anchor: Option<usize>,
+    clipboard_games: Vec<Game>,
     node: usize,
     orientation: Color,
     show_clocks: bool,
@@ -1082,12 +1309,22 @@ pub struct App {
     /// Optional default opening-tree database, indexed separately from the
     /// currently open database.
     tree_path: String,
+    /// Source selected in the Reference workspace (the configured paths stay
+    /// independent so browsing a live source never overwrites local defaults).
+    #[allow(dead_code)]
+    reference_mode: ReferenceMode,
+    #[allow(dead_code)]
+    ref_games_sort: RefGamesSort,
+    #[allow(dead_code)]
+    ref_position_games: Option<RefPositionGames>,
+    #[allow(dead_code)]
+    ref_position_games_rx: Option<mpsc::Receiver<RefPositionGames>>,
     tree_index: Option<PositionIndex>,
     tree_index_rx: Option<mpsc::Receiver<TreeIndexMessage>>,
     tree_index_job: Option<PathBuf>,
     tree_library: Option<Arc<dyn GameLibrary>>,
     tree_status: String,
-    /// Optional native opening book shown in the Tree tab.
+    /// Optional native opening book used by the Reference workspace.
     book_path: String,
     book: Option<Arc<Book>>,
     book_rx: Option<mpsc::Receiver<BookMessage>>,
@@ -1104,7 +1341,8 @@ pub struct App {
     players_status: String,
     player_filter: String,
     selected_player: Option<usize>,
-    /// Wikipedia summaries are fetched only for the opened profile.
+    /// Profile summaries are fetched on demand; batch metadata is an explicit
+    /// separate action in Settings.
     wiki_enabled: bool,
     wiki_cache: crate::wiki::Cache,
     wiki_rx: Option<mpsc::Receiver<WikiMessage>>,
@@ -1112,12 +1350,33 @@ pub struct App {
     wiki_for: Option<String>,
     wiki_state: WikiState,
     wiki_expanded: bool,
+    /// Highest title learned from Wikipedia/Wikidata for each player key.
+    wiki_titles: HashMap<String, titles::PlayerTitle>,
+    /// Dated title history for historical game rows.
+    wiki_title_awards: Arc<std::collections::BTreeMap<String, Vec<titles::TitleAward>>>,
+    wiki_title_history_dirty: bool,
+    wiki_title_cache_rx:
+        Option<mpsc::Receiver<std::collections::BTreeMap<String, Vec<titles::TitleAward>>>>,
+    wiki_title_cache_loaded: bool,
+    wiki_batch_rx: Option<mpsc::Receiver<WikiBatchMessage>>,
+    wiki_batch_total: usize,
+    wiki_batch_done: usize,
+    wiki_batch_ok: usize,
+    wiki_batch_ambiguous: usize,
+    wiki_batch_errors: usize,
+    wiki_batch_cache_pending: usize,
+    wiki_batch_status: String,
+    /// Memoized `(scope, directory length, total, pending, seconds)` so a
+    /// 476k-player directory is not scanned on every settings frame.
+    wiki_batch_plan_cache: Option<(WikiBatchScope, usize, usize, usize, f64)>,
+    settings_wiki_batch_scope: WikiBatchScope,
     player_book: Option<PlayerBook>,
     player_book_rx: Option<mpsc::Receiver<PlayerBookMessage>>,
     player_book_job: Option<String>,
     player_book_status: String,
     prep: Option<PrepSession>,
     prep_recent_limit: usize,
+    prep_recent_rows_cache: Option<PrepRecentRowsCache>,
     /// Show every game reaching the position instead of only the last N.
     prep_recent_all: bool,
     prep_exclude_chesscom: bool,
@@ -1140,7 +1399,9 @@ pub struct App {
     prep_setup_use_current: bool,
     prep_setup_use_reference: bool,
     prep_setup_use_chessabc: bool,
-    prep_setup_extra_path: String,
+    /// Additional preparation database files (any supported format). Each one
+    /// contributes only the prepared player's games.
+    prep_setup_extra_paths: Vec<String>,
     prep_setup_filter: players::PrepFilterConfig,
     prep_setup_accounts: Vec<players::PrepOnlineAccount>,
     prep_setup_account_service: OnlineSource,
@@ -1239,6 +1500,13 @@ pub struct App {
     /// memory.
     photo_textures: std::collections::HashMap<String, egui::TextureHandle>,
     photo_order: VecDeque<String>,
+    /// Cached source information avoids per-frame filesystem reads for missing
+    /// custom portraits and photo-pack entries.
+    photo_custom_keys: HashSet<String>,
+    custom_photo_misses: HashSet<String>,
+    custom_photo_miss_order: VecDeque<String>,
+    photo_pack_misses: HashSet<String>,
+    photo_pack_miss_order: VecDeque<String>,
     show_player_photos: bool,
     /// Avatar size for board strips and the selected-player header.
     photo_size: PhotoSize,
@@ -1324,6 +1592,9 @@ pub struct App {
     engine_infos: BTreeMap<usize, EngineInfo>,
     engine_bestmove: Option<String>,
     engine_searching: bool,
+    /// Reveal chessdb-only candidate moves in the Cloud Engine table. Lichess
+    /// and local-cache PVs are always shown regardless of this toggle.
+    engine_show_chessdb_only: bool,
     engine_path: String,
     engine_threads: u32,
     engine_hash_mb: u32,
@@ -1332,7 +1603,6 @@ pub struct App {
     analysis_cache: Option<crate::analysis_cache::AnalysisCacheHandle>,
     review_engine: Option<EngineHandle>,
     review: Option<ReviewState>,
-    review_open: bool,
     engine_settings_open: bool,
     review_status: String,
     review_depth: u32,
@@ -1342,7 +1612,15 @@ pub struct App {
     review_book_min_games: u32,
     review_book_max_plies: u32,
     review_book_rx: Option<mpsc::Receiver<ReviewBookMessage>>,
+    /// Pending Lichess cloud-eval lookup for the next review position.
+    review_cloud_rx: Option<mpsc::Receiver<ReviewCloudMessage>>,
+    review_cloud_job: Option<String>,
+    /// Positions already checked against Lichess Cloud Eval in this review.
+    review_cloud_tried: HashSet<String>,
+    review_cloud_seeded: usize,
     review_cache: Vec<(review::ReviewKey, ReviewState)>,
+    review_only_key_moments: bool,
+    player_clock_summary: Option<(String, Option<review::PlayerClockSummary>)>,
     trend_window: crate::recent::TrendWindow,
     trend_baseline: crate::recent::TrendBaseline,
     trend_min_games: u32,
@@ -1383,6 +1661,12 @@ pub struct App {
     settings_online_reference: bool,
     settings_engine_bar: bool,
     settings_my_player_names: String,
+    settings_reference_path: String,
+    settings_reference_enabled: bool,
+    settings_reference_band: u32,
+    settings_reference_offset: i32,
+    settings_tree_path: String,
+    settings_book_path: String,
     settings_correspondence_enabled: bool,
     settings_correspondence_path: String,
     settings_review_skip_book: bool,
@@ -1468,8 +1752,8 @@ impl App {
         visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, BORDER);
         visuals.widgets.hovered.bg_fill = Color32::from_rgb(0x26, 0x2B, 0x35);
         visuals.widgets.active.bg_fill = Color32::from_rgb(0x2F, 0x35, 0x42);
-        visuals.selection.bg_fill = Color32::from_rgba_premultiplied(0x4C, 0x9A, 0xFF, 0x40);
-        visuals.selection.stroke = Stroke::new(1.0, Color32::from_rgb(0x4C, 0x9A, 0xFF));
+        visuals.selection.bg_fill = SELECT_BG;
+        visuals.selection.stroke = Stroke::new(1.0, SELECT_ACCENT);
         cc.egui_ctx.set_visuals(visuals);
         fonts::install(&cc.egui_ctx);
         let engine_prefs = EnginePrefs::load();
@@ -1522,8 +1806,16 @@ impl App {
             dirty: false,
             pending_game_drop: None,
             pending_merge: None,
+            pending_shelf_merge: None,
             pending_open_choice: None,
+            shelf_entries: vec![None],
+            active_db_index: 0,
+            shelf_hover_switch: None,
+            open_into_new_shelf: true,
             current_slot: None,
+            selected_slots: BTreeSet::new(),
+            selection_anchor: None,
+            clipboard_games: Vec::new(),
             node: 0,
             orientation: Color::White,
             show_clocks: display_prefs.show_clocks,
@@ -1563,6 +1855,10 @@ impl App {
             save_database_close_after: false,
             save_database_error: String::new(),
             tree_path: display_prefs.opening_tree_path.clone(),
+            reference_mode: ReferenceMode::default(),
+            ref_games_sort: RefGamesSort::default(),
+            ref_position_games: None,
+            ref_position_games_rx: None,
             tree_index: None,
             tree_index_rx: None,
             tree_index_job: None,
@@ -1598,12 +1894,28 @@ impl App {
             wiki_for: None,
             wiki_state: WikiState::Idle,
             wiki_expanded: false,
+            wiki_titles: HashMap::new(),
+            wiki_title_awards: Arc::new(std::collections::BTreeMap::new()),
+            wiki_title_history_dirty: false,
+            wiki_title_cache_rx: None,
+            wiki_title_cache_loaded: false,
+            wiki_batch_rx: None,
+            wiki_batch_total: 0,
+            wiki_batch_done: 0,
+            wiki_batch_ok: 0,
+            wiki_batch_ambiguous: 0,
+            wiki_batch_errors: 0,
+            wiki_batch_cache_pending: 0,
+            wiki_batch_status: String::new(),
+            wiki_batch_plan_cache: None,
+            settings_wiki_batch_scope: WikiBatchScope::default(),
             player_book: None,
             player_book_rx: None,
             player_book_job: None,
             player_book_status: "Select a player to build their preparation book.".to_string(),
             prep: None,
             prep_recent_limit: display_prefs.prep_recent_limit,
+            prep_recent_rows_cache: None,
             prep_recent_all: true,
             prep_exclude_chesscom: preparation_prefs.exclude_chesscom,
             prep_player_names: preparation_prefs.prep_player_names.clone(),
@@ -1616,7 +1928,7 @@ impl App {
             prep_setup_use_current: true,
             prep_setup_use_reference: true,
             prep_setup_use_chessabc: true,
-            prep_setup_extra_path: String::new(),
+            prep_setup_extra_paths: Vec::new(),
             prep_setup_filter: players::PrepFilterConfig::default(),
             prep_setup_accounts: Vec::new(),
             prep_setup_account_service: OnlineSource::Lichess,
@@ -1697,6 +2009,11 @@ impl App {
             }),
             photo_textures: std::collections::HashMap::new(),
             photo_order: VecDeque::new(),
+            photo_custom_keys: HashSet::new(),
+            custom_photo_misses: HashSet::new(),
+            custom_photo_miss_order: VecDeque::new(),
+            photo_pack_misses: HashSet::new(),
+            photo_pack_miss_order: VecDeque::new(),
             show_player_photos: display_prefs.show_player_photos,
             photo_size: display_prefs.photo_size,
             champion_lineage: display_prefs.champion_lineage,
@@ -1745,7 +2062,7 @@ impl App {
             explorer_rx: None,
             explorer_job: None,
             cloud_pending: None,
-            cloud_status: "Open a game and select References.".to_string(),
+            cloud_status: "Open a game and select Reference.".to_string(),
             cached_analyses: Vec::new(),
             lichess_token: cloud_prefs.lichess_token,
             explorer_source: cloud_prefs.explorer_source,
@@ -1797,6 +2114,7 @@ impl App {
             engine_infos: BTreeMap::new(),
             engine_bestmove: None,
             engine_searching: false,
+            engine_show_chessdb_only: false,
             engine_path: engine_prefs.resolved_path().display().to_string(),
             engine_threads: engine_prefs.threads,
             engine_hash_mb: engine_prefs.hash_mb,
@@ -1808,7 +2126,6 @@ impl App {
             )),
             review_engine: None,
             review: None,
-            review_open: false,
             engine_settings_open: false,
             review_status: "No game review yet.".to_string(),
             review_depth: 14,
@@ -1818,7 +2135,13 @@ impl App {
             review_book_min_games: display_prefs.review_book_min_games,
             review_book_max_plies: display_prefs.review_book_max_plies,
             review_book_rx: None,
+            review_cloud_rx: None,
+            review_cloud_job: None,
+            review_cloud_tried: HashSet::new(),
+            review_cloud_seeded: 0,
             review_cache: Vec::new(),
+            review_only_key_moments: true,
+            player_clock_summary: None,
             trend_window: display_prefs.trend_window,
             trend_baseline: display_prefs.trend_baseline,
             trend_min_games: display_prefs.trend_min_games,
@@ -1857,6 +2180,16 @@ impl App {
             settings_online_reference: false,
             settings_engine_bar: display_prefs.engine_bar,
             settings_my_player_names: String::new(),
+            settings_reference_path: preparation_prefs
+                .reference_path
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_default(),
+            settings_reference_enabled: preparation_prefs.reference_enabled,
+            settings_reference_band: preparation_prefs.rating_band,
+            settings_reference_offset: preparation_prefs.rating_offset,
+            settings_tree_path: display_prefs.opening_tree_path.clone(),
+            settings_book_path: display_prefs.opening_book_path.clone(),
             settings_correspondence_enabled: preparation_prefs.correspondence_enabled,
             settings_correspondence_path: String::new(),
             settings_review_skip_book: display_prefs.review_skip_book,
@@ -2269,6 +2602,17 @@ impl App {
         } else {
             path
         };
+        if self.open_into_new_shelf
+            && let Some(existing_idx) = (0..self.shelf_entries.len())
+                .find(|&idx| self.shelf_entry_path(idx).as_deref() == Some(path))
+        {
+            self.switch_shelf_database(existing_idx);
+            self.status = format!(
+                "Switched to {} on the Open Databases shelf.",
+                self.shelf_entry_title(existing_idx)
+            );
+            return;
+        }
         let extension = path
             .extension()
             .and_then(|extension| extension.to_str())
@@ -2355,11 +2699,37 @@ impl App {
             count,
             indexed_in.as_secs_f64()
         );
+        if self.shelf_entries.is_empty() {
+            self.shelf_entries.push(None);
+            self.active_db_index = 0;
+        }
+        if self.open_into_new_shelf
+            && (self.library.is_some()
+                || !self.session.is_empty()
+                || self.dirty
+                || self.session_dirty)
+        {
+            let parked = self.pack_active_database();
+            self.shelf_entries[self.active_db_index] = Some(parked);
+            self.shelf_entries.push(None);
+            self.active_db_index = self.shelf_entries.len() - 1;
+        }
+        self.open_into_new_shelf = true;
+        self.selected_slots.clear();
+        self.selection_anchor = None;
         self.players = PlayerDirectory::default();
         self.players_rx = None;
         self.players_job = None;
         self.players_status = "No players indexed.".to_string();
-        self.session = crate::session::GameList::from_library(library.clone());
+        let new_session = crate::session::GameList::from_library(library.clone());
+        let old_session = std::mem::replace(&mut self.session, new_session);
+        if !old_session.is_empty()
+            && let Err(err) = std::thread::Builder::new()
+                .name("brett-session-reaper".to_string())
+                .spawn(move || drop(old_session))
+        {
+            tracing::warn!("could not defer old database session cleanup: {err}");
+        }
         self.library = Some(library.clone());
         self.edited.clear();
         self.dirty = false;
@@ -2374,6 +2744,7 @@ impl App {
         self.focus_right_tab(RightTab::Moves);
         self.selected_player = None;
         self.reset_wiki();
+        self.start_wiki_title_cache_load();
         self.player_filter.clear();
         self.player_book = None;
         self.player_book_rx = None;
@@ -2390,7 +2761,7 @@ impl App {
         self.cloud_pending = None;
         self.online_game_rx = None;
         self.online_game_job = None;
-        self.cloud_status = "Open a game and select References.".to_string();
+        self.cloud_status = "Open a game and select Reference.".to_string();
         self.annotation_editor = None;
         self.annotation_focus = false;
         self.index_status = format!(
@@ -2405,11 +2776,15 @@ impl App {
             self.select_slot(id);
         }
         self.prompt_persist_index = None;
-        if count > 2_000 {
+        // Even a modest database can take noticeable time to summarize; keep
+        // the UI responsive once the player directory reaches a few hundred
+        // games.
+        if count > 500 {
             self.start_player_directory(library, path.to_path_buf());
         } else {
             self.players = PlayerDirectory::build(library.as_ref());
             self.players_status = format!("{} players indexed.", games_label(self.players.len()));
+            self.preload_cached_wiki_titles();
         }
         if count <= AUTO_INDEX_MAX_GAMES {
             self.start_index();
@@ -2423,7 +2798,7 @@ impl App {
                 path.display()
             );
             self.status = format!(
-                "{} · open Tree to build the position index when needed.",
+                "{} · open Reference to build the position index when needed.",
                 self.index_status
             );
         }
@@ -2499,6 +2874,7 @@ impl App {
             return;
         }
         self.players = PlayerDirectory::default();
+        self.wiki_batch_plan_cache = None;
         self.selected_player = None;
         self.reset_wiki();
         self.players_job = Some(path.clone());
@@ -2576,6 +2952,8 @@ impl App {
                 self.players_status = format!("{} players indexed.", games_label(directory.len()));
                 self.players = directory;
                 self.players_job = None;
+                self.preload_cached_wiki_titles();
+                self.wiki_batch_plan_cache = None;
             }
             Err(TryRecvError::Empty) => {
                 self.players_rx = Some(rx);
@@ -2583,6 +2961,49 @@ impl App {
             Err(TryRecvError::Disconnected) => {
                 self.players_status = "Player indexing stopped unexpectedly.".to_string();
                 self.players_job = None;
+            }
+        }
+    }
+
+    fn start_wiki_title_cache_load(&mut self) {
+        if self.wiki_title_cache_loaded || self.wiki_title_cache_rx.is_some() {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        let ctx = self.ctx.clone();
+        self.wiki_title_cache_rx = Some(rx);
+        std::thread::spawn(move || {
+            let _ = tx.send(crate::wiki::load_title_history_cache());
+            ctx.request_repaint();
+        });
+    }
+
+    fn poll_wiki_title_cache(&mut self) {
+        let Some(rx) = self.wiki_title_cache_rx.take() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(histories) => {
+                self.wiki_title_cache_loaded = true;
+                self.wiki_title_cache_rx = None;
+                for (key, awards) in histories {
+                    if let Some(title) = titles::strongest(&awards) {
+                        self.wiki_titles.entry(key.clone()).or_insert(title);
+                    }
+                    Arc::make_mut(&mut self.wiki_title_awards)
+                        .entry(key)
+                        .or_insert(awards);
+                }
+                self.preload_cached_wiki_titles();
+                self.prep_recent_rows_cache = None;
+                self.wiki_batch_plan_cache = None;
+            }
+            Err(TryRecvError::Empty) => {
+                self.wiki_title_cache_rx = Some(rx);
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.wiki_title_cache_rx = None;
+                self.wiki_title_cache_loaded = true;
             }
         }
     }
@@ -2690,6 +3111,439 @@ impl App {
                 }
                 Err(err) => self.status = format!("Merge failed: {err:#}"),
             },
+        }
+    }
+
+    fn shelf_entry_path(&self, idx: usize) -> Option<PathBuf> {
+        if idx == self.active_db_index {
+            self.database_save_path
+                .clone()
+                .or_else(|| self.library.as_ref().map(|l| l.path().to_path_buf()))
+        } else {
+            let parked = self.shelf_entries.get(idx)?.as_ref()?;
+            parked
+                .database_save_path
+                .clone()
+                .or_else(|| parked.library.as_ref().map(|l| l.path().to_path_buf()))
+        }
+    }
+
+    fn shelf_entry_title(&self, idx: usize) -> String {
+        if let Some(path) = self.shelf_entry_path(idx) {
+            path.file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| path.display().to_string())
+        } else if self.shelf_entry_count(idx) == 0 {
+            "Empty database".to_string()
+        } else {
+            format!("Scratch DB {}", idx + 1)
+        }
+    }
+
+    fn shelf_entry_count(&self, idx: usize) -> usize {
+        if idx == self.active_db_index {
+            self.session.len()
+        } else {
+            self.shelf_entries
+                .get(idx)
+                .and_then(|e| e.as_ref())
+                .map_or(0, |p| p.session.len())
+        }
+    }
+
+    fn shelf_entry_dirty(&self, idx: usize) -> bool {
+        if idx == self.active_db_index {
+            self.dirty || self.session_dirty
+        } else {
+            self.shelf_entries
+                .get(idx)
+                .and_then(|e| e.as_ref())
+                .is_some_and(|p| p.dirty || p.session_dirty)
+        }
+    }
+
+    fn shelf_entry_read_only(&self, idx: usize) -> bool {
+        let (save_path, lib_path) = if idx == self.active_db_index {
+            (
+                self.database_save_path.as_deref(),
+                self.library.as_ref().map(|l| l.path()),
+            )
+        } else if let Some(Some(p)) = self.shelf_entries.get(idx) {
+            (
+                p.database_save_path.as_deref(),
+                p.library.as_ref().map(|l| l.path()),
+            )
+        } else {
+            return false;
+        };
+        if save_path.is_some() {
+            return false;
+        }
+        lib_path
+            .is_some_and(|path| is_read_only_export_target(path) || reference_path_is_mega(path))
+    }
+
+    fn pack_active_database(&mut self) -> ParkedDatabase {
+        self.persist_current_edit();
+        self.players_rx = None;
+        self.players_job = None;
+        self.index_rx = None;
+        self.index_job = None;
+        ParkedDatabase {
+            library: self.library.take(),
+            session: std::mem::replace(&mut self.session, crate::session::GameList::empty()),
+            current: self.current.take(),
+            edited: std::mem::take(&mut self.edited),
+            dirty: std::mem::replace(&mut self.dirty, false),
+            session_dirty: std::mem::replace(&mut self.session_dirty, false),
+            database_save_path: self.database_save_path.take(),
+            current_slot: self.current_slot.take(),
+            selected_slots: std::mem::take(&mut self.selected_slots),
+            selection_anchor: self.selection_anchor.take(),
+            node: std::mem::replace(&mut self.node, 0),
+            players: std::mem::take(&mut self.players),
+            players_status: std::mem::take(&mut self.players_status),
+            index: self.index.take(),
+            index_status: std::mem::take(&mut self.index_status),
+        }
+    }
+
+    fn unpack_database(&mut self, parked: ParkedDatabase) {
+        self.library = parked.library;
+        self.session = parked.session;
+        self.current = parked.current;
+        self.edited = parked.edited;
+        self.dirty = parked.dirty;
+        self.session_dirty = parked.session_dirty;
+        self.database_save_path = parked.database_save_path;
+        self.current_slot = parked.current_slot;
+        self.selected_slots = parked.selected_slots;
+        self.selection_anchor = parked.selection_anchor;
+        self.node = parked.node;
+        self.players = parked.players;
+        self.players_status = parked.players_status;
+        self.index = parked.index;
+        self.index_status = parked.index_status;
+        self.selected_player = None;
+        self.reset_wiki();
+        self.recent_preview = None;
+        self.hovered_game_browse = None;
+        self.clear_engine_results();
+        if self.players.is_empty()
+            && let Some(lib) = self.library.clone()
+        {
+            if lib.len() > 500 {
+                let path = lib.path().to_path_buf();
+                self.start_player_directory(lib, path);
+            } else {
+                self.players = PlayerDirectory::build(lib.as_ref());
+                self.players_status =
+                    format!("{} players indexed.", games_label(self.players.len()));
+            }
+        }
+    }
+
+    fn switch_shelf_database(&mut self, target_index: usize) {
+        if self.shelf_entries.is_empty() {
+            self.shelf_entries.push(None);
+            self.active_db_index = 0;
+        }
+        if target_index == self.active_db_index || target_index >= self.shelf_entries.len() {
+            return;
+        }
+        let parked_current = self.pack_active_database();
+        self.shelf_entries[self.active_db_index] = Some(parked_current);
+        if let Some(target) = self.shelf_entries[target_index].take() {
+            self.unpack_database(target);
+        }
+        self.active_db_index = target_index;
+    }
+
+    fn new_shelf_database(&mut self) {
+        if self.shelf_entries.is_empty() {
+            self.shelf_entries.push(None);
+            self.active_db_index = 0;
+        }
+        if self.library.is_some() || !self.session.is_empty() || self.dirty || self.session_dirty {
+            let parked = self.pack_active_database();
+            self.shelf_entries[self.active_db_index] = Some(parked);
+            self.shelf_entries.push(None);
+            self.active_db_index = self.shelf_entries.len() - 1;
+        }
+        self.players_status = "No players indexed.".to_string();
+        self.index_status = "Empty scratch database.".to_string();
+        self.status = "Created a new scratch database on the Open Databases shelf.".to_string();
+    }
+
+    fn close_shelf_database(&mut self, index: usize) {
+        if index >= self.shelf_entries.len() {
+            return;
+        }
+        let title = self.shelf_entry_title(index);
+        if self.shelf_entries.len() <= 1 {
+            let old = self.pack_active_database();
+            let _ = std::thread::Builder::new()
+                .name("brett-shelf-reaper".to_string())
+                .spawn(move || drop(old));
+            self.shelf_entries = vec![None];
+            self.active_db_index = 0;
+            self.status = format!("Closed {title}.");
+            return;
+        }
+        if index != self.active_db_index {
+            let removed = self.shelf_entries.remove(index);
+            let _ = std::thread::Builder::new()
+                .name("brett-shelf-reaper".to_string())
+                .spawn(move || drop(removed));
+            if index < self.active_db_index {
+                self.active_db_index -= 1;
+            }
+            self.status = format!("Closed {title}.");
+            return;
+        }
+        let next = if index + 1 < self.shelf_entries.len() {
+            index + 1
+        } else {
+            index - 1
+        };
+        let old_active = self.pack_active_database();
+        let _ = std::thread::Builder::new()
+            .name("brett-shelf-reaper".to_string())
+            .spawn(move || drop(old_active));
+        self.shelf_entries.remove(index);
+        let next_idx = if next > index { next - 1 } else { next };
+        if let Some(target) = self.shelf_entries[next_idx].take() {
+            self.unpack_database(target);
+        }
+        self.active_db_index = next_idx;
+        self.status = format!("Closed {title}.");
+    }
+
+    fn resolve_dragged_games(&mut self, payload: &GameRowDrag) -> Vec<Game> {
+        match &payload.source {
+            GameDragSource::SessionSlots {
+                shelf_index,
+                slot_ids,
+            } => {
+                if *shelf_index == self.active_db_index {
+                    self.persist_current_edit();
+                    slot_ids
+                        .iter()
+                        .filter_map(|&id| self.session.load(id, &self.edited).ok())
+                        .collect()
+                } else if let Some(Some(parked)) = self.shelf_entries.get(*shelf_index) {
+                    slot_ids
+                        .iter()
+                        .filter_map(|&id| parked.session.load(id, &parked.edited).ok())
+                        .collect()
+                } else {
+                    Vec::new()
+                }
+            }
+            GameDragSource::LibraryGame { library, index } => {
+                library.load(*index).into_iter().collect()
+            }
+            GameDragSource::OwnedGame(game) => vec![(**game).clone()],
+        }
+    }
+
+    fn copy_games_to_shelf(
+        &mut self,
+        games: Vec<Game>,
+        target_shelf_index: usize,
+        insert_at: Option<usize>,
+    ) -> (usize, usize) {
+        if games.is_empty() || target_shelf_index >= self.shelf_entries.len() {
+            return (0, 0);
+        }
+        let target_title = self.shelf_entry_title(target_shelf_index);
+        let mut added = 0usize;
+        let mut skipped = 0usize;
+        let mut new_ids = Vec::new();
+        let mut at = insert_at;
+
+        if target_shelf_index == self.active_db_index {
+            self.persist_current_edit();
+            for game in games {
+                if let Some(id) = self.session.insert_game_dedup(game, &self.edited, at) {
+                    added += 1;
+                    new_ids.push(id);
+                    if let Some(pos) = at.as_mut() {
+                        *pos += 1;
+                    }
+                } else {
+                    skipped += 1;
+                }
+            }
+            if added > 0 {
+                self.session_dirty = true;
+                self.selected_slots = new_ids.iter().copied().collect();
+                self.selection_anchor = new_ids.last().copied();
+                if self.current_slot.is_none()
+                    && let Some(&first) = new_ids.first()
+                {
+                    self.select_slot(first);
+                }
+            }
+        } else if let Some(Some(parked)) = self.shelf_entries.get_mut(target_shelf_index) {
+            for game in games {
+                if parked
+                    .session
+                    .insert_game_dedup(game, &parked.edited, at)
+                    .is_some()
+                {
+                    added += 1;
+                    if let Some(pos) = at.as_mut() {
+                        *pos += 1;
+                    }
+                } else {
+                    skipped += 1;
+                }
+            }
+            if added > 0 {
+                parked.session_dirty = true;
+            }
+        }
+
+        self.status = format!(
+            "Copied {} into {} ({} duplicate{} skipped).",
+            games_label(added),
+            target_title,
+            skipped,
+            if skipped == 1 { "" } else { "s" }
+        );
+        (added, skipped)
+    }
+
+    fn copy_selected_games_to_clipboard(&mut self, ctx: &egui::Context) {
+        self.persist_current_edit();
+        let mut ids: Vec<(usize, usize)> = self
+            .selected_slots
+            .iter()
+            .filter_map(|&id| self.session.position_of(id).map(|pos| (pos, id)))
+            .collect();
+        ids.sort_by_key(|&(pos, _)| pos);
+        let mut games: Vec<Game> = if !ids.is_empty() {
+            ids.into_iter()
+                .filter_map(|(_, id)| self.session.load(id, &self.edited).ok())
+                .collect()
+        } else if let Some(id) = self.current_slot {
+            self.session.load(id, &self.edited).into_iter().collect()
+        } else {
+            Vec::new()
+        };
+        if games.is_empty()
+            && let Some(curr) = &self.current
+        {
+            games.push(curr.clone());
+        }
+        if games.is_empty() {
+            self.status = "No selected game to copy.".to_string();
+            return;
+        }
+        let pgn_bundle = games
+            .iter()
+            .map(pgn::game_to_pgn)
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        ctx.copy_text(pgn_bundle);
+        let count = games.len();
+        self.clipboard_games = games;
+        self.status = format!("Copied {} to clipboard.", games_label(count));
+    }
+
+    fn paste_games_from_clipboard(&mut self, pasted_text: Option<&str>, insert_at: Option<usize>) {
+        let mut games = Vec::new();
+        if let Some(txt) = pasted_text.map(str::trim).filter(|t| !t.is_empty())
+            && (txt.contains('[') || txt.contains("1."))
+            && let Ok(parsed) = domain::parse_pgn(txt.as_bytes())
+        {
+            let valid: Vec<Game> = parsed
+                .into_iter()
+                .filter(|g| !g.headers.is_empty() || g.nodes.len() > 1)
+                .collect();
+            if !valid.is_empty() {
+                games = valid;
+            }
+        }
+        if games.is_empty() {
+            games = self.clipboard_games.clone();
+        }
+        if games.is_empty() {
+            self.status = "Clipboard has no games or PGN to paste.".to_string();
+            return;
+        }
+        let target = self.active_db_index;
+        let (added, skipped) = self.copy_games_to_shelf(games, target, insert_at);
+        self.status = format!(
+            "Pasted {} ({} duplicate{} skipped).",
+            games_label(added),
+            skipped,
+            if skipped == 1 { "" } else { "s" }
+        );
+    }
+
+    fn execute_shelf_merge(
+        &mut self,
+        pending: PendingShelfMerge,
+        deduplicate: bool,
+        save_copy_as: bool,
+    ) {
+        let target_idx = pending.target_shelf_index;
+        if target_idx >= self.shelf_entries.len() {
+            return;
+        }
+        if target_idx != self.active_db_index {
+            self.switch_shelf_database(target_idx);
+        }
+        self.persist_current_edit();
+        let target_title = self.shelf_entry_title(self.active_db_index);
+
+        let result = match pending.source {
+            ShelfMergeSource::Library(library) => {
+                if deduplicate {
+                    self.session.merge_library(library, &self.edited)
+                } else {
+                    let added = self.session.append_library(library).len();
+                    Ok(crate::session::MergeReport { added, skipped: 0 })
+                }
+            }
+            ShelfMergeSource::ShelfEntry(src_idx) => {
+                if src_idx == self.active_db_index {
+                    return;
+                }
+                if let Some(Some(src_parked)) = self.shelf_entries.get(src_idx) {
+                    self.session.merge_from_session(
+                        &src_parked.session,
+                        &src_parked.edited,
+                        &self.edited,
+                        deduplicate,
+                    )
+                } else {
+                    return;
+                }
+            }
+        };
+
+        match result {
+            Ok(report) => {
+                if report.added > 0 {
+                    self.session_dirty = true;
+                }
+                self.status = format!(
+                    "Merged {} into {}: {} added, {} duplicates skipped.",
+                    pending.source_label,
+                    target_title,
+                    games_label(report.added),
+                    report.skipped
+                );
+                if save_copy_as {
+                    self.save_database_as_now(false);
+                }
+            }
+            Err(err) => {
+                self.status = format!("Merge failed: {err:#}");
+            }
         }
     }
 
@@ -4814,7 +5668,14 @@ impl App {
     }
 
     fn save_display_prefs(&mut self) {
-        let prefs = DisplayPrefs {
+        let prefs = self.display_prefs();
+        if let Err(err) = prefs.save() {
+            self.status = format!("Could not save display settings: {err:#}");
+        }
+    }
+
+    fn display_prefs(&self) -> DisplayPrefs {
+        DisplayPrefs {
             rating_priority: self.rating_priority,
             show_all_ratings: self.show_all_ratings,
             engine_view: self.engine_view.config_value().to_string(),
@@ -4847,9 +5708,6 @@ impl App {
             engine_time_ms: self.engine_time_ms,
             prep_filter_facing_color: self.prep_filter_facing_color,
             category_colors: self.category_colors,
-        };
-        if let Err(err) = prefs.save() {
-            self.status = format!("Could not save display settings: {err:#}");
         }
     }
 
@@ -4886,18 +5744,70 @@ impl App {
     }
 
     fn photo_texture(&mut self, ctx: &egui::Context, name: &str) -> Option<egui::TextureHandle> {
-        const PHOTO_CACHE_LIMIT: usize = 12;
-        if !self.show_player_photos {
-            return None;
-        }
+        const PHOTO_CACHE_LIMIT: usize = 64;
+        const PHOTO_MISS_CACHE_LIMIT: usize = 2_048;
         let key = crate::players::player_key(name)?;
         if let Some(texture) = self.photo_textures.get(&key) {
-            return Some(texture.clone());
+            return (self.show_player_photos || self.photo_custom_keys.contains(&key))
+                .then(|| texture.clone());
         }
-        let image = {
-            let photos = self.photos.as_ref()?;
-            let bytes = photos.bytes(name)?;
-            crate::photos::decode_webp(bytes).ok()?
+        if self.show_player_photos && self.photo_pack_misses.contains(&key) {
+            return None;
+        }
+
+        // User portraits override the optional pack and the pack visibility
+        // toggle. Cache missing custom files too: the Players list can render
+        // many rows on every frame, and most players have no custom portrait.
+        let custom_image = if self.custom_photo_misses.contains(&key) {
+            None
+        } else if let Some(bytes) = crate::photos::custom_bytes(name) {
+            match crate::photos::decode_custom_webp(&bytes) {
+                Ok(image) => Some(image),
+                Err(_) => {
+                    remember_photo_miss(
+                        &mut self.custom_photo_misses,
+                        &mut self.custom_photo_miss_order,
+                        key.clone(),
+                        PHOTO_MISS_CACHE_LIMIT,
+                    );
+                    None
+                }
+            }
+        } else {
+            remember_photo_miss(
+                &mut self.custom_photo_misses,
+                &mut self.custom_photo_miss_order,
+                key.clone(),
+                PHOTO_MISS_CACHE_LIMIT,
+            );
+            None
+        };
+
+        let (image, is_custom) = if let Some(image) = custom_image {
+            (image, true)
+        } else {
+            if !self.show_player_photos {
+                return None;
+            }
+            let Some(bytes) = self.photos.as_ref().and_then(|photos| photos.bytes(name)) else {
+                remember_photo_miss(
+                    &mut self.photo_pack_misses,
+                    &mut self.photo_pack_miss_order,
+                    key.clone(),
+                    PHOTO_MISS_CACHE_LIMIT,
+                );
+                return None;
+            };
+            let Ok(image) = crate::photos::decode_webp(bytes) else {
+                remember_photo_miss(
+                    &mut self.photo_pack_misses,
+                    &mut self.photo_pack_miss_order,
+                    key.clone(),
+                    PHOTO_MISS_CACHE_LIMIT,
+                );
+                return None;
+            };
+            (image, false)
         };
         let texture = ctx.load_texture(
             format!("player-photo:{key}"),
@@ -4907,11 +5817,28 @@ impl App {
         while self.photo_order.len() >= PHOTO_CACHE_LIMIT {
             if let Some(oldest) = self.photo_order.pop_front() {
                 self.photo_textures.remove(&oldest);
+                self.photo_custom_keys.remove(&oldest);
             }
         }
         self.photo_order.push_back(key.clone());
+        if is_custom {
+            self.photo_custom_keys.insert(key.clone());
+        }
         self.photo_textures.insert(key, texture.clone());
         Some(texture)
+    }
+
+    fn invalidate_photo_cache(&mut self, name: &str) {
+        let Some(key) = crate::players::player_key(name) else {
+            return;
+        };
+        self.photo_textures.remove(&key);
+        self.photo_order.retain(|cached| cached != &key);
+        self.photo_custom_keys.remove(&key);
+        self.custom_photo_misses.remove(&key);
+        self.custom_photo_miss_order.retain(|cached| cached != &key);
+        self.photo_pack_misses.remove(&key);
+        self.photo_pack_miss_order.retain(|cached| cached != &key);
     }
 
     fn save_reference_prefs(&mut self) {
@@ -4957,6 +5884,12 @@ impl App {
         self.settings_engine_bar = self.engine_bar;
         self.settings_wiki_enabled = self.wiki_enabled;
         self.settings_my_player_names = self.prep_player_names.join("\n");
+        self.settings_reference_path = self.reference_path.clone();
+        self.settings_reference_enabled = self.reference_enabled;
+        self.settings_reference_band = self.reference_band;
+        self.settings_reference_offset = self.reference_offset;
+        self.settings_tree_path = self.tree_path.clone();
+        self.settings_book_path = self.book_path.clone();
         self.settings_correspondence_enabled = self.correspondence_enabled;
         self.settings_correspondence_path = if self.correspondence_path.trim().is_empty() {
             default_correspondence_path()
@@ -5039,6 +5972,56 @@ impl App {
             .map(str::to_string)
             .collect();
 
+        let reference_path_changed = self.reference_path != self.settings_reference_path;
+        let reference_enabled_changed = self.reference_enabled != self.settings_reference_enabled;
+        let reference_window_changed = self.reference_band != self.settings_reference_band
+            || self.reference_offset != self.settings_reference_offset;
+        let tree_path_changed = self.tree_path != self.settings_tree_path;
+        let book_path_changed = self.book_path != self.settings_book_path;
+        self.reference_path = self.settings_reference_path.trim().to_string();
+        self.reference_enabled = self.settings_reference_enabled;
+        self.reference_band = self.settings_reference_band.clamp(25, 1_000);
+        self.reference_offset = self.settings_reference_offset.clamp(-1_000, 1_000);
+        self.tree_path = self.settings_tree_path.trim().to_string();
+        self.book_path = self.settings_book_path.trim().to_string();
+
+        if reference_path_changed || reference_enabled_changed || reference_window_changed {
+            if self.reference_enabled {
+                self.set_reference_path_or_book(self.reference_path.clone());
+            } else {
+                self.reference = None;
+                self.reference_rx = None;
+                self.reference_job = None;
+                self.reference_book = None;
+                self.reference_status =
+                    "Using the current database as the preparation reference.".to_string();
+                self.save_reference_prefs();
+            }
+        }
+        if tree_path_changed {
+            self.tree_index = None;
+            self.tree_library = None;
+            self.tree_index_rx = None;
+            self.tree_index_job = None;
+            if !self.tree_path.trim().is_empty() {
+                self.start_tree_index(PathBuf::from(self.tree_path.trim()));
+            } else {
+                self.tree_status = "Using the current database for the opening tree.".to_string();
+            }
+        }
+        if book_path_changed {
+            self.book = None;
+            self.book_rx = None;
+            self.book_job = None;
+            if let Some(source) = LiveReferenceSource::from_config_str(self.book_path.trim()) {
+                self.book_status = format!("Using {} as live opening book.", source.label());
+            } else if !self.book_path.trim().is_empty() {
+                self.start_book(PathBuf::from(self.book_path.trim()));
+            } else {
+                self.book_status = "No opening book loaded.".to_string();
+            }
+        }
+
         let old_enabled = self.correspondence_enabled;
         let old_path = self.correspondence_path.clone();
         let mut path = self.settings_correspondence_path.trim().to_string();
@@ -5084,6 +6067,13 @@ impl App {
         self.save_engine_prefs();
         self.save_display_prefs();
         self.save_reference_prefs();
+        if (reference_path_changed || reference_enabled_changed)
+            && self.reference_enabled
+            && let Some(index) = self.selected_player
+            && let Some(player) = self.players.get(index).cloned()
+        {
+            self.ensure_reference_for_player(&player);
+        }
         if wiki_changed {
             if self.wiki_enabled {
                 if let Some(index) = self.selected_player
@@ -5216,7 +6206,7 @@ impl App {
     }
 
     /// Configure the reference source from a database or opening-book path.
-    /// Opening books are opened immediately so the General Reference Tree and
+    /// Opening books are opened immediately so the Reference workspace and
     /// the preparation prior can serve their moves without an index build.
     fn set_reference_path_or_book(&mut self, path: String) {
         let trimmed = path.trim().to_string();
@@ -6249,13 +7239,13 @@ impl App {
         if self.cache_engine_analysis {
             self.flush_all_engine_caches();
         }
-        for i in 0..3 {
-            self.engine_slots[i].request = 0;
-            self.engine_slots[i].fen = None;
-            self.engine_slots[i].infos.clear();
-            self.engine_slots[i].bestmove = None;
-            self.engine_slots[i].searching = false;
-            self.engine_slots[i].ready = false;
+        for slot in &mut self.engine_slots {
+            slot.request = 0;
+            slot.fen = None;
+            slot.infos.clear();
+            slot.bestmove = None;
+            slot.searching = false;
+            slot.ready = false;
         }
         self.engine_request = 0;
         self.engine_infos.clear();
@@ -6269,12 +7259,12 @@ impl App {
             self.flush_all_engine_caches();
         }
         self.stop_all_engines();
-        for i in 0..3 {
-            self.engine_slots[i].request = 0;
-            self.engine_slots[i].fen = None;
-            self.engine_slots[i].infos.clear();
-            self.engine_slots[i].bestmove = None;
-            self.engine_slots[i].searching = false;
+        for slot in &mut self.engine_slots {
+            slot.request = 0;
+            slot.fen = None;
+            slot.infos.clear();
+            slot.bestmove = None;
+            slot.searching = false;
         }
         self.engine_request = 0;
         self.engine_infos.clear();
@@ -6314,7 +7304,6 @@ impl App {
             }
             self.review_status = "Review stopped: Cloud-only mode.".to_string();
         }
-        self.review_open = false;
     }
 
     /// Save the current engine selection and replace both engine processes.
@@ -6360,18 +7349,18 @@ impl App {
         let multipv = self.engine_multipv;
         let limit = self.engine_limit();
 
-        for i in 0..3 {
-            if !self.engine_slots[i].enabled {
+        for slot in &mut self.engine_slots {
+            if !slot.enabled {
                 continue;
             }
-            if let Some(engine) = self.engine_slots[i].engine.as_mut() {
+            if let Some(engine) = slot.engine.as_mut() {
                 let request = engine.analyze(fen.clone(), multipv, limit);
-                self.engine_slots[i].request = request;
-                self.engine_slots[i].fen = Some(fen.clone());
-                self.engine_slots[i].infos.clear();
-                self.engine_slots[i].bestmove = None;
-                self.engine_slots[i].searching = true;
-                self.engine_slots[i].status = match limit {
+                slot.request = request;
+                slot.fen = Some(fen.clone());
+                slot.infos.clear();
+                slot.bestmove = None;
+                slot.searching = true;
+                slot.status = match limit {
                     SearchLimit::Infinite => "Searching (infinite)…".to_string(),
                     SearchLimit::Depth(depth) => format!("Searching to depth {depth}…"),
                     SearchLimit::MoveTime(time) => {
@@ -6572,6 +7561,198 @@ impl App {
         }
     }
 
+    /// Depth at which Lichess Cloud Eval is considered good enough to replace
+    /// a local review search. In time mode the threshold scales with the
+    /// configured per-move budget instead of using a single fixed depth.
+    fn review_cloud_target_depth(&self) -> u32 {
+        if self.review_use_time {
+            match self.review_time_ms {
+                0..=499 => 22,
+                500..=1500 => 26,
+                _ => 30,
+            }
+        } else {
+            self.review_depth
+        }
+    }
+
+    /// Convert the first two Lichess cloud PVs into review evaluation parts.
+    fn cloud_eval_parts(eval: &cloud::CloudEval) -> CloudEvalParts {
+        let score_of = |pv: &cloud::CloudPv| pv.mate.map(Score::Mate).or(pv.cp.map(Score::Cp));
+        let pv1 = eval.pvs.first();
+        let pv2 = eval.pvs.get(1);
+        let pv: Vec<String> = pv1
+            .map(|pv| pv.moves.split_whitespace().map(str::to_string).collect())
+            .unwrap_or_default();
+        (
+            pv1.and_then(score_of),
+            pv.first().cloned(),
+            pv,
+            pv2.and_then(score_of),
+            (eval.depth > 0).then_some(eval.depth),
+        )
+    }
+
+    /// Seed a new review from cloud evaluations already cached by the
+    /// evaluation bar or the Reference workspace. Returns the hit count.
+    fn seed_review_from_cached_cloud(
+        &self,
+        review: &mut ReviewState,
+        tried: &mut HashSet<String>,
+    ) -> usize {
+        let target = self.review_cloud_target_depth();
+        let mut seen = HashSet::new();
+        let mut hits = 0usize;
+        let mut candidates: Vec<(String, cloud::CloudEval)> = Vec::new();
+        for (fen, eval) in &self.bar_cloud_cache {
+            tried.insert(fen.clone());
+            if let Some(eval) = eval {
+                candidates.push((fen.clone(), eval.clone()));
+            }
+        }
+        if let Some(snapshot) = &self.cloud {
+            if snapshot.cloud_eval.is_ok() || cloud::is_cloud_eval_empty(&snapshot.cloud_eval) {
+                tried.insert(snapshot.fen.clone());
+            }
+            if let Ok(eval) = &snapshot.cloud_eval {
+                candidates.push((snapshot.fen.clone(), eval.clone()));
+            }
+        }
+        for snapshot in self.cloud_cache.values() {
+            if snapshot.cloud_eval.is_ok() || cloud::is_cloud_eval_empty(&snapshot.cloud_eval) {
+                tried.insert(snapshot.fen.clone());
+            }
+            if let Ok(eval) = &snapshot.cloud_eval {
+                candidates.push((snapshot.fen.clone(), eval.clone()));
+            }
+        }
+        for (fen, eval) in candidates {
+            if eval.depth < target || !seen.insert(fen.clone()) {
+                continue;
+            }
+            let (score, best, pv, second, depth) = Self::cloud_eval_parts(&eval);
+            if review.seed_from_cloud(&fen, score, best, pv, second, depth) {
+                hits += 1;
+            }
+        }
+        hits
+    }
+
+    fn start_review_cloud_fetch(&mut self, fen: String) {
+        let (tx, rx) = mpsc::channel();
+        let ctx = self.ctx.clone();
+        let job = fen.clone();
+        self.review_cloud_job = Some(job);
+        self.review_cloud_rx = Some(rx);
+        std::thread::spawn(move || {
+            let result = cloud::fetch_eval_only(&fen);
+            let _ = tx.send((fen, result));
+            ctx.request_repaint();
+        });
+    }
+
+    fn request_review_engine_next(&mut self) {
+        let mut failed = false;
+        if let (Some(engine), Some(review)) = (self.review_engine.as_mut(), self.review.as_mut())
+            && review.running
+            && !review.request_next(engine)
+        {
+            review.running = false;
+            failed = true;
+        }
+        if failed {
+            self.review_status = "Review stopped: the engine request failed.".to_string();
+        }
+        self.finish_review_if_complete();
+    }
+
+    /// Pick the next review action: ask Lichess Cloud Eval first, then fall
+    /// back to the dedicated local review engine.
+    fn advance_review(&mut self) {
+        if self.review_cloud_rx.is_some() {
+            return;
+        }
+        let Some(review) = self.review.as_ref() else {
+            return;
+        };
+        if !review.running {
+            return;
+        }
+        if review.is_deepening() {
+            self.request_review_engine_next();
+            return;
+        }
+        let Some(fen) = review.next_pending_fen().map(str::to_string) else {
+            // No fresh positions left: request_next either starts the
+            // two-pass deepening queue or marks the review complete.
+            self.request_review_engine_next();
+            return;
+        };
+        if !self.review_cloud_tried.contains(&fen) {
+            self.review_cloud_tried.insert(fen.clone());
+            self.start_review_cloud_fetch(fen);
+            return;
+        }
+        self.request_review_engine_next();
+    }
+
+    fn poll_review_cloud(&mut self) {
+        let Some(rx) = self.review_cloud_rx.take() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok((fen, result)) => {
+                self.review_cloud_job = None;
+                if let Ok(cached_result) = &result {
+                    self.remember_bar_cloud_eval(fen.clone(), cached_result.clone());
+                }
+                let target = self.review_cloud_target_depth();
+                if let Ok(Some(eval)) = result
+                    && eval.depth >= target
+                {
+                    let (score, best, pv, second, depth) = Self::cloud_eval_parts(&eval);
+                    let seeded = self.review.as_mut().is_some_and(|review| {
+                        review.seed_from_cloud(&fen, score, best, pv, second, depth)
+                    });
+                    if seeded {
+                        self.review_cloud_seeded += 1;
+                    }
+                }
+                self.advance_review();
+                self.finish_review_if_complete();
+            }
+            Err(TryRecvError::Empty) => {
+                self.review_cloud_rx = Some(rx);
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.review_cloud_job = None;
+                self.advance_review();
+                self.finish_review_if_complete();
+            }
+        }
+    }
+
+    fn finish_review_if_complete(&mut self) {
+        let Some(review) = self.review.as_ref() else {
+            return;
+        };
+        if !review.complete() {
+            return;
+        }
+        let (done, total) = review.progress();
+        let cloud = self.review_cloud_seeded;
+        let key = review.key.clone();
+        let cloned = review.clone();
+        if let Some(key) = key {
+            self.store_review(key, cloned);
+        }
+        self.review_status = if cloud > 0 {
+            format!("Review complete: {done}/{total} positions ({cloud} via Lichess Cloud Eval).")
+        } else {
+            format!("Review complete: {done}/{total} positions.")
+        };
+    }
+
     /// Move a matching completed review to the front of the reuse cache.
     fn cached_review(&mut self, key: &review::ReviewKey) -> Option<ReviewState> {
         let index = self
@@ -6604,10 +7785,6 @@ impl App {
     }
 
     fn ensure_review_engine(&mut self) -> bool {
-        if self.engine_view == EngineView::Cloud {
-            self.review_status = "Game review is unavailable in Cloud-only mode.".to_string();
-            return false;
-        }
         let path = self.engine_path();
         let options = self.engine_options();
         if let Some(engine) = &self.review_engine {
@@ -6629,15 +7806,14 @@ impl App {
     }
 
     fn start_review(&mut self) {
-        if self.engine_view == EngineView::Cloud {
-            self.review_status = "Game review is unavailable in Cloud-only mode.".to_string();
-            self.review_open = false;
-            return;
-        }
         let Some(game) = self.current.clone() else {
             self.review_status = "Open a game before starting a review.".to_string();
             return;
         };
+        self.review_cloud_rx = None;
+        self.review_cloud_job = None;
+        self.review_cloud_tried.clear();
+        self.review_cloud_seeded = 0;
         // An explicit restart must rerun the analysis instead of restoring the
         // result it is replacing.
         self.invalidate_current_review_cache();
@@ -6668,7 +7844,7 @@ impl App {
         let (tx, rx) = mpsc::channel();
         let ctx = self.ctx.clone();
         self.review = None;
-        self.review_open = true;
+        self.focus_right_tab(RightTab::Engine);
         self.review_status = "Checking opening book…".to_string();
         std::thread::spawn(move || {
             struct PrecomputedHits {
@@ -6746,6 +7922,11 @@ impl App {
     }
 
     fn begin_review(&mut self, game: &Game, config: ReviewConfig, book_plies: usize) {
+        self.focus_right_tab(RightTab::Engine);
+        self.review_cloud_rx = None;
+        self.review_cloud_job = None;
+        self.review_cloud_tried.clear();
+        self.review_cloud_seeded = 0;
         let key = review::ReviewKey::new(
             game,
             config,
@@ -6757,7 +7938,6 @@ impl App {
             let total = cached.total();
             let skipped = cached.book_plies;
             self.review = Some(cached);
-            self.review_open = true;
             self.review_status = if skipped > 0 {
                 format!(
                     "Review restored from cache: {total} positions ({skipped} book plies skipped)."
@@ -6769,14 +7949,42 @@ impl App {
         }
 
         let mut review = ReviewState::new(game, config, book_plies);
-        review.key = Some(key);
+        review.key = Some(key.clone());
+        review.enable_two_pass_deepening();
         if review.total() == 0 {
             self.review = Some(review);
-            self.review_open = true;
             self.review_status = if book_plies > 0 {
                 format!("Review complete: all {book_plies} plies are in the opening book.")
             } else {
                 "This game has no positions to review.".to_string()
+            };
+            return;
+        }
+        let cache_hits = if let Some(cache) = &self.analysis_cache {
+            let min_depth = match config.limit {
+                SearchLimit::Depth(d) => d.min(18),
+                _ => 14,
+            };
+            review.seed_from_analysis_cache(cache, min_depth)
+        } else {
+            0
+        };
+        let mut tried_cloud_fens = HashSet::new();
+        let cloud_hits = self.seed_review_from_cached_cloud(&mut review, &mut tried_cloud_fens);
+        self.review_cloud_tried = tried_cloud_fens;
+        self.review_cloud_seeded = cloud_hits;
+        if review.complete() {
+            let total = review.total();
+            self.store_review(key, review.clone());
+            self.review = Some(review);
+            self.review_status = if cloud_hits > 0 {
+                format!(
+                    "Review complete from cache: {total} positions ({cache_hits} analysis.db, {cloud_hits} Lichess Cloud Eval)."
+                )
+            } else {
+                format!(
+                    "Review complete from local analysis.db cache ({cache_hits}/{total} positions)."
+                )
             };
             return;
         }
@@ -6786,21 +7994,18 @@ impl App {
         if let Some(engine) = &self.review_engine {
             engine.stop();
         }
-        let Some(engine) = self.review_engine.as_mut() else {
-            return;
-        };
-        if !review.request_next(engine) {
-            self.review_status = "This game has no positions to review.".to_string();
-            return;
-        }
         let total = review.total();
         self.review = Some(review);
-        self.review_open = true;
-        self.review_status = if book_plies > 0 {
+        self.review_status = if cache_hits > 0 || cloud_hits > 0 {
+            format!(
+                "Reviewing {total} positions ({cache_hits} from analysis.db, {cloud_hits} from Lichess Cloud Eval; checking cloud first)…"
+            )
+        } else if book_plies > 0 {
             format!("Reviewing {total} positions ({book_plies} book plies skipped)…")
         } else {
             format!("Reviewing {total} positions…")
         };
+        self.advance_review();
     }
 
     fn poll_review_book(&mut self) {
@@ -6834,6 +8039,8 @@ impl App {
 
     fn cancel_review(&mut self) {
         self.review_book_rx = None;
+        self.review_cloud_rx = None;
+        self.review_cloud_job = None;
         if let Some(engine) = &self.review_engine {
             engine.stop();
         }
@@ -6845,6 +8052,8 @@ impl App {
 
     fn clear_review(&mut self) {
         self.review_book_rx = None;
+        self.review_cloud_rx = None;
+        self.review_cloud_job = None;
         if let Some(engine) = &self.review_engine {
             engine.stop();
         }
@@ -6853,6 +8062,7 @@ impl App {
     }
 
     fn poll_review(&mut self) {
+        self.poll_review_cloud();
         let Some(engine) = self.review_engine.as_ref() else {
             return;
         };
@@ -6871,13 +8081,24 @@ impl App {
                     let mut next_request = false;
                     let mut status = None;
                     let mut completed = None;
+                    let mut cache_writes = Vec::new();
                     if let Some(review) = &mut self.review
                         && review.finish_search(request, &best)
                     {
+                        cache_writes = review.take_pending_cache_writes(&self.engine_name);
                         next_request = review.running;
                         let (done, total) = review.progress();
                         status = Some(if next_request {
-                            format!("Reviewing: {done}/{total} positions…")
+                            if review.is_deepening() {
+                                format!("Deepening critical swings ({done}/{total} positions)…")
+                            } else {
+                                format!("Reviewing: {done}/{total} positions…")
+                            }
+                        } else if self.review_cloud_seeded > 0 {
+                            format!(
+                                "Review complete: {done}/{total} positions ({} via Lichess Cloud Eval).",
+                                self.review_cloud_seeded
+                            )
                         } else {
                             format!("Review complete: {done}/{total} positions.")
                         });
@@ -6887,6 +8108,12 @@ impl App {
                             completed = Some((key, review.clone()));
                         }
                     }
+                    if self.cache_engine_analysis
+                        && !cache_writes.is_empty()
+                        && let Some(cache) = &self.analysis_cache
+                    {
+                        cache.store_batch(cache_writes);
+                    }
                     if let Some(status) = status {
                         self.review_status = status;
                     }
@@ -6894,18 +8121,7 @@ impl App {
                         self.store_review(key, review);
                     }
                     if next_request {
-                        let mut failed = false;
-                        if let (Some(engine), Some(review)) =
-                            (self.review_engine.as_mut(), self.review.as_mut())
-                            && !review.request_next(engine)
-                        {
-                            review.running = false;
-                            failed = true;
-                        }
-                        if failed {
-                            self.review_status =
-                                "Review stopped: the engine request failed.".to_string();
-                        }
+                        self.advance_review();
                     }
                 }
                 EngineEvent::Error(err) => {
@@ -6952,9 +8168,9 @@ impl App {
         self.select_player(index);
     }
 
-    /// Load the Wikipedia card for a profile. This is the only entry point
-    /// that may start a Wikipedia request: database installation and player
-    /// directory builds never call it.
+    /// Load the Wikipedia card for a profile. Database installation and
+    /// player-directory builds never trigger requests; batch enrichment is a
+    /// separate explicit action in Settings.
     fn open_wiki_for(&mut self, player: &PlayerSummary) {
         if !self.wiki_enabled {
             self.reset_wiki();
@@ -6975,7 +8191,9 @@ impl App {
             self.wiki_rx = None;
             self.wiki_job = None;
             self.wiki_for = Some(player.key.clone());
-            self.wiki_state = WikiState::Ready(lookup);
+            // Cached summaries carry enrichment too; apply them on every
+            // profile open so country flags and IDs survive DB/app restarts.
+            self.apply_wiki_result(player.key.clone(), Ok(lookup));
             return;
         }
         self.start_wiki_lookup(player);
@@ -7044,6 +8262,7 @@ impl App {
         if cache_changed && let Err(err) = self.wiki_cache.save() {
             tracing::warn!("could not save the Wikipedia cache: {err:#}");
         }
+        self.persist_wiki_title_history_cache();
     }
 
     fn apply_wiki_result(
@@ -7051,14 +8270,50 @@ impl App {
         player_key: String,
         result: Result<crate::wiki::Lookup, String>,
     ) {
+        self.apply_wiki_result_at(None, player_key, result);
+    }
+
+    /// Apply a lookup. Batch enrichment passes the directory index so a
+    /// 476k-player list is never scanned once per player.
+    fn apply_wiki_result_at(
+        &mut self,
+        player_index: Option<usize>,
+        player_key: String,
+        result: Result<crate::wiki::Lookup, String>,
+    ) {
+        if player_index.is_none() {
+            // A profile lookup changes how many batch targets are cached.
+            self.wiki_batch_plan_cache = None;
+        }
         if let Ok(lookup) = &result {
             self.wiki_cache.insert(&player_key, lookup);
         }
         // Wikidata enrichment (§12): fold federations, FIDE id, birth year
         // and peak Elo into the matching PlayerSummary so the profile card
         // and player list show the latest federation flag.
+        if let Ok(crate::wiki::Lookup::Summary(summary)) = &result {
+            if let Some(title) = summary.current_title() {
+                self.wiki_titles.insert(player_key.clone(), title);
+            }
+            if !summary.title_history.is_empty() {
+                let previous = Arc::make_mut(&mut self.wiki_title_awards)
+                    .insert(player_key.clone(), summary.title_history.clone());
+                let changed = previous.as_ref() != Some(&summary.title_history);
+                self.wiki_title_history_dirty |= changed;
+                if changed {
+                    self.prep_recent_rows_cache = None;
+                }
+            }
+        }
+        let player_index = player_index
+            .filter(|&index| {
+                self.players
+                    .get(index)
+                    .is_some_and(|player| player.key == player_key)
+            })
+            .or_else(|| self.players.find_key(&player_key));
         if let Ok(crate::wiki::Lookup::Summary(summary)) = &result
-            && let Some(index) = self.players.find_key(&player_key)
+            && let Some(index) = player_index
             && let Some(player) = self.players.get_mut(index)
         {
             let resolved = summary.all_countries();
@@ -7091,6 +8346,285 @@ impl App {
         }
     }
 
+    /// Restore titles from summaries cached in earlier sessions so the player
+    /// list shows them immediately after indexing, without network requests.
+    fn preload_cached_wiki_titles(&mut self) {
+        for (key, summary) in self.wiki_cache.title_entries() {
+            if let Some(title) = summary.current_title() {
+                self.wiki_titles.entry(key.clone()).or_insert(title);
+            }
+            if !summary.title_history.is_empty() {
+                Arc::make_mut(&mut self.wiki_title_awards)
+                    .entry(key)
+                    .or_insert_with(|| summary.title_history.clone());
+            }
+        }
+        self.prep_recent_rows_cache = None;
+    }
+
+    /// Current title for a player badge: a Wikipedia/Wikidata title wins over
+    /// the strongest title tag seen in the database.
+    fn display_title(&self, player: &PlayerSummary) -> Option<titles::PlayerTitle> {
+        self.wiki_titles.get(&player.key).copied().or(player.title)
+    }
+
+    /// Title a player held on a dated game row. A raw PGN title remains a
+    /// fallback; a dated Wikipedia history is preferred when it has an award
+    /// on or before the game year.
+    fn title_for_player_date(
+        &self,
+        name: &str,
+        date: &str,
+        fallback: Option<&'static str>,
+    ) -> Option<&'static str> {
+        let Some(year) = year_of_date(date) else {
+            return fallback;
+        };
+        let Some(key) = players::player_key(name) else {
+            return fallback;
+        };
+        self.wiki_title_awards
+            .get(&key)
+            .and_then(|awards| titles::at_year(awards, year))
+            .map(titles::PlayerTitle::short)
+            .or(fallback)
+    }
+
+    fn title_for_game(&self, game: &Game, color: Color) -> Option<&'static str> {
+        let fallback = player_title(game, color);
+        let name = match color {
+            Color::White => game.white(),
+            Color::Black => game.black(),
+        };
+        self.title_for_player_date(name, game.date(), fallback)
+    }
+
+    /// Number of players selected by the batch scope, how many still need a
+    /// network lookup, and a time estimate for those lookups.
+    fn wiki_batch_plan(&mut self) -> (usize, usize, f64) {
+        let scope = self.settings_wiki_batch_scope;
+        let player_count = self.players.len();
+        if let Some((cached_scope, cached_count, total, pending, seconds)) =
+            self.wiki_batch_plan_cache
+            && cached_scope == scope
+            && cached_count == player_count
+        {
+            return (total, pending, seconds);
+        }
+        let selected = scope.select(self.players.players());
+        let total = selected.len();
+        let pending = selected
+            .iter()
+            .filter(|&&index| {
+                let Some(player) = self.players.get(index) else {
+                    return false;
+                };
+                let lookup_name = self.wiki_lookup_name(player);
+                self.wiki_cache.get(&player.name).is_none()
+                    && self.wiki_cache.get(&lookup_name).is_none()
+            })
+            .count();
+        // A typical lookup hits the REST summary and Wikidata; names needing
+        // search can take a few requests. Keep this a deliberately rough,
+        // conservative estimate rather than implying a precise completion time.
+        let seconds = pending as f64 * 1.5;
+        self.wiki_batch_plan_cache = Some((scope, player_count, total, pending, seconds));
+        (total, pending, seconds)
+    }
+
+    fn start_wiki_batch(&mut self) {
+        if self.wiki_batch_rx.is_some() {
+            return;
+        }
+        let selected = self
+            .settings_wiki_batch_scope
+            .select(self.players.players());
+        self.wiki_batch_total = selected.len();
+        self.wiki_batch_done = 0;
+        self.wiki_batch_ok = 0;
+        self.wiki_batch_ambiguous = 0;
+        self.wiki_batch_errors = 0;
+        self.wiki_batch_cache_pending = 0;
+        let mut targets: Vec<(usize, String, String)> = Vec::new();
+        let mut cached_results = Vec::new();
+        for index in selected {
+            let Some(player) = self.players.get(index) else {
+                continue;
+            };
+            let key = player.key.clone();
+            let player_name = player.name.clone();
+            let lookup_name = self.wiki_lookup_name(player);
+            let cached = self
+                .wiki_cache
+                .get(&player_name)
+                .or_else(|| self.wiki_cache.get(&lookup_name));
+            if let Some(lookup) = cached {
+                self.wiki_batch_done += 1;
+                match &lookup {
+                    crate::wiki::Lookup::Summary(_) => self.wiki_batch_ok += 1,
+                    crate::wiki::Lookup::Ambiguous { .. } => self.wiki_batch_ambiguous += 1,
+                }
+                cached_results.push((index, key, lookup));
+            } else {
+                targets.push((index, key, lookup_name));
+            }
+        }
+        for (index, key, lookup) in cached_results {
+            self.apply_wiki_result_at(Some(index), key, Ok(lookup));
+        }
+        let pending = targets.len();
+        self.wiki_batch_plan_cache = Some((
+            self.settings_wiki_batch_scope,
+            self.players.len(),
+            self.wiki_batch_total,
+            pending,
+            pending as f64 * 1.5,
+        ));
+        if targets.is_empty() {
+            self.wiki_batch_status = if self.wiki_batch_total == 0 {
+                "No players are available for enrichment.".to_string()
+            } else {
+                format!(
+                    "All {} selected players already have cached summaries.",
+                    self.wiki_batch_total
+                )
+            };
+            self.wiki_batch_plan_cache = None;
+            self.persist_wiki_title_history_cache();
+            return;
+        }
+        self.wiki_batch_status = format!(
+            "Enriching {} players ({} already cached)…",
+            self.wiki_batch_total, self.wiki_batch_done
+        );
+        let (tx, rx) = mpsc::channel();
+        let ctx = self.ctx.clone();
+        self.wiki_batch_rx = Some(rx);
+        std::thread::spawn(move || {
+            for (player_index, player_key, name) in targets {
+                let result = crate::wiki::lookup(&name);
+                if tx
+                    .send(WikiBatchMessage::Result {
+                        player_index,
+                        player_key,
+                        result: Box::new(result),
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+                ctx.request_repaint();
+                std::thread::sleep(Duration::from_millis(140));
+            }
+            let _ = tx.send(WikiBatchMessage::Finished);
+            ctx.request_repaint();
+        });
+    }
+
+    fn cancel_wiki_batch(&mut self) {
+        self.wiki_batch_rx = None;
+        self.wiki_batch_plan_cache = None;
+        self.wiki_batch_status = format!(
+            "Enrichment stopped after {} of {} players.",
+            self.wiki_batch_done, self.wiki_batch_total
+        );
+        if let Err(err) = self.wiki_cache.save() {
+            tracing::warn!("could not save the Wikipedia cache: {err:#}");
+        }
+        self.persist_wiki_title_history_cache();
+    }
+
+    fn poll_wiki_batch(&mut self) {
+        let Some(rx) = self.wiki_batch_rx.take() else {
+            return;
+        };
+        loop {
+            match rx.try_recv() {
+                Ok(WikiBatchMessage::Result {
+                    player_index,
+                    player_key,
+                    result,
+                }) => {
+                    self.wiki_batch_done += 1;
+                    match result.as_ref() {
+                        Ok(crate::wiki::Lookup::Summary(_)) => self.wiki_batch_ok += 1,
+                        Ok(crate::wiki::Lookup::Ambiguous { .. }) => {
+                            self.wiki_batch_ambiguous += 1;
+                        }
+                        Err(_) => self.wiki_batch_errors += 1,
+                    }
+                    // Failed entries remain uncached and should still count
+                    // as needing a retry in the UI's pending estimate.
+                    let pending = self
+                        .wiki_batch_total
+                        .saturating_sub(self.wiki_batch_done)
+                        .saturating_add(self.wiki_batch_errors);
+                    self.wiki_batch_plan_cache = Some((
+                        self.settings_wiki_batch_scope,
+                        self.players.len(),
+                        self.wiki_batch_total,
+                        pending,
+                        pending as f64 * 1.5,
+                    ));
+                    let cache_changed = result.is_ok();
+                    self.apply_wiki_result_at(Some(player_index), player_key, *result);
+                    if cache_changed {
+                        self.wiki_batch_cache_pending += 1;
+                        if self.wiki_batch_cache_pending >= 10 {
+                            self.wiki_batch_cache_pending = 0;
+                            if let Err(err) = self.wiki_cache.save() {
+                                tracing::warn!("could not save the Wikipedia cache: {err:#}");
+                            }
+                        }
+                    }
+                }
+                Ok(WikiBatchMessage::Finished) => {
+                    self.finish_wiki_batch();
+                    return;
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    self.wiki_batch_rx = Some(rx);
+                    return;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.finish_wiki_batch();
+                    return;
+                }
+            }
+        }
+    }
+
+    fn finish_wiki_batch(&mut self) {
+        self.wiki_batch_rx = None;
+        self.wiki_batch_plan_cache = None;
+        self.wiki_batch_status = format!(
+            "Enrichment finished: {} summaries, {} ambiguous, {} errors ({} of {} players).",
+            self.wiki_batch_ok,
+            self.wiki_batch_ambiguous,
+            self.wiki_batch_errors,
+            self.wiki_batch_done,
+            self.wiki_batch_total
+        );
+        if let Err(err) = self.wiki_cache.save() {
+            tracing::warn!("could not save the Wikipedia cache: {err:#}");
+        }
+        self.wiki_batch_cache_pending = 0;
+        self.persist_wiki_title_history_cache();
+    }
+
+    fn persist_wiki_title_history_cache(&mut self) {
+        if !self.wiki_title_history_dirty {
+            return;
+        }
+        self.wiki_title_history_dirty = false;
+        let histories = Arc::clone(&self.wiki_title_awards);
+        std::thread::spawn(move || {
+            if let Err(err) = crate::wiki::save_title_history_cache(&histories) {
+                tracing::warn!("could not save the title-history cache: {err:#}");
+            }
+        });
+    }
+
     /// Short, attributed Wikipedia card shown between the profile statistics
     /// and the preparation buttons.
     fn wiki_summary_section(&mut self, ui: &mut Ui, player: &PlayerSummary) {
@@ -7117,21 +8651,19 @@ impl App {
                 if is_long && !self.wiki_expanded {
                     let excerpt = summary.excerpt(320);
                     let trimmed = excerpt.trim_end_matches('…');
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(RichText::new(trimmed).small());
-                        if ui
-                            .link(RichText::new("… Read more").small().color(GOLD))
-                            .on_hover_text("Expand the full article extract")
-                            .clicked()
-                        {
-                            self.wiki_expanded = true;
-                        }
-                    });
+                    ui.label(RichText::new(trimmed).size(13.0));
+                    if ui
+                        .link(RichText::new("Read more ▾").size(12.0).color(GOLD))
+                        .on_hover_text("Expand the full article extract")
+                        .clicked()
+                    {
+                        self.wiki_expanded = true;
+                    }
                 } else {
-                    ui.label(RichText::new(extract).small());
+                    ui.label(RichText::new(extract).size(13.0));
                     if is_long
                         && ui
-                            .link(RichText::new("Read less").small().weak())
+                            .link(RichText::new("Read less ▴").size(12.0).weak())
                             .on_hover_text("Collapse the article extract")
                             .clicked()
                     {
@@ -7297,8 +8829,32 @@ impl App {
     pub(crate) const PREP_ACCOUNT_PROBE_MAX: usize = 200;
 
     pub(crate) fn handle_prepare_color_action(&mut self, opponent_color: Color) {
-        let as_white = opponent_color == Color::Black;
+        let our_color = opponent_color.other();
+        if let (Some(prep), Some(selected)) = (
+            self.prep.as_ref(),
+            self.selected_player
+                .and_then(|index| self.players.get(index)),
+        ) && prep.player_key == selected.key
+        {
+            self.set_active_prep_color(our_color);
+            return;
+        }
+        let as_white = our_color == Color::White;
         self.open_prep_setup(as_white);
+    }
+
+    fn set_active_prep_color(&mut self, our_color: Color) {
+        let Some(prep) = self.prep.as_mut() else {
+            return;
+        };
+        if prep.our_color == our_color {
+            return;
+        }
+        prep.our_color = our_color;
+        self.orientation = our_color;
+        self.prep_swapped_view = false;
+        self.prep_show_all_games = false;
+        self.status = format!("Preparation color changed to {}.", color_name(our_color));
     }
 
     // Temporary minimal stub for the in-progress preparation-setup task.
@@ -7520,13 +9076,47 @@ impl App {
             .map(|prep| prep.chessabc_fide_ids.clone())
             .unwrap_or_default();
         let canonical_name = player.name.clone();
-        let extra_path = self.prep_setup_extra_path.trim().to_string();
+        let extra_paths: Vec<String> = self
+            .prep_setup_extra_paths
+            .iter()
+            .map(|path| path.trim().to_string())
+            .filter(|path| !path.is_empty())
+            .collect();
+        // Reuse an already-open shelf library for the reference file instead of
+        // reopening a 11M-game 2CBH container a second time.
+        let reference_lib = if use_reference_file
+            && !reference_path.trim().is_empty()
+            && !reference_is_book
+            && !reference_is_live
+        {
+            let wanted = Path::new(reference_path.trim());
+            (0..self.shelf_entries.len()).find_map(|idx| {
+                if self.shelf_entry_path(idx).as_deref() == Some(wanted) {
+                    self.shelf_entries
+                        .get(idx)
+                        .and_then(|entry| entry.as_ref())
+                        .and_then(|parked| parked.library.clone())
+                        .or_else(|| {
+                            if idx == self.active_db_index {
+                                self.library.clone()
+                            } else {
+                                None
+                            }
+                        })
+                } else {
+                    None
+                }
+            })
+        } else {
+            None
+        };
         let accounts: Vec<players::PrepOnlineAccount> = self
             .prep
             .as_ref()
             .filter(|prep| prep.player_key == player.key)
             .map(|prep| prep.accounts.clone())
             .unwrap_or_default();
+        let lichess_token = self.lichess_token.clone();
         // Probed games are kept by the setup dialog's account checks: reuse
         // them so pressing Start never downloads an already-verified account
         // or ChessABC profile a second time.
@@ -7562,9 +9152,7 @@ impl App {
                 total += 1;
             }
             total += accounts.iter().filter(|account| account.enabled).count();
-            if !extra_path.is_empty() {
-                total += 1;
-            }
+            total += extra_paths.len();
             total
         };
         std::thread::spawn(move || {
@@ -7596,22 +9184,35 @@ impl App {
                         || players::player_key(game.black()).as_deref() == Some(player.key.as_str())
                 });
                 let games: Vec<Game> = merged.into_iter().map(|(_, game)| game).collect();
-                let book = PlayerBook::from_merged_games(
-                    player.key.clone(),
-                    player.name.clone(),
-                    &games,
-                    config,
-                    as_of,
-                );
-                let sources_label = format!("{} · {} games", notes.join(" + "), book.games());
-                let _ = tx.send(PrepLoadMessage::Progress {
-                    step,
-                    total,
-                    current_label: label.to_string(),
-                    sources_label,
-                    book,
-                    games,
-                });
+                let sources_label = format!("{} · {} games", notes.join(" + "), games.len());
+                // Rebuilding PlayerBook over 20k+ games after every online source
+                // dominated the load time (several seconds per step). Only install
+                // a live book for small local steps; larger sets get a lightweight
+                // status update and the full book is built once at Done.
+                if games.len() <= 2_500 {
+                    let book = PlayerBook::from_merged_games(
+                        player.key.clone(),
+                        player.name.clone(),
+                        &games,
+                        config,
+                        as_of,
+                    );
+                    let _ = tx.send(PrepLoadMessage::Progress {
+                        step,
+                        total,
+                        current_label: label.to_string(),
+                        sources_label,
+                        book,
+                        games,
+                    });
+                } else {
+                    let _ = tx.send(PrepLoadMessage::Status {
+                        step,
+                        total,
+                        current_label: format!("{label} · {sources_label}"),
+                        completed_notes: notes.to_vec(),
+                    });
+                }
                 ctx.request_repaint();
             };
             if use_current && let Some(library) = library.as_ref() {
@@ -7646,28 +9247,26 @@ impl App {
                         step += 1;
                         let label = "Loading reference file…";
                         send_status(step, label, &notes);
-                        // Any supported database format (2CBH/CBH/SCID/PGN);
-                        // only the prepared player's games are merged in.
-                        match open_library(Path::new(trimmed)) {
-                            Ok(reference) => {
-                                let games = player_games_from_library(
-                                    &reference,
-                                    &player.key,
-                                    &canonical_name,
-                                );
-                                notes.push(format!("Reference file {}", games.len()));
-                                if !games.is_empty() {
-                                    sources.push((
-                                        players::SourceTag::Other("Reference file".to_string()),
-                                        games,
-                                    ));
-                                }
+                        // Reuse the already-open shelf library when possible;
+                        // otherwise open any supported database format.
+                        let opened = if reference_lib.is_none() {
+                            open_library(Path::new(trimmed)).ok()
+                        } else {
+                            None
+                        };
+                        let reference = reference_lib.as_ref().or(opened.as_ref());
+                        if let Some(reference) = reference {
+                            let games =
+                                player_games_from_library(reference, &player.key, &canonical_name);
+                            notes.push(format!("Reference file {}", games.len()));
+                            if !games.is_empty() {
+                                sources.push((
+                                    players::SourceTag::Other("Reference file".to_string()),
+                                    games,
+                                ));
                             }
-                            Err(err) => {
-                                notes.push(truncate_status_error(&format!(
-                                    "Reference file unreadable: {err:#}"
-                                )));
-                            }
+                        } else {
+                            notes.push("Reference file unreadable".to_string());
                         }
                         emit_progress(&sources, &notes, step, label);
                     }
@@ -7736,69 +9335,99 @@ impl App {
                 }
                 emit_progress(&sources, &notes, step, label);
             }
-            for account in &accounts {
-                if !account.enabled {
-                    continue;
-                }
-                step += 1;
-                let label = format!("Loading {} · {}…", account.source.label(), account.username);
-                send_status(step, &label, &notes);
-                let as_of_account = as_of;
-                let cache_key = prep_account_check_key(account.source, &account.username);
-                let fetched = if let Some(cached) = cached_checks.get(&cache_key) {
-                    cached
-                        .iter()
-                        .filter(|game| account.filter.matches_game(game, as_of_account))
-                        .cloned()
-                        .collect()
-                } else {
-                    match online::fetch_player_games_filtered(
-                        account.source,
-                        &account.username,
-                        max_games,
-                        Some(&account.filter),
-                        as_of_account,
-                    ) {
-                        Ok(fetched) => fetched,
-                        Err(err) => {
-                            notes.push(truncate_status_error(&format!(
-                                "{} unavailable ({err:#})",
-                                account.source.label()
-                            )));
-                            emit_progress(&sources, &notes, step, &label);
-                            continue;
-                        }
+            let pending_accounts: Vec<_> = accounts
+                .into_iter()
+                .filter(|account| account.enabled)
+                .collect();
+            if !pending_accounts.is_empty() {
+                send_status(step, "Loading online accounts in parallel…", &notes);
+                let (account_tx, account_rx) = mpsc::channel();
+                std::thread::scope(|scope| {
+                    for account in pending_accounts {
+                        let tx = account_tx.clone();
+                        let cached = cached_checks
+                            .get(&prep_account_check_key(account.source, &account.username))
+                            .cloned();
+                        let canonical_name = canonical_name.clone();
+                        let lichess_token = lichess_token.clone();
+                        scope.spawn(move || {
+                            let fetched = if let Some(cached) = cached {
+                                Ok(cached
+                                    .iter()
+                                    .filter(|game| account.filter.matches_game(game, as_of))
+                                    .cloned()
+                                    .collect())
+                            } else {
+                                online::fetch_player_games_filtered_with_token(
+                                    account.source,
+                                    &account.username,
+                                    max_games,
+                                    Some(&account.filter),
+                                    as_of,
+                                    lichess_token.as_deref(),
+                                )
+                                .map_err(|err| format!("{err:#}"))
+                            };
+                            let result = fetched.map(|fetched| {
+                                let total = fetched.len();
+                                let mut games = fetched;
+                                players::canonicalize_account_games(
+                                    &mut games,
+                                    &account.username,
+                                    &canonical_name,
+                                );
+                                let kept: Vec<Game> = games
+                                    .into_iter()
+                                    .filter(|game| account.filter.matches_game(game, as_of))
+                                    .collect();
+                                (kept, total)
+                            });
+                            let _ = tx.send((account, result));
+                        });
                     }
-                };
-                let total = fetched.len();
-                let mut games = fetched;
-                players::canonicalize_account_games(&mut games, &account.username, &canonical_name);
-                let kept: Vec<Game> = games
-                    .into_iter()
-                    .filter(|game| account.filter.matches_game(game, as_of_account))
-                    .collect();
-                notes.push(format!(
-                    "{} {}/{}",
-                    account.source.label(),
-                    kept.len(),
-                    total
-                ));
-                sources.push((players::SourceTag::Online(account.source), kept));
-                emit_progress(&sources, &notes, step, &label);
+                    drop(account_tx);
+                    for (account, result) in account_rx {
+                        step += 1;
+                        let label =
+                            format!("Loaded {} · {}", account.source.label(), account.username);
+                        match result {
+                            Ok((games, total)) => {
+                                notes.push(format!(
+                                    "{} {}/{}",
+                                    account.source.label(),
+                                    games.len(),
+                                    total
+                                ));
+                                sources.push((players::SourceTag::Online(account.source), games));
+                            }
+                            Err(err) => notes.push(truncate_status_error(&format!(
+                                "{} unavailable ({err})",
+                                account.source.label()
+                            ))),
+                        }
+                        emit_progress(&sources, &notes, step, &label);
+                    }
+                });
             }
-            if !extra_path.is_empty() {
+            for extra_path in &extra_paths {
                 step += 1;
                 let label = "Loading extra file…";
                 send_status(step, label, &notes);
                 // Any supported database format (2CBH/CBH/SCID/PGN); only the
                 // prepared player's games are merged in.
-                match open_library(Path::new(&extra_path)) {
+                match open_library(Path::new(extra_path)) {
                     Ok(extra) => {
                         let games = player_games_from_library(&extra, &player.key, &canonical_name);
-                        notes.push(format!("Extra file {}", games.len()));
+                        let file_name = Path::new(extra_path)
+                            .file_name()
+                            .map(|name| name.to_string_lossy().to_string())
+                            .unwrap_or_else(|| extra_path.clone());
+                        notes.push(format!("{file_name} {}", games.len()));
                         if !games.is_empty() {
-                            sources
-                                .push((players::SourceTag::Other("Extra file".to_string()), games));
+                            sources.push((
+                                players::SourceTag::Other(format!("Extra file · {file_name}")),
+                                games,
+                            ));
                         }
                     }
                     Err(err) => {
@@ -8290,7 +9919,7 @@ impl App {
                     player.name.clone(),
                     elo,
                     player.fide_id.clone(),
-                    player.title,
+                    self.display_title(player),
                 )
             });
         let account_checks = self.prep_setup_account_checks.clone();
@@ -8653,16 +10282,27 @@ impl App {
                     }
                 });
                 ui.horizontal(|ui| {
-                    ui.label("Extra DB file:");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.prep_setup_extra_path)
-                            .hint_text("/path/to/extra.pgn")
-                            .desired_width(280.0),
-                    );
-                    if ui.small_button("Browse…").clicked() {
+                    ui.label("Extra database files:");
+                    if ui
+                        .small_button("Add file…")
+                        .on_hover_text("Add another database to merge into this preparation")
+                        .clicked()
+                    {
                         choose_extra = true;
                     }
                 });
+                let mut remove_extra = None;
+                for (position, path) in self.prep_setup_extra_paths.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(path).small().weak());
+                        if ui.small_button("✕").on_hover_text("Remove this file").clicked() {
+                            remove_extra = Some(position);
+                        }
+                    });
+                }
+                if let Some(position) = remove_extra {
+                    self.prep_setup_extra_paths.remove(position);
+                }
                 ui.separator();
                 ui.label(RichText::new("Online accounts").strong());
                 let mut accounts_changed = false;
@@ -8861,7 +10501,10 @@ impl App {
                 });
             });
         if choose_extra && let Some(path) = open_dialog(None) {
-            self.prep_setup_extra_path = path.display().to_string();
+            let path = path.display().to_string();
+            if !self.prep_setup_extra_paths.contains(&path) {
+                self.prep_setup_extra_paths.push(path);
+            }
         }
         if search_chessabc {
             let typed = self.prep_setup_search.trim().to_string();
@@ -9055,7 +10698,7 @@ impl App {
             ("Date".to_string(), pgn_date(players::today())),
             ("Result".to_string(), "*".to_string()),
         ];
-        if let Some(title) = player.title {
+        if let Some(title) = self.display_title(&player) {
             headers.push((
                 if as_white { "WhiteTitle" } else { "BlackTitle" }.to_string(),
                 title.short().to_string(),
@@ -9096,7 +10739,7 @@ impl App {
         self.prep = Some(PrepSession {
             player_key: player.key.clone(),
             player_name: display_name.clone(),
-            player_title: player.title,
+            player_title: self.display_title(&player),
             player_fide_id: player.fide_id.clone(),
             our_color,
             previous_game,
@@ -9119,7 +10762,7 @@ impl App {
         self.current = Some(game);
         self.current_slot = None;
         self.dirty = false;
-        self.focus_right_tab(RightTab::Tree);
+        self.focus_right_tab(RightTab::Preparation);
         self.goto(0);
         self.status = format!(
             "Preparing against {} as {} · board from {}",
@@ -9134,6 +10777,24 @@ impl App {
         let Some(prep) = self.prep.take() else {
             return;
         };
+        if self.multi_view {
+            self.visible_tabs[RightTab::Preparation.index()] = false;
+            let other_visible = RightTab::ALL
+                .iter()
+                .copied()
+                .find(|tab| *tab != RightTab::Preparation && self.visible_tabs[tab.index()]);
+            if self.right_tab == RightTab::Preparation
+                || !self.visible_tabs[self.right_tab.index()]
+                || other_visible.is_none()
+            {
+                self.right_tab = other_visible.unwrap_or_else(|| {
+                    self.visible_tabs[RightTab::Moves.index()] = true;
+                    RightTab::Moves
+                });
+            }
+        } else if self.right_tab == RightTab::Preparation {
+            self.right_tab = RightTab::Moves;
+        }
         self.recent_preview = None;
         self.prep_online_games.clear();
         self.prep_online_status.clear();
@@ -9394,9 +11055,15 @@ impl App {
         match rx.try_recv() {
             Ok(CloudMessage::Done(snapshot)) => {
                 let fen = snapshot.fen.clone();
+                if let Ok(eval) = &snapshot.cloud_eval {
+                    self.remember_bar_cloud_eval(fen.clone(), Some(eval.clone()));
+                } else if cloud::is_cloud_eval_empty(&snapshot.cloud_eval) {
+                    self.remember_bar_cloud_eval(fen.clone(), None);
+                }
                 if let Some(current) = self.current_fen()
                     && current == fen
-                    && snapshot.explorer_source == self.explorer_source
+                    && (snapshot.explorer_source == self.explorer_source
+                        || !self.explorer_needed_for_active_tabs())
                 {
                     self.cloud = Some(snapshot.clone());
                     self.cloud_status = if snapshot.has_any_data() {
@@ -9422,6 +11089,15 @@ impl App {
                 self.cloud_status =
                     "Reference query stopped unexpectedly. Press Refresh to retry.".to_string();
             }
+        }
+    }
+
+    fn remember_bar_cloud_eval(&mut self, fen: String, eval: Option<cloud::CloudEval>) {
+        self.bar_cloud_cache.insert(fen, eval);
+        if self.bar_cloud_cache.len() > 256
+            && let Some(oldest) = self.bar_cloud_cache.keys().next().cloned()
+        {
+            self.bar_cloud_cache.remove(&oldest);
         }
     }
 
@@ -9611,13 +11287,80 @@ impl App {
         false
     }
 
+    /// True when any visible workspace consumes the Lichess opening explorer
+    /// (as opposed to only `chessdb.cn` and Lichess `cloud_eval`).
+    fn explorer_needed_for_active_tabs(&self) -> bool {
+        let needs_explorer = |tab: RightTab| match tab {
+            RightTab::Tree => true,
+            RightTab::Preparation => {
+                self.reference_wanted()
+                    && LiveReferenceSource::from_config_str(&self.reference_path)
+                        .and_then(LiveReferenceSource::explorer_source)
+                        .is_some()
+            }
+            RightTab::Moves | RightTab::Engine => false,
+        };
+        if self.multi_view {
+            RightTab::ALL
+                .iter()
+                .copied()
+                .any(|tab| self.visible_tabs[tab.index()] && needs_explorer(tab))
+        } else {
+            needs_explorer(self.right_tab)
+        }
+    }
+
+    /// Cached Lichess cloud evaluation result for `fen`, from either the
+    /// full reference cache or the evaluation-bar cache.
+    fn cached_cloud_eval_result(&self, fen: &str) -> Option<Result<cloud::CloudEval, String>> {
+        if let Some(snapshot) = self.cloud.as_ref().filter(|s| s.fen == fen)
+            && (snapshot.cloud_eval.is_ok() || cloud::is_cloud_eval_empty(&snapshot.cloud_eval))
+        {
+            return Some(snapshot.cloud_eval.clone());
+        }
+        if let Some((_, snapshot)) = self.cloud_cache.iter().find(|((_, f), snapshot)| {
+            f == fen
+                && (snapshot.cloud_eval.is_ok() || cloud::is_cloud_eval_empty(&snapshot.cloud_eval))
+        }) {
+            return Some(snapshot.cloud_eval.clone());
+        }
+        match self.bar_cloud_cache.get(fen) {
+            Some(Some(eval)) => Some(Ok(eval.clone())),
+            Some(None) => Some(Err(
+                "Lichess has no cloud evaluation for this position".to_string()
+            )),
+            None => None,
+        }
+    }
+
+    /// Snapshot to render in the Engine tab's Cloud Engine section. Reuses a
+    /// cached evaluation-bar Lichess result immediately while `chessdb.cn` is
+    /// still pending or in flight.
+    fn cloud_snapshot_for_engine_view(&self, fen: &str) -> Option<cloud::Snapshot> {
+        if let Some(snapshot) = self.cloud.as_ref().filter(|s| s.fen == fen) {
+            return Some(snapshot.clone());
+        }
+        if let Some((_, snapshot)) = self.cloud_cache.iter().find(|((_, f), _)| f == fen) {
+            return Some(snapshot.clone());
+        }
+        let eval = self.bar_cloud_cache.get(fen)?.as_ref()?.clone();
+        Some(cloud::Snapshot {
+            fen: fen.to_string(),
+            explorer_source: self.explorer_source,
+            chessdb: Err("Querying chessdb.cn…".to_string()),
+            explorer: Ok(cloud::empty_explorer()),
+            cloud_eval: Ok(eval),
+        })
+    }
+
     /// Query the external references for the current position. Queries are
     /// delayed briefly so holding an arrow key does not fire a request for
     /// every intermediate position.
     fn maybe_request_cloud(&mut self) {
         self.update_cached_analyses();
         let wants_tab = |tab: RightTab| match tab {
-            RightTab::References | RightTab::Tree => true,
+            RightTab::Tree => true,
+            RightTab::Preparation => true,
             RightTab::Engine => self.engine_view != EngineView::Local,
             RightTab::Moves => false,
         };
@@ -9637,12 +11380,12 @@ impl App {
             self.cloud_status = "No game is open.".to_string();
             return;
         };
-        if self.cloud_rx.is_some() {
-            return;
-        }
+        let needs_explorer = self.explorer_needed_for_active_tabs();
         if self.cloud.as_ref().is_some_and(|snapshot| {
-            snapshot.fen == fen && snapshot.explorer_source == self.explorer_source
+            snapshot.fen == fen
+                && (snapshot.explorer_source == self.explorer_source || !needs_explorer)
         }) {
+            self.cloud_pending = None;
             return;
         }
         let cache_key = (self.explorer_source, fen.clone());
@@ -9650,6 +11393,27 @@ impl App {
             self.cloud = Some(snapshot);
             self.cloud_status = "References loaded from cache.".to_string();
             self.cloud_pending = None;
+            return;
+        }
+        if let Some(snapshot) = self
+            .cloud_cache
+            .iter()
+            .find(|((_, f), _)| f == &fen)
+            .map(|(_, snapshot)| snapshot.clone())
+        {
+            self.cloud = Some(snapshot);
+            self.cloud_pending = None;
+            if needs_explorer {
+                self.start_explorer_refresh(fen);
+            } else {
+                self.cloud_status = "References loaded from cache.".to_string();
+            }
+            return;
+        }
+        if self.cloud_rx.is_some() {
+            if self.cloud_job.as_deref() == Some(fen.as_str()) {
+                self.cloud_pending = None;
+            }
             return;
         }
         // Online tree pruning: when any ancestor ply is verified
@@ -9691,6 +11455,7 @@ impl App {
         if self.cloud_rx.is_some() {
             return;
         }
+        let cached_eval = self.cached_cloud_eval_result(&fen);
         self.cloud_job = Some(fen.clone());
         self.cloud_status = "Querying chessdb.cn and Lichess…".to_string();
         let token = self.lichess_token.clone();
@@ -9698,7 +11463,8 @@ impl App {
         let (tx, rx) = mpsc::channel();
         let ctx = self.ctx.clone();
         std::thread::spawn(move || {
-            let snapshot = cloud::fetch(&fen, token.as_deref(), explorer_source);
+            let snapshot =
+                cloud::fetch_with_cached_eval(&fen, token.as_deref(), explorer_source, cached_eval);
             let _ = tx.send(CloudMessage::Done(snapshot));
             ctx.request_repaint();
         });
@@ -10044,6 +11810,10 @@ impl App {
         };
         let position = self.session.position_of(id);
         self.current_slot = Some(id);
+        if self.selected_slots.is_empty() {
+            self.selected_slots.insert(id);
+            self.selection_anchor = Some(id);
+        }
         self.focus_right_tab(RightTab::Moves);
         self.goto(0);
         match loaded {
@@ -10081,7 +11851,13 @@ impl App {
     }
 
     fn has_unsaved_changes(&self) -> bool {
-        self.dirty || self.session_dirty
+        self.dirty
+            || self.session_dirty
+            || self
+                .shelf_entries
+                .iter()
+                .flatten()
+                .any(|db| db.dirty || db.session_dirty)
     }
 
     /// Collect the session games matching the current game's
@@ -11157,6 +12933,25 @@ impl App {
         if ctx.egui_wants_keyboard_input() {
             return;
         }
+        let (copy_cmd, paste_cmd, pasted_text) = ctx.input(|i| {
+            let cmd = i.modifiers.ctrl || i.modifiers.command;
+            let copy_ev = i.raw.events.iter().any(|e| matches!(e, egui::Event::Copy))
+                || (cmd && i.key_pressed(Key::C));
+            let pasted = i.raw.events.iter().find_map(|e| match e {
+                egui::Event::Paste(text) => Some(text.clone()),
+                _ => None,
+            });
+            let paste_ev = pasted.is_some() || (cmd && i.key_pressed(Key::V));
+            (copy_ev, paste_ev, pasted)
+        });
+        if copy_cmd {
+            self.copy_selected_games_to_clipboard(ctx);
+            return;
+        }
+        if paste_cmd {
+            self.paste_games_from_clipboard(pasted_text.as_deref(), None);
+            return;
+        }
         if self.branch_choice.is_some() {
             self.handle_branch_keys(ctx);
             return;
@@ -11197,6 +12992,7 @@ impl App {
             refs,
             online_ref,
             players,
+            prep_tab,
             date,
         ) = ctx.input(|i| {
             (
@@ -11216,7 +13012,8 @@ impl App {
                 i.key_pressed(Key::R),
                 i.key_pressed(Key::C),
                 i.key_pressed(Key::O),
-                i.key_pressed(Key::P),
+                i.key_pressed(Key::P) && !i.modifiers.shift,
+                i.key_pressed(Key::P) && i.modifiers.shift,
                 i.key_pressed(Key::D),
             )
         });
@@ -11294,20 +13091,18 @@ impl App {
         }
         if review {
             self.focus_right_tab(RightTab::Engine);
-            if self.engine_view == EngineView::Cloud {
-                self.status = "Game review is unavailable in Cloud-only mode.".to_string();
-            } else {
-                self.review_open = true;
-            }
         }
         if refs {
-            self.focus_right_tab(RightTab::References);
+            self.focus_right_tab(RightTab::Tree);
         }
         if online_ref {
             self.online_reference_open = !self.online_reference_open;
         }
         if players {
             self.left_tab = LeftTab::Players;
+        }
+        if prep_tab && self.prep.is_some() {
+            self.focus_right_tab(RightTab::Preparation);
         }
         if date && self.current.is_some() {
             self.date_picker_anchor = None;
@@ -11432,20 +13227,6 @@ impl App {
                     }
                     if ui.button("Prepare…").clicked() {
                         self.open_prep_setup_any();
-                        ui.close();
-                    }
-                    if ui
-                        .button("Sample DB")
-                        .on_hover_text(
-                            "Load the bundled grandmaster showcase sample database",
-                        )
-                        .clicked()
-                    {
-                        if let Some(path) = sample_db_path() {
-                            self.load_file(&path);
-                        } else {
-                            self.status = "Sample DB not found.".to_string();
-                        }
                         ui.close();
                     }
                     ui.separator();
@@ -11730,18 +13511,6 @@ impl App {
                     }
                 });
 
-                if ui
-                    .button("Sample DB")
-                    .on_hover_text("Load the bundled grandmaster showcase sample database")
-                    .clicked()
-                {
-                    if let Some(path) = sample_db_path() {
-                        self.load_file(&path);
-                    } else {
-                        self.status = "Sample DB not found.".to_string();
-                    }
-                }
-
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     let is_err = self.status.starts_with("Could not")
                         || self.status.contains("failed")
@@ -11768,6 +13537,9 @@ impl App {
             .size_range(260.0..=520.0)
             .show(root, |ui| {
                 ui.add_space(6.0);
+                self.open_databases_shelf_ui(ui);
+                ui.add_space(4.0);
+                ui.separator();
                 ui.horizontal(|ui| {
                     ui.selectable_value(&mut self.left_tab, LeftTab::Games, "Games")
                         .on_hover_text("Database games");
@@ -11775,12 +13547,7 @@ impl App {
                         .on_hover_text("Player index and preparation");
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         let count = match self.left_tab {
-                            LeftTab::Games => self
-                                .library
-                                .as_ref()
-                                .map(|l| l.len())
-                                .unwrap_or(0)
-                                .to_string(),
+                            LeftTab::Games => self.session.len().to_string(),
                             LeftTab::Players => self.players.len().to_string(),
                         };
                         ui.label(RichText::new(count).weak());
@@ -11803,6 +13570,322 @@ impl App {
                     LeftTab::Players => self.players_content(ui),
                 }
             });
+    }
+
+    fn open_databases_shelf_ui(&mut self, ui: &mut Ui) {
+        if self.shelf_entries.is_empty() {
+            self.shelf_entries.push(None);
+            self.active_db_index = 0;
+        }
+        let mut open_new_file = false;
+        let mut create_scratch = false;
+        let mut switch_to = None;
+        let mut close_idx = None;
+        let mut set_ref_path = None;
+        let mut drop_games_into: Option<(usize, GameRowDrag)> = None;
+        let mut start_shelf_merge: Option<PendingShelfMerge> = None;
+        let mut hovered_shelf_with_drag = None;
+
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("OPEN DATABASES")
+                    .size(11.0)
+                    .strong()
+                    .color(ui.visuals().weak_text_color()),
+            );
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if folder_open_button(ui, "Open another database into the shelf").clicked() {
+                    open_new_file = true;
+                }
+                if ui
+                    .small_button("New")
+                    .on_hover_text("Create an empty scratch database on the shelf")
+                    .clicked()
+                {
+                    create_scratch = true;
+                }
+            });
+        });
+        ui.add_space(2.0);
+
+        let shelf_len = self.shelf_entries.len();
+        for idx in 0..shelf_len {
+            let active = idx == self.active_db_index;
+            let dirty = self.shelf_entry_dirty(idx);
+            let read_only = self.shelf_entry_read_only(idx);
+            let title = self.shelf_entry_title(idx);
+            let count = self.shelf_entry_count(idx);
+            let path_opt = self.shelf_entry_path(idx);
+
+            let row_w = ui.available_width();
+            let row_h = 24.0;
+            let (rect, response) =
+                ui.allocate_exact_size(vec2(row_w, row_h), Sense::click_and_drag());
+            let hovering_game_drag = response.dnd_hover_payload::<GameRowDrag>().is_some();
+            let hovering_db_drag = response
+                .dnd_hover_payload::<ShelfDbDrag>()
+                .is_some_and(|d| d.shelf_index != idx);
+
+            let bg = if hovering_game_drag || hovering_db_drag {
+                SELECT_BG
+            } else if active {
+                ui.visuals().selection.bg_fill
+            } else if response.hovered() {
+                ui.visuals().widgets.hovered.bg_fill
+            } else {
+                Color32::TRANSPARENT
+            };
+            let painter = ui.painter_at(rect);
+            painter.rect_filled(rect, 4.0, bg);
+            if hovering_game_drag || hovering_db_drag {
+                painter.rect_stroke(
+                    rect,
+                    4.0,
+                    Stroke::new(1.5, SELECT_ACCENT),
+                    StrokeKind::Inside,
+                );
+            }
+
+            let dot = if dirty {
+                ("● ", GOLD)
+            } else if active {
+                ("• ", ui.visuals().strong_text_color())
+            } else {
+                ("  ", ui.visuals().weak_text_color())
+            };
+            let mut x = rect.left() + 6.0;
+            let dot_g =
+                painter.layout_no_wrap(dot.0.to_string(), FontId::proportional(12.5), dot.1);
+            let dot_w = dot_g.size().x;
+            painter.galley(
+                pos2(x, rect.center().y - dot_g.size().y * 0.5),
+                dot_g,
+                dot.1,
+            );
+            x += dot_w;
+
+            let close_rect = Rect::from_min_size(
+                pos2(rect.right() - 20.0, rect.top() + 3.0),
+                vec2(16.0, 18.0),
+            );
+            let count_str = format!(
+                "{}{}",
+                compact_count(count as u64),
+                if read_only { " 🔒" } else { "" }
+            );
+            let count_g = painter.layout_no_wrap(
+                count_str,
+                FontId::monospace(11.0),
+                ui.visuals().weak_text_color(),
+            );
+            let count_x = (close_rect.left() - count_g.size().x - 6.0).max(x + 24.0);
+            painter.galley(
+                pos2(count_x, rect.center().y - count_g.size().y * 0.5),
+                count_g,
+                ui.visuals().weak_text_color(),
+            );
+
+            let title_avail = (count_x - x - 6.0).max(16.0);
+            let mut title_job = LayoutJob::single_section(
+                title.clone(),
+                TextFormat {
+                    font_id: FontId::proportional(12.5),
+                    color: if active {
+                        ui.visuals().strong_text_color()
+                    } else {
+                        ui.visuals().text_color()
+                    },
+                    ..Default::default()
+                },
+            );
+            title_job.wrap.max_width = title_avail;
+            title_job.wrap.max_rows = 1;
+            title_job.wrap.break_anywhere = true;
+            let title_g = painter.layout_job(title_job);
+            painter.galley(
+                pos2(x, rect.center().y - title_g.size().y * 0.5),
+                title_g,
+                ui.visuals().text_color(),
+            );
+
+            let close_resp = ui.interact(
+                close_rect,
+                ui.scope_id().with(("shelf-close", idx)),
+                Sense::click(),
+            );
+            painter.text(
+                close_rect.center(),
+                Align2::CENTER_CENTER,
+                "×",
+                FontId::proportional(13.0),
+                if close_resp.hovered() {
+                    ui.visuals().strong_text_color()
+                } else {
+                    ui.visuals().weak_text_color()
+                },
+            );
+            if close_resp.clicked() {
+                close_idx = Some(idx);
+            } else if response.clicked() {
+                switch_to = Some(idx);
+            }
+
+            if response.sense.senses_drag() {
+                response.dnd_set_drag_payload(ShelfDbDrag { shelf_index: idx });
+            }
+            if hovering_game_drag && !active {
+                hovered_shelf_with_drag = Some(idx);
+            }
+            if let Some(payload) = response.dnd_release_payload::<GameRowDrag>() {
+                drop_games_into = Some((idx, (*payload).clone()));
+            }
+            if let Some(payload) = response.dnd_release_payload::<ShelfDbDrag>()
+                && payload.shelf_index != idx
+            {
+                let src_idx = payload.shelf_index;
+                start_shelf_merge = Some(PendingShelfMerge {
+                    source: ShelfMergeSource::ShelfEntry(src_idx),
+                    target_shelf_index: idx,
+                    source_label: self.shelf_entry_title(src_idx),
+                    source_count: self.shelf_entry_count(src_idx),
+                });
+            }
+
+            response.context_menu(|ui| {
+                if let Some(path) = &path_opt
+                    && ui.button("★ Set as Reference Database").clicked()
+                {
+                    set_ref_path = Some(path.display().to_string());
+                    ui.close();
+                }
+                if idx != self.active_db_index
+                    && count > 0
+                    && ui.button("Merge into active database…").clicked()
+                {
+                    start_shelf_merge = Some(PendingShelfMerge {
+                        source: ShelfMergeSource::ShelfEntry(idx),
+                        target_shelf_index: self.active_db_index,
+                        source_label: title.clone(),
+                        source_count: count,
+                    });
+                    ui.close();
+                }
+                if ui.button("Close database").clicked() {
+                    close_idx = Some(idx);
+                    ui.close();
+                }
+            });
+        }
+
+        if let Some(hover_idx) = hovered_shelf_with_drag {
+            let now = Instant::now();
+            match self.shelf_hover_switch {
+                Some((prev_idx, started)) if prev_idx == hover_idx => {
+                    if now.duration_since(started) >= Duration::from_millis(450) {
+                        switch_to = Some(hover_idx);
+                        self.shelf_hover_switch = None;
+                    } else {
+                        ui.ctx().request_repaint_after(Duration::from_millis(50));
+                    }
+                }
+                _ => {
+                    self.shelf_hover_switch = Some((hover_idx, now));
+                    ui.ctx().request_repaint_after(Duration::from_millis(450));
+                }
+            }
+        } else {
+            self.shelf_hover_switch = None;
+        }
+
+        if let Some(pending) = &self.pending_shelf_merge {
+            let target_title = self.shelf_entry_title(pending.target_shelf_index);
+            let target_ro = self.shelf_entry_read_only(pending.target_shelf_index);
+            let mut merge_choice: Option<(bool, bool)> = None;
+            let mut cancel_merge = false;
+            ui.add_space(4.0);
+            egui::Frame::new()
+                .fill(SURFACE)
+                .corner_radius(6.0)
+                .stroke(Stroke::new(1.0, GOLD))
+                .inner_margin(6.0)
+                .show(ui, |ui| {
+                    ui.label(
+                        RichText::new(format!(
+                            "Merge {} from {} into {target_title}?",
+                            games_label(pending.source_count),
+                            pending.source_label
+                        ))
+                        .small()
+                        .strong(),
+                    );
+                    if target_ro {
+                        ui.label(
+                            RichText::new(format!(
+                                "🔒 {target_title} is a read-only source; merged result will save as a copy."
+                            ))
+                            .small()
+                            .color(GOLD),
+                        );
+                    }
+                    ui.horizontal_wrapped(|ui| {
+                        if target_ro {
+                            if ui.small_button("Merge & Save Copy As…").clicked() {
+                                merge_choice = Some((true, true));
+                            }
+                        } else {
+                            if ui.small_button("Merge & Deduplicate").clicked() {
+                                merge_choice = Some((true, false));
+                            }
+                            if ui.small_button("Append All").clicked() {
+                                merge_choice = Some((false, false));
+                            }
+                        }
+                        if ui.small_button("Cancel").clicked() {
+                            cancel_merge = true;
+                        }
+                    });
+                });
+            if let Some((dedup, save_copy)) = merge_choice {
+                if let Some(pending) = self.pending_shelf_merge.take() {
+                    self.execute_shelf_merge(pending, dedup, save_copy);
+                }
+            } else if cancel_merge {
+                self.pending_shelf_merge = None;
+            }
+        }
+
+        if open_new_file {
+            self.open_into_new_shelf = true;
+            if let Some(path) = open_dialog(self.last_database_dir.as_deref()) {
+                self.load_file(&path);
+            }
+        }
+        if create_scratch {
+            self.new_shelf_database();
+        }
+        if let Some(path) = set_ref_path {
+            self.set_reference_path_or_book(path);
+        }
+        if let Some((target_idx, payload)) = drop_games_into {
+            if self.shelf_entry_read_only(target_idx) {
+                self.status = format!(
+                    "🔒 {} is read-only. Use Save database as… to create a writable copy first.",
+                    self.shelf_entry_title(target_idx)
+                );
+            } else {
+                let games = self.resolve_dragged_games(&payload);
+                self.copy_games_to_shelf(games, target_idx, None);
+            }
+        }
+        if let Some(pending) = start_shelf_merge {
+            self.pending_shelf_merge = Some(pending);
+        }
+        if let Some(idx) = switch_to {
+            self.switch_shelf_database(idx);
+        }
+        if let Some(idx) = close_idx {
+            self.close_shelf_database(idx);
+        }
     }
 
     fn online_reference_panel(&mut self, root: &mut Ui) {
@@ -11962,52 +14045,45 @@ impl App {
                                 let game = &self.online_ref_games[index];
                                 let is_white = game.white().to_lowercase() == username;
                                 let is_black = game.black().to_lowercase() == username;
-                                let prefix = if is_white || is_black {
-                                    format!("as {} against ", if is_white { "White" } else { "Black" })
-                                } else {
-                                    String::new()
-                                };
-                                let (white, black, suffix, subtitle) = if is_white || is_black {
-                                    let (opponent, opponent_color) = if is_white {
-                                        (game.black(), Color::Black)
+                                let (prefix, white, black, subtitle, player_color) = if is_white || is_black {
+                                    let (opponent, opponent_color, player_color) = if is_white {
+                                        (game.black(), Color::Black, Color::White)
                                     } else {
-                                        (game.white(), Color::White)
+                                        (game.white(), Color::White, Color::Black)
                                     };
                                     (
-                                        RowName::new(opponent, player_title(game, opponent_color))
-                                            .with_country(player_country(game, opponent_color)),
-                                        None,
-                                        String::new(),
-                                        format!(
-                                            "{} · {} · {}",
-                                            game.event(),
-                                            game.date(),
-                                            game.result()
+                                        format!("{} vs ", color_name(player_color)),
+                                        RowName::new(
+                                            opponent,
+                                            self.title_for_game(game, opponent_color),
                                         ),
+                                        None,
+                                        format!("{} · {}", game.event(), game.date()),
+                                        Some(player_color),
                                     )
                                 } else {
                                     (
+                                        String::new(),
                                         RowName::new(
                                             game.white(),
-                                            player_title(game, Color::White),
-                                        )
-                                        .with_country(player_country(game, Color::White)),
-                                        Some(
-                                            RowName::new(
-                                                game.black(),
-                                                player_title(game, Color::Black),
-                                            )
-                                            .with_country(player_country(game, Color::Black)),
+                                            self.title_for_game(game, Color::White),
                                         ),
-                                        String::new(),
+                                        Some(RowName::new(
+                                            game.black(),
+                                            self.title_for_game(game, Color::Black),
+                                        )),
                                         format!(
                                             "{} · {} · {}",
                                             game.event(),
                                             game.date(),
                                             game.result()
                                         ),
+                                        None,
                                     )
                                 };
+                                let result_badge = standardize_result_badge(game.result());
+                                let outcome = player_color
+                                    .and_then(|color| calc_player_outcome(game.result(), color));
                                 let site_owned = game.header("Site").map(str::to_string);
                                 let width = ui.available_width();
                                 if game_row(
@@ -12016,13 +14092,13 @@ impl App {
                                     &prefix,
                                     white,
                                     black,
-                                    &suffix,
+                                    "",
                                     &subtitle,
                                     site_owned.as_deref(),
                                     width,
                                     42.0,
                                     None,
-                                    None,
+                                    player_color.map(|_| (result_badge.as_str(), outcome)),
                                 )
                                 .clicked()
                                 {
@@ -12185,12 +14261,11 @@ impl App {
                             ui,
                             false,
                             "",
-                            RowName::new(game.white(), player_title(game, Color::White))
-                                .with_country(player_country(game, Color::White)),
-                            Some(
-                                RowName::new(game.black(), player_title(game, Color::Black))
-                                    .with_country(player_country(game, Color::Black)),
-                            ),
+                            RowName::new(game.white(), self.title_for_game(game, Color::White)),
+                            Some(RowName::new(
+                                game.black(),
+                                self.title_for_game(game, Color::Black),
+                            )),
                             "",
                             &subtitle,
                             site_owned.as_deref(),
@@ -12200,6 +14275,11 @@ impl App {
                             None,
                         );
                         response = response.on_hover_text(cat.label());
+                        if response.sense.senses_drag() {
+                            response.dnd_set_drag_payload(GameRowDrag {
+                                source: GameDragSource::OwnedGame(Arc::new(game.clone())),
+                            });
+                        }
                         if response.hovered() {
                             let id = format!("merged:{position}");
                             if !self.touch_hovered_game(&id)
@@ -12268,7 +14348,14 @@ impl App {
         }
 
         let mut select = None;
-        let mut reorder = None;
+        let mut reorder: Option<(GameRowDrag, usize)> = None;
+        let mut ctx_copy = false;
+        let mut ctx_paste_at: Option<usize> = None;
+        let mut ctx_copy_to_shelf: Option<(usize, Vec<usize>)> = None;
+        let shelf_targets: Vec<(usize, String)> = (0..self.shelf_entries.len())
+            .filter(|&idx| idx != self.active_db_index && !self.shelf_entry_read_only(idx))
+            .map(|idx| (idx, self.shelf_entry_title(idx)))
+            .collect();
         egui::ScrollArea::vertical()
             .id_salt("game-list")
             .auto_shrink([false, false])
@@ -12292,13 +14379,18 @@ impl App {
                             })
                             .map(|(_, value)| value.as_str())
                     };
-                    let white_title = title_from_tag(header("WhiteTitle"));
-                    let black_title = title_from_tag(header("BlackTitle"));
-                    let _white_country = player_country_from_header(
-                        header("WhiteCountry").or_else(|| header("WhiteFed")),
+                    let white_name = self.session.slot_white(id);
+                    let black_name = self.session.slot_black(id);
+                    let date = header("Date").unwrap_or("????.??.??");
+                    let white_title = self.title_for_player_date(
+                        &white_name,
+                        date,
+                        title_from_tag(header("WhiteTitle")),
                     );
-                    let _black_country = player_country_from_header(
-                        header("BlackCountry").or_else(|| header("BlackFed")),
+                    let black_title = self.title_for_player_date(
+                        &black_name,
+                        date,
+                        title_from_tag(header("BlackTitle")),
                     );
                     let cat = players::classify_headers_category(
                         header("Event"),
@@ -12313,10 +14405,10 @@ impl App {
                         header("Result").unwrap_or("*")
                     );
                     let site_owned = header("Site").map(str::to_string);
-                    let selected = self.current_slot == Some(id) && self.prep.is_none();
+                    let selected = (self.current_slot == Some(id)
+                        || self.selected_slots.contains(&id))
+                        && self.prep.is_none();
                     let width = ui.available_width();
-                    let white_name = self.session.slot_white(id);
-                    let black_name = self.session.slot_black(id);
                     let mut response = game_row(
                         ui,
                         selected,
@@ -12345,8 +14437,19 @@ impl App {
                             }
                         }
                     }
+                    let drag_ids: Vec<usize> =
+                        if self.selected_slots.contains(&id) && !self.selected_slots.is_empty() {
+                            self.selected_slots.iter().copied().collect()
+                        } else {
+                            vec![id]
+                        };
                     if response.sense.senses_drag() {
-                        response.dnd_set_drag_payload(GameRowDrag { id });
+                        response.dnd_set_drag_payload(GameRowDrag {
+                            source: GameDragSource::SessionSlots {
+                                shelf_index: self.active_db_index,
+                                slot_ids: drag_ids.clone(),
+                            },
+                        });
                     }
 
                     let pointer = ui.ctx().pointer_interact_pos();
@@ -12364,7 +14467,7 @@ impl App {
                                 egui::pos2(response.rect.left() + 4.0, y),
                                 egui::pos2(response.rect.right() - 4.0, y),
                             ],
-                            egui::Stroke::new(2.0, ui.visuals().selection.bg_fill),
+                            egui::Stroke::new(2.0, SELECT_ACCENT),
                         );
                     }
                     let insertion = self
@@ -12374,19 +14477,126 @@ impl App {
                     if let Some(payload) = response.dnd_release_payload::<GameRowDrag>()
                         && let Some(insertion) = insertion
                     {
-                        reorder = Some((payload.id, insertion));
+                        reorder = Some(((*payload).clone(), insertion));
                     }
 
                     if response.clicked() {
-                        select = Some(id);
+                        let mods = ui.input(|i| i.modifiers);
+                        if mods.ctrl || mods.command {
+                            if self.selected_slots.is_empty()
+                                && let Some(curr) = self.current_slot
+                            {
+                                self.selected_slots.insert(curr);
+                            }
+                            if !self.selected_slots.remove(&id) {
+                                self.selected_slots.insert(id);
+                            }
+                            self.selection_anchor = Some(id);
+                        } else if mods.shift {
+                            let anchor = self.selection_anchor.or(self.current_slot).unwrap_or(id);
+                            if let (Some(a_pos), Some(b_pos)) = (
+                                self.session.position_of(anchor),
+                                self.session.position_of(id),
+                            ) {
+                                let (lo, hi) = if a_pos <= b_pos {
+                                    (a_pos, b_pos)
+                                } else {
+                                    (b_pos, a_pos)
+                                };
+                                self.selected_slots.clear();
+                                for p in lo..=hi {
+                                    if let Some(row_id) = self.session.id_at(p) {
+                                        self.selected_slots.insert(row_id);
+                                    }
+                                }
+                            } else {
+                                self.selected_slots.insert(id);
+                            }
+                        } else {
+                            self.selected_slots.clear();
+                            self.selected_slots.insert(id);
+                            self.selection_anchor = Some(id);
+                            select = Some(id);
+                        }
                     }
+
+                    let row_insert_pos = self.session.position_of(id).map(|p| p + 1);
+                    response.context_menu(|ui| {
+                        let copy_count = drag_ids.len();
+                        if ui
+                            .button(format!("Copy {} (Ctrl+C)", games_label(copy_count)))
+                            .clicked()
+                        {
+                            if !self.selected_slots.contains(&id) {
+                                self.selected_slots.clear();
+                                self.selected_slots.insert(id);
+                            }
+                            ctx_copy = true;
+                            ui.close();
+                        }
+                        if ui
+                            .add_enabled(
+                                !self.clipboard_games.is_empty(),
+                                egui::Button::new("Paste game(s) here (Ctrl+V)"),
+                            )
+                            .clicked()
+                        {
+                            ctx_paste_at = Some(row_insert_pos.unwrap_or(self.session.len()));
+                            ui.close();
+                        }
+                        if !shelf_targets.is_empty() {
+                            ui.separator();
+                            for (target_idx, target_name) in &shelf_targets {
+                                if ui
+                                    .button(format!(
+                                        "Copy {} to {target_name}",
+                                        games_label(copy_count)
+                                    ))
+                                    .clicked()
+                                {
+                                    ctx_copy_to_shelf = Some((*target_idx, drag_ids.clone()));
+                                    ui.close();
+                                }
+                            }
+                        }
+                    });
                 }
             });
-        if let Some((id, insertion)) = reorder
-            && self.session.move_slot(id, insertion)
-        {
-            self.session_dirty = true;
-            self.status = "Game moved in the current list.".to_string();
+        if ctx_copy {
+            let ctx = ui.ctx().clone();
+            self.copy_selected_games_to_clipboard(&ctx);
+        }
+        if let Some(insert_at) = ctx_paste_at {
+            self.paste_games_from_clipboard(None, Some(insert_at));
+        }
+        if let Some((target_idx, slot_ids)) = ctx_copy_to_shelf {
+            let payload = GameRowDrag {
+                source: GameDragSource::SessionSlots {
+                    shelf_index: self.active_db_index,
+                    slot_ids,
+                },
+            };
+            let games = self.resolve_dragged_games(&payload);
+            self.copy_games_to_shelf(games, target_idx, None);
+        }
+        if let Some((payload, insertion)) = reorder {
+            match &payload.source {
+                GameDragSource::SessionSlots {
+                    shelf_index,
+                    slot_ids,
+                } if *shelf_index == self.active_db_index => {
+                    if self.session.move_slots(slot_ids, insertion) {
+                        self.session_dirty = true;
+                        self.status =
+                            format!("Moved {} in the current list.", games_label(slot_ids.len()));
+                    }
+                }
+                _ => {
+                    let games = self.resolve_dragged_games(&payload);
+                    let target = self.active_db_index;
+                    self.copy_games_to_shelf(games, target, Some(insertion));
+                }
+            }
         }
         if let Some(id) = select {
             self.select_slot(id);
@@ -12408,8 +14618,41 @@ impl App {
         }
         let ctx = ui.ctx().clone();
         let portrait = self.photo_texture(&ctx, &player.name);
+        let has_custom_portrait =
+            crate::photos::custom_path(&player.name).is_some_and(|path| path.exists());
         let champion = champions::champion(&player.name, self.champion_lineage);
+        let country_periods = match &self.wiki_state {
+            WikiState::Ready(crate::wiki::Lookup::Summary(summary))
+                if self.wiki_for.as_deref() == Some(player.key.as_str()) =>
+            {
+                summary.country_periods.clone()
+            }
+            _ => {
+                let countries: Vec<Country> = if player.wiki_countries.is_empty() {
+                    player.country.into_iter().collect()
+                } else {
+                    player.wiki_countries.clone()
+                };
+                countries
+                    .iter()
+                    .map(|country| crate::wiki::CountryPeriod {
+                        code: country.code.to_string(),
+                        start_year: None,
+                        end_year: None,
+                        context: None,
+                    })
+                    .collect()
+            }
+        };
+        let mut country_flags = Vec::<String>::new();
+        for period in country_periods.iter().rev() {
+            if !country_flags.iter().any(|code| code == &period.code) {
+                country_flags.push(period.code.clone());
+            }
+        }
         let mut open_photo = false;
+        let mut choose_portrait = false;
+        let mut remove_portrait = false;
 
         let prep_color = self
             .prep
@@ -12440,9 +14683,6 @@ impl App {
         let mut back = false;
         let mut exit = false;
         let mut select_game = None;
-        let mut apply_reference = false;
-        let mut save_reference = false;
-        let mut clear_reference = false;
         let mut color_action: Option<Color> = None;
 
         egui::Frame::new()
@@ -12451,7 +14691,7 @@ impl App {
             .stroke(Stroke::new(1.0, BORDER))
             .inner_margin(10.0)
             .show(ui, |ui| {
-                // Header row: ← All players left; compact Prepare + FIDE pill right.
+                // Header row: navigation left; FIDE link and Exit prep right.
                 ui.horizontal(|ui| {
                     if ui.small_button("← All players").clicked() {
                         back = true;
@@ -12474,79 +14714,91 @@ impl App {
                         if let Some(id) = player.fide_id.clone() {
                             paint_fide_pill(ui, &id);
                         }
-                        egui::Frame::new()
-                            .fill(SURFACE_ALT)
-                            .corner_radius(11.0)
-                            .stroke(Stroke::new(1.0, BORDER))
-                            .inner_margin(egui::Margin::symmetric(8, 3))
-                            .show(ui, |ui| {
-                                ui.horizontal(|ui| {
-                                    ui.label(
-                                        RichText::new("Prepare").small().strong().color(MUTED),
-                                    );
-                                    let natural = natural_player_name(&player.name);
-                                    if paint_prepare_color_square(
-                                        ui,
-                                        Color32::from_rgb(0xE8, 0xEC, 0xF2),
-                                        &format!(
-                                            "You play White — prepare against {natural}'s Black games"
-                                        ),
-                                    )
-                                    .clicked()
-                                    {
-                                        // White square = the colour YOU play; the
-                                        // opponent therefore plays Black.
-                                        color_action = Some(Color::Black);
-                                    }
-                                    if paint_prepare_color_square(
-                                        ui,
-                                        Color32::from_rgb(0x20, 0x24, 0x2C),
-                                        &format!(
-                                            "You play Black — prepare against {natural}'s White games"
-                                        ),
-                                    )
-                                    .clicked()
-                                    {
-                                        color_action = Some(Color::White);
-                                    }
-                                });
-                            });
                     });
                 });
                 ui.add_space(4.0);
 
                 // Main body: Left 64x64 portrait/silhouette, Right player details
                 ui.horizontal(|ui| {
-                    let photo_size = 64.0;
-                    let (photo_rect, photo_resp) =
-                        ui.allocate_exact_size(vec2(photo_size, photo_size), Sense::click());
-                    if let Some(texture) = portrait.as_ref() {
-                        let painter = ui.painter_at(photo_rect);
-                        painter.rect_filled(photo_rect, 6.0, Color32::from_rgb(0x2C, 0x30, 0x34));
-                        painter.image(
-                            texture.id(),
-                            photo_rect,
-                            egui::Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
-                            Color32::WHITE,
-                        );
-                        painter.rect_stroke(
-                            photo_rect,
-                            6.0,
-                            Stroke::new(1.0, BORDER),
-                            StrokeKind::Inside,
-                        );
-                        if photo_resp.clicked() {
-                            open_photo = true;
+                    ui.vertical(|ui| {
+                        ui.set_min_width(70.0);
+                        let photo_size = 64.0;
+                        let (photo_rect, photo_resp) =
+                            ui.allocate_exact_size(vec2(photo_size, photo_size), Sense::click());
+                        if let Some(texture) = portrait.as_ref() {
+                            let painter = ui.painter_at(photo_rect);
+                            painter.rect_filled(
+                                photo_rect,
+                                6.0,
+                                Color32::from_rgb(0x2C, 0x30, 0x34),
+                            );
+                            painter.image(
+                                texture.id(),
+                                photo_rect,
+                                egui::Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+                                Color32::WHITE,
+                            );
+                            painter.rect_stroke(
+                                photo_rect,
+                                6.0,
+                                Stroke::new(1.0, BORDER),
+                                StrokeKind::Inside,
+                            );
+                            if photo_resp.clicked() {
+                                open_photo = true;
+                            }
+                        } else {
+                            let painter = ui.painter_at(photo_rect);
+                            paint_player_silhouette(&painter, photo_rect);
+                            if photo_resp
+                                .on_hover_text(
+                                    "Click to choose a portrait image (PNG, JPEG, WebP, GIF)",
+                                )
+                                .clicked()
+                            {
+                                choose_portrait = true;
+                            }
                         }
-                    } else {
-                        let painter = ui.painter_at(photo_rect);
-                        paint_player_silhouette(&painter, photo_rect);
-                    }
+                        if portrait.is_some() && ui.small_button("Change…").clicked() {
+                            choose_portrait = true;
+                        }
+                        if has_custom_portrait && ui.small_button("Remove").clicked() {
+                            remove_portrait = true;
+                        }
+                        ui.add_space(3.0);
+                        ui.label(RichText::new("Prepare").small().strong().color(MUTED));
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 5.0;
+                            let natural = natural_player_name(&player.name);
+                            if paint_prepare_color_square(
+                                ui,
+                                Color32::from_rgb(0xE8, 0xEC, 0xF2),
+                                &format!(
+                                    "You play White — prepare against {natural}'s Black games"
+                                ),
+                            )
+                            .clicked()
+                            {
+                                color_action = Some(Color::Black);
+                            }
+                            if paint_prepare_color_square(
+                                ui,
+                                Color32::from_rgb(0x0B, 0x0D, 0x11),
+                                &format!(
+                                    "You play Black — prepare against {natural}'s White games"
+                                ),
+                            )
+                            .clicked()
+                            {
+                                color_action = Some(Color::White);
+                            }
+                        });
+                    });
 
                     ui.vertical(|ui| {
                         // Line 1: Title pill + Name
                         ui.horizontal_wrapped(|ui| {
-                            if let Some(title) = player.title {
+                            if let Some(title) = self.display_title(&player) {
                                 ui.label(
                                     RichText::new(title.short())
                                         .small()
@@ -12570,10 +14822,7 @@ impl App {
                                 .unwrap_or_else(|| "—".to_string());
                             ui.label(RichText::new(elo_display).monospace().strong());
                             let db_peak = (player.elo_max > 0).then_some(player.elo_max);
-                            let peak = player
-                                .peak_elo
-                                .map(u32::from)
-                                .or(db_peak);
+                            let peak = player.peak_elo.map(u32::from).or(db_peak);
                             if let Some(peak) = peak {
                                 ui.label(RichText::new(format!("peak {peak}")).small().weak());
                             }
@@ -12585,32 +14834,28 @@ impl App {
                         // Line 2b: federation line — every known country, current first.
                         // Wikidata supplies `wiki_countries` (§12); until then the
                         // single database federation is shown.
-                        let federations: Vec<Country> = if player.wiki_countries.is_empty() {
-                            player.country.into_iter().collect()
-                        } else {
-                            player.wiki_countries.clone()
-                        };
-                        if !federations.is_empty() {
+                        if !country_flags.is_empty() {
                             ui.horizontal_wrapped(|ui| {
-                                for (index, country) in
-                                    federations.iter().rev().enumerate()
-                                {
+                                for (index, code) in country_flags.iter().enumerate() {
                                     if index > 0 {
-                                        ui.label(RichText::new("·").small().weak());
+                                        ui.add_space(3.0);
                                     }
-                                    flags::flag_response(
-                                        ui,
-                                        *country,
-                                        flags::PROFILE_SIZE,
-                                    );
-                                    ui.label(
-                                        RichText::new(country.name)
-                                            .small()
-                                            .weak(),
-                                    )
-                                    .on_hover_text(format!(
-                                        "{} ({})",
-                                        country.name, country.code
+                                    let (rect, response) =
+                                        ui.allocate_exact_size(flags::PROFILE_SIZE, Sense::hover());
+                                    let painter = ui.painter_at(rect);
+                                    if code == "GER"
+                                        && country_periods.iter().any(|period| {
+                                            period.code == *code
+                                                && period.context.as_deref() == Some("Nazi Germany")
+                                        })
+                                    {
+                                        flags::paint_german_war_ensign(&painter, rect);
+                                    } else if let Some(country) = country::normalize(code) {
+                                        flags::paint_flag(&painter, country, rect);
+                                    }
+                                    response.on_hover_text(country_period_tooltip(
+                                        code,
+                                        &country_periods,
                                     ));
                                 }
                             });
@@ -12636,122 +14881,60 @@ impl App {
                         record_bar(ui, player.wins(), player.draws(), player.losses());
                     });
                 });
-
             });
 
         if let Some(opp_color) = color_action {
             self.handle_prepare_color_action(opp_color);
         }
         self.wiki_summary_section(ui, &player);
+        if self
+            .player_clock_summary
+            .as_ref()
+            .is_none_or(|(k, _)| k != &player.key)
+        {
+            let sample_games: Vec<Game> = if self
+                .prep
+                .as_ref()
+                .is_some_and(|p| p.player_key == player.key)
+                && !self.prep_merged_games.is_empty()
+            {
+                self.prep_merged_games.iter().take(120).cloned().collect()
+            } else if let Some(lib) = &self.library {
+                player
+                    .game_indices
+                    .iter()
+                    .take(60)
+                    .filter_map(|&i| lib.load(i).ok())
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let summary = review::summarize_player_clocks(&sample_games, &player.key);
+            self.player_clock_summary = Some((player.key.clone(), summary));
+        }
+        if let Some((_, Some(clk))) = &self.player_clock_summary {
+            let mut parts = Vec::new();
+            for (mv, pct) in [
+                (10, clk.pct_at_move_10),
+                (20, clk.pct_at_move_20),
+                (30, clk.pct_at_move_30),
+                (40, clk.pct_at_move_40),
+            ] {
+                if let Some(p) = pct {
+                    parts.push(format!("m{mv} {p:.0}%"));
+                }
+            }
+            let mut line = format!("⏱ Clock pacing ({} games)", clk.clocked_games);
+            if !parts.is_empty() {
+                line.push_str(&format!(" · left: {}", parts.join(" · ")));
+            }
+            line.push_str(&format!(" · time trouble {:.0}%", clk.time_trouble_rate));
+            if let Some((exit_mv, avg_dt)) = clk.prep_exit_move {
+                line.push_str(&format!(" · theory exit ~m{exit_mv} ({avg_dt:.0}s think)"));
+            }
+            ui.label(RichText::new(line).small().color(GOLD));
+        }
         ui.label(RichText::new(&self.player_book_status).weak().small());
-        ui.add_space(4.0);
-        egui::CollapsingHeader::new(RichText::new("Reference database prior").strong())
-            .default_open(false)
-            .show(ui, |ui| {
-                ui.checkbox(
-                    &mut self.reference_enabled,
-                    "Use a separate reference database",
-                )
-                .on_hover_text(
-                    "Reference games are indexed separately and filtered to the prepared player's rating window. Without one, the current database prior is used and labelled as potentially skewed.",
-                );
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.reference_path)
-                        .hint_text("/path/to/masters.pgn, reference.si4, database.cbh, or database.2cbh")
-                        .desired_width(f32::INFINITY),
-                );
-                ui.horizontal_wrapped(|ui| {
-                    ui.label("Rating window ±");
-                    ui.add(
-                        egui::DragValue::new(&mut self.reference_band)
-                            .range(25..=1_000)
-                            .speed(10.0)
-                            .suffix(" Elo"),
-                    );
-                    ui.label("· offset");
-                    ui.add(
-                        egui::DragValue::new(&mut self.reference_offset)
-                            .range(-1_000..=1_000)
-                            .speed(5.0)
-                            .suffix(" Elo"),
-                    );
-                });
-                if let Some(elo) = player.elo_avg() {
-                    let target = (elo.round() as i64 + i64::from(self.reference_offset))
-                        .clamp(50, 4_000) as u32;
-                    let filter = RatingFilter::around(target, self.reference_band);
-                    ui.label(
-                        RichText::new(format!(
-                            "Player average {elo:.0} → reference window {}–{} Elo",
-                            filter.min, filter.max
-                        ))
-                        .weak()
-                        .small(),
-                    );
-                } else {
-                    ui.label(
-                        RichText::new("No player rating: a rating-filtered reference cannot be built.")
-                            .weak()
-                            .small(),
-                    );
-                }
-                ui.horizontal_wrapped(|ui| {
-                    if ui.button("Save & index for this player").clicked() {
-                        apply_reference = true;
-                        save_reference = true;
-                    }
-                    if ui.button("Clear reference").clicked() {
-                        clear_reference = true;
-                        save_reference = true;
-                    }
-                });
-                ui.add_space(5.0);
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(RichText::new("My player names").small().strong());
-                    if self.prep_player_names.is_empty() {
-                        ui.label(RichText::new("not configured").small().weak());
-                    } else {
-                        ui.label(
-                            RichText::new(self.prep_player_names.join(" · "))
-                                .small()
-                                .weak(),
-                        )
-                        .on_hover_text("Highest priority first");
-                    }
-                    if ui.small_button("Edit in Settings…").clicked() {
-                        self.open_settings_window();
-                    }
-                });
-                ui.label(RichText::new(&self.reference_status).weak().small());
-                if let Some(reference) = &self.reference {
-                    ui.label(
-                        RichText::new(format!(
-                            "Loaded: {} · {} · prior window {}",
-                            games_label(reference.index.game_count()),
-                            positions_label(reference.index.position_count()),
-                            reference.job.label()
-                        ))
-                        .weak()
-                        .small(),
-                    );
-                }
-            });
-        if clear_reference {
-            self.reference_path.clear();
-            self.reference = None;
-            self.reference_job = None;
-            self.reference_rx = None;
-            self.reference_book = None;
-            self.reference_status =
-                "No reference database configured — using the current database prior (may be skewed)."
-                    .to_string();
-        }
-        if save_reference {
-            self.save_reference_prefs();
-        }
-        if apply_reference {
-            self.ensure_reference_for_player(&player);
-        }
         ui.separator();
 
         let row_h = 42.0;
@@ -12804,7 +14987,7 @@ impl App {
         } else if merged_active {
             let mut merged_preview: Option<usize> = None;
             egui::ScrollArea::vertical()
-                .id_salt("player-games")
+                .id_salt(("player-games", &player.key))
                 .auto_shrink([false, false])
                 .show_rows(ui, row_h, total, |ui, range| {
                     for pos in range {
@@ -12816,23 +14999,22 @@ impl App {
                         };
                         let player_white = players::player_key(game.white()).as_deref()
                             == Some(player.key.as_str());
-                        let (opponent, opponent_color, color) = if player_white {
-                            (game.black().to_string(), Color::Black, "White")
+                        let (opponent, opponent_color, player_color) = if player_white {
+                            (game.black().to_string(), Color::Black, Color::White)
                         } else {
-                            (game.white().to_string(), Color::White, "Black")
+                            (game.white().to_string(), Color::White, Color::Black)
                         };
                         let cat = players::classify_game_category(game);
                         let type_color = self.game_category_color(cat);
-                        let subtitle =
-                            format!("{} · {} · {}", game.event(), game.date(), game.result());
+                        let subtitle = format!("{} · {}", game.event(), game.date());
+                        let result_badge = standardize_result_badge(game.result());
                         let site_owned = game.header("Site").map(str::to_string);
                         let width = ui.available_width();
                         let mut response = game_row(
                             ui,
                             false,
-                            &format!("as {color} against "),
-                            RowName::new(&opponent, player_title(game, opponent_color))
-                                .with_country(player_country(game, opponent_color)),
+                            &format!("{} vs ", color_name(player_color)),
+                            RowName::new(&opponent, self.title_for_game(game, opponent_color)),
                             None,
                             "",
                             &subtitle,
@@ -12840,9 +15022,17 @@ impl App {
                             width,
                             row_h - 2.0,
                             Some(type_color),
-                            None,
+                            Some((
+                                result_badge.as_str(),
+                                calc_player_outcome(game.result(), player_color),
+                            )),
                         );
                         response = response.on_hover_text(cat.label());
+                        if response.sense.senses_drag() {
+                            response.dnd_set_drag_payload(GameRowDrag {
+                                source: GameDragSource::OwnedGame(Arc::new(game.clone())),
+                            });
+                        }
                         if response.hovered() {
                             let id = format!("player:{position}");
                             if !self.touch_hovered_game(&id)
@@ -12864,7 +15054,7 @@ impl App {
             }
         } else {
             egui::ScrollArea::vertical()
-                .id_salt("player-games")
+                .id_salt(("player-games", &player.key))
                 .auto_shrink([false, false])
                 .show_rows(ui, row_h, total, |ui, range| {
                     for &idx in &game_indices[range] {
@@ -12874,7 +15064,6 @@ impl App {
                         let (
                             opponent,
                             opponent_title,
-                            opponent_country,
                             opponent_site,
                             color,
                             result,
@@ -12890,23 +15079,13 @@ impl App {
                             } else {
                                 (entry.white().to_string(), Color::White, "Black")
                             };
-                            let opponent_title =
+                            let opponent_title = self.title_for_player_date(
+                                &opponent,
+                                entry.date(),
                                 title_from_tag(entry.header(match opponent_color {
                                     Color::White => "WhiteTitle",
                                     Color::Black => "BlackTitle",
-                                }));
-                            let opponent_country = player_country_from_header(
-                                entry
-                                    .header(match opponent_color {
-                                        Color::White => "WhiteCountry",
-                                        Color::Black => "BlackCountry",
-                                    })
-                                    .or_else(|| {
-                                        entry.header(match opponent_color {
-                                            Color::White => "WhiteFed",
-                                            Color::Black => "BlackFed",
-                                        })
-                                    }),
+                                })),
                             );
                             let opponent_site = entry.header("Site").map(str::to_string);
                             let cat = players::classify_headers_category(
@@ -12919,7 +15098,6 @@ impl App {
                             (
                                 opponent,
                                 opponent_title,
-                                opponent_country,
                                 opponent_site,
                                 color,
                                 entry.result().to_string(),
@@ -12944,25 +15122,17 @@ impl App {
                                     .find(|(k, _)| k.eq_ignore_ascii_case(name))
                                     .map(|(_, v)| v.as_str())
                             };
-                            let opponent_title = title_from_tag(find_h(match opponent_color {
-                                Color::White => "WhiteTitle",
-                                Color::Black => "BlackTitle",
-                            }));
-                            let opponent_country = player_country_from_header(
-                                find_h(match opponent_color {
-                                    Color::White => "WhiteCountry",
-                                    Color::Black => "BlackCountry",
-                                })
-                                .or_else(|| {
-                                    find_h(match opponent_color {
-                                        Color::White => "WhiteFed",
-                                        Color::Black => "BlackFed",
-                                    })
-                                }),
+                            let date = find_h("Date").unwrap_or("????.??.??").to_string();
+                            let opponent_title = self.title_for_player_date(
+                                &opponent,
+                                &date,
+                                title_from_tag(find_h(match opponent_color {
+                                    Color::White => "WhiteTitle",
+                                    Color::Black => "BlackTitle",
+                                })),
                             );
                             let result = find_h("Result").unwrap_or("*").to_string();
                             let event = find_h("Event").unwrap_or("?").to_string();
-                            let date = find_h("Date").unwrap_or("????.??.??").to_string();
                             let opponent_site = find_h("Site").map(str::to_string);
                             let cat = players::classify_headers_category(
                                 Some(&event),
@@ -12974,7 +15144,6 @@ impl App {
                             (
                                 opponent,
                                 opponent_title,
-                                opponent_country,
                                 opponent_site,
                                 color,
                                 result,
@@ -12984,7 +15153,14 @@ impl App {
                                 type_label,
                             )
                         };
-                        let subtitle = format!("{event} · {date} · {result}");
+                        let subtitle = format!("{event} · {date}");
+                        let player_color = if color == "White" {
+                            Color::White
+                        } else {
+                            Color::Black
+                        };
+                        let result_badge = standardize_result_badge(&result);
+                        let outcome = calc_player_outcome(&result, player_color);
                         let selected = self
                             .session
                             .source_slot(idx)
@@ -12994,8 +15170,8 @@ impl App {
                         let mut response = game_row(
                             ui,
                             selected,
-                            &format!("as {color} against "),
-                            RowName::new(&opponent, opponent_title).with_country(opponent_country),
+                            &format!("{color} vs "),
+                            RowName::new(&opponent, opponent_title),
                             None,
                             "",
                             &subtitle,
@@ -13003,9 +15179,17 @@ impl App {
                             width,
                             row_h - 2.0,
                             Some(type_color),
-                            None,
+                            Some((result_badge.as_str(), outcome)),
                         );
                         response = response.on_hover_text(type_label);
+                        if response.sense.senses_drag() {
+                            response.dnd_set_drag_payload(GameRowDrag {
+                                source: GameDragSource::LibraryGame {
+                                    library: Arc::clone(library),
+                                    index: idx,
+                                },
+                            });
+                        }
                         if response.hovered() {
                             let lib_clone = Arc::clone(library);
                             self.activate_hovered_game_browse_lazy(
@@ -13022,6 +15206,34 @@ impl App {
 
         if open_photo {
             self.photo_viewer = Some(player.name.clone());
+        }
+        if choose_portrait
+            && let Some(path) = open_file_dialog(
+                "Choose player portrait",
+                None,
+                "Images | *.png *.PNG *.jpg *.JPG *.jpeg *.JPEG *.webp *.WEBP *.gif *.GIF *.bmp *.BMP",
+                "*.png *.PNG *.jpg *.JPG *.jpeg *.JPEG *.webp *.WEBP *.gif *.GIF *.bmp *.BMP",
+            )
+        {
+            match crate::photos::store_custom(&player.name, &path) {
+                Ok(target) => {
+                    self.invalidate_photo_cache(&player.name);
+                    self.status = format!("Portrait saved as {}", target.display());
+                }
+                Err(err) => {
+                    self.status = format!("Could not save the portrait: {err:#}");
+                }
+            }
+        }
+        if remove_portrait {
+            match crate::photos::remove_custom(&player.name) {
+                Ok(true) => {
+                    self.invalidate_photo_cache(&player.name);
+                    self.status = "Custom portrait removed.".to_string();
+                }
+                Ok(false) => self.status = "No custom portrait was found.".to_string(),
+                Err(err) => self.status = format!("Could not remove the portrait: {err:#}"),
+            }
         }
         if back {
             if prep_matches(self, &player.key) {
@@ -13082,7 +15294,8 @@ impl App {
                     };
                     let name = player.name.clone();
                     let key = player.key.clone();
-                    let (player_title, player_elo, player_country) = player_list_row_meta(player);
+                    let (player_title, player_elo, player_country) =
+                        player_list_row_meta(player, self.display_title(player));
                     let is_you = you_key.as_deref() == Some(key.as_str());
                     let title = if is_you {
                         "You".to_string()
@@ -13154,7 +15367,11 @@ impl App {
                 ui.set_max_width(ui.available_width());
                 ui.add_space(6.0);
                 ui.horizontal_wrapped(|ui| {
-                    for tab in RightTab::ALL {
+                    for tab in RightTab::ALL
+                        .iter()
+                        .copied()
+                        .filter(|tab| *tab != RightTab::Preparation || self.prep.is_some())
+                    {
                         if self.multi_view {
                             let visible = self.visible_tabs[tab.index()];
                             let response = ui.selectable_label(visible, tab.label()).on_hover_text(
@@ -13224,7 +15441,10 @@ impl App {
                     let visible: Vec<RightTab> = RightTab::ALL
                         .iter()
                         .copied()
-                        .filter(|tab| self.visible_tabs[tab.index()])
+                        .filter(|tab| {
+                            self.visible_tabs[tab.index()]
+                                && (*tab != RightTab::Preparation || self.prep.is_some())
+                        })
                         .collect();
                     let available = ui.available_height();
                     let section_height = ((available - 10.0 * visible.len() as f32)
@@ -13267,234 +15487,8 @@ impl App {
                     });
             }
             RightTab::Tree => self.tree_content(ui),
+            RightTab::Preparation => self.preparation_content(ui),
             RightTab::Engine => self.engine_content(ui),
-            RightTab::References => self.references_content(ui),
-        }
-    }
-
-    fn references_content(&mut self, ui: &mut Ui) {
-        self.maybe_request_cloud();
-
-        let snapshot = self.cloud.clone();
-        let position = self
-            .current
-            .as_ref()
-            .map(|game| game.nodes[self.node].pos.clone());
-        let status = self.cloud_status.clone();
-        let loading = self.cloud_rx.is_some() || self.explorer_rx.is_some();
-        let token_configured = self.lichess_token.is_some();
-        let mut refresh = false;
-        let mut open_settings = false;
-        let mut reference_path = self.reference_path.clone();
-        let mut reference_enabled = self.reference_enabled;
-        let mut choose_reference = false;
-        let mut use_current_reference = false;
-        let mut set_current_reference = false;
-        let current_db = self
-            .library
-            .as_ref()
-            .map(|library| library.path().display().to_string())
-            .unwrap_or_else(|| "No database open".to_string());
-        let reference_status = self.reference_status.clone();
-
-        egui::ScrollArea::both()
-            .id_salt("cloud-references")
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                ui.set_max_width(ui.available_width());
-                ui.horizontal(|ui| {
-                    ui.heading("References");
-                    if loading {
-                        ui.spinner();
-                    }
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui.button("Refresh").clicked() {
-                            refresh = true;
-                        }
-                    });
-                });
-                ui.label(RichText::new(&status).small().weak());
-                if let Some(position) = &position {
-                    ui.label(RichText::new(fen_string(position)).monospace().small().weak())
-                        .on_hover_text("Current FEN");
-                }
-                ui.add_space(6.0);
-
-                egui::Frame::new()
-                    .fill(SURFACE)
-                    .corner_radius(10.0)
-                    .stroke(Stroke::new(1.0, BORDER))
-                    .inner_margin(10.0)
-                    .show(ui, |ui| {
-                        ui.heading("Reference sources");
-                        ui.label(
-                            RichText::new(
-                                "Preparation can use the current database, a stronger reference database, or an online account.",
-                            )
-                            .small()
-                            .weak(),
-                        );
-                        ui.add_space(4.0);
-                        ui.label(
-                            RichText::new(format!("Current database · {current_db}"))
-                                .small()
-                                .weak(),
-                        );
-                        if ui
-                            .button("Use current database")
-                            .on_hover_text(
-                                "Use the open database as the fallback preparation reference",
-                            )
-                            .clicked()
-                        {
-                            use_current_reference = true;
-                        }
-                        if ui
-                            .add_enabled(
-                                self.library.is_some(),
-                                egui::Button::new("Set open DB as default"),
-                            )
-                            .on_hover_text(
-                                "Persist the open database as the default preparation reference",
-                            )
-                            .clicked()
-                        {
-                            set_current_reference = true;
-                        }
-
-                        ui.add_space(4.0);
-                        ui.horizontal_wrapped(|ui| {
-                            ui.label(RichText::new("Reference database").small().strong());
-                            let width = (ui.available_width() - 92.0).max(80.0);
-                            ui.add(
-                                egui::TextEdit::singleline(&mut reference_path)
-                                    .desired_width(width)
-                                    .hint_text("e.g. Mega Database (.pgn, .si4, .cbh, .2cbh)"),
-                            );
-                            if ui.button("Choose…").clicked() {
-                                choose_reference = true;
-                            }
-                        });
-                        ui.horizontal_wrapped(|ui| {
-                            ui.label(RichText::new("Live:").small().weak());
-                            for src in LiveReferenceSource::ALL {
-                                let active = LiveReferenceSource::from_config_str(&reference_path) == Some(src);
-                                if ui.selectable_label(active, src.short_label()).clicked() {
-                                    reference_path = src.config_str().to_string();
-                                    reference_enabled = true;
-                                }
-                            }
-                        });
-                        ui.checkbox(
-                            &mut reference_enabled,
-                            "Use the reference database for preparation",
-                        );
-                        ui.label(RichText::new(&reference_status).small().weak());
-
-                        ui.add_space(6.0);
-                        ui.separator();
-                        ui.add_space(4.0);
-                        ui.label(RichText::new("Online accounts").small().strong());
-                        ui.horizontal_wrapped(|ui| {
-                            for source in [
-                                OnlineSource::Lichess,
-                                OnlineSource::ChessCom,
-                                OnlineSource::ChessAbc,
-                            ] {
-                                if ui
-                                    .button(source.label())
-                                    .on_hover_text(format!(
-                                        "Open the {} opponent reference panel",
-                                        source.label()
-                                    ))
-                                    .clicked()
-                                {
-                                    self.online_ref_source = source;
-                                    self.online_reference_open = true;
-                                }
-                            }
-                        });
-                        ui.label(
-                            RichText::new(
-                                "Use File → Import to save games from an online account into a database.",
-                            )
-                            .small()
-                            .weak(),
-                        );
-                    });
-                ui.add_space(6.0);
-
-                let Some(snapshot) = &snapshot else {
-                    ui.label(
-                        RichText::new(
-                            "Move the board or open a game; references are queried automatically.",
-                        )
-                        .weak(),
-                    );
-                    return;
-                };
-
-                if let Err(err) = &snapshot.chessdb {
-                    ui.label(
-                        RichText::new(format!("chessdb.cn: {err}"))
-                            .small()
-                            .weak(),
-                    );
-                }
-                if let Err(err) = &snapshot.explorer {
-                    ui.add_space(3.0);
-                    if token_configured {
-                        ui.label(RichText::new(format!("Lichess explorer: {err}")).small().weak());
-                    } else {
-                        ui.label(
-                            RichText::new(
-                                "Lichess opening-explorer requests need an API token. The public cloud evaluation works without one.",
-                            )
-                            .small()
-                            .weak(),
-                        );
-                        if ui.small_button("Add a token in Settings").clicked() {
-                            open_settings = true;
-                        }
-                    }
-                }
-            });
-
-        if open_settings {
-            self.open_settings_window();
-        }
-        if set_current_reference {
-            self.set_current_database_as_reference();
-        }
-        if use_current_reference {
-            reference_path.clear();
-            reference_enabled = false;
-        }
-        if choose_reference && let Some(path) = open_dialog(None) {
-            reference_path = path.display().to_string();
-            reference_enabled = true;
-        }
-        if reference_path != self.reference_path || reference_enabled != self.reference_enabled {
-            if reference_enabled && !reference_path.trim().is_empty() {
-                self.set_reference_path_or_book(reference_path);
-            } else {
-                self.reference_path = reference_path;
-                self.reference_enabled = reference_enabled;
-                self.reference = None;
-                self.reference_rx = None;
-                self.reference_job = None;
-                self.reference_book = None;
-                self.reference_status = if use_current_reference {
-                    "Using the current database as the reference source.".to_string()
-                } else {
-                    "No reference database configured — using the current database prior."
-                        .to_string()
-                };
-                self.save_reference_prefs();
-            }
-        }
-        if refresh {
-            self.refresh_cloud();
         }
     }
 
@@ -13511,6 +15505,12 @@ impl App {
     }
 
     fn engine_content_inner(&mut self, ui: &mut Ui) {
+        // Game Review lives at the top of the Engine workspace so it is always
+        // directly visible; it uses its own dedicated engine and does not
+        // depend on the local auto-analysis slots below.
+        self.review_content(ui);
+        ui.add_space(10.0);
+
         let mut start = false;
         let mut stop = false;
         let mut settings_changed = false;
@@ -13603,27 +15603,6 @@ impl App {
                         {
                             self.engine_settings_open = !self.engine_settings_open;
                         }
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            let review_running =
-                                self.review.as_ref().is_some_and(|review| review.running);
-                            if review_running {
-                                ui.spinner();
-                            }
-                            let label = if self.review_open {
-                                "Game review ▾"
-                            } else {
-                                "Game review"
-                            };
-                            if ui
-                                .selectable_label(self.review_open, label)
-                                .on_hover_text(
-                                    "Local-engine game review · grades every mainline move",
-                                )
-                                .clicked()
-                            {
-                                self.review_open = !self.review_open;
-                            }
-                        });
                     });
                     if self.engine_settings_open {
                         ui.horizontal(|ui| {
@@ -14116,21 +16095,20 @@ impl App {
             }
         }
 
-        if engine_view != EngineView::Cloud && self.review_open {
-            ui.add_space(8.0);
-            self.review_content(ui);
-        }
-
         if engine_view != EngineView::Local {
             if engine_view == EngineView::Both {
                 ui.add_space(8.0);
             }
+            let engine_cloud_snapshot = self
+                .current_fen()
+                .and_then(|fen| self.cloud_snapshot_for_engine_view(&fen));
             let (cloud_line, cloud_preview, show_cache_info) = cloud_engine_section(
                 ui,
-                self.cloud.as_ref(),
+                engine_cloud_snapshot.as_ref(),
                 &self.cached_analyses,
                 Some(&pos),
                 &self.cloud_status,
+                &mut self.engine_show_chessdb_only,
             );
             if cloud_line.is_some() {
                 clicked_line = cloud_line;
@@ -14189,9 +16167,6 @@ impl App {
                         ui.spinner();
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui.small_button("Hide").clicked() {
-                            self.review_open = false;
-                        }
                         ui.label(
                             RichText::new(if running { "analyzing" } else { "idle" })
                                 .small()
@@ -14200,7 +16175,9 @@ impl App {
                     });
                 });
                 ui.label(
-                    RichText::new("Stockfish grades every mainline move by centipawn loss.")
+                    RichText::new(
+                        "Lichess Cloud Eval is reused first; the selected engine fills any remaining positions.",
+                    )
                         .small()
                         .weak(),
                 );
@@ -14288,6 +16265,8 @@ impl App {
         }
 
         let mut clicked_node = None;
+        let mut insert_refutation: Option<(usize, Vec<String>)> = None;
+        let mut annotate_mistakes = false;
         if let Some(review) = &self.review
             && let Some(game) = &self.current
         {
@@ -14298,12 +16277,14 @@ impl App {
             } else {
                 done as f32 / total as f32
             };
-            ui.add_space(8.0);
-            ui.add(
-                egui::ProgressBar::new(fraction)
-                    .text(format!("{done} / {total} positions analyzed"))
-                    .desired_width(ui.available_width()),
-            );
+            if running {
+                ui.add_space(8.0);
+                ui.add(
+                    egui::ProgressBar::new(fraction)
+                        .text(format!("{done} / {total} positions analyzed"))
+                        .desired_width(ui.available_width()),
+                );
+            }
 
             if review.book_plies > 0 {
                 ui.label(
@@ -14373,18 +16354,75 @@ impl App {
                 }
             });
 
-            ui.add_space(6.0);
-            review_graph(ui, review);
-
-            if !running
-                && can_write_nags
-                && !moves.is_empty()
-                && ui
-                    .button("Write NAGs to mainline")
-                    .on_hover_text("Add !! / ! / ?! / ? / ?? annotations to the reviewed moves")
-                    .clicked()
+            if summary.white_opening.is_some()
+                || summary.black_opening.is_some()
+                || summary.white_middlegame.is_some()
+                || summary.black_middlegame.is_some()
+                || summary.white_endgame.is_some()
+                || summary.black_endgame.is_some()
             {
-                write_nags = true;
+                let fmt_pair = |w: Option<f64>, b: Option<f64>| -> String {
+                    let ws = w
+                        .map(|v| format!("{v:.0}%"))
+                        .unwrap_or_else(|| "—".to_string());
+                    let bs = b
+                        .map(|v| format!("{v:.0}%"))
+                        .unwrap_or_else(|| "—".to_string());
+                    format!("{ws}/{bs}")
+                };
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        RichText::new(format!(
+                            "Phases (W/B): Opening {} · Mid {} · End {}",
+                            fmt_pair(summary.white_opening, summary.black_opening),
+                            fmt_pair(summary.white_middlegame, summary.black_middlegame),
+                            fmt_pair(summary.white_endgame, summary.black_endgame),
+                        ))
+                        .small()
+                        .weak(),
+                    );
+                    if summary.white_time_discipline.is_some()
+                        || summary.black_time_discipline.is_some()
+                    {
+                        ui.label(
+                            RichText::new(format!(
+                                "· ⏱ Time discipline {}",
+                                fmt_pair(
+                                    summary.white_time_discipline,
+                                    summary.black_time_discipline
+                                )
+                            ))
+                            .small()
+                            .color(GOLD),
+                        );
+                    }
+                });
+            }
+
+            ui.add_space(6.0);
+            if let Some(graph_node) = review_graph(ui, review, &moves) {
+                clicked_node = Some(graph_node);
+            }
+
+            if !running && can_write_nags && !moves.is_empty() {
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .button("Write NAGs to mainline")
+                        .on_hover_text("Add !! / ! / ?! / ? / ?? annotations to the reviewed moves")
+                        .clicked()
+                    {
+                        write_nags = true;
+                    }
+                    if ui
+                        .button("Annotate key mistakes + refutations")
+                        .on_hover_text(
+                            "Write NAGs and insert short engine refutation variations on mistakes and blunders",
+                        )
+                        .clicked()
+                    {
+                        annotate_mistakes = true;
+                    }
+                });
             }
 
             if moves.is_empty() {
@@ -14395,13 +16433,36 @@ impl App {
                         .italics(),
                 );
             } else {
+                let key_count = moves.iter().filter(|m| m.is_key_moment()).count();
                 ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .selectable_label(
+                            self.review_only_key_moments && key_count > 0,
+                            format!("Key Moments ({key_count})"),
+                        )
+                        .clicked()
+                    {
+                        self.review_only_key_moments = true;
+                    }
+                    if ui
+                        .selectable_label(
+                            !self.review_only_key_moments || key_count == 0,
+                            format!("All Moves ({})", moves.len()),
+                        )
+                        .clicked()
+                    {
+                        self.review_only_key_moments = false;
+                    }
+                });
+                ui.add_space(4.0);
+                let show_key_only = self.review_only_key_moments && key_count > 0;
                 egui::ScrollArea::vertical()
                     .id_salt("review-moves")
-                    .max_height(250.0)
+                    .max_height(320.0)
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        for mov in &moves {
+                        for mov in moves.iter().filter(|m| !show_key_only || m.is_key_moment()) {
                             let number = if mov.color == Color::White {
                                 format!("{}. ", mov.number)
                             } else {
@@ -14411,37 +16472,106 @@ impl App {
                                 .eval_before
                                 .map(|score| engine_score_label(Some(score), mov.color))
                                 .unwrap_or_else(|| "—".to_string());
-                            ui.horizontal(|ui| {
+                            let sym = if mov.is_only_move_great {
+                                "!"
+                            } else {
+                                mov.quality.symbol()
+                            };
+                            let sym_color = if mov.is_only_move_great {
+                                Color32::from_rgb(0x38, 0xBD, 0xF8)
+                            } else {
+                                quality_color(mov.quality)
+                            };
+                            ui.horizontal_wrapped(|ui| {
                                 ui.label(
-                                    RichText::new(mov.quality.symbol())
+                                    RichText::new(sym)
                                         .monospace()
                                         .strong()
-                                        .color(quality_color(mov.quality)),
+                                        .color(sym_color),
                                 )
-                                .on_hover_text(mov.quality.label());
+                                .on_hover_text(if mov.is_only_move_great {
+                                    "Only Move / Great find in a critical position"
+                                } else {
+                                    mov.quality.label()
+                                });
                                 let label = format!("{number}{}  {eval}", mov.san);
-                                let best = mov.best.as_deref().unwrap_or("?");
+                                let best_uci = mov.best.as_deref().unwrap_or("?");
+                                let parent_pos = game
+                                    .nodes
+                                    .get(mov.node)
+                                    .and_then(|n| n.parent)
+                                    .and_then(|p| game.nodes.get(p))
+                                    .map(|n| &n.pos);
+                                let best_san = parent_pos
+                                    .and_then(|pos| cloud::uci_san(pos, best_uci))
+                                    .unwrap_or_else(|| best_uci.to_string());
                                 if ui
                                     .selectable_label(
                                         self.node == mov.node,
                                         RichText::new(label).monospace().small(),
                                     )
                                     .on_hover_text(format!(
-                                        "{} · played {} · best {best}",
+                                        "{} · played {} · best {best_san}",
                                         mov.quality.label(),
-                                        mov.played
+                                        mov.san
                                     ))
                                     .clicked()
                                 {
                                     clicked_node = Some(mov.node);
                                 }
-                                if let Some(loss) = mov.cp_loss {
+                                if let Some(loss) = mov.cp_loss
+                                    && loss > 0
+                                {
                                     ui.label(
                                         RichText::new(format!("-{loss}"))
                                             .monospace()
                                             .small()
                                             .color(quality_color(mov.quality)),
                                     );
+                                }
+                                if let Some(dt) = mov.move_time_secs {
+                                    ui.label(
+                                        RichText::new(format!("{dt:.0}s"))
+                                            .monospace()
+                                            .small()
+                                            .weak(),
+                                    );
+                                }
+                                if let Some(tag) = mov.time_tag {
+                                    ui.label(
+                                        RichText::new(tag.badge())
+                                            .small()
+                                            .color(GOLD),
+                                    )
+                                    .on_hover_text(tag.tooltip());
+                                }
+                                if mov.from_cache {
+                                    ui.label(RichText::new("💾").small().weak())
+                                        .on_hover_text("Loaded from local analysis.db cache");
+                                }
+                                if mov.best.as_deref().is_some_and(|b| b != mov.played)
+                                    && matches!(
+                                        mov.quality,
+                                        Quality::Inaccuracy | Quality::Mistake | Quality::Blunder
+                                    )
+                                {
+                                    ui.label(
+                                        RichText::new(format!("Best: {best_san}"))
+                                            .small()
+                                            .weak(),
+                                    );
+                                    if can_write_nags
+                                        && !mov.best_pv.is_empty()
+                                        && ui
+                                            .small_button("+ Line")
+                                            .on_hover_text(
+                                                "Insert the engine's refutation line as a variation",
+                                            )
+                                            .clicked()
+                                    {
+                                        insert_refutation =
+                                            Some((mov.node, mov.best_pv.clone()));
+                                    }
                                 }
                             });
                         }
@@ -14452,8 +16582,67 @@ impl App {
         if write_nags {
             self.write_review_nags();
         }
+        if annotate_mistakes {
+            self.annotate_key_mistakes_into_game();
+        }
+        if let Some((node, pv)) = insert_refutation {
+            self.insert_refutation_variation(node, &pv);
+        }
         if let Some(node) = clicked_node {
             self.goto(node);
+        }
+    }
+
+    fn insert_refutation_variation(&mut self, move_node: usize, pv: &[String]) -> bool {
+        let Some(game) = self.current.as_mut() else {
+            return false;
+        };
+        let Some(parent) = game.nodes.get(move_node).and_then(|n| n.parent) else {
+            return false;
+        };
+        let mut cur = parent;
+        let mut added = false;
+        for uci_str in pv.iter().take(6) {
+            let pos = game.nodes[cur].pos.clone();
+            let Ok(uci) = uci_str.parse::<UciMove>() else {
+                break;
+            };
+            let Ok(mv) = uci.to_move(&pos) else {
+                break;
+            };
+            cur = game.add_move(cur, mv);
+            added = true;
+        }
+        if added {
+            self.dirty = true;
+            self.persist_current_edit();
+        }
+        added
+    }
+
+    fn annotate_key_mistakes_into_game(&mut self) {
+        self.write_review_nags();
+        let moves = self
+            .review
+            .as_ref()
+            .and_then(|review| self.current.as_ref().map(|game| review.moves(game)))
+            .unwrap_or_default();
+        let mut lines_added = 0usize;
+        for mov in moves {
+            if matches!(mov.quality, Quality::Mistake | Quality::Blunder)
+                && mov.best.as_deref().is_some_and(|b| b != mov.played)
+                && !mov.best_pv.is_empty()
+                && self.insert_refutation_variation(mov.node, &mov.best_pv)
+            {
+                lines_added += 1;
+            }
+        }
+        if lines_added > 0 {
+            self.review_status = format!(
+                "{} Inserted {lines_added} refutation variation{}.",
+                self.review_status,
+                if lines_added == 1 { "" } else { "s" }
+            );
         }
     }
 
@@ -14531,6 +16720,10 @@ impl App {
         game_header_card(
             ui,
             &game,
+            (
+                self.title_for_game(&game, Color::White),
+                self.title_for_game(&game, Color::Black),
+            ),
             prep.as_ref(),
             self.rating_priority,
             self.show_all_ratings,
@@ -14883,35 +17076,20 @@ impl App {
             return;
         };
         let key = position::position_key(&pos);
-        if self.recent_preview.is_none()
-            && let Some(prep) = self.prep.clone()
-        {
-            self.prep_tree(ui, &prep, &pos, key);
-            return;
-        }
-
         self.maybe_request_cloud();
-        if let Some(live_src) = LiveReferenceSource::from_config_str(&self.book_path) {
-            match live_src {
-                LiveReferenceSource::ChessAbc => self.maybe_request_chessabc_live(&pos),
-                LiveReferenceSource::LichessMasters => {
-                    if self.explorer_source != cloud::ExplorerSource::Masters {
-                        self.explorer_source = cloud::ExplorerSource::Masters;
-                    }
-                    self.maybe_request_cloud();
-                }
-                LiveReferenceSource::LichessAll => {
-                    if self.explorer_source != cloud::ExplorerSource::Lichess {
-                        self.explorer_source = cloud::ExplorerSource::Lichess;
-                    }
-                    self.maybe_request_cloud();
-                }
-            }
+        if LiveReferenceSource::from_config_str(&self.book_path)
+            == Some(LiveReferenceSource::ChessAbc)
+        {
+            self.maybe_request_chessabc_live(&pos);
         }
         let mut explorer_source = self.explorer_source;
         let mut source_changed = None;
         let mut choose_tree = false;
         let mut use_current_tree = false;
+        let mut use_reference_tree = false;
+        let mut open_sources_settings = false;
+        let mut toggle_online_scout = false;
+        let mut refresh_references = false;
         let mut clicked = None;
         let mut clicked_uci = None;
         let mut hover_preview = None;
@@ -14933,6 +17111,34 @@ impl App {
                     if self.cloud_rx.is_some() || self.explorer_rx.is_some() {
                         ui.spinner();
                     }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.small_button("Settings…").clicked() {
+                            open_sources_settings = true;
+                        }
+                        if ui
+                            .add_enabled(self.current.is_some(), egui::Button::new("Refresh"))
+                            .on_hover_text("Refresh the live Lichess / ChessABC reference")
+                            .clicked()
+                        {
+                            refresh_references = true;
+                        }
+                        if ui
+                            .selectable_label(
+                                self.online_reference_open,
+                                if self.online_reference_open {
+                                    "Scout online ▾"
+                                } else {
+                                    "Scout online…"
+                                },
+                            )
+                            .on_hover_text(
+                                "Find a player's recent Lichess, Chess.com, or ChessABC games",
+                            )
+                            .clicked()
+                        {
+                            toggle_online_scout = true;
+                        }
+                    });
                 });
                 ui.horizontal_wrapped(|ui| {
                     ui.label(RichText::new("Source:").small().strong());
@@ -14941,6 +17147,18 @@ impl App {
                         .clicked()
                     {
                         use_current_tree = true;
+                    }
+                    let ref_path = self.reference_path.trim();
+                    let has_reference_file = !ref_path.is_empty()
+                        && LiveReferenceSource::from_config_str(ref_path).is_none()
+                        && !is_opening_book_path(Path::new(ref_path));
+                    if has_reference_file
+                        && ui
+                            .selectable_label(self.tree_path.trim() == ref_path, "Reference DB")
+                            .on_hover_text(format!("Use {}", Path::new(ref_path).display()))
+                            .clicked()
+                    {
+                        use_reference_tree = true;
                     }
                     for src in LiveReferenceSource::ALL {
                         let active =
@@ -15168,6 +17386,23 @@ impl App {
                                     });
                             }
                         });
+                } else if LiveReferenceSource::from_config_str(&self.book_path).is_none() {
+                    ui.add_space(8.0);
+                    egui::Frame::new()
+                        .fill(SURFACE)
+                        .corner_radius(10.0)
+                        .stroke(Stroke::new(1.0, BORDER))
+                        .inner_margin(10.0)
+                        .show(ui, |ui| {
+                            ui.heading("Opening book");
+                            ui.label(
+                                RichText::new(
+                                    "No opening book configured. Choose a .bin/.ctg/.abk file or a live Lichess/ChessABC source above.",
+                                )
+                                .weak()
+                                .small(),
+                            );
+                        });
                 } else if let Some(live_src) = LiveReferenceSource::from_config_str(&self.book_path) {
                     ui.add_space(8.0);
                     egui::Frame::new()
@@ -15245,67 +17480,15 @@ impl App {
                                         });
                                     }
                                 }
-                                LiveReferenceSource::LichessMasters | LiveReferenceSource::LichessAll => {
-                                    let source = match live_src {
-                                        LiveReferenceSource::LichessMasters => cloud::ExplorerSource::Masters,
-                                        _ => cloud::ExplorerSource::Lichess,
-                                    };
-                                    let fen = Fen::from_position(&pos, EnPassantMode::Legal).to_string();
-                                    if let Some(snapshot) = self.cloud_cache.get(&(source, fen)) {
-                                        match &snapshot.explorer {
-                                            Ok(explorer) if !explorer.moves.is_empty() => {
-                                                egui::Grid::new("tree-live-book-grid")
-                                                    .num_columns(4)
-                                                    .striped(true)
-                                                    .spacing([10.0, 4.0])
-                                                    .show(ui, |ui| {
-                                                        ui.label(RichText::new("Move").strong());
-                                                        ui.label(RichText::new("Games").strong());
-                                                        ui.label(RichText::new("Score").strong());
-                                                        ui.label(RichText::new("W/D/B").strong());
-                                                        ui.end_row();
-                                                        for em in &explorer.moves {
-                                                            let Ok(uci) = em.uci.parse::<UciMove>() else { continue };
-                                                            let Ok(mv) = uci.to_move(&pos) else { continue };
-                                                            let response = ui.selectable_label(
-                                                                false,
-                                                                RichText::new(&em.san).strong(),
-                                                            );
-                                                            if response.hovered() {
-                                                                hover_preview = preview_after_move(&pos, mv);
-                                                            }
-                                                            if response.clicked() {
-                                                                clicked = Some(mv);
-                                                            }
-                                                            ui.label(em.total().to_string());
-                                                            let pct = if em.total() > 0 {
-                                                                (em.white as f64 + em.draws as f64 * 0.5) / em.total() as f64 * 100.0
-                                                            } else {
-                                                                0.0
-                                                            };
-                                                            ui.label(format!("{pct:.0}%"));
-                                                            draw_wdl_bar(
-                                                                ui,
-                                                                em.white as u32,
-                                                                em.draws as u32,
-                                                                em.black as u32,
-                                                                60.0,
-                                                                10.0,
-                                                            );
-                                                            ui.end_row();
-                                                        }
-                                                    });
-                                            }
-                                            Ok(_) => {
-                                                ui.label(RichText::new("No moves found in explorer for this position.").weak().italics());
-                                            }
-                                            Err(err) => {
-                                                ui.label(RichText::new(format!("Explorer query failed: {err}")).weak());
-                                            }
-                                        }
-                                    } else {
-                                        ui.label(RichText::new(format!("Loading {}...", live_src.label())).weak());
-                                    }
+                                LiveReferenceSource::LichessMasters
+                                | LiveReferenceSource::LichessAll => {
+                                    ui.label(
+                                        RichText::new(
+                                            "Lichess explorer moves and top games are shown in the section below.",
+                                        )
+                                        .weak()
+                                        .small(),
+                                    );
                                 }
                             }
                         });
@@ -15499,6 +17682,21 @@ impl App {
         if dismiss_prompt {
             self.prompt_persist_index = None;
         }
+        if toggle_online_scout {
+            self.online_reference_open = !self.online_reference_open;
+        }
+        if refresh_references {
+            self.refresh_cloud();
+        }
+        if open_sources_settings {
+            self.open_settings_window();
+        }
+        if use_reference_tree && !self.reference_path.trim().is_empty() {
+            let path = Path::new(self.reference_path.trim()).to_path_buf();
+            self.tree_path = path.display().to_string();
+            self.save_display_prefs();
+            self.start_tree_index(path);
+        }
         if choose_tree && let Some(path) = open_dialog(None) {
             self.tree_path = path.display().to_string();
             self.save_display_prefs();
@@ -15550,6 +17748,54 @@ impl App {
         } else if let Some(preview) = hover_preview {
             self.hover_preview = Some(preview);
         }
+    }
+
+    #[allow(dead_code)]
+    fn poll_ref_position_games(&mut self) {
+        let Some(rx) = self.ref_position_games_rx.take() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(result) => {
+                self.ref_position_games = Some(result);
+            }
+            Err(TryRecvError::Empty) => {
+                self.ref_position_games_rx = Some(rx);
+            }
+            Err(TryRecvError::Disconnected) => {}
+        }
+    }
+
+    #[allow(dead_code)]
+    fn maybe_request_ref_position_games(&mut self, key: u64) {
+        let Some(active_lib) = self
+            .tree_library
+            .as_ref()
+            .or(self.library.as_ref())
+            .cloned()
+        else {
+            self.ref_position_games = None;
+            return;
+        };
+        if self
+            .ref_position_games
+            .as_ref()
+            .is_some_and(|g| g.key == key && g.source_path == active_lib.path())
+        {
+            return;
+        }
+        if self.ref_position_games_rx.is_some() {
+            return;
+        }
+        let is_start = key == position::position_key(&Chess::default());
+        let (tx, rx) = mpsc::channel();
+        self.ref_position_games_rx = Some(rx);
+        let ctx = self.ctx.clone();
+        std::thread::spawn(move || {
+            let result = collect_ref_position_games(active_lib, key, is_start);
+            let _ = tx.send(result);
+            ctx.request_repaint();
+        });
     }
 
     /// Build the prepared player's moves from the root to the current node.
@@ -15761,8 +18007,6 @@ impl App {
                     black,
                     white_title,
                     black_title,
-                    white_country,
-                    black_country,
                     site,
                     result,
                     event,
@@ -15779,17 +18023,15 @@ impl App {
                     (
                         indexed.white().to_string(),
                         indexed.black().to_string(),
-                        title_from_tag(indexed.header("WhiteTitle")),
-                        title_from_tag(indexed.header("BlackTitle")),
-                        player_country_from_header(
-                            indexed
-                                .header("WhiteCountry")
-                                .or_else(|| indexed.header("WhiteFed")),
+                        self.title_for_player_date(
+                            indexed.white(),
+                            indexed.date(),
+                            title_from_tag(indexed.header("WhiteTitle")),
                         ),
-                        player_country_from_header(
-                            indexed
-                                .header("BlackCountry")
-                                .or_else(|| indexed.header("BlackFed")),
+                        self.title_for_player_date(
+                            indexed.black(),
+                            indexed.date(),
+                            title_from_tag(indexed.header("BlackTitle")),
                         ),
                         indexed.header("Site").map(str::to_string),
                         indexed.result().to_string(),
@@ -15819,13 +18061,16 @@ impl App {
                     } else {
                         find_h("Black").unwrap_or("?").to_string()
                     };
-                    let white_title = title_from_tag(find_h("WhiteTitle"));
-                    let black_title = title_from_tag(find_h("BlackTitle"));
-                    let white_country = player_country_from_header(
-                        find_h("WhiteCountry").or_else(|| find_h("WhiteFed")),
+                    let date = find_h("Date").unwrap_or("????.??.??");
+                    let white_title = self.title_for_player_date(
+                        &white,
+                        date,
+                        title_from_tag(find_h("WhiteTitle")),
                     );
-                    let black_country = player_country_from_header(
-                        find_h("BlackCountry").or_else(|| find_h("BlackFed")),
+                    let black_title = self.title_for_player_date(
+                        &black,
+                        date,
+                        title_from_tag(find_h("BlackTitle")),
                     );
                     let site = find_h("Site").map(str::to_string);
                     let result = find_h("Result").unwrap_or("*").to_string();
@@ -15842,8 +18087,6 @@ impl App {
                         black,
                         white_title,
                         black_title,
-                        white_country,
-                        black_country,
                         site,
                         result,
                         event,
@@ -15860,10 +18103,8 @@ impl App {
                     black,
                     white_title,
                     black_title,
-                    white_country,
-                    black_country,
                     site,
-                    subtitle: format!("{} · {} · {}", event, short_date(game.date), result),
+                    subtitle: format!("{} · {}", event, short_date(game.date)),
                     type_color,
                     type_label,
                     result_badge,
@@ -15905,12 +18146,10 @@ impl App {
                     merged_index: Some(position),
                     white: game.white().to_string(),
                     black: game.black().to_string(),
-                    white_title: player_title(game, Color::White),
-                    black_title: player_title(game, Color::Black),
-                    white_country: player_country(game, Color::White),
-                    black_country: player_country(game, Color::Black),
+                    white_title: self.title_for_game(game, Color::White),
+                    black_title: self.title_for_game(game, Color::Black),
                     site: game.header("Site").map(str::to_string),
-                    subtitle: format!("{} · {} · {}", game.event(), game.date(), game.result()),
+                    subtitle: format!("{} · {}", game.event(), game.date()),
                     type_color,
                     type_label,
                     result_badge,
@@ -15920,11 +18159,123 @@ impl App {
             .collect()
     }
 
+    /// Return the recent rows for the current position, recomputing only when
+    /// the player, position, facing colour, or loaded sources change.
+    fn prep_cached_recent_rows(
+        &mut self,
+        prep: &PrepSession,
+        facing: Color,
+        key: u64,
+    ) -> Vec<PrepRecentRow> {
+        let use_unified = !self.prep_merged_games.is_empty();
+        let merge_len = self.prep_merged_games.len();
+        let include_online = prep.filter.include_online;
+        let hit = self.prep_recent_rows_cache.as_ref().is_some_and(|cache| {
+            cache.player_key == prep.player_key
+                && cache.key == key
+                && cache.facing == facing
+                && cache.use_unified == use_unified
+                && cache.include_online == include_online
+                && cache.merged_len == merge_len
+        });
+        if hit {
+            return self
+                .prep_recent_rows_cache
+                .as_ref()
+                .map(|cache| cache.rows.clone())
+                .unwrap_or_default();
+        }
+        let rows = if use_unified {
+            self.prep_unified_recent_rows(prep, facing, key, usize::MAX)
+        } else {
+            self.prep_recent_rows(prep, key, usize::MAX)
+        };
+        self.prep_recent_rows_cache = Some(PrepRecentRowsCache {
+            player_key: prep.player_key.clone(),
+            key,
+            facing,
+            use_unified,
+            include_online,
+            merged_len: merge_len,
+            rows: rows.clone(),
+        });
+        rows
+    }
+
+    fn preparation_content(&mut self, ui: &mut Ui) {
+        if let Some(prep) = self.prep.clone() {
+            if self.recent_preview.is_some() {
+                ui.heading("Preparation");
+                ui.label(
+                    RichText::new(
+                        "A read-only game preview is open. Close it to return to the current preparation line.",
+                    )
+                    .weak(),
+                );
+                if ui.button("Close game preview").clicked() {
+                    self.close_recent_preview();
+                }
+                return;
+            }
+            let Some(position) = self
+                .current
+                .as_ref()
+                .and_then(|game| game.nodes.get(self.node))
+                .map(|node| node.pos.clone())
+            else {
+                ui.heading("Preparation");
+                ui.label(RichText::new("Open a position to continue preparation.").weak());
+                return;
+            };
+            self.prep_tree(ui, &prep, &position, position::position_key(&position));
+            return;
+        }
+
+        ui.heading("Preparation");
+        ui.label(
+            RichText::new(
+                "Build an opponent-specific repertoire from local databases, ChessABC, Lichess, or Chess.com.",
+            )
+            .weak(),
+        );
+        let selected = self
+            .selected_player
+            .and_then(|index| self.players.get(index))
+            .map(|player| player.name.clone());
+        if let Some(name) = selected {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new(format!("Selected player · {name}")).strong());
+            });
+            ui.horizontal(|ui| {
+                if ui.button("Prepare as White").clicked() {
+                    self.handle_prepare_color_action(Color::Black);
+                }
+                if ui.button("Prepare as Black").clicked() {
+                    self.handle_prepare_color_action(Color::White);
+                }
+                if ui.button("Choose another opponent…").clicked() {
+                    self.open_prep_setup_any();
+                }
+            });
+        } else {
+            ui.label(
+                RichText::new(
+                    "Select a player in the Players list, or choose an opponent to search local and online sources.",
+                )
+                .weak(),
+            );
+            if ui.button("Choose opponent…").clicked() {
+                self.open_prep_setup_any();
+            }
+        }
+    }
+
     fn prep_tree(&mut self, ui: &mut Ui, prep: &PrepSession, pos: &crate::chess::Chess, key: u64) {
         let mut exit = false;
         let mut edit_sources = false;
+        let mut choose_our_color = None;
         ui.horizontal(|ui| {
-            ui.heading("Player tree");
+            ui.heading("Opponent preparation");
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if ui.small_button("Exit prep").clicked() {
                     exit = true;
@@ -15962,14 +18313,16 @@ impl App {
                 ui.label(RichText::new(format!("· {id}")).small().weak())
                     .on_hover_text(format!("FIDE ID {id}"));
             }
-            ui.label(
-                RichText::new(format!(
-                    "· You play {} · board from {}",
-                    color_name(prep.our_color),
-                    color_name(self.orientation)
-                ))
-                .weak(),
-            );
+            ui.separator();
+            ui.label(RichText::new("You play").small().weak());
+            for color in [Color::White, Color::Black] {
+                if ui
+                    .selectable_label(prep.our_color == color, color_name(color))
+                    .clicked()
+                {
+                    choose_our_color = Some(color);
+                }
+            }
         });
         let mut toggle_exclude = false;
         ui.horizontal(|ui| {
@@ -16001,6 +18354,10 @@ impl App {
         if edit_sources {
             self.open_prep_setup(prep.our_color == Color::White);
         }
+        if let Some(color) = choose_our_color {
+            self.set_active_prep_color(color);
+            return;
+        }
 
         let facing = if self.prep_swapped_view {
             prep.our_color
@@ -16013,16 +18370,10 @@ impl App {
         } else {
             self.prep_prediction_data(prep, pos, key)
         };
-        let legacy_rows = self.prep_recent_rows(prep, key, usize::MAX);
-        let unified_rows = self.prep_unified_recent_rows(prep, facing, key, usize::MAX);
         // Most-recent games come from the merged multi-source book; while it
         // is still loading the legacy database rows are shown instead.
         let use_unified = !self.prep_merged_games.is_empty();
-        let recent_rows = if use_unified {
-            &unified_rows
-        } else {
-            &legacy_rows
-        };
+        let recent_rows = self.prep_cached_recent_rows(prep, facing, key);
         let sources_label = prep.sources_label.clone();
         let ply_depth = {
             let mut depth = 0u32;
@@ -16348,7 +18699,7 @@ impl App {
                     ui.add_space(2.0);
                     ui.label(
                         RichText::new(format!(
-                            "🧭 Your Move ({}) — Moves Previously Played Against {}",
+                            "Your Move ({}) — Moves Previously Played Against {}",
                             color_name(prep.our_color),
                             prep.player_name
                         ))
@@ -16889,60 +19240,67 @@ impl App {
                             );
                         } else {
                             let width = (ui.available_width() - 4.0).max(100.0);
-                            let visible: Vec<&PrepRecentRow> = if recent_all {
-                                recent_rows.iter().collect()
+                            let shown = if recent_all {
+                                recent_rows.len()
                             } else {
-                                recent_rows.iter().take(recent_limit).collect()
+                                recent_rows.len().min(recent_limit)
                             };
-                            for row in visible {
-                                let mut row_response = game_row(
-                                    ui,
-                                    false,
-                                    "",
-                                    RowName::new(&row.white, row.white_title)
-                                        .with_country(row.white_country),
-                                    Some(
-                                        RowName::new(&row.black, row.black_title)
-                                            .with_country(row.black_country),
-                                    ),
-                                    "",
-                                    &row.subtitle,
-                                    row.site.as_deref(),
-                                    width,
-                                    40.0,
-                                    Some(row.type_color),
-                                    Some((&row.result_badge, row.player_outcome)),
-                                );
-                                row_response =
-                                    row_response.on_hover_text(row.type_label);
-                                if row_response.hovered() {
-                                    let browse_id = if let Some(merged) = row.merged_index {
-                                        format!("recent-merged:{merged}")
-                                    } else {
-                                        format!("recent-lib:{}", row.index)
-                                    };
-                                    if !self.touch_hovered_game(&browse_id) {
-                                        let game = if let Some(merged) = row.merged_index {
-                                            self.prep_merged_games.get(merged).cloned()
-                                        } else {
-                                            self.library
-                                                .as_ref()
-                                                .and_then(|lib| lib.load(row.index).ok())
+                            // Virtualize: only lay out the rows actually on screen. With
+                            // thousands of games this is the difference between ~60 fps
+                            // and a multi-second freeze on every move click.
+                            egui::ScrollArea::vertical()
+                                .id_salt("prep-recent-games")
+                                .max_height(260.0)
+                                .auto_shrink([false, false])
+                                .show_rows(ui, 40.0, shown, |ui, row_range| {
+                                    for row_index in row_range {
+                                        let Some(row) = recent_rows.get(row_index) else {
+                                            continue;
                                         };
-                                        if let Some(game) = game {
-                                            self.activate_hovered_game_browse(browse_id, game);
+                                        let mut row_response = game_row(
+                                            ui,
+                                            false,
+                                            "",
+                                            RowName::new(&row.white, row.white_title),
+                                            Some(RowName::new(&row.black, row.black_title)),
+                                            "",
+                                            &row.subtitle,
+                                            row.site.as_deref(),
+                                            width,
+                                            40.0,
+                                            Some(row.type_color),
+                                            Some((&row.result_badge, row.player_outcome)),
+                                        );
+                                        row_response =
+                                            row_response.on_hover_text(row.type_label);
+                                        if row_response.hovered() {
+                                            let browse_id = if let Some(merged) = row.merged_index {
+                                                format!("recent-merged:{merged}")
+                                            } else {
+                                                format!("recent-lib:{}", row.index)
+                                            };
+                                            if !self.touch_hovered_game(&browse_id) {
+                                                let game = if let Some(merged) = row.merged_index {
+                                                    self.prep_merged_games.get(merged).cloned()
+                                                } else {
+                                                    self.library
+                                                        .as_ref()
+                                                        .and_then(|lib| lib.load(row.index).ok())
+                                                };
+                                                if let Some(game) = game {
+                                                    self.activate_hovered_game_browse(browse_id, game);
+                                                }
+                                            }
+                                        }
+                                        if row_response.clicked() {
+                                            if let Some(merged) = row.merged_index {
+                                                merged_preview = Some(merged);
+                                            } else {
+                                                preview = Some(row.index);
+                                            }
                                         }
                                     }
-                                }
-                                if row_response.clicked()
-                                {
-                                    if let Some(merged) = row.merged_index {
-                                        merged_preview = Some(merged);
-                                    } else {
-                                        preview = Some(row.index);
-                                    }
-                                }
-                            }
+                                });
                             if !recent_all && recent_rows.len() > recent_limit {
                                 ui.label(
                                     RichText::new(format!(
@@ -17335,6 +19693,10 @@ impl App {
         game_header_card(
             ui,
             &game,
+            (
+                self.title_for_game(&game, Color::White),
+                self.title_for_game(&game, Color::Black),
+            ),
             None,
             self.rating_priority,
             self.show_all_ratings,
@@ -17597,18 +19959,21 @@ impl App {
                 ));
                 ui.label(
                     RichText::new(
-                        "Merge skips duplicates; opening replaces the current database on the board.",
+                        "Open in shelf keeps the current database warm in the sidebar; Merge adds distinct games into the active database.",
                     )
                     .small()
                     .weak(),
                 );
                 ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    if ui.button("Open (replace)").clicked() {
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("Open in shelf").clicked() {
                         action = Some(0);
                     }
-                    if ui.button("Merge into current").clicked() {
+                    if ui.button("Merge & Deduplicate").clicked() {
                         action = Some(1);
+                    }
+                    if ui.button("Append All").clicked() {
+                        action = Some(2);
                     }
                     if ui.button("Cancel").clicked() {
                         keep = false;
@@ -17616,14 +19981,25 @@ impl App {
                 });
             });
         match action {
-            Some(0) => self.load_file(&pending.path),
-            Some(1) => match open_library(&pending.path) {
+            Some(0) => {
+                self.open_into_new_shelf = true;
+                self.load_file(&pending.path);
+            }
+            Some(1 | 2) => match open_library(&pending.path) {
                 Ok(library) => {
-                    self.pending_merge = Some(PendingMerge {
-                        library,
-                        target: DropTarget::Main,
-                        label: pending.path.display().to_string(),
-                    });
+                    let count = library.len();
+                    let label = pending
+                        .path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| pending.path.display().to_string());
+                    let merge = PendingShelfMerge {
+                        source: ShelfMergeSource::Library(library),
+                        target_shelf_index: self.active_db_index,
+                        source_label: label,
+                        source_count: count,
+                    };
+                    self.execute_shelf_merge(merge, action == Some(1), false);
                 }
                 Err(err) => {
                     self.status = format!("Could not read {}: {err}", pending.path.display());
@@ -17793,6 +20169,9 @@ impl App {
         let mut close = false;
         let mut choose_correspondence = false;
         let mut use_default_correspondence = false;
+        let mut choose_reference_database = false;
+        let mut choose_opening_tree = false;
+        let mut choose_opening_book = false;
         let mut clear_online_cache = false;
         let mut choose_engine_idx = None;
 
@@ -17920,10 +20299,110 @@ impl App {
 
                 ui.add_space(8.0);
                 ui.separator();
+                ui.heading("Databases & sources");
+                ui.label(
+                    RichText::new(
+                        "Choose the human-game reference base, the Reference workspace's local database tree, and an optional opening book. These affect reference browsing and preparation, not the open database.",
+                    )
+                    .small()
+                    .weak(),
+                );
+                ui.checkbox(
+                    &mut self.settings_reference_enabled,
+                    "Use a separate preparation reference base",
+                );
+                ui.add_enabled_ui(self.settings_reference_enabled, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new("Reference base").small().strong());
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.settings_reference_path)
+                                .desired_width((ui.available_width() - 112.0).max(120.0))
+                                .hint_text("Database path or live source"),
+                        );
+                        if ui.button("Choose…").clicked() {
+                            choose_reference_database = true;
+                        }
+                        if ui
+                            .small_button("Current DB")
+                            .on_hover_text("Use the open database as the preparation fallback")
+                            .clicked()
+                        {
+                            self.settings_reference_path.clear();
+                            self.settings_reference_enabled = false;
+                        }
+                    });
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new("Live source").small().weak());
+                        for source in LiveReferenceSource::ALL {
+                            if ui
+                                .selectable_label(
+                                    LiveReferenceSource::from_config_str(
+                                        &self.settings_reference_path,
+                                    ) == Some(source),
+                                    source.short_label(),
+                                )
+                                .clicked()
+                            {
+                                self.settings_reference_path = source.config_str().to_string();
+                            }
+                        }
+                    });
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new("Prep rating window ±").small().strong());
+                        ui.add(
+                            egui::DragValue::new(&mut self.settings_reference_band)
+                                .range(25..=1_000)
+                                .speed(10.0)
+                                .suffix(" Elo"),
+                        );
+                        ui.label(RichText::new("· offset").small().weak());
+                        ui.add(
+                            egui::DragValue::new(&mut self.settings_reference_offset)
+                                .range(-1_000..=1_000)
+                                .speed(5.0)
+                                .suffix(" Elo"),
+                        );
+                    });
+                });
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("Opening tree").small().strong());
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.settings_tree_path)
+                            .desired_width((ui.available_width() - 112.0).max(120.0))
+                            .hint_text("Optional local database; blank uses Current DB"),
+                    );
+                    if ui.button("Choose…").clicked() {
+                        choose_opening_tree = true;
+                    }
+                    if ui
+                        .small_button("Current DB")
+                        .on_hover_text("Use the currently open database in the Reference workspace")
+                        .clicked()
+                    {
+                        self.settings_tree_path.clear();
+                    }
+                });
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("Opening book").small().strong());
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.settings_book_path)
+                            .desired_width((ui.available_width() - 112.0).max(120.0))
+                            .hint_text("Optional .bin, .ctg, .abk, .bkt or live source"),
+                    );
+                    if ui.button("Choose…").clicked() {
+                        choose_opening_book = true;
+                    }
+                    if ui.small_button("Clear").clicked() {
+                        self.settings_book_path.clear();
+                    }
+                });
+
+                ui.add_space(8.0);
+                ui.separator();
                 ui.heading("Move trends");
                 ui.label(
                     RichText::new(
-                        "The Tree tab compares a recent window with a historical baseline. Small samples are shrunk toward the baseline and never shown as a trend.",
+                        "Reference popularity compares a recent window with a historical baseline. Small samples are shrunk toward the baseline and never shown as a trend.",
                     )
                     .small()
                     .weak(),
@@ -18153,6 +20632,76 @@ impl App {
                     .weak(),
                 );
 
+                ui.add_space(6.0);
+                ui.add_enabled_ui(self.wiki_batch_rx.is_none(), |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Batch metadata:");
+                        egui::ComboBox::from_id_salt("wiki-batch-scope")
+                            .selected_text(self.settings_wiki_batch_scope.label())
+                            .show_ui(ui, |ui| {
+                                for scope in WikiBatchScope::ALL {
+                                    ui.selectable_value(
+                                        &mut self.settings_wiki_batch_scope,
+                                        scope,
+                                        scope.label(),
+                                    );
+                                }
+                            });
+                    });
+                });
+                let (batch_total, batch_pending, batch_seconds) = self.wiki_batch_plan();
+                ui.label(
+                    RichText::new(format!(
+                        "{batch_total} players selected · {batch_pending} need a lookup · about {}",
+                        format_eta(batch_seconds)
+                    ))
+                    .small()
+                    .weak(),
+                );
+                let mut start_batch = false;
+                let mut cancel_batch = false;
+                ui.horizontal(|ui| {
+                    if self.wiki_batch_rx.is_some() {
+                        if ui.button("Cancel").clicked() {
+                            cancel_batch = true;
+                        }
+                        ui.label(
+                            RichText::new(format!(
+                                "{}/{} players",
+                                self.wiki_batch_done, self.wiki_batch_total
+                            ))
+                            .small()
+                            .weak(),
+                        );
+                    } else if ui
+                        .button("Enrich metadata")
+                        .on_hover_text(
+                            "Look up titles, federations, FIDE IDs, birth years, and peak ratings for the selected players. Results are cached.",
+                        )
+                        .clicked()
+                    {
+                        start_batch = true;
+                    }
+                });
+                if self.wiki_batch_rx.is_some() && self.wiki_batch_total > 0 {
+                    let progress =
+                        self.wiki_batch_done as f32 / self.wiki_batch_total as f32;
+                    ui.add(
+                        egui::ProgressBar::new(progress)
+                            .desired_width(ui.available_width())
+                            .show_percentage(),
+                    );
+                }
+                if !self.wiki_batch_status.is_empty() {
+                    ui.label(RichText::new(&self.wiki_batch_status).small().weak());
+                }
+                if start_batch {
+                    self.start_wiki_batch();
+                }
+                if cancel_batch {
+                    self.cancel_wiki_batch();
+                }
+
                 ui.add_space(8.0);
                 ui.separator();
                 ui.heading("Analysis engines & hotkeys (1, 2, 3)");
@@ -18242,6 +20791,16 @@ impl App {
             if idx == 0 {
                 self.engine_path = path.display().to_string();
             }
+        }
+        if choose_reference_database && let Some(path) = open_dialog(None) {
+            self.settings_reference_path = path.display().to_string();
+            self.settings_reference_enabled = true;
+        }
+        if choose_opening_tree && let Some(path) = open_dialog(None) {
+            self.settings_tree_path = path.display().to_string();
+        }
+        if choose_opening_book && let Some(path) = open_book_dialog(None) {
+            self.settings_book_path = path.display().to_string();
         }
         if clear_online_cache {
             match online::clear_online_cache() {
@@ -18420,6 +20979,7 @@ impl eframe::App for App {
         self.poll_index();
         self.poll_tree_index();
         self.poll_player_directory();
+        self.poll_wiki_title_cache();
         self.poll_book();
         self.poll_player_book();
         self.poll_prep_load();
@@ -18437,6 +20997,7 @@ impl eframe::App for App {
         self.poll_chessabc_live();
         self.poll_explorer_since();
         self.poll_review_book();
+        self.poll_wiki_batch();
         self.poll_engine();
         self.poll_review();
         self.maybe_engine_analysis();
@@ -18530,8 +21091,8 @@ impl eframe::App for App {
                             } else {
                                 game.black().to_string()
                             },
-                            title: player_title(game, color).map(str::to_string),
-                            country: player_country(game, color).map(|c| c.badge),
+                            title: self.title_for_game(game, color).map(str::to_string),
+                            country: player_country_with_directory(game, color, &self.players),
                             fide_id: player_fide_id(game, color).map(str::to_string),
                             rating: player_rating(
                                 game,
@@ -18807,15 +21368,6 @@ fn player_strip(
             },
         );
     }
-    if let Some(country) = player.country {
-        let format = TextFormat {
-            font_id: FontId::proportional(11.0),
-            color: MUTED,
-            ..Default::default()
-        };
-        label.append(" · ", 0.0, format.clone());
-        label.append(country, 0.0, format);
-    }
     if champion.is_some() {
         label.append(
             " 👑",
@@ -18827,13 +21379,19 @@ fn player_strip(
             },
         );
     }
-    let right_limit = if move_counter.is_some() {
+    let base_right_limit = if move_counter.is_some() {
         (rect.center().x - 45.0).max(text_left + 40.0)
     } else if show_clock {
         rect.right() - 104.0
     } else {
         rect.right() - 8.0
     };
+    let country_space = if player.country.is_some() {
+        flags::LIST_SIZE.x + 8.0
+    } else {
+        0.0
+    };
+    let right_limit = (base_right_limit - country_space).max(text_left + 40.0);
     let name_clip = egui::Rect::from_min_max(rect.min, pos2(right_limit, rect.bottom()));
     let name_painter = ui.painter_at(name_clip);
     let name_galley = name_painter.layout_job(label);
@@ -18852,6 +21410,18 @@ fn player_strip(
         )
     });
     name_painter.galley(pos2(text_left, name_y), name_galley.clone(), TEXT);
+    if let Some(country) = player.country {
+        let flag_rect = Rect::from_min_size(
+            pos2(
+                right_limit + 4.0,
+                rect.center().y - flags::LIST_SIZE.y * 0.5,
+            ),
+            flags::LIST_SIZE,
+        );
+        flags::paint_flag(&painter, country, flag_rect);
+        ui.interact(flag_rect, response.id.with("country-flag"), Sense::hover())
+            .on_hover_text(format!("{} ({})", country.name, country.code));
+    }
     let name_hit_rect = egui::Rect::from_min_size(pos2(text_left, name_y), name_galley.size());
     let name_response = ui.interact(
         name_hit_rect.expand2(vec2(2.0, 2.0)),
@@ -19274,31 +21844,37 @@ fn quality_color(quality: Quality) -> Color32 {
     }
 }
 
-/// Small white-perspective evaluation chart. Mates are clamped to the top and
-/// bottom so one forced mate does not flatten the rest of the game.
-fn review_graph(ui: &mut Ui, review: &ReviewState) {
+/// Synchronized white-perspective evaluation chart and per-move think-time bar
+/// chart. Clicking any ply jumps to that move on the board.
+fn review_graph(ui: &mut Ui, review: &ReviewState, moves: &[review::MoveReview]) -> Option<usize> {
+    let mut clicked_node = None;
+    let has_clocks = moves.iter().any(|m| m.move_time_secs.is_some());
     let width = ui.available_width().max(160.0);
-    let (rect, _) = ui.allocate_exact_size(vec2(width, 96.0), Sense::hover());
+    let eval_h = 92.0;
+    let clock_h = if has_clocks { 44.0 } else { 0.0 };
+    let total_h = eval_h + clock_h;
+    let (rect, response) = ui.allocate_exact_size(vec2(width, total_h), Sense::click());
+    let eval_rect = Rect::from_min_size(rect.min, vec2(width, eval_h));
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 6.0, Color32::from_rgb(0x18, 0x1A, 0x1C));
     painter.rect_stroke(rect, 6.0, Stroke::new(1.0, BORDER), StrokeKind::Inside);
-    let middle = rect.center().y;
+    let middle = eval_rect.center().y;
     painter.line_segment(
         [
-            pos2(rect.left() + 6.0, middle),
-            pos2(rect.right() - 6.0, middle),
+            pos2(eval_rect.left() + 6.0, middle),
+            pos2(eval_rect.right() - 6.0, middle),
         ],
         Stroke::new(1.0, Color32::from_gray(62)),
     );
     painter.text(
-        pos2(rect.left() + 7.0, rect.top() + 4.0),
+        pos2(eval_rect.left() + 7.0, eval_rect.top() + 4.0),
         Align2::LEFT_TOP,
         "+8",
         FontId::monospace(9.0),
         Color32::from_gray(95),
     );
     painter.text(
-        pos2(rect.left() + 7.0, rect.bottom() - 4.0),
+        pos2(eval_rect.left() + 7.0, eval_rect.bottom() - 4.0),
         Align2::LEFT_BOTTOM,
         "−8",
         FontId::monospace(9.0),
@@ -19308,20 +21884,20 @@ fn review_graph(ui: &mut Ui, review: &ReviewState) {
     let points = review.eval_points();
     if points.is_empty() {
         painter.text(
-            rect.center(),
+            eval_rect.center(),
             Align2::CENTER_CENTER,
             "Waiting for evaluations…",
             FontId::proportional(11.0),
             Color32::from_gray(110),
         );
-        return;
+        return None;
     }
 
     let denominator = review.total().max(2).saturating_sub(1) as f32;
-    let scale = (rect.height() / 2.0 - 10.0) / 800.0;
+    let scale = (eval_rect.height() / 2.0 - 10.0) / 800.0;
     let position = |index: usize, cp: f64| {
         pos2(
-            rect.left() + 8.0 + (index as f32 / denominator) * (rect.width() - 16.0),
+            eval_rect.left() + 8.0 + (index as f32 / denominator) * (eval_rect.width() - 16.0),
             middle - (cp.clamp(-800.0, 800.0) as f32) * scale,
         )
     };
@@ -19339,6 +21915,55 @@ fn review_graph(ui: &mut Ui, review: &ReviewState) {
     if let Some(&(index, cp)) = points.last() {
         painter.circle_filled(position(index, cp), 3.0, GOLD);
     }
+
+    if has_clocks {
+        let clock_top = eval_rect.bottom();
+        painter.line_segment(
+            [
+                pos2(rect.left() + 4.0, clock_top),
+                pos2(rect.right() - 4.0, clock_top),
+            ],
+            Stroke::new(1.0, BORDER),
+        );
+        let max_dt = moves
+            .iter()
+            .filter_map(|m| m.move_time_secs)
+            .fold(10.0f64, f64::max);
+        let bar_w = ((rect.width() - 16.0) / denominator.max(1.0) * 0.65).clamp(2.0, 8.0);
+        for (idx, mov) in moves.iter().enumerate() {
+            let Some(dt) = mov.move_time_secs else {
+                continue;
+            };
+            let x = rect.left() + 8.0 + ((idx + 1) as f32 / denominator) * (rect.width() - 16.0);
+            let frac = (dt / max_dt).clamp(0.06, 1.0) as f32;
+            let bar_h = frac * (clock_h - 10.0);
+            let bar_rect = Rect::from_min_max(
+                pos2(x - bar_w * 0.5, rect.bottom() - 4.0 - bar_h),
+                pos2(x + bar_w * 0.5, rect.bottom() - 4.0),
+            );
+            let bar_color = match mov.time_tag {
+                Some(review::TimeManagementTag::Rushed) => Color32::from_rgb(0xF8, 0x71, 0x71),
+                Some(review::TimeManagementTag::Overthink) => Color32::from_rgb(0xFB, 0xBF, 0x24),
+                Some(review::TimeManagementTag::TimeTrouble) => Color32::from_rgb(0xFB, 0x92, 0x3C),
+                Some(review::TimeManagementTag::Clutch) => Color32::from_rgb(0x38, 0xBD, 0xF8),
+                None if mov.color == Color::White => Color32::from_rgb(0xD0, 0xD7, 0xE2),
+                None => Color32::from_rgb(0x64, 0x74, 0x8B),
+            };
+            painter.rect_filled(bar_rect, 1.5, bar_color);
+        }
+    }
+
+    if response.clicked()
+        && let Some(pos) = response.interact_pointer_pos()
+        && !moves.is_empty()
+    {
+        let frac = ((pos.x - (rect.left() + 8.0)) / (rect.width() - 16.0).max(1.0)).clamp(0.0, 1.0);
+        let idx =
+            ((frac * (moves.len().saturating_sub(1) as f32)).round() as usize).min(moves.len() - 1);
+        clicked_node = Some(moves[idx].node);
+    }
+
+    clicked_node
 }
 
 fn white_cp_color(white_cp: i32) -> Color32 {
@@ -20298,6 +22923,7 @@ fn elo_of(header: Option<&str>) -> Option<u32> {
 fn game_header_card(
     ui: &mut Ui,
     game: &Game,
+    titles: (Option<&'static str>, Option<&'static str>),
     prep: Option<&PrepSession>,
     priority: RatingPriority,
     show_all_ratings: bool,
@@ -20460,8 +23086,8 @@ fn game_header_card(
             header_player_row(
                 ui,
                 game.white(),
-                player_title(game, Color::White),
-                player_country(game, Color::White).map(|c| c.badge),
+                titles.0,
+                player_country(game, Color::White),
                 player_fide_id(game, Color::White),
                 player_rating(game, Color::White, priority, show_all_ratings),
                 team_for(game, Color::White),
@@ -20471,8 +23097,8 @@ fn game_header_card(
             header_player_row(
                 ui,
                 game.black(),
-                player_title(game, Color::Black),
-                player_country(game, Color::Black).map(|c| c.badge),
+                titles.1,
+                player_country(game, Color::Black),
                 player_fide_id(game, Color::Black),
                 player_rating(game, Color::Black, priority, show_all_ratings),
                 team_for(game, Color::Black),
@@ -20522,7 +23148,7 @@ fn header_player_row(
     ui: &mut Ui,
     name: &str,
     title: Option<&str>,
-    country: Option<&str>,
+    country: Option<Country>,
     fide_id: Option<&str>,
     rating: Option<String>,
     team: Option<&str>,
@@ -20575,15 +23201,6 @@ fn header_player_row(
                     ..Default::default()
                 },
             );
-            if let Some(country) = country {
-                let format = TextFormat {
-                    font_id: FontId::proportional(10.5),
-                    color: Color32::from_gray(150),
-                    ..Default::default()
-                };
-                label.append(" · ", 0.0, format.clone());
-                label.append(country, 0.0, format);
-            }
             if let Some(id) = fide_id {
                 let format = TextFormat {
                     font_id: FontId::proportional(10.5),
@@ -20597,8 +23214,19 @@ fn header_player_row(
                 vec2(width, 21.0),
                 Layout::left_to_right(Align::Center),
                 |ui| {
-                    ui.add(egui::Label::new(label).truncate())
-                        .on_hover_text(name)
+                    let flag_width = if country.is_some() {
+                        flags::LIST_SIZE.x + 4.0
+                    } else {
+                        0.0
+                    };
+                    ui.add_sized(
+                        [width - flag_width, 21.0],
+                        egui::Label::new(label).truncate(),
+                    )
+                    .on_hover_text(name);
+                    if let Some(country) = country {
+                        flags::flag(ui, country, flags::LIST_SIZE);
+                    }
                 },
             );
             if let Some(team) = team.filter(|team| !team.trim().is_empty()) {
@@ -20651,10 +23279,6 @@ fn player_fide_id(game: &Game, color: Color) -> Option<&str> {
     }))
 }
 
-fn player_country_from_header(raw: Option<&str>) -> Option<Country> {
-    country::from_header(raw)
-}
-
 fn player_country(game: &Game, color: Color) -> Option<Country> {
     let raw = match color {
         Color::White => game
@@ -20665,6 +23289,21 @@ fn player_country(game: &Game, color: Color) -> Option<Country> {
             .or_else(|| game.header("BlackFed")),
     };
     country::from_header(raw)
+}
+
+fn player_country_with_directory(
+    game: &Game,
+    color: Color,
+    directory: &PlayerDirectory,
+) -> Option<Country> {
+    player_country(game, color).or_else(|| {
+        let name = match color {
+            Color::White => game.white(),
+            Color::Black => game.black(),
+        };
+        let key = players::player_key(name)?;
+        directory.get(directory.find_key(&key)?)?.country
+    })
 }
 
 /// `3.4` means round 3, board 4. A plain value is a round with no board.
@@ -21402,6 +24041,65 @@ fn positions_label(n: usize) -> String {
     }
 }
 
+fn format_eta(seconds: f64) -> String {
+    let seconds = seconds.max(0.0).round() as u64;
+    if seconds < 60 {
+        format!("{seconds} s")
+    } else if seconds < 3_600 {
+        format!("{} min", seconds.div_ceil(60))
+    } else {
+        let hours = seconds / 3_600;
+        let minutes = (seconds % 3_600).div_ceil(60);
+        if minutes == 0 {
+            format!("{hours} h")
+        } else {
+            format!("{hours} h {minutes} min")
+        }
+    }
+}
+
+/// Folder-open icon for the shelf header. The bundled fonts have no emoji
+/// folder glyph, so paint one with the theme's own stroke colors.
+fn folder_open_button(ui: &mut Ui, tooltip: &str) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(vec2(24.0, 20.0), Sense::click());
+    if ui.is_rect_visible(rect) {
+        let visuals = ui.style().interact(&response);
+        let painter = ui.painter();
+        if response.hovered() || response.has_focus() {
+            painter.rect_filled(rect, 4.0, visuals.bg_fill);
+        }
+        let stroke = Stroke::new(1.3, visuals.fg_stroke.color);
+        let left = rect.left() + 4.0;
+        let right = rect.right() - 4.0;
+        let top = rect.top() + 5.0;
+        let bottom = rect.bottom() - 5.0;
+        // Back tab.
+        painter.line_segment([pos2(left, top + 2.0), pos2(left, top)], stroke);
+        painter.line_segment([pos2(left, top), pos2(left + 5.0, top)], stroke);
+        painter.line_segment([pos2(left + 5.0, top), pos2(left + 7.0, top + 3.0)], stroke);
+        // Folder body and open front flap.
+        painter.line_segment([pos2(left, top + 2.0), pos2(left + 1.0, bottom)], stroke);
+        painter.line_segment(
+            [pos2(left + 1.0, bottom), pos2(right - 2.0, bottom)],
+            stroke,
+        );
+        painter.line_segment([pos2(right - 2.0, bottom), pos2(right, top + 5.0)], stroke);
+        painter.line_segment(
+            [pos2(right, top + 5.0), pos2(left + 6.0, top + 5.0)],
+            stroke,
+        );
+        painter.line_segment(
+            [pos2(left + 6.0, top + 5.0), pos2(left + 4.0, top + 3.0)],
+            stroke,
+        );
+        painter.line_segment(
+            [pos2(left + 3.0, top + 8.0), pos2(right - 3.0, top + 8.0)],
+            stroke,
+        );
+    }
+    response.on_hover_text(tooltip)
+}
+
 fn moves_label(n: usize) -> String {
     if n == 1 {
         "1 move".to_string()
@@ -21410,15 +24108,16 @@ fn moves_label(n: usize) -> String {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct GameRowDrag {
-    id: usize,
+    source: GameDragSource,
 }
 
 pub(crate) fn player_list_row_meta(
     player: &players::PlayerSummary,
+    wiki_title: Option<titles::PlayerTitle>,
 ) -> (Option<&'static str>, Option<u16>, Option<Country>) {
-    let title = player.title.map(titles::PlayerTitle::short);
+    let title = wiki_title.or(player.title).map(titles::PlayerTitle::short);
     let elo = player.display_elo();
     let country = player.country;
     (title, elo, country)
@@ -21465,16 +24164,61 @@ fn paint_prepare_color_square(ui: &mut Ui, fill: Color32, tooltip: &str) -> egui
     let painter = ui.painter_at(rect);
     let radius = CornerRadius::same(3);
     painter.rect_filled(rect, radius, fill);
+    // A light outline keeps the near-black "you play Black" square legible on
+    // the dark panel, while still framing the white square cleanly.
     painter.rect_stroke(
         rect,
         radius,
-        Stroke::new(1.0, Color32::from_rgb(0x26, 0x2B, 0x35)),
+        Stroke::new(1.0, Color32::from_rgb(0x8A, 0x93, 0xA3)),
         StrokeKind::Inside,
     );
     if response.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
     response.on_hover_text(tooltip)
+}
+
+fn country_period_tooltip(code: &str, periods: &[crate::wiki::CountryPeriod]) -> String {
+    let matching: Vec<_> = periods
+        .iter()
+        .filter(|period| period.code == code)
+        .collect();
+    let name = matching
+        .iter()
+        .find_map(|period| period.context.as_deref())
+        .or_else(|| country::normalize(code).map(|country| country.name))
+        .unwrap_or(code);
+    let intervals: Vec<String> = matching
+        .iter()
+        .filter_map(|period| match (period.start_year, period.end_year) {
+            (Some(start), Some(end)) => Some(format!("{start}–{end}")),
+            (Some(start), None) => Some(format!("since {start}")),
+            (None, Some(end)) => Some(format!("until {end}")),
+            (None, None) => None,
+        })
+        .collect();
+    if intervals.is_empty() {
+        format!("{name} ({code})")
+    } else {
+        format!("{name} ({})", intervals.join(", "))
+    }
+}
+
+fn remember_photo_miss(
+    misses: &mut HashSet<String>,
+    order: &mut VecDeque<String>,
+    key: String,
+    limit: usize,
+) {
+    if !misses.insert(key.clone()) {
+        return;
+    }
+    order.push_back(key);
+    while order.len() > limit {
+        if let Some(oldest) = order.pop_front() {
+            misses.remove(&oldest);
+        }
+    }
 }
 
 /// Painted globe emblem for the FIDE pill (circle + meridians + equator).
@@ -21685,21 +24429,11 @@ fn player_row(
 struct RowName<'a> {
     name: &'a str,
     title: Option<&'a str>,
-    country: Option<Country>,
 }
 
 impl<'a> RowName<'a> {
     fn new(name: &'a str, title: Option<&'a str>) -> Self {
-        Self {
-            name,
-            title,
-            country: None,
-        }
-    }
-
-    fn with_country(mut self, country: Option<Country>) -> Self {
-        self.country = country;
-        self
+        Self { name, title }
     }
 }
 
@@ -21727,11 +24461,32 @@ fn keep_deeper(best: &mut Option<BoardEval>, candidate: BoardEval) {
     }
 }
 
-/// Drag-to-reorder is unavailable while a finger is on the screen, so a
-/// touch scroll gesture never turns into a game drag. Mouse and trackpad
-/// input keeps the full drag-and-drop behaviour.
-fn rows_are_draggable(ui: &Ui) -> bool {
-    !ui.input(|input| input.any_touches())
+const GAME_ROW_GRIP_WIDTH: f32 = 20.0;
+
+/// Drag-to-reorder is available across the full row for mouse and trackpad
+/// input. During touch input, only a touch starting in the left reorder grip
+/// (`GAME_ROW_GRIP_WIDTH`) enables drag-and-drop, so a finger swipe anywhere
+/// on the row body scrolls smoothly without starting a game drag.
+fn row_is_draggable_at(ui: &Ui, row_rect: Rect) -> bool {
+    ui.input(|input| {
+        if !input.any_touches() {
+            return true;
+        }
+        let grip = Rect::from_min_max(
+            row_rect.min,
+            pos2(
+                (row_rect.left() + GAME_ROW_GRIP_WIDTH).min(row_rect.right()),
+                row_rect.bottom(),
+            ),
+        );
+        let touch_pos = input.pointer.press_origin().or_else(|| {
+            input.raw.events.iter().find_map(|event| match event {
+                egui::Event::Touch { pos, .. } => Some(*pos),
+                _ => None,
+            })
+        });
+        touch_pos.is_some_and(|pos| grip.contains(pos))
+    })
 }
 
 /// Paint the venue flag for `site` into `rect`; returns the width consumed
@@ -21824,7 +24579,8 @@ fn game_row(
     text_color: Option<Color32>,
     badge: Option<(&str, Option<f32>)>,
 ) -> egui::Response {
-    let sense = if rows_are_draggable(ui) {
+    let planned_rect = Rect::from_min_size(ui.cursor().min, vec2(width, height));
+    let sense = if row_is_draggable_at(ui, planned_rect) {
         Sense::click_and_drag()
     } else {
         Sense::click()
@@ -21840,6 +24596,15 @@ fn game_row(
     };
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 4.0, bg);
+    if response.hovered() || response.dragged() {
+        painter.text(
+            pos2(rect.left() + 3.5, rect.center().y),
+            Align2::CENTER_CENTER,
+            "⋮",
+            FontId::proportional(11.0),
+            visuals.weak_text_color(),
+        );
+    }
 
     let name_format = TextFormat {
         font_id: FontId::proportional(14.0),
@@ -21857,7 +24622,8 @@ fn game_row(
         ..Default::default()
     };
     // A LayoutJob cannot embed images, so the title line is laid out as
-    // consecutive segments: [prefix][title+name][flag][" – "][title+name][flag].
+    // consecutive text segments. Player nationality flags intentionally do
+    // not appear in game lists; venue flags live on the subtitle line.
     let right_pad = if badge.is_some() { 48.0 } else { 16.0 };
     let max_x = rect.right() - right_pad;
     let line_y = rect.top() + 5.0;
@@ -21894,26 +24660,6 @@ fn game_row(
         x = nx;
         stopped = !fits;
     }
-    if !stopped && let Some(country) = white.country {
-        let gap = 4.0;
-        let flag_w = if flags::has_flag(country) { 16.0 } else { 30.0 };
-        if x + gap + flag_w > max_x {
-            let galley = painter.layout_no_wrap(
-                "…".to_string(),
-                name_format.font_id.clone(),
-                visuals.strong_text_color(),
-            );
-            painter.galley(pos2(x, line_y), galley, visuals.strong_text_color());
-            stopped = true;
-        } else {
-            let flag_rect = Rect::from_min_size(
-                pos2(x + gap, line_y + 1.0),
-                vec2(flag_w, flags::LIST_SIZE.y),
-            );
-            flags::paint_flag(&painter, country, flag_rect);
-            x = flag_rect.right();
-        }
-    }
     if !stopped && black.is_some() {
         let parts = vec![(" – ".to_string(), weak_format.clone())];
         let (nx, fits) = draw_game_row_segment(
@@ -21945,29 +24691,6 @@ fn game_row(
         x = nx;
         stopped = !fits;
     }
-    if !stopped
-        && let Some(black) = black
-        && let Some(country) = black.country
-    {
-        let gap = 4.0;
-        let flag_w = if flags::has_flag(country) { 16.0 } else { 30.0 };
-        if x + gap + flag_w > max_x {
-            let galley = painter.layout_no_wrap(
-                "…".to_string(),
-                name_format.font_id.clone(),
-                visuals.strong_text_color(),
-            );
-            painter.galley(pos2(x, line_y), galley, visuals.strong_text_color());
-            stopped = true;
-        } else {
-            let flag_rect = Rect::from_min_size(
-                pos2(x + gap, line_y + 1.0),
-                vec2(flag_w, flags::LIST_SIZE.y),
-            );
-            flags::paint_flag(&painter, country, flag_rect);
-            x = flag_rect.right();
-        }
-    }
     if !stopped && !suffix.is_empty() {
         let parts = vec![(suffix.to_string(), name_format.clone())];
         let (_nx, _fits) = draw_game_row_segment(
@@ -21983,6 +24706,10 @@ fn game_row(
     let subtitle_pos = rect.left_top() + vec2(8.0, 23.0);
     let venue_rect = Rect::from_min_size(subtitle_pos, flags::LIST_SIZE);
     let venue_w = paint_venue_flag(&painter, site, venue_rect);
+    if let Some(country) = country::from_site_tag(site) {
+        ui.interact(venue_rect, response.id.with("venue-flag"), Sense::hover())
+            .on_hover_text(format!("Venue: {} ({})", country.name, country.code));
+    }
     painter.text(
         subtitle_pos + vec2(venue_w, 0.0),
         Align2::LEFT_TOP,
@@ -22036,6 +24763,147 @@ fn fen_string(pos: &crate::chess::Chess) -> String {
 
 fn format_cp(cp: i32) -> String {
     format!("{:+.2}", cp as f64 / 100.0)
+}
+
+#[allow(dead_code)]
+fn parse_ref_game_date(date: &str) -> u32 {
+    let mut parts = date.split('.');
+    let y = parts
+        .next()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(0);
+    let m = parts
+        .next()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(0);
+    let d = parts
+        .next()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(0);
+    y * 10_000 + m * 100 + d
+}
+
+/// Bounded scan of a database for games and top players reaching `key`.
+/// Capped at 2,500 games and 80 ms so it completes rapidly without holding memory.
+#[allow(dead_code)]
+fn collect_ref_position_games(
+    lib: Arc<dyn GameLibrary>,
+    key: u64,
+    is_start: bool,
+) -> RefPositionGames {
+    let total_games = lib.len();
+    let max_scan = total_games.min(2_500);
+    let started = Instant::now();
+    let budget = Duration::from_millis(80);
+    let mut matched = Vec::new();
+    let mut player_counts: HashMap<String, u32> = HashMap::new();
+
+    for idx in 0..max_scan {
+        if idx > 0 && idx % 64 == 0 && started.elapsed() >= budget {
+            break;
+        }
+        let mut reaches = is_start;
+        if !reaches {
+            let mut hit = false;
+            match lib.stream_mainline(idx, 60, &mut |pos_key, _| {
+                if pos_key == key {
+                    hit = true;
+                }
+            }) {
+                Ok(true) => {
+                    reaches = hit;
+                }
+                Ok(false) if total_games <= 500 => {
+                    if let Ok(game) = lib.load(idx) {
+                        reaches =
+                            game.mainline().into_iter().take(60).any(|node_id| {
+                                position::position_key(&game.nodes[node_id].pos) == key
+                            });
+                    }
+                }
+                _ => {}
+            }
+        }
+        if !reaches {
+            continue;
+        }
+        let headers = lib.game_headers(idx);
+        let header = |name: &str| {
+            headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                .map(|(_, v)| v.as_str())
+        };
+        let white = header("White").unwrap_or("?").to_string();
+        let black = header("Black").unwrap_or("?").to_string();
+        if white != "?" && !white.is_empty() {
+            *player_counts.entry(white.clone()).or_insert(0) += 1;
+        }
+        if black != "?" && !black.is_empty() {
+            *player_counts.entry(black.clone()).or_insert(0) += 1;
+        }
+        let white_title = title_from_tag(header("WhiteTitle"));
+        let black_title = title_from_tag(header("BlackTitle"));
+        let white_elo = header("WhiteElo").and_then(|v| v.parse::<u32>().ok());
+        let black_elo = header("BlackElo").and_then(|v| v.parse::<u32>().ok());
+        let event = header("Event").unwrap_or("?").to_string();
+        let site = header("Site").map(str::to_string);
+        let date = header("Date").unwrap_or("????.??.??").to_string();
+        let date_sort = parse_ref_game_date(&date);
+        let result = header("Result").unwrap_or("*").to_string();
+        let cat = players::classify_headers_category(
+            header("Event"),
+            header("Site"),
+            header("TimeControl"),
+        );
+        matched.push(RefGameEntry {
+            lib_index: idx,
+            white,
+            black,
+            white_title,
+            black_title,
+            white_elo,
+            black_elo,
+            event,
+            site,
+            date,
+            date_sort,
+            result,
+            cat,
+        });
+    }
+
+    let total_matched = matched.len();
+    let mut top_players: Vec<(String, u32)> = player_counts.into_iter().collect();
+    top_players.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    top_players.truncate(6);
+
+    let mut by_rating = matched.clone();
+    by_rating.sort_by(|a, b| {
+        b.avg_elo()
+            .cmp(&a.avg_elo())
+            .then_with(|| b.date_sort.cmp(&a.date_sort))
+            .then_with(|| a.lib_index.cmp(&b.lib_index))
+    });
+    by_rating.truncate(16);
+
+    let mut by_recent = matched;
+    by_recent.sort_by(|a, b| {
+        b.date_sort
+            .cmp(&a.date_sort)
+            .then_with(|| b.avg_elo().cmp(&a.avg_elo()))
+            .then_with(|| a.lib_index.cmp(&b.lib_index))
+    });
+    by_recent.truncate(16);
+
+    RefPositionGames {
+        source_path: lib.path().to_path_buf(),
+        key,
+        total_matched,
+        top_players,
+        by_rating,
+        by_recent,
+    }
 }
 
 /// Automatic local correspondence reference for the current position.
@@ -22112,7 +24980,7 @@ fn correspondence_section(
                 .striped(true)
                 .spacing([8.0, 4.0])
                 .show(ui, |ui| {
-                    for heading in ["Move", "Games", "White", "W/D/L", "Elo"] {
+                    for heading in ["Move", "Games", "White", "W/D/B", "Elo"] {
                         ui.label(RichText::new(heading).strong().small());
                     }
                     ui.end_row();
@@ -22141,7 +25009,7 @@ fn correspondence_section(
                         }
                         ui.label(stat.games.to_string());
                         ui.label(format!("{:.0}%", stat.score_white() * 100.0));
-                        ui.label(format!("{}/{}/{}", stat.white, stat.draw, stat.black));
+                        draw_wdl_bar(ui, stat.white, stat.draw, stat.black, 60.0, 10.0);
                         ui.label(
                             stat.elo_avg()
                                 .map(|elo| format!("{elo:.0}"))
@@ -22345,7 +25213,7 @@ pub(crate) fn merge_multi_source_engine_rows(
         }
         if let Some(pv) = c.lichess_pv {
             let d = c.lichess_depth.unwrap_or(0);
-            variations.push((d, format!("Lichess d{d}"), pv));
+            variations.push((d, "Lichess".to_string(), pv));
         }
         if let Some(pv) = c.leela_pv {
             let d = c.leela_depth.unwrap_or(0);
@@ -22379,7 +25247,6 @@ pub(crate) fn merge_multi_source_engine_rows(
             san: c.san,
             chessdb: c.chessdb,
             lichess: c.lichess,
-            lichess_depth: c.lichess_depth,
             stockfish: c.stockfish,
             stockfish_depth: c.stockfish_depth,
             stockfish_name: c.stockfish_name,
@@ -22402,7 +25269,6 @@ fn cloud_engine_rows(snapshot: &cloud::Snapshot, pos: &Chess) -> Vec<CloudEngine
     merge_multi_source_engine_rows(Some(snapshot), &[], pos)
 }
 
-#[allow(dead_code)]
 /// Number of leading rows that still have an engine line. Any chessdb-only
 /// rows after the last engine variation are trailing and can be folded into one
 /// compact line.
@@ -22425,6 +25291,7 @@ fn cloud_engine_section(
     local_cached: &[crate::analysis_cache::CachedAnalysis],
     position: Option<&Chess>,
     status: &str,
+    show_chessdb_only: &mut bool,
 ) -> (Option<Vec<String>>, Option<HoverPreview>, bool) {
     let mut clicked_line = None;
     let mut hover_preview = None;
@@ -22542,14 +25409,8 @@ fn cloud_engine_section(
                 });
                 ui.separator();
 
-                let (line_rows, folded_chessdb_rows): (Vec<&CloudEngineRow>, Vec<&CloudEngineRow>) = rows
-                    .iter()
-                    .partition(|row| {
-                        row.lichess.is_some()
-                            || row.stockfish.is_some()
-                            || row.leela.is_some()
-                            || row.variation.len() > 1
-                    });
+                let primary_split = cloud_primary_split(&rows);
+                let (line_rows, folded_chessdb_rows) = rows.split_at(primary_split);
 
                 for row in line_rows {
                     cloud_row_ui(
@@ -22568,20 +25429,47 @@ fn cloud_engine_section(
 
                 if !folded_chessdb_rows.is_empty() {
                     ui.add_space(2.0);
-                    ui.horizontal_wrapped(|ui| {
-                        ui.spacing_mut().item_spacing = vec2(5.0, 2.0);
-                        ui.label(RichText::new("chessdb:").small().weak());
-                        for row in folded_chessdb_rows {
-                            cloud_compact_row_ui(
-                                ui,
-                                row,
-                                pos,
-                                best_score,
-                                &mut hover_preview,
-                                &mut clicked_line,
-                            );
+                    let count = folded_chessdb_rows.len();
+                    if *show_chessdb_only {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.spacing_mut().item_spacing = vec2(5.0, 2.0);
+                            ui.label(RichText::new("chessdb:").small().weak());
+                            for row in folded_chessdb_rows {
+                                cloud_compact_row_ui(
+                                    ui,
+                                    row,
+                                    pos,
+                                    best_score,
+                                    &mut hover_preview,
+                                    &mut clicked_line,
+                                );
+                            }
+                        });
+                        if ui
+                            .small_button(format!("Hide {count} chessdb-only move(s)"))
+                            .on_hover_text(
+                                "Lichess and local-cache variations always stay visible",
+                            )
+                            .clicked()
+                        {
+                            *show_chessdb_only = false;
                         }
-                    });
+                    } else {
+                        let label = if count == 1 {
+                            "+ 1 chessdb-only move".to_string()
+                        } else {
+                            format!("+ {count} chessdb-only moves")
+                        };
+                        if ui
+                            .small_button(label)
+                            .on_hover_text(
+                                "chessdb.cn candidates without a Lichess or local-cache variation are hidden by default",
+                            )
+                            .clicked()
+                        {
+                            *show_chessdb_only = true;
+                        }
+                    }
                 }
             }
 
@@ -22957,11 +25845,7 @@ fn cloud_row_ui(
                     Color32::from_gray(150)
                 }),
             )
-            .on_hover_text(if let Some(d) = row.lichess_depth {
-                format!("{eval_hint} · Lichess depth {d}")
-            } else {
-                eval_hint.clone()
-            });
+            .on_hover_text(eval_hint.clone());
         }
 
         if has_stockfish {
@@ -23035,7 +25919,9 @@ fn cloud_row_ui(
                 // Line 1: Primary (deeper) variation
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 2.0;
-                    if let Some(src) = &row.variation_source {
+                    if row.alt_variation.is_some()
+                        && let Some(src) = &row.variation_source
+                    {
                         ui.label(RichText::new(format!("[{src}]")).size(9.0).weak());
                     }
                     if row.variation.is_empty() {
@@ -24029,26 +26915,6 @@ fn xdg_data_dir() -> Option<PathBuf> {
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
 }
 
-/// Bundled sample database (`databases/samples/grandmaster_showcase.pgn`).
-pub fn sample_db_path() -> Option<PathBuf> {
-    let env = std::env::var_os("BRETT_SAMPLE_DB")
-        .map(PathBuf::from)
-        .filter(|path| !path.as_os_str().is_empty());
-    let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("databases/samples");
-    let executable = std::env::current_exe()
-        .ok()
-        .and_then(|path| path.parent().map(Path::to_path_buf));
-    let candidates = [
-        Some(PathBuf::from("databases/samples/grandmaster_showcase.pgn")),
-        Some(manifest.join("grandmaster_showcase.pgn")),
-        executable.map(|dir| dir.join("databases/samples/grandmaster_showcase.pgn")),
-        xdg_data_dir().map(|dir| dir.join("brett/databases/samples/grandmaster_showcase.pgn")),
-    ];
-    env.into_iter()
-        .chain(candidates.into_iter().flatten())
-        .find(|path| path.exists())
-}
-
 fn download_and_unpack_correspondence(
     target_dir: &Path,
     tx: &mpsc::Sender<CorrespondenceDownloadMsg>,
@@ -24593,6 +27459,42 @@ mod tests {
     }
 
     #[test]
+    fn dated_wiki_title_history_never_guesses_onto_earlier_games() {
+        let mut app = test_app();
+        let key = players::player_key("Carlsen, Magnus").unwrap();
+        Arc::make_mut(&mut app.wiki_title_awards).insert(
+            key,
+            vec![
+                titles::TitleAward {
+                    title: titles::PlayerTitle::Im,
+                    year: Some(2003),
+                },
+                titles::TitleAward {
+                    title: titles::PlayerTitle::Gm,
+                    year: Some(2004),
+                },
+            ],
+        );
+        let game = |date: &str| {
+            let pgn = format!(
+                "[Event \"Title history\"]\n[White \"Carlsen, Magnus\"]\n[Black \"Opponent\"]\n[Date \"{date}\"]\n[Result \"*\"]\n\n*\n"
+            );
+            domain::parse_pgn(pgn.as_bytes()).unwrap().remove(0)
+        };
+        assert_eq!(app.title_for_game(&game("2001.05.01"), Color::White), None);
+        assert_eq!(
+            app.title_for_game(&game("2003.05.01"), Color::White),
+            Some("IM")
+        );
+        assert_eq!(
+            app.title_for_game(&game("2010.05.01"), Color::White),
+            Some("GM")
+        );
+        // The PGN tag remains a fallback when the year has no dated award.
+        assert_eq!(app.title_for_game(&game("1999.05.01"), Color::Black), None);
+    }
+
+    #[test]
     fn player_fide_id_reads_numeric_tags_without_rewriting_them() {
         let pgn = b"[Event \"FIDE\"]\n[White \"A\"]\n[WhiteFideId \" 1503014 \"]\n[Black \"B\"]\n[BlackFideId \"not-an-id\"]\n[Result \"*\"]\n\n*\n";
         let mut games = domain::parse_pgn(&pgn[..]).unwrap();
@@ -24741,7 +27643,20 @@ mod tests {
         assert!(touch.senses_click());
         assert!(
             !touch.senses_drag(),
-            "a finger held on a game row must scroll, not start a drag"
+            "a finger held on a game row body must scroll, not start a drag"
+        );
+
+        let touch_grip = row_sense(vec![egui::Event::Touch {
+            device_id: egui::TouchDeviceId(0),
+            id: egui::TouchId(0),
+            phase: egui::TouchPhase::Start,
+            pos: egui::Pos2::new(6.0, 20.0),
+            force: None,
+        }]);
+        assert!(touch_grip.senses_click());
+        assert!(
+            touch_grip.senses_drag(),
+            "a finger starting in the left reorder grip must be able to drag-reorder"
         );
 
         let mouse = row_sense(vec![egui::Event::PointerMoved(egui::Pos2::new(40.0, 40.0))]);
@@ -24750,7 +27665,7 @@ mod tests {
     }
 
     #[test]
-    fn row_country_is_a_flag_not_a_text_suffix() {
+    fn game_row_player_names_do_not_append_nationality() {
         let name_format = TextFormat {
             font_id: FontId::proportional(14.0),
             color: Color32::WHITE,
@@ -24775,10 +27690,6 @@ mod tests {
         assert_eq!(both.text, "GM Carlsen, Magnus");
         assert!(!both.text.contains("1503014"));
         assert!(!both.text.contains("NOR"));
-
-        let row =
-            RowName::new("Nakamura, Hikaru", Some("GM")).with_country(country::normalize("USA"));
-        assert_eq!(row.country.map(|c| c.code), Some("USA"));
 
         let mut only_country = LayoutJob::default();
         append_player_name(
@@ -24983,8 +27894,16 @@ mod tests {
             dirty: false,
             pending_game_drop: None,
             pending_merge: None,
+            pending_shelf_merge: None,
             pending_open_choice: None,
+            shelf_entries: vec![None],
+            active_db_index: 0,
+            shelf_hover_switch: None,
+            open_into_new_shelf: true,
             current_slot: None,
+            selected_slots: BTreeSet::new(),
+            selection_anchor: None,
+            clipboard_games: Vec::new(),
             node: 0,
             orientation: Color::White,
             show_clocks: true,
@@ -25023,6 +27942,10 @@ mod tests {
             save_database_close_after: false,
             save_database_error: String::new(),
             tree_path: String::new(),
+            reference_mode: ReferenceMode::default(),
+            ref_games_sort: RefGamesSort::default(),
+            ref_position_games: None,
+            ref_position_games_rx: None,
             tree_index: None,
             tree_index_rx: None,
             tree_index_job: None,
@@ -25050,12 +27973,28 @@ mod tests {
             wiki_for: None,
             wiki_state: WikiState::Idle,
             wiki_expanded: false,
+            wiki_titles: HashMap::new(),
+            wiki_title_awards: Arc::new(std::collections::BTreeMap::new()),
+            wiki_title_history_dirty: false,
+            wiki_title_cache_rx: None,
+            wiki_title_cache_loaded: false,
+            wiki_batch_rx: None,
+            wiki_batch_total: 0,
+            wiki_batch_done: 0,
+            wiki_batch_ok: 0,
+            wiki_batch_ambiguous: 0,
+            wiki_batch_errors: 0,
+            wiki_batch_cache_pending: 0,
+            wiki_batch_status: String::new(),
+            wiki_batch_plan_cache: None,
+            settings_wiki_batch_scope: WikiBatchScope::default(),
             player_book: None,
             player_book_rx: None,
             player_book_job: None,
             player_book_status: String::new(),
             prep: None,
             prep_recent_limit: 10,
+            prep_recent_rows_cache: None,
             prep_recent_all: true,
             prep_exclude_chesscom: false,
             prep_player_names: Vec::new(),
@@ -25068,7 +28007,7 @@ mod tests {
             prep_setup_use_current: true,
             prep_setup_use_reference: true,
             prep_setup_use_chessabc: true,
-            prep_setup_extra_path: String::new(),
+            prep_setup_extra_paths: Vec::new(),
             prep_setup_filter: players::PrepFilterConfig::default(),
             prep_setup_accounts: Vec::new(),
             prep_setup_account_service: OnlineSource::Lichess,
@@ -25131,6 +28070,11 @@ mod tests {
             photos: None,
             photo_textures: std::collections::HashMap::new(),
             photo_order: VecDeque::new(),
+            photo_custom_keys: HashSet::new(),
+            custom_photo_misses: HashSet::new(),
+            custom_photo_miss_order: VecDeque::new(),
+            photo_pack_misses: HashSet::new(),
+            photo_pack_miss_order: VecDeque::new(),
             show_player_photos: true,
             photo_size: PhotoSize::Small,
             champion_lineage: ChampionLineage::Fide,
@@ -25203,6 +28147,7 @@ mod tests {
             engine_infos: BTreeMap::new(),
             engine_bestmove: None,
             engine_searching: false,
+            engine_show_chessdb_only: false,
             engine_path: "/usr/bin/stockfish".to_string(),
             engine_threads: 1,
             engine_hash_mb: 16,
@@ -25211,7 +28156,6 @@ mod tests {
             analysis_cache: None,
             review_engine: None,
             review: None,
-            review_open: false,
             engine_settings_open: false,
             review_status: "No game review yet.".to_string(),
             review_depth: 14,
@@ -25221,7 +28165,13 @@ mod tests {
             review_book_min_games: 3,
             review_book_max_plies: 30,
             review_book_rx: None,
+            review_cloud_rx: None,
+            review_cloud_job: None,
+            review_cloud_tried: HashSet::new(),
+            review_cloud_seeded: 0,
             review_cache: Vec::new(),
+            review_only_key_moments: true,
+            player_clock_summary: None,
             trend_window: crate::recent::TrendWindow::default(),
             trend_baseline: crate::recent::TrendBaseline::default(),
             trend_min_games: 10,
@@ -25261,6 +28211,12 @@ mod tests {
             settings_online_reference: false,
             settings_engine_bar: true,
             settings_my_player_names: String::new(),
+            settings_reference_path: String::new(),
+            settings_reference_enabled: true,
+            settings_reference_band: 200,
+            settings_reference_offset: 0,
+            settings_tree_path: String::new(),
+            settings_book_path: String::new(),
             settings_correspondence_enabled: true,
             settings_correspondence_path: String::new(),
             settings_review_skip_book: true,
@@ -25367,6 +28323,15 @@ mod tests {
             assert_eq!(LiveReferenceSource::from_config_str(s), Some(src));
         }
         assert_eq!(
+            LiveReferenceSource::LichessMasters.explorer_source(),
+            Some(cloud::ExplorerSource::Masters)
+        );
+        assert_eq!(
+            LiveReferenceSource::LichessAll.explorer_source(),
+            Some(cloud::ExplorerSource::Lichess)
+        );
+        assert_eq!(LiveReferenceSource::ChessAbc.explorer_source(), None);
+        assert_eq!(
             LiveReferenceSource::from_config_str("live:masters"),
             Some(LiveReferenceSource::LichessMasters)
         );
@@ -25455,9 +28420,16 @@ mod tests {
             extract: format!("{title} is a Norwegian chess grandmaster."),
             url: format!("https://en.wikipedia.org/wiki/{}", title.replace(' ', "_")),
             countries: vec!["NOR".to_string()],
+            country_periods: vec![crate::wiki::CountryPeriod {
+                code: "NOR".to_string(),
+                start_year: None,
+                end_year: None,
+                context: None,
+            }],
             fide_id: None,
             birth_year: None,
             peak_elo: None,
+            title_history: Vec::new(),
         }
     }
 
@@ -25465,6 +28437,8 @@ mod tests {
     fn wikipedia_summary_loads_from_the_cache_when_a_profile_opens() {
         let mut app = test_app();
         let player = wiki_player("Carlsen, Magnus");
+        let player_index = app.players.ensure_player(&player.name);
+        app.selected_player = Some(player_index);
         app.wiki_cache.insert(
             &player.name,
             &crate::wiki::Lookup::Summary(wiki_summary("Magnus Carlsen")),
@@ -25480,6 +28454,14 @@ mod tests {
             panic!("expected the cached summary");
         };
         assert_eq!(summary.title, "Magnus Carlsen");
+        assert_eq!(
+            app.players
+                .get(player_index)
+                .and_then(|player| player.country)
+                .map(|country| country.code),
+            Some("NOR"),
+            "cached enrichment should be re-applied to the player directory"
+        );
     }
 
     #[test]
@@ -25541,6 +28523,141 @@ mod tests {
             panic!("expected the second player's summary");
         };
         assert_eq!(summary.title, "Judit Polgár");
+    }
+
+    #[test]
+    fn cached_title_history_restores_player_list_titles_without_network() {
+        let mut app = test_app();
+        app.players.ensure_player("Carlsen, Magnus");
+        let key = players::player_key("Carlsen, Magnus").unwrap();
+        let mut summary = wiki_summary("Magnus Carlsen");
+        summary.title_history = vec![
+            titles::TitleAward {
+                title: titles::PlayerTitle::Im,
+                year: Some(2003),
+            },
+            titles::TitleAward {
+                title: titles::PlayerTitle::Gm,
+                year: Some(2004),
+            },
+        ];
+        app.wiki_cache
+            .insert("Carlsen, Magnus", &crate::wiki::Lookup::Summary(summary));
+        app.preload_cached_wiki_titles();
+        assert_eq!(
+            app.wiki_titles.get(&key).copied(),
+            Some(titles::PlayerTitle::Gm)
+        );
+        assert_eq!(
+            app.wiki_title_awards
+                .get(&key)
+                .and_then(|awards| titles::at_year(awards, 2003)),
+            Some(titles::PlayerTitle::Im)
+        );
+    }
+
+    #[test]
+    fn compact_title_cache_load_restores_metadata_without_a_large_database() {
+        let mut app = test_app();
+        let key = players::player_key("Carlsen, Magnus").unwrap();
+        let history = vec![
+            titles::TitleAward {
+                title: titles::PlayerTitle::Im,
+                year: Some(2003),
+            },
+            titles::TitleAward {
+                title: titles::PlayerTitle::Gm,
+                year: Some(2004),
+            },
+        ];
+        let (tx, rx) = mpsc::channel();
+        tx.send(std::collections::BTreeMap::from([(key.clone(), history)]))
+            .unwrap();
+        app.wiki_title_cache_rx = Some(rx);
+
+        app.poll_wiki_title_cache();
+
+        assert!(app.wiki_title_cache_loaded);
+        assert_eq!(
+            app.wiki_titles.get(&key).copied(),
+            Some(titles::PlayerTitle::Gm)
+        );
+        assert_eq!(
+            app.title_for_game(
+                &domain::parse_pgn(
+                    b"[Event \"Historical\"]\n[White \"Carlsen, Magnus\"]\n[Black \"Opponent\"]\n[Date \"2003.01.01\"]\n\n*\n"
+                )
+                .unwrap()[0],
+                Color::White
+            ),
+            Some("IM")
+        );
+    }
+
+    #[test]
+    fn batch_scope_indices_follow_the_sorted_player_directory() {
+        let mut app = test_app();
+        for index in 0..12 {
+            let player_index = app.players.ensure_player(&format!("Player {index:02}"));
+            app.players.get_mut(player_index).unwrap().white.games = 12 - index as u32;
+        }
+        let players = app.players.players().to_vec();
+        assert_eq!(WikiBatchScope::Top100.select(&players).len(), 12);
+        assert_eq!(WikiBatchScope::Top100.select(&players)[0], 0);
+        assert_eq!(WikiBatchScope::Games10.select(&players).len(), 3);
+    }
+
+    #[test]
+    fn exiting_prep_in_multi_view_keeps_a_workspace_visible() {
+        let mut app = test_app();
+        app.prep = Some(PrepSession {
+            player_key: "opponent".to_string(),
+            player_name: "Opponent".to_string(),
+            player_title: None,
+            player_fide_id: None,
+            our_color: Color::White,
+            previous_game: None,
+            previous_orientation: Color::White,
+            mode: crate::settings::PrepMode::Classic,
+            filter: players::PrepFilterConfig::default(),
+            accounts: Vec::new(),
+            chessabc_fide_ids: Vec::new(),
+            sources_label: String::new(),
+        });
+        app.multi_view = true;
+        app.visible_tabs = [false, false, false, true];
+        app.right_tab = RightTab::Preparation;
+
+        app.exit_prep();
+
+        assert!(app.visible_tabs.iter().any(|visible| *visible));
+        assert_eq!(app.right_tab, RightTab::Moves);
+        assert!(app.visible_tabs[RightTab::Moves.index()]);
+    }
+
+    #[test]
+    fn batch_plan_and_start_reuse_cached_summaries_without_network() {
+        let mut app = test_app();
+        let index = app.players.ensure_player("Carlsen, Magnus");
+        let player = app.players.get(index).unwrap().clone();
+        app.settings_wiki_batch_scope = WikiBatchScope::All;
+        let mut summary = wiki_summary("Magnus Carlsen");
+        summary.title_history.push(titles::TitleAward {
+            title: titles::PlayerTitle::Gm,
+            year: Some(2004),
+        });
+        app.wiki_cache
+            .insert(&player.name, &crate::wiki::Lookup::Summary(summary));
+
+        assert_eq!(app.wiki_batch_plan(), (1, 0, 0.0));
+        app.start_wiki_batch();
+        assert!(app.wiki_batch_rx.is_none());
+        assert_eq!(app.wiki_batch_done, 1);
+        assert!(app.wiki_batch_status.contains("already have cached"));
+        assert_eq!(
+            app.wiki_titles.get(&player.key).copied(),
+            Some(titles::PlayerTitle::Gm)
+        );
     }
 
     #[test]
@@ -26133,6 +29250,74 @@ mod tests {
     }
 
     #[test]
+    fn dragging_king_to_castle_destination_works_for_both_colours_and_sides() {
+        let cases = [
+            (
+                "r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1",
+                Color::White,
+                Square::E1,
+                Square::G1,
+                Square::G1,
+                Square::F1,
+                "O-O",
+            ),
+            (
+                "r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1",
+                Color::White,
+                Square::E1,
+                Square::C1,
+                Square::C1,
+                Square::D1,
+                "O-O-O",
+            ),
+            (
+                "r3k2r/8/8/8/8/8/8/R3K2R b KQkq - 0 1",
+                Color::Black,
+                Square::E8,
+                Square::G8,
+                Square::G8,
+                Square::F8,
+                "O-O",
+            ),
+            (
+                "r3k2r/8/8/8/8/8/8/R3K2R b KQkq - 0 1",
+                Color::Black,
+                Square::E8,
+                Square::C8,
+                Square::C8,
+                Square::D8,
+                "O-O-O",
+            ),
+        ];
+
+        let mut app = test_app();
+        for (fen, color, from, to, king_square, rook_square, san) in cases {
+            let pgn = format!("[Event \"Castle drag\"]\n[SetUp \"1\"]\n[FEN \"{fen}\"]\n\n*");
+            app.current = Some(domain::parse_pgn(pgn.as_bytes()).unwrap().remove(0));
+            app.node = 0;
+
+            app.handle_board_event(BoardEvent::DragStart(from));
+            assert!(
+                app.targets.contains(&to),
+                "castle destination {to} should be highlighted"
+            );
+            app.handle_board_event(BoardEvent::Drop { from, to });
+
+            let game = app.current.as_ref().unwrap();
+            let position = &game.nodes[app.node].pos;
+            assert_eq!(game.nodes[app.node].san(), Some(san));
+            assert_eq!(
+                position.board().piece_at(king_square),
+                Some(crate::chess::Piece::new(color, crate::chess::Role::King))
+            );
+            assert_eq!(
+                position.board().piece_at(rook_square),
+                Some(crate::chess::Piece::new(color, crate::chess::Role::Rook))
+            );
+        }
+    }
+
+    #[test]
     fn cloud_primary_split_folds_only_trailing_chessdb_rows() {
         let row = |san: &str, lichess: bool| CloudEngineRow {
             uci: "e2e4".to_string(),
@@ -26233,6 +29418,7 @@ mod tests {
             e4_row.alt_variation.as_ref().unwrap(),
             &vec!["e2e4", "c7c5", "g1f3", "d7d6"]
         );
+        assert_eq!(e4_row.alt_variation_source.as_deref(), Some("Lichess"));
     }
 
     #[test]
@@ -26473,7 +29659,8 @@ mod tests {
         use crate::analysis_cache::{CachedAnalysis, EngineFamily};
 
         let mut app = test_app();
-        app.right_tab = RightTab::References;
+        app.right_tab = RightTab::Tree;
+        app.reference_mode = ReferenceMode::Lichess;
         let node_count = app.current.as_ref().unwrap().nodes.len();
         assert!(node_count >= 5);
         let source = app.explorer_source;
@@ -26489,7 +29676,12 @@ mod tests {
         assert!(!app.has_verified_empty_cloud_ancestor(4));
         app.maybe_request_cloud();
         assert!(app.cloud.is_none(), "unqueried ancestors must not prune");
-        assert!(app.cloud_pending.is_some());
+        assert!(
+            app.cloud_pending.is_some(),
+            "cloud query should be pending in {:?} mode on {:?}",
+            app.reference_mode,
+            app.right_tab
+        );
         assert!(!app.cloud_cache.contains_key(&(source, fen4.clone())));
         assert!(app.cloud_rx.is_none());
 
@@ -26598,6 +29790,74 @@ mod tests {
         assert!(app.bar_cloud_pending.is_some());
         assert!(!app.bar_cloud_cache.contains_key(&fen4));
         assert!(app.bar_cloud_rx.is_none());
+    }
+
+    #[test]
+    fn cloud_eval_deduplicates_across_bar_cache_explorer_sources_and_in_flight_jobs() {
+        let mut app = test_app();
+        app.goto(1);
+        let fen1 = app.current_fen().unwrap();
+
+        // 1. Navigating on Moves populates `bar_cloud_cache`. Switching to
+        // Engine immediately exposes that Lichess CloudEval for rendering and
+        // for `start_cloud` reuse without a duplicate Lichess cloud-eval HTTP
+        // call.
+        let cached_eval = cloud::CloudEval {
+            depth: 36,
+            knodes: 12_500,
+            pvs: vec![cloud::CloudPv {
+                moves: "e7e5 g1f3".to_string(),
+                cp: Some(25),
+                mate: None,
+            }],
+        };
+        app.bar_cloud_cache
+            .insert(fen1.clone(), Some(cached_eval.clone()));
+        app.right_tab = RightTab::Engine;
+        app.engine_view = EngineView::Both;
+        let engine_snapshot = app
+            .cloud_snapshot_for_engine_view(&fen1)
+            .expect("bar cache should seed Engine view immediately");
+        assert_eq!(engine_snapshot.cloud_eval, Ok(cached_eval.clone()));
+        assert_eq!(
+            app.cached_cloud_eval_result(&fen1),
+            Some(Ok(cached_eval.clone()))
+        );
+
+        // 2. When `cloud_cache` already has a Snapshot for `fen1` under
+        // Masters and `explorer_source` is later changed to Lichess, the
+        // Engine tab reuses `chessdb` and `cloud_eval` immediately from cache
+        // without starting a new cloud or explorer request.
+        let masters_snapshot = cloud::Snapshot {
+            fen: fen1.clone(),
+            explorer_source: cloud::ExplorerSource::Masters,
+            chessdb: Ok(cloud::ChessDb { moves: Vec::new() }),
+            explorer: Ok(cloud::empty_explorer()),
+            cloud_eval: Ok(cached_eval.clone()),
+        };
+        app.cloud_cache.insert(
+            (cloud::ExplorerSource::Masters, fen1.clone()),
+            masters_snapshot.clone(),
+        );
+        app.explorer_source = cloud::ExplorerSource::Lichess;
+        app.cloud = None;
+        app.cloud_pending = None;
+        app.maybe_request_cloud();
+        assert_eq!(app.cloud, Some(masters_snapshot.clone()));
+        assert!(app.cloud_pending.is_none());
+        assert!(app.cloud_rx.is_none());
+        assert!(app.explorer_rx.is_none());
+
+        // 3. Even while an older position's `cloud_rx` is still in flight,
+        // stepping back to a cached position loads the cache immediately.
+        let (_tx, rx) = mpsc::channel();
+        app.cloud_rx = Some(rx);
+        app.cloud_job = Some("other-fen".to_string());
+        app.cloud = None;
+        app.explorer_source = cloud::ExplorerSource::Masters;
+        app.maybe_request_cloud();
+        assert_eq!(app.cloud, Some(masters_snapshot));
+        assert!(app.cloud_pending.is_none());
     }
 
     #[test]
@@ -27219,7 +30479,7 @@ mod tests {
         app.prep_setup_use_current = false;
         app.prep_setup_use_reference = false;
         app.prep_setup_use_chessabc = false;
-        app.prep_setup_extra_path = path.display().to_string();
+        app.prep_setup_extra_paths = vec![path.display().to_string()];
         app.start_prep(true);
         let prep = app
             .prep
@@ -27262,6 +30522,27 @@ mod tests {
         app.orientation = Color::Black;
         app.goto(node);
         assert_eq!(app.orientation, Color::White);
+    }
+
+    #[test]
+    fn active_preparation_color_switch_keeps_the_existing_session() {
+        let mut app = test_app();
+        app.prep = Some(prep_test_session());
+        app.prep_swapped_view = true;
+        app.prep_merged_games =
+            domain::parse_pgn(b"[White \"A\"]\n[Black \"B\"]\n\n1. e4 e5 *\n").unwrap();
+        let original_game_count = app.prep_merged_games.len();
+
+        app.set_active_prep_color(Color::Black);
+
+        assert_eq!(
+            app.prep.as_ref().map(|prep| prep.our_color),
+            Some(Color::Black)
+        );
+        assert_eq!(app.orientation, Color::Black);
+        assert_eq!(app.prep_locked_orientation(), Some(Color::Black));
+        assert!(!app.prep_swapped_view);
+        assert_eq!(app.prep_merged_games.len(), original_game_count);
     }
 
     #[test]
@@ -27407,7 +30688,7 @@ mod tests {
         let prep_game = app.current.clone().unwrap();
         app.library = Some(Arc::new(library) as Arc<dyn GameLibrary>);
         app.node = 2;
-        app.right_tab = RightTab::Tree;
+        app.right_tab = RightTab::Preparation;
         app.prep = Some(PrepSession {
             player_key: "opponent".to_string(),
             player_name: "Opponent".to_string(),
@@ -27446,7 +30727,7 @@ mod tests {
         assert!(app.recent_preview.is_none());
         assert_eq!(app.current.as_ref().unwrap().event(), prep_game.event());
         assert_eq!(app.node, 2);
-        assert_eq!(app.right_tab, RightTab::Tree);
+        assert_eq!(app.right_tab, RightTab::Preparation);
 
         std::fs::remove_file(path).unwrap();
     }
@@ -27520,6 +30801,154 @@ mod tests {
     }
 
     #[test]
+    fn review_cloud_time_breakoff_tracks_the_move_budget() {
+        let mut app = test_app();
+        app.review_use_time = true;
+        for (time, depth) in [(100, 22), (499, 22), (500, 26), (1_500, 26), (1_501, 30)] {
+            app.review_time_ms = time;
+            assert_eq!(app.review_cloud_target_depth(), depth, "{time} ms");
+        }
+        app.review_use_time = false;
+        app.review_depth = 17;
+        assert_eq!(app.review_cloud_target_depth(), 17);
+    }
+
+    #[test]
+    fn cloud_eval_parts_preserve_lichess_white_perspective_scores() {
+        let eval = cloud::CloudEval {
+            depth: 31,
+            knodes: 500,
+            pvs: vec![
+                cloud::CloudPv {
+                    moves: "e2e4 e7e5".to_string(),
+                    cp: Some(135),
+                    mate: None,
+                },
+                cloud::CloudPv {
+                    moves: "d2d4 d7d5".to_string(),
+                    cp: None,
+                    mate: Some(-4),
+                },
+            ],
+        };
+        let (score, best, pv, second, depth) = App::cloud_eval_parts(&eval);
+        assert_eq!(score, Some(Score::Cp(135)));
+        assert_eq!(best.as_deref(), Some("e2e4"));
+        assert_eq!(pv, vec!["e2e4", "e7e5"]);
+        assert_eq!(second, Some(Score::Mate(-4)));
+        assert_eq!(depth, Some(31));
+    }
+
+    #[test]
+    fn photo_miss_cache_is_bounded_and_deduplicated() {
+        let mut misses = HashSet::new();
+        let mut order = VecDeque::new();
+        remember_photo_miss(&mut misses, &mut order, "one".to_string(), 2);
+        remember_photo_miss(&mut misses, &mut order, "one".to_string(), 2);
+        remember_photo_miss(&mut misses, &mut order, "two".to_string(), 2);
+        remember_photo_miss(&mut misses, &mut order, "three".to_string(), 2);
+
+        assert_eq!(
+            order,
+            VecDeque::from(["two".to_string(), "three".to_string()])
+        );
+        assert_eq!(misses.len(), 2);
+        assert!(!misses.contains("one"));
+    }
+
+    #[test]
+    fn cached_cloud_misses_and_shallow_results_are_marked_tried() {
+        let mut app = test_app();
+        let game = domain::parse_pgn(b"[Event \"Cloud cache\"]\n\n1. e4 *\n")
+            .unwrap()
+            .remove(0);
+        let review = ReviewState::new(
+            &game,
+            ReviewConfig {
+                limit: SearchLimit::Depth(20),
+            },
+            0,
+        );
+        let mainline = game.mainline();
+        let first_fen = Fen::from_position(&game.nodes[0].pos, EnPassantMode::Legal).to_string();
+        let last_fen = Fen::from_position(
+            &game.nodes[*mainline.last().unwrap()].pos,
+            EnPassantMode::Legal,
+        )
+        .to_string();
+        app.bar_cloud_cache.insert(first_fen.clone(), None);
+        app.bar_cloud_cache.insert(
+            last_fen.clone(),
+            Some(cloud::CloudEval {
+                depth: 10,
+                knodes: 100,
+                pvs: vec![cloud::CloudPv {
+                    moves: "e7e5".to_string(),
+                    cp: Some(20),
+                    mate: None,
+                }],
+            }),
+        );
+        let mut tried = HashSet::new();
+
+        assert_eq!(
+            app.seed_review_from_cached_cloud(&mut review.clone(), &mut tried),
+            0
+        );
+        assert!(tried.contains(&first_fen));
+        assert!(tried.contains(&last_fen));
+    }
+
+    #[test]
+    fn fetched_cloud_eval_is_shared_with_the_bar_cache() {
+        let mut app = test_app();
+        let game = domain::parse_pgn(b"[Event \"Cloud cache write\"]\n\n1. e4 *\n")
+            .unwrap()
+            .remove(0);
+        let mut review = ReviewState::new(
+            &game,
+            ReviewConfig {
+                limit: SearchLimit::Depth(8),
+            },
+            0,
+        );
+        let mainline = game.mainline();
+        let first_fen = Fen::from_position(&game.nodes[0].pos, EnPassantMode::Legal).to_string();
+        let last_fen = Fen::from_position(
+            &game.nodes[*mainline.last().unwrap()].pos,
+            EnPassantMode::Legal,
+        )
+        .to_string();
+        assert!(review.seed_from_cloud(
+            &first_fen,
+            Some(Score::Cp(0)),
+            Some("e2e4".to_string()),
+            vec!["e2e4".to_string()],
+            None,
+            Some(30),
+        ));
+        app.review = Some(review);
+        let eval = cloud::CloudEval {
+            depth: 30,
+            knodes: 100,
+            pvs: vec![cloud::CloudPv {
+                moves: "e7e5".to_string(),
+                cp: Some(25),
+                mate: None,
+            }],
+        };
+        let (tx, rx) = mpsc::channel();
+        tx.send((last_fen.clone(), Ok(Some(eval.clone())))).unwrap();
+        app.review_cloud_rx = Some(rx);
+        app.review_cloud_job = Some(last_fen.clone());
+
+        app.poll_review_cloud();
+
+        assert_eq!(app.bar_cloud_cache.get(&last_fen), Some(&Some(eval)));
+        assert!(app.review.as_ref().unwrap().complete());
+    }
+
+    #[test]
     fn review_cache_restores_a_completed_review_without_an_engine() {
         let mut app = test_app();
         let game = app.current.clone().unwrap();
@@ -27539,7 +30968,7 @@ mod tests {
         assert!(restored.complete());
         assert_eq!(restored.key.as_ref(), Some(&key));
         assert!(app.review_status.starts_with("Review restored from cache"));
-        assert!(app.review_open);
+        assert_eq!(app.right_tab, RightTab::Engine);
         assert!(
             app.review_engine.is_none(),
             "a cache hit must not spawn an engine"
@@ -27965,7 +31394,7 @@ mod tests {
             let badge = PlayerBadge {
                 name: "Carlsen, Magnus".to_string(),
                 title: Some("GM".to_string()),
-                country: Some("🇳🇴 NOR"),
+                country: country::normalize("NOR"),
                 fide_id: Some("1503014".to_string()),
                 rating: Some("2882".to_string()),
                 team: None,
@@ -27995,8 +31424,10 @@ mod tests {
         assert!(app.show_annotations);
         app.show_annotations = false;
         app.show_pgn_tags = false;
-        app.save_display_prefs();
-        let loaded = DisplayPrefs::load();
+        // Round-trip through JSON rather than the user's config file: the real
+        // path is covered by settings::tests, and this keeps parallel tests
+        // from racing on ~/.config/brett/display.json.
+        let loaded = DisplayPrefs::from_json(&app.display_prefs().to_json());
         assert!(!loaded.show_annotations);
         assert!(!loaded.show_pgn_tags);
     }
@@ -28301,7 +31732,7 @@ mod tests {
             game_indices: Vec::new(),
         };
 
-        let (title, elo, country) = player_list_row_meta(&player);
+        let (title, elo, country) = player_list_row_meta(&player, None);
         assert_eq!(title, Some("GM"));
         assert_eq!(elo, Some(2882));
         assert_eq!(country.map(|c| c.code), Some("NOR"));
@@ -28361,5 +31792,211 @@ mod tests {
             account_check_text(&done).text(),
             "✓ Found · 10012 games · 10012 pass filters (0 bullet) (12 new)"
         );
+    }
+
+    #[test]
+    fn collect_ref_position_games_finds_top_players_and_sorted_games() {
+        // Build a small fixture at runtime instead of relying on a bundled
+        // sample database. Ten start-position games give the collector enough
+        // material to rank players, ratings, and dates.
+        let players = [
+            "Carlsen, Magnus",
+            "Nakamura, Hikaru",
+            "Firouzja, Alireza",
+            "Gukesh, Dommaraju",
+            "Keymer, Vincent",
+        ];
+        let mut pgn = String::new();
+        for index in 0..10 {
+            let white = players[index % players.len()];
+            let black = players[(index + 2) % players.len()];
+            let day = format!("2024.{:02}.{:02}", index % 12 + 1, index + 1);
+            pgn.push_str(&format!(
+                "[Event \"Fixture {index}\"]\n[Site \"Test\"]\n[Date \"{day}\"]\n[Round \"{}\"]\n[White \"{white}\"]\n[Black \"{black}\"]\n[Result \"1-0\"]\n[WhiteElo \"{}\"]\n[BlackElo \"{}\"]\n[WhiteTitle \"GM\"]\n[BlackTitle \"GM\"]\n\n1. e4 e5 2. Nf3 Nc6 3. Bb5 a6 1-0\n\n",
+                index + 1,
+                2700 + index,
+                2650 + index,
+            ));
+        }
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "brett-ref-fixture-{}-{}.pgn",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, pgn).unwrap();
+        let lib: Arc<dyn GameLibrary> = Arc::new(PgnLibrary::build(&path).unwrap());
+        let start_key = position::position_key(&Chess::default());
+        let start_games = collect_ref_position_games(lib.clone(), start_key, true);
+        assert!(start_games.total_matched >= 8);
+        assert!(!start_games.top_players.is_empty());
+        assert!(!start_games.by_rating.is_empty());
+        assert!(!start_games.by_recent.is_empty());
+        assert!(
+            start_games.by_rating[0].avg_elo() >= start_games.by_rating.last().unwrap().avg_elo()
+        );
+        assert!(
+            start_games.by_recent[0].date_sort >= start_games.by_recent.last().unwrap().date_sort
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn open_databases_shelf_switches_copies_merges_and_pastes_pgn() {
+        let mut app = test_app();
+        let g1 = domain::parse_pgn(
+            b"[Event \"Match\"]\n[White \"Carlsen, Magnus\"]\n[Black \"Nakamura, Hikaru\"]\n[Date \"2024.06.01\"]\n[Result \"1-0\"]\n\n1. e4 e5 2. Nf3 Nc6 1-0\n",
+        )
+        .unwrap()
+        .remove(0);
+        let g2 = domain::parse_pgn(
+            b"[Event \"Match\"]\n[White \"Firouzja, Alireza\"]\n[Black \"Gukesh, Dommaraju\"]\n[Date \"2024.06.02\"]\n[Result \"0-1\"]\n\n1. d4 Nf6 2. c4 e6 0-1\n",
+        )
+        .unwrap()
+        .remove(0);
+
+        let id1 = app.session.insert_game(g1.clone(), None);
+        let id2 = app.session.insert_game(g2.clone(), None);
+        app.select_slot(id1);
+        assert_eq!(app.shelf_entries.len(), 1);
+        assert_eq!(app.active_db_index, 0);
+
+        // Create a second scratch database on the shelf.
+        app.new_shelf_database();
+        assert_eq!(app.shelf_entries.len(), 2);
+        assert_eq!(app.active_db_index, 1);
+        assert_eq!(app.session.len(), 0);
+        assert_eq!(app.shelf_entry_count(0), 2);
+
+        // Copy game 1 from shelf 0 into shelf 1; a second copy of the same
+        // game is skipped as a duplicate.
+        let payload = GameRowDrag {
+            source: GameDragSource::SessionSlots {
+                shelf_index: 0,
+                slot_ids: vec![id1],
+            },
+        };
+        let dragged = app.resolve_dragged_games(&payload);
+        assert_eq!(dragged.len(), 1);
+        let (added, skipped) = app.copy_games_to_shelf(dragged.clone(), 1, None);
+        assert_eq!((added, skipped), (1, 0));
+        let (added2, skipped2) = app.copy_games_to_shelf(dragged, 1, None);
+        assert_eq!((added2, skipped2), (0, 1));
+        assert_eq!(app.session.len(), 1);
+
+        // Merge shelf 0 into shelf 1 with deduplication: only g2 is added.
+        app.execute_shelf_merge(
+            PendingShelfMerge {
+                source: ShelfMergeSource::ShelfEntry(0),
+                target_shelf_index: 1,
+                source_label: "Shelf 1".to_string(),
+                source_count: 2,
+            },
+            true,
+            false,
+        );
+        assert_eq!(app.session.len(), 2);
+
+        // Switch back to shelf 0 and copy/paste via clipboard + raw PGN.
+        app.switch_shelf_database(0);
+        assert_eq!(app.active_db_index, 0);
+        assert_eq!(app.session.len(), 2);
+        app.selected_slots = [id1, id2].into_iter().collect();
+        let ctx = egui::Context::default();
+        app.copy_selected_games_to_clipboard(&ctx);
+        assert_eq!(app.clipboard_games.len(), 2);
+
+        app.paste_games_from_clipboard(
+            Some(
+                "[Event \"Pasted\"]\n[White \"Keymer, Vincent\"]\n[Black \"Caruana, Fabiano\"]\n[Date \"2024.07.01\"]\n[Result \"1/2-1/2\"]\n\n1. c4 c5 2. Nc3 Nc6 1/2-1/2\n",
+            ),
+            None,
+        );
+        assert_eq!(app.session.len(), 3);
+
+        // Closing shelf 0 switches cleanly to the remaining shelf entry.
+        app.close_shelf_database(0);
+        assert_eq!(app.shelf_entries.len(), 1);
+        assert_eq!(app.active_db_index, 0);
+        assert_eq!(app.session.len(), 2);
+    }
+
+    #[test]
+    fn review_seeds_from_analysis_cache_and_inserts_refutations() {
+        let mut app = test_app();
+        let game = domain::parse_pgn(b"[Event \"Review Cache\"]\n\n1. e4 e5 *\n")
+            .unwrap()
+            .remove(0);
+        app.current = Some(game.clone());
+
+        let db_path = std::env::temp_dir().join(format!(
+            "brett-review-cache-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        {
+            let mut db = crate::analysis_cache::AnalysisDb::open_at(&db_path).unwrap();
+            for node in [0usize, 1, 2] {
+                let pos = &game.nodes[node].pos;
+                let fen = Fen::from_position(pos, EnPassantMode::Legal).to_string();
+                let best_mv = match node {
+                    0 => "d2d4",
+                    1 => "e7e5",
+                    _ => "g1f3",
+                };
+                db.store(
+                    &crate::analysis_cache::CachedAnalysis {
+                        pos_hash: pos.position_hash(),
+                        fen,
+                        engine_family: crate::analysis_cache::EngineFamily::Stockfish,
+                        engine_name: "Stockfish 18".to_string(),
+                        multipv: 1,
+                        depth: 20,
+                        seldepth: Some(26),
+                        score_cp: Some(if node == 1 { -180 } else { 30 }),
+                        score_mate: None,
+                        nodes: Some(200_000),
+                        time_ms: Some(100),
+                        nps: Some(2_000_000),
+                        pv: vec![best_mv.to_string()],
+                        quality_score: 0.0,
+                        analyzed_at: 1,
+                    },
+                    true,
+                )
+                .unwrap();
+            }
+        }
+        let handle = crate::analysis_cache::AnalysisCacheHandle::spawn(Some(db_path.clone()), true);
+        app.analysis_cache = Some(handle);
+        app.begin_review(
+            &game,
+            ReviewConfig {
+                limit: SearchLimit::Depth(14),
+            },
+            0,
+        );
+        let review = app.review.as_ref().expect("review seeded from cache");
+        assert!(
+            review.complete(),
+            "all 3 positions should be satisfied from cache"
+        );
+        let moves = review.moves(&game);
+        assert_eq!(moves.len(), 2);
+        assert!(moves[0].from_cache);
+
+        // Insert the refutation line ("d2d4") as a variation on move 1 ("e2e4").
+        assert!(app.insert_refutation_variation(1, &[String::from("d2d4")]));
+        assert!(
+            app.current.as_ref().unwrap().nodes[0].children.len() >= 2,
+            "root should now have the refutation variation"
+        );
+        let _ = std::fs::remove_file(db_path);
     }
 }

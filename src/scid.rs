@@ -397,6 +397,8 @@ impl GameLibrary for ScidLibrary {
                 draws: stats.draws,
                 losses: stats.losses,
                 elo_max: u32::from(stats.max_elo),
+                elo_sum: 0,
+                elo_count: 0,
                 first_year: stats.first_year,
                 last_year: stats.last_year,
             });

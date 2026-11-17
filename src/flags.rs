@@ -184,6 +184,67 @@ pub fn paint_flag(painter: &Painter, country: Country, rect: Rect) -> f32 {
     paint_pill(painter, country, rect)
 }
 
+/// Paint the 1933–1935 German war ensign without a swastika for the
+/// historically specific Keres federation tooltip.
+///
+/// This uses the requested black-white-red field and a small hoist-side Iron
+/// Cross treatment; it intentionally omits the central emblem.
+pub fn paint_german_war_ensign(painter: &Painter, rect: Rect) {
+    let stripe_h = rect.height() / 3.0;
+    for (index, color) in [
+        Color32::BLACK,
+        Color32::WHITE,
+        Color32::from_rgb(0xD0, 0x1C, 0x1F),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        painter.rect_filled(
+            Rect::from_min_size(
+                egui::pos2(rect.left(), rect.top() + stripe_h * index as f32),
+                vec2(rect.width(), stripe_h),
+            ),
+            0.0,
+            color,
+        );
+    }
+
+    // A compact outlined cross keeps the historical ensign recognizable at
+    // list-icon scale without reproducing the prohibited emblem.
+    let cross_size = rect.height() * 0.48;
+    let center = egui::pos2(rect.left() + rect.width() * 0.29, rect.center().y);
+    let iron_cross = |scale: f32| {
+        let arm = cross_size * scale;
+        let half = arm * 0.5;
+        let neck = arm * 0.17;
+        vec![
+            egui::pos2(center.x - neck, center.y - half),
+            egui::pos2(center.x + neck, center.y - half),
+            egui::pos2(center.x + neck, center.y - neck),
+            egui::pos2(center.x + half, center.y - neck),
+            egui::pos2(center.x + half, center.y + neck),
+            egui::pos2(center.x + neck, center.y + neck),
+            egui::pos2(center.x + neck, center.y + half),
+            egui::pos2(center.x - neck, center.y + half),
+            egui::pos2(center.x - neck, center.y + neck),
+            egui::pos2(center.x - half, center.y + neck),
+            egui::pos2(center.x - half, center.y - neck),
+            egui::pos2(center.x - neck, center.y - neck),
+        ]
+    };
+    painter.add(egui::Shape::convex_polygon(
+        iron_cross(1.0),
+        Color32::WHITE,
+        Stroke::NONE,
+    ));
+    painter.add(egui::Shape::convex_polygon(
+        iron_cross(0.76),
+        Color32::BLACK,
+        Stroke::NONE,
+    ));
+    painter.rect_stroke(rect, 0.0, Stroke::new(1.0, hairline()), StrokeKind::Inside);
+}
+
 /// Simplified tricolor paintings for dissolved federations, drawn at the
 /// same display size so they appear as real flags rather than text pills.
 fn paint_former_flag(painter: &Painter, code: &str, rect: Rect) -> bool {

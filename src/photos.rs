@@ -285,6 +285,19 @@ pub fn decode_webp(bytes: &[u8]) -> Result<egui::ColorImage> {
     let image = image::load_from_memory_with_format(bytes, image::ImageFormat::WebP)
         .context("decoding the player photo")?;
     let image = image.thumbnail(160, 160);
+    color_image(image)
+}
+
+/// Decode a user portrait at the size stored by [`store_custom`] so the
+/// standalone profile viewer does not upscale a 160 px avatar.
+pub fn decode_custom_webp(bytes: &[u8]) -> Result<egui::ColorImage> {
+    let image = image::load_from_memory_with_format(bytes, image::ImageFormat::WebP)
+        .context("decoding the custom player portrait")?;
+    let image = image.thumbnail(400, 400);
+    color_image(image)
+}
+
+fn color_image(image: image::DynamicImage) -> Result<egui::ColorImage> {
     let rgba = image.to_rgba8();
     let size = [rgba.width() as usize, rgba.height() as usize];
     Ok(egui::ColorImage::from_rgba_unmultiplied(
@@ -314,6 +327,78 @@ pub fn default_path() -> Option<PathBuf> {
     env.into_iter()
         .chain(candidates.into_iter().flatten())
         .find(|path| path.exists())
+}
+
+/// Directory for user-supplied portraits, stored as WebP files keyed by the
+/// canonical player identity. Lives beside the other Brett config files so it
+/// survives application updates.
+pub fn custom_dir() -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .map(|home| home.join(".config"))
+        })?;
+    Some(base.join("brett").join("portraits"))
+}
+
+/// Path of a player's custom portrait file.
+pub fn custom_path(name: &str) -> Option<PathBuf> {
+    let key = player_key(name)?;
+    Some(custom_dir()?.join(format!("{key}.webp")))
+}
+
+/// Read a player's custom portrait bytes when one has been chosen.
+pub fn custom_bytes(name: &str) -> Option<Vec<u8>> {
+    std::fs::read(custom_path(name)?).ok()
+}
+
+/// Remove a player's user portrait. Returns whether a file was removed.
+pub fn remove_custom(name: &str) -> Result<bool> {
+    let path = custom_path(name).context("the player has no canonical photo key")?;
+    remove_custom_path(&path)
+}
+
+fn remove_custom_path(path: &Path) -> Result<bool> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).with_context(|| format!("removing portrait {}", path.display())),
+    }
+}
+
+/// Convert a user-selected image to a small lossless WebP portrait and store it
+/// under the player's key. Returns the written path.
+pub fn store_custom(name: &str, source: &Path) -> Result<PathBuf> {
+    let target = custom_path(name).context("the player has no canonical photo key")?;
+    store_custom_to_path(source, &target)
+}
+
+fn store_custom_to_path(source: &Path, target: &Path) -> Result<PathBuf> {
+    let image = image::open(source)
+        .with_context(|| format!("decoding the portrait {}", source.display()))?;
+    // 400 px keeps the avatar crisp at the largest UI size while staying tiny
+    // on disk; the viewer scales the texture itself.
+    let image = image.thumbnail(400, 400);
+    let rgba = image.to_rgba8();
+    if let Some(dir) = target.parent() {
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("creating the portrait folder {}", dir.display()))?;
+    }
+    let file = File::create(target)
+        .with_context(|| format!("creating the portrait {}", target.display()))?;
+    let writer = std::io::BufWriter::new(file);
+    image::codecs::webp::WebPEncoder::new_lossless(writer)
+        .encode(
+            rgba.as_raw(),
+            rgba.width(),
+            rgba.height(),
+            image::ExtendedColorType::Rgba8,
+        )
+        .with_context(|| format!("encoding the portrait {}", target.display()))?;
+    Ok(target.to_path_buf())
 }
 
 fn home_path(relative: &str) -> Option<PathBuf> {
@@ -450,6 +535,54 @@ mod tests {
         );
         assert_eq!(library.full_name("Nobody, X"), None);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn custom_portrait_is_stored_and_decoded_as_full_size_webp() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let source = std::env::temp_dir().join(format!(
+            "brett-custom-portrait-source-{}-{stamp}.png",
+            std::process::id()
+        ));
+        let target = std::env::temp_dir().join(format!(
+            "brett-custom-portrait-target-{}-{stamp}.webp",
+            std::process::id()
+        ));
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            600,
+            300,
+            image::Rgba([0xE6, 0xB4, 0x50, 0xFF]),
+        ))
+        .save(&source)
+        .unwrap();
+
+        let stored = store_custom_to_path(&source, &target).unwrap();
+        assert_eq!(stored, target);
+        let bytes = std::fs::read(&stored).unwrap();
+        let image = decode_custom_webp(&bytes).unwrap();
+        assert_eq!(image.size, [400, 200]);
+        assert!(decode_webp(&bytes).unwrap().size[0] <= 160);
+
+        let _ = std::fs::remove_file(source);
+        let _ = std::fs::remove_file(stored);
+    }
+
+    #[test]
+    fn removing_custom_portrait_handles_present_and_missing_files() {
+        let path = std::env::temp_dir().join(format!(
+            "brett-custom-remove-{}-{}.webp",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, b"webp").unwrap();
+        assert!(remove_custom_path(&path).unwrap());
+        assert!(!remove_custom_path(&path).unwrap());
     }
 
     #[test]

@@ -8,8 +8,52 @@ in `README.md`; this file tracks what is next.
 community-maintained project. Functional correctness, data safety, and clear
 documentation come first; visual polish is queued and may land incrementally.
 
-**Status (2026-11-09 Cycle 4 backlog sync + post-Cycle 4 fixes, commit bb5bda2):** items 1–7, 11–17, 20–21, 25–29, 31, 34–35, 37, 39 (largely), 40, and 41 are implemented.
-Cycle 4 landed 2026-11-09 (commit 9c540f0, v0.1.7+): flag atlas rendering (`src/flags.rs`, `assets/flags_4x3.webp`); Wikidata enrichment for countries/FIDE ID/birth/peak (`src/wiki.rs`, `src/country.rs`, `src/players.rs`, `src/app.rs`); online incremental cache at `~/.cache/brett/online` (Lichess delta via `since`, Chess.com monthly cache, clear-cache button); prep/account UX polish (200+ probe wording, Bullet default, `filter_version` migration, URL paste via `parse_account_or_profile_input`, as-White-against rows); search/UI polish (fuzzy search memo, no-DB ChessABC Search, welcome labels `Set` / `Not right now` / `Never`, preview notation removal, FIDE pill moved to profile-only, bare Elo, Site venue flags, `Prepare` pill); sample database button + `databases/samples/grandmaster_showcase.pgn`; app icon initially `assets/brett.webp` with `with_app_id` (post-fix bb5bda2: now `assets/brett.png`, `.webp` removed, KDE desktop refresh); `PlayerDirectory` `.brettplayers` sidecar; and disk cleanup (obsolete 69 GB rating-band indexes deleted, `~/.cache/brett/index` reduced 71 G → 1.3 G).
+**Status (2026-11-17 Cycles A–D complete):** items 1–7, 11–17, 20–35, 37, and 39–41 are implemented.
+Cycles A–D (2026-11-16..17):
+- **Cycle A:** `assets/brett.webp` README logo; `src/flags.rs` 1933–35 War Ensign (no swastika); `src/wiki.rs` historical country periods (`P1532`/`P27` `P580`–`P582`) and cached-summary repair; `White vs [Title] [Opponent]` game rows without player flags; Player Profile `[Prepare ⬜ ⬛]` fitted below portrait; active **Prep** 1-click `[⬜ | ⬛]` switch; parallel `smart_prep_load` + `lichess_token`; background reaper for Mega `GameList` drop.
+- **Cycle B:** 5 right-panel tabs (**Moves · Reference · Prep · Engine · Review**); retired `Refs` tab; centralized corpus settings + rating window in **Settings → Databases & sources**; removed duplicate `"Reference database prior"` form from Player Profile; upgraded Correspondence and Lichess tables to horizontal `W/D/B` bars; added **Top Players** and **Reference Games** (`Sort: [Top Rated | Recent]`) at the bottom of `Reference` (`Database` mode).
+- **Cycle C:** **Open Databases** warm shelf at the top of the left sidebar (`OPEN DATABASES [New] [+]`) with `●` dirty indicator, `🔒` read-only badge, `×` close button, and right-click `★ Set as Reference Database`; multi-select (`Click`, `Ctrl+Click`, `Shift+Click`) and drag-reorder (`move_slots`) or drag-to-shelf copy & deduplicate (`insert_game_dedup`); shelf-to-shelf inline merge confirmation (`[Merge & Deduplicate]`, `[Append All]`, `[Merge & Save Copy As…]`); `Ctrl+C` / `Ctrl+V` and context-menu slot/PGN clipboard.
+- **Cycle D:** Bidirectional `analysis.db` lookup (`seed_from_analysis_cache`) and write-back (`take_pending_cache_writes`) in Game Review; MultiPV=2 position criticality ($K_i = |W(\text{PV}_1) - W(\text{PV}_2)|$), Win%-guarded grading + `!` Great/Only Move ($K_i \ge 15\%$), and two-pass review (`enable_two_pass_deepening`); `[%clk]` clock-management analytics (`⚡ Rushed`, `⏳ Overthink`, `🔥 Time trouble`, `🎯 Clutch`), Opening/Middlegame/Endgame phase accuracy + Time Discipline score, synchronized Eval + Think-Time dual chart, **Key Moments** vs **All Moves** filter, 1-click **`[+ Line]`** refutation insertion, and corpus-level **Clock Pacing Summary** (`summarize_player_clocks`) in Player Profile.
+**Post-Cycle A–D fix pass (2026-11-17):**
+- **Tree workspace restored:** the original stacked local opening tree, native opening book, and
+  Lichess explorer + top games now share one scrollable `Tree` tab again. Tabs are
+  `Moves · Tree · Engine`, with `Preparation` appended and visible only while a preparation
+  session is active.
+- **Game Review folded into Engine:** a prominent review card sits at the top of the Engine
+  workspace and remains clickable while local auto-analysis is off; it starts a dedicated review
+  engine. Review checks Lichess Cloud Eval first and breaks off at the configured depth in depth
+  mode (`d >= 22` for <500 ms, `d >= 26` for 500–1500 ms, `d >= 30` above that in time mode),
+  then finishes any remaining positions locally with analysis-cache seeding.
+- **Engine move filtering:** trailing chessdb.cn-only moves are collapsed by default behind an
+  expand control; Lichess Cloud Eval and local-cache PVs always stay visible.
+- **Selection and preparation polish:** selected rows use the dark-slate/gold palette instead of
+  blue, the black Prepare square is outlined for dark backgrounds, and the shelf header uses a
+  painted folder-open icon instead of `+`. Preparation setup accepts any number of extra databases.
+- **Portrait picker:** clicking an empty profile portrait opens an image picker and stores a 400 px
+  lossless WebP under `$XDG_CONFIG_HOME/brett/portraits/<player-key>.webp`; custom portraits
+  override the optional photo pack.
+- **Wikipedia/Wikidata metadata:** `P2962` (“title of chess person”) claims are parsed with `P580`
+  award years, cached in the summary title history, and used for current/highest profile badges
+  and dated historical game rows only when the game year is known. Settings → Player profiles adds
+  batch enrichment for top 100/500/1,000 players, players with 10+ or 3+ games, or all players,
+  showing the selected/pending counts, an ETA, progress, and cancellation. Cached titles are
+  re-applied to the player list at indexing time without network calls.
+- **Sample database removed:** the `Sample DB` buttons, `sample_db_path`, and
+  `databases/samples/grandmaster_showcase.pgn` are gone; the reference-collection test now builds
+  an inline temporary fixture.
+- **Fresh-review follow-up:** Lichess's White-POV scores are converted before entering side-to-move
+  review state; final cloud seeds no longer skip pass-2 deepening, cached shallow/404 results are
+  reused, and cloud completion counts persist. Historical titles now cover Games, Player, and Prep
+  rows; title-cache loading is async for both small and large databases and saves merge with prior
+  players. Tree explorer selection is independent from the optional live-book selector. Portrait
+  misses are memoized, custom portraits can be replaced/removed, and cached full-size WebP is used
+  for the viewer.
+
+Follow-ups from this pass: add batch enrichment from the empty-welcome screen and consider a
+history panel for dated title awards. Dated title histories from batch runs are stored separately
+from the bounded Wikipedia article-summary cache so larger scopes survive restarts.
+
+Cycle 4 landed 2026-11-09 (commit 9c540f0, v0.1.7+): flag atlas rendering (`src/flags.rs`, `assets/flags_4x3.webp`); Wikidata enrichment for countries/FIDE ID/birth/peak (`src/wiki.rs`, `src/country.rs`, `src/players.rs`, `src/app.rs`); online incremental cache at `~/.cache/brett/online` (Lichess delta via `since`, Chess.com monthly cache, clear-cache button); prep/account UX polish (200+ probe wording, Bullet default, `filter_version` migration, URL paste via `parse_account_or_profile_input`, as-White-against rows); search/UI polish (fuzzy search memo, no-DB ChessABC Search, welcome labels `Set` / `Not right now` / `Never`, preview notation removal, FIDE pill moved to profile-only, bare Elo, Site venue flags, `Prepare` pill); sample database button + `databases/samples/grandmaster_showcase.pgn` (both removed 2026-11-17); app icon initially `assets/brett.webp` with `with_app_id` (post-fix bb5bda2: now `assets/brett.png`, `.webp` removed, KDE desktop refresh); `PlayerDirectory` `.brettplayers` sidecar; and disk cleanup (obsolete 69 GB rating-band indexes deleted, `~/.cache/brett/index` reduced 71 G → 1.3 G).
 Post-Cycle 4 fixes landed 2026-11-09 (commit bb5bda2, done): Lichess 1/1 dedup fix (GameId-first `lichess_game_id` + `game/` strip, stale 1-game caches cleared); former federation flags (URS/YUG/GDR/TCH/SCG vector tricolors in `src/flags.rs`); Wikipedia/Wikidata country priority fix (Armenia Q399 not Q237, lead demonyms beat P27 residency so Keres=EST·URS not GER, Aronian=ARM·USA) + peak Elo text fallback; prep **Exclude online games** now excludes *all* online games (not just Chess.com tournaments); right-panel `ScrollArea::vertical` drift fix; Mega index `max_plies=40` cap + storage/time estimate dialog.
 Cycle 3 landed 2026-11-08 (resilient incremental PGN streaming with server-side filters for Lichess,
 AllTime date cutoff defaults for prep and accounts, removal of the unused Database Views subsystem and
@@ -54,7 +98,7 @@ replaced the separate PGN/SCID/CBH save entries with **Save database** and
 closing a modified database. Item 25's Typst target is implemented, including
 the `White - Black` default filename and remembered export folder. Item 26
 (Set up position) is implemented with board setup, real-time FEN editing, and
-legality validation. Item 27 adds country-flag display and **Cycle 4 flag atlas rendering**. Item 37 adds Chess.com/Lichess import and **Cycle 4 online incremental cache** (`~/.cache/brett/online`, Lichess delta `since`, Chess.com monthly cache, clear button). Cycle 4 also adds no-DB ChessABC Search, fuzzy search memo, sample DB button (`databases/samples/grandmaster_showcase.pgn`), welcome/setup labels, and app icon (`assets/brett.webp`, `with_app_id`).
+legality validation. Item 27 adds country-flag display and **Cycle 4 flag atlas rendering**. Item 37 adds Chess.com/Lichess import and **Cycle 4 online incremental cache** (`~/.cache/brett/online`, Lichess delta `since`, Chess.com monthly cache, clear button). Cycle 4 also adds no-DB ChessABC Search, fuzzy search memo, sample DB button (`databases/samples/grandmaster_showcase.pgn`, removed 2026-11-17), welcome/setup labels, and app icon (`assets/brett.webp`, `with_app_id`).
 
 **Decision log (2026-10-28):**
 
@@ -226,6 +270,11 @@ view only.
 
 ## 4. Castling by dragging the king
 
+**Status:** implemented. Legal-target highlighting and drop resolution accept
+the king's castling destination as well as the rook square. A regression test
+covers kingside and queenside castling for both colors through the board-event
+handler.
+
 **Goal:** both common drag gestures castle.
 
 - Dropping the king on its castling destination (`g1`/`c1`, `g8`/`c8`) must
@@ -392,24 +441,26 @@ part of the roadmap.
   be indexed without a multi-gigabyte RAM spike.
 - **Cloud references (done):** chessdb.cn `queryall`, the Lichess opening
   explorer (Masters by default; full Lichess with an OAuth token), and Lichess
-  cloud evaluation, with asynchronous requests and per-FEN caching. The Tree
-  tab shows the explorer table and Lichess top games; the Cloud Engine in the
-  Engine tab shows cloud variations. The Refs tab configures sources rather
-  than duplicating either table. See `src/cloud.rs`.
+  cloud evaluation, with asynchronous requests and per-FEN caching. The
+  **Reference** tab (**Lichess** source mode) shows the explorer table and
+  Lichess top games; the Cloud Engine in the **Engine** tab shows cloud
+  variations. See `src/cloud.rs`.
 - **Cloud Engine (done):** the Engine tab switches between **Local**,
   **Cloud**, and **Both**. The Cloud Engine table combines chessdb.cn and the
   Lichess cloud evaluation, includes Lichess variations, and supports clickable
-  SAN prefixes. The Tree tab shows a Lichess Masters/full reference table.
-- **Opening-tree files (done):** the Tree tab can index a separate PGN, SCID,
-  or classic CBH database and persist it as the default opening-tree source.
-  Native Polyglot `.bin`, ChessBase `.ctg`, Arena `.abk`, and Shredder `.bkt`
-  readers now live in `src/book.rs` and `src/book/`.
-- **Reference sources (done):** the Refs tab exposes the current database and
-  a Mega-style reference database path, plus Lichess/Chess.com/ChessABC
-  opponent lookups (each service listed once). Live reference sources
-  (`live:lichess-masters`, `live:lichess-all`, `live:chessabc`) can also be selected
-  as the general reference tree or default opening book directly. Importing is **File → Import**.
-  The correspondence database is configured in **Settings**, not Refs.
+  SAN prefixes. The Reference tab shows the Lichess Masters/full reference table.
+- **Opening-tree files (done):** the Reference tab (**Database** source mode)
+  can index a separate PGN, SCID, or classic CBH database and persist it as the
+  default opening-tree source. Native Polyglot `.bin`, ChessBase `.ctg`, Arena
+  `.abk`, and Shredder `.bkt` readers now live in `src/book.rs` and `src/book/`.
+- **Reference sources (done):** the **Reference** tab switches cleanly between
+  **Database**, **Lichess**, **ChessABC**, and **Book** while **Scout online…**
+  opens the Lichess/Chess.com/ChessABC account-game panel and **Settings →
+  Databases & sources** configures the preparation reference, opening-tree
+  source, opening book, and correspondence database. Live reference sources
+  (`live:lichess-masters`, `live:lichess-all`, `live:chessabc`) can also be
+  selected as the preparation reference or default opening book directly.
+  Importing is **File → Import**.
 - **Reference merging:** combine several databases into one opening tree
   without rebuilding unrelated caches.
 
@@ -914,7 +965,13 @@ existing `ureq` HTTP client. **Related:** item 16 (FIDE profile link) and item
 
 ## 22. Player clock-usage analysis
 
-**Status:** brainstorm / backlog only. No implementation is scheduled yet.
+**Status:** implemented 2026-11-17 in `src/review.rs` (`TimeManagementTag`,
+`PlayerClockSummary`, `summarize_player_clocks`) and `src/app.rs` (`review_content`,
+`review_graph`, `players_content`). Per-move `[%clk]` think times, normalized
+clock effort, `⚡ Rushed` / `⏳ Overthink` / `🔥 Time trouble` / `🎯 Clutch`
+tags, Time Discipline score, synchronized Eval + Think-Time dual chart, and the
+Player Profile corpus clock-pacing strip (remaining % at moves 10/20/30/40,
+time-trouble rate, and theory-exit think spike move) are live.
 
 **Goal:** in the player profile view, where preparation against that player
 also happens, analyze how the player uses clock time. The profile is the right
@@ -1145,7 +1202,7 @@ Brett already fully supports Leela:
 
 ## 30. Touchscreen Gestures: Disambiguating Scroll vs. Drag Reordering in Database View
 
-**Status:** queued.
+**Status:** implemented 2026-11-16 (`row_is_draggable_at` and left reorder grip in `src/app.rs`). Mouse and trackpad input remain draggable across the row; touch swipes on the row body stay click-only for smooth vertical scrolling while touches starting in the 20 px left grip (`⋮`) initiate drag-reordering. Covered by `game_rows_are_click_only_while_a_touch_is_active`.
 
 **Goal:** make scrolling and drag-reordering feel natural and responsive on
 touchscreens (e.g. 2-in-1 convertible laptops, tablets, mobile devices) within
@@ -1184,7 +1241,14 @@ Engine tab's cloud evaluation candidate box.
 
 ## 32. Cloud Evaluation Fetch Lifecycle & Deduplication Across Navigation
 
-**Status:** queued.
+**Status:** implemented 2026-11-16. `fetch_eval_only` now requests `multiPv=5`,
+`poll_cloud` and `bar_cloud_cache` share cached Lichess `CloudEval` results,
+`cloud_snapshot_for_engine_view` immediately seeds the Engine tab from
+`bar_cloud_cache` while `chessdb.cn` finishes, `fetch_with_cached_eval` skips
+redundant Lichess `cloud-eval` HTTP calls when the position evaluation is
+already cached, and `maybe_request_cloud` reuses cross-`ExplorerSource`
+snapshots without re-querying when only `chessdb.cn` and `cloud_eval` are
+needed.
 
 **Goal:** audit and unify the ChessDB and Lichess cloud eval request triggers so
 positions are not fetched or aggregated multiple times when switching between the
@@ -1200,7 +1264,12 @@ Moves panel and the Engine panel.
 
 ## 33. Database & Cloud Tree Pruning Logic (No Hits Downstream vs Transpositions)
 
-**Status:** on hold — flagged for investigation with a more capable reasoning model.
+**Status:** implemented in `src/cloud.rs` (`Snapshot::is_verified_empty`,
+`Snapshot::pruned`) and `src/app.rs` (`has_verified_empty_cloud_ancestor`,
+`has_verified_empty_bar_cloud_ancestor`, `has_local_position_hit`). Any
+verified-empty ancestor along the branch prunes downstream online queries unless
+a local source (opening book, current/tree/correspondence/reference index, or
+local analysis cache) has data for the position.
 
 **Goal:** avoid issuing redundant or fruitless lookup requests for downstream positions
 when earlier positions along the same branch had zero hits.
@@ -1307,9 +1376,9 @@ releases.
 
 **Depends on:** `src/twocbh/`, `src/eval.rs`, `src/review.rs`, and `src/ui/board.rs`.
 
-## 39. Preparation & Predictor Round-2 Fixes (Queued)
+## 39. Preparation & Predictor Round-2 Fixes
 
-**Status:** largely landed 2026-11-07 (6 commits, full `cargo test` green). Still queued: `predict_v2` calibration (`18/18` → `>=90%`, adaptive `alpha0` + reserved/unseen alpha).
+**Status:** implemented 2026-11-07 (`predict_v2` adaptive `alpha0 = 2.5 * (1.25 - 0.85 * C) / (1 + 0.25 * N)` and `unseen_alpha = 0.35 / (1 + 0.5 * N)` in `src/players.rs`, plus Tasks 1–6).
 
 **Goal:** land the batched Preparation/predictor/UI fixes identified for round 2 without regressing the queued Smart Preparation v2 / Predictor v2 design.
 

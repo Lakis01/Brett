@@ -32,7 +32,7 @@ Unlike browser tools that fragment OTB databases and online accounts or legacy d
 - Native `eframe`/`egui` immediate-mode UI with three primary spatial zones:
   1. **Left — Database & Players Navigation** (`Games`, `Players`, top Player Profile card with direct `Prepare` color-square triggers).
   2. **Center — Board Canvas** (warm wood/stone board, slim left evaluation bar, compact top/bottom player strips with photo, title badge, latest OTB Elo, country flag, and clock).
-  3. **Right — Analysis & Preparation Workspace** (`Moves`, `Tree` / `Preparation`, `Engine`, `Review`).
+  3. **Right — Analysis & Preparation Workspace** (`Moves`, `Reference`, `Prep`, `Engine`, `Review`).
 - Game-category identity is communicated exclusively via user-configurable font colors (differentiating OTB Classical/Rapid/Blitz, Online Classical/Rapid/Blitz/Bullet, and Correspondence) rather than noisy text badges.
 - All W/D/B statistics render as compact horizontal stacked bars (White wins = white, Draws = neutral slate/grey, Black wins = dark charcoal/black).
 
@@ -42,4 +42,3 @@ Unlike browser tools that fragment OTB databases and online accounts or legacy d
 2. **Zero-commit hover exploration:** Hovering any game row in any list previews its board position, player strips, and move tree in the right-hand Moves section with arrow-key stepping (`←`/`→`/`Home`/`End`), committing only on click.
 3. **Resilient background streaming:** Multi-source compilation streams incremental results without blocking the UI or stretching layout containers.
 4. **Earned familiarity:** Controls, typography, and spacing follow strict `Operate`-mode discipline—no nested card-in-card clutter, no decorative gradients, and consistent 1px structural hairlines.
-

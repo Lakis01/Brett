@@ -286,6 +286,17 @@ pub fn fetch_explorer_only(
 }
 
 pub fn fetch(fen: &str, lichess_token: Option<&str>, explorer_source: ExplorerSource) -> Snapshot {
+    fetch_with_cached_eval(fen, lichess_token, explorer_source, None)
+}
+
+/// Fetch position references, reusing an already-cached Lichess cloud
+/// evaluation when the evaluation bar has already resolved `fen`.
+pub fn fetch_with_cached_eval(
+    fen: &str,
+    lichess_token: Option<&str>,
+    explorer_source: ExplorerSource,
+    cached_cloud_eval: Option<Result<CloudEval, String>>,
+) -> Snapshot {
     let agent = ureq::AgentBuilder::new()
         .user_agent(USER_AGENT)
         .timeout_connect(Duration::from_secs(10))
@@ -306,18 +317,20 @@ pub fn fetch(fen: &str, lichess_token: Option<&str>, explorer_source: ExplorerSo
         )),
         ExplorerSource::Both => fetch_both_explorers(&agent, fen, token),
     };
-    let cloud_eval = fetch_cloud_eval(&agent, fen);
+    let cloud_eval = cached_cloud_eval
+        .unwrap_or_else(|| fetch_cloud_eval(&agent, fen).map_err(|err| format!("{err:#}")));
 
     Snapshot {
         fen: fen.to_string(),
         explorer_source,
         chessdb: chessdb.map_err(|err| format!("{err:#}")),
         explorer: explorer.map_err(|err| format!("{err:#}")),
-        cloud_eval: cloud_eval.map_err(|err| format!("{err:#}")),
+        cloud_eval,
     }
 }
 
-/// Fetch only the Lichess cloud evaluation (`multiPv=1`) for the evaluation bar.
+/// Fetch only the Lichess cloud evaluation (`multiPv=5`) for the evaluation bar
+/// and Cloud Engine reuse.
 ///
 /// Returns `Ok(None)` when Lichess does not have a cached cloud evaluation for
 /// `fen` (HTTP 404).
@@ -328,7 +341,7 @@ pub fn fetch_eval_only(fen: &str) -> Result<Option<CloudEval>, String> {
         .timeout(Duration::from_secs(6))
         .build();
     let url = format!(
-        "https://lichess.org/api/cloud-eval?fen={}&multiPv=1",
+        "https://lichess.org/api/cloud-eval?fen={}&multiPv=5",
         encode_component(fen)
     );
     match agent.get(&url).set("Accept", "application/json").call() {
@@ -396,9 +409,7 @@ pub fn fetch_explorer_since(
         .user_agent(USER_AGENT)
         .timeout(REQUEST_TIMEOUT)
         .build();
-    let token = lichess_token
-        .map(str::trim)
-        .filter(|t| !t.is_empty());
+    let token = lichess_token.map(str::trim).filter(|t| !t.is_empty());
     let url = explorer_since_url(fen, explorer_source, since_year, since_month);
     let text = get_text(&agent, &url, token)
         .map_err(|err| format!("querying Lichess explorer with since: {err:#}"))?;

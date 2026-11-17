@@ -401,6 +401,28 @@ impl GameList {
         id
     }
 
+    /// Insert `game` if it is not already present (checked by header candidates
+    /// and move prefix). Returns `Some(slot_id)` when added, or `None` when a
+    /// duplicate was skipped.
+    pub fn insert_game_dedup(
+        &mut self,
+        game: Game,
+        edited: &HashMap<usize, Game>,
+        insert_at: Option<usize>,
+    ) -> Option<usize> {
+        let mut pool = crate::library::StringPool::default();
+        let headers = crate::library::intern_headers(game.headers.clone(), &mut pool);
+        let candidates = self.duplicate_candidate_ids(&headers);
+        for id in candidates {
+            if let Ok(existing) = self.load(id, edited)
+                && same_game(&existing, &game)
+            {
+                return None;
+            }
+        }
+        Some(self.insert_game(game, insert_at))
+    }
+
     /// Copy an existing row into a new independent row.
     pub fn duplicate_game(
         &mut self,
@@ -498,6 +520,122 @@ impl GameList {
             }
         }
         true
+    }
+
+    /// Reorder multiple rows to `insertion_index` while preserving their
+    /// relative visible order.
+    pub fn move_slots(&mut self, ids: &[usize], insertion_index: usize) -> bool {
+        let mut selected_pos: Vec<(usize, usize)> = ids
+            .iter()
+            .filter_map(|&id| self.position_of(id).map(|pos| (pos, id)))
+            .collect();
+        selected_pos.sort_by_key(|&(pos, _)| pos);
+        selected_pos.dedup_by_key(|&mut (_, id)| id);
+        if selected_pos.is_empty() {
+            return false;
+        }
+        if selected_pos.len() == 1 {
+            return self.move_slot(selected_pos[0].1, insertion_index);
+        }
+
+        let insertion_index = insertion_index.min(self.slots.len());
+        let before_count = selected_pos
+            .iter()
+            .filter(|&&(pos, _)| pos < insertion_index)
+            .count();
+        let selected_set: std::collections::HashSet<usize> =
+            selected_pos.iter().map(|&(_, id)| id).collect();
+
+        let original_ids: Vec<usize> = self.slots.iter().map(|s| s.id).collect();
+        let mut moving = Vec::with_capacity(selected_pos.len());
+        let mut remaining = Vec::with_capacity(self.slots.len().saturating_sub(selected_pos.len()));
+        for slot in self.slots.drain(..) {
+            if selected_set.contains(&slot.id) {
+                moving.push(slot);
+            } else {
+                remaining.push(slot);
+            }
+        }
+        let insert_at = before_count.min(remaining.len());
+        remaining.splice(insert_at..insert_at, moving);
+        let changed = remaining
+            .iter()
+            .map(|s| s.id)
+            .ne(original_ids.iter().copied());
+        self.slots = remaining;
+        if changed {
+            for (position, slot) in self.slots.iter().enumerate() {
+                self.positions[slot.id] = position;
+            }
+        }
+        changed
+    }
+
+    /// Merge or append every row from `source` into `self`, keeping unedited
+    /// library-backed rows lazy.
+    pub fn merge_from_session(
+        &mut self,
+        source: &GameList,
+        source_edited: &HashMap<usize, Game>,
+        target_edited: &HashMap<usize, Game>,
+        deduplicate: bool,
+    ) -> Result<MergeReport> {
+        let mut report = MergeReport::default();
+        let source_primary = source.primary.as_ref();
+        for slot in &source.slots {
+            if let Some(edited_game) = source_edited.get(&slot.id) {
+                if deduplicate {
+                    if self
+                        .insert_game_dedup(edited_game.clone(), target_edited, None)
+                        .is_some()
+                    {
+                        report.added += 1;
+                    } else {
+                        report.skipped += 1;
+                    }
+                } else {
+                    self.insert_game(edited_game.clone(), None);
+                    report.added += 1;
+                }
+                continue;
+            }
+            if deduplicate {
+                let headers = slot.headers_with(source_primary);
+                let candidates = self.duplicate_candidate_ids(headers);
+                if !candidates.is_empty() {
+                    let incoming = source.load(slot.id, source_edited)?;
+                    let mut duplicate = false;
+                    for id in candidates {
+                        let existing = self.load(id, target_edited)?;
+                        if same_game(&existing, &incoming) {
+                            duplicate = true;
+                            break;
+                        }
+                    }
+                    if duplicate {
+                        report.skipped += 1;
+                        continue;
+                    }
+                }
+            }
+            let id = self.next_id;
+            self.next_id += 1;
+            let new_slot = match &slot.source {
+                SlotSource::Primary { index } => {
+                    let lib = source_primary
+                        .context("source primary database missing")?
+                        .clone();
+                    GameSlot::external(id, lib, *index)
+                }
+                SlotSource::External { library, index } => {
+                    GameSlot::external(id, library.clone(), *index)
+                }
+                SlotSource::Local(local) => GameSlot::local(id, local.game.clone()),
+            };
+            self.push_slot(new_slot);
+            report.added += 1;
+        }
+        Ok(report)
     }
 
     pub fn remove(&mut self, id: usize) -> Option<GameSlot> {
@@ -919,5 +1057,57 @@ mod tests {
         );
         assert_eq!(list.len(), 2);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn move_slots_preserves_relative_order_and_positions() {
+        let mut list = GameList::empty();
+        let a = list.insert_game(game("A", "B", "2020.01.01", "1. e4"), None);
+        let b = list.insert_game(game("C", "D", "2020.01.01", "1. d4"), None);
+        let c = list.insert_game(game("E", "F", "2020.01.01", "1. c4"), None);
+        let d = list.insert_game(game("G", "H", "2020.01.01", "1. Nf3"), None);
+
+        assert!(list.move_slots(&[d, b], 0));
+        assert_eq!(
+            list.slots().iter().map(|s| s.id).collect::<Vec<_>>(),
+            vec![b, d, a, c]
+        );
+        for (pos, slot) in list.slots().iter().enumerate() {
+            assert_eq!(list.position_of(slot.id), Some(pos));
+        }
+    }
+
+    #[test]
+    fn merge_from_session_supports_dedup_and_append_all() {
+        let mut src = GameList::empty();
+        src.insert_game(game("A", "B", "2020.01.01", "1. e4 e5"), None);
+        src.insert_game(game("C", "D", "2020.01.01", "1. d4 d5"), None);
+
+        let mut dst = GameList::empty();
+        dst.insert_game(game("A", "B", "2020.01.01", "1. e4 e5"), None);
+
+        let dedup = dst
+            .merge_from_session(&src, &HashMap::new(), &HashMap::new(), true)
+            .unwrap();
+        assert_eq!(
+            dedup,
+            MergeReport {
+                added: 1,
+                skipped: 1
+            }
+        );
+        assert_eq!(dst.len(), 2);
+
+        let append = dst
+            .merge_from_session(&src, &HashMap::new(), &HashMap::new(), false)
+            .unwrap();
+        assert_eq!(
+            append,
+            MergeReport {
+                added: 2,
+                skipped: 0
+            }
+        );
+        assert_eq!(dst.len(), 4);
     }
 }

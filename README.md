@@ -1,5 +1,9 @@
 # Brett
 
+<p align="center">
+  <img src="assets/brett.webp" alt="Brett logo" width="180">
+</p>
+
 Brett is a Chess Preparation and Database Suite. It is built for fast opening
 preparation, game review, database management, and deep position analysis.
 
@@ -109,24 +113,27 @@ ICCF server games under ICCF's terms, and comply with ICCF's terms. See
   games the player directory is built in the background, so the game list stays
   usable while it runs. A full position index is built automatically only up to
   250,000 games; larger databases show a manual action, and full indexing is
-  refused above 1,000,000 games until the external-sort indexer lands. Reference
+  refused above 1,000,000 games until the external-sort indexer lands. Tree
   and opening-tree indexes have the same guard, and very large source files are
   rejected before they are opened just to be rejected.
 
-### Opening tree and position index
+### Tree workspace and position index
 
 - A stable Zobrist key is computed for every mainline position. `(position,
   move)` statistics are aggregated into a sorted, memory-mapped file with
   games, W/D/L, Elo, and date ranges.
-- The **Tree** tab lets you click any indexed move. The index is built in the
+- The **Tree** tab stacks the local opening tree, the configured opening book, and the
+  live Lichess explorer with top games in one workspace. The index is built in the
   background on first open and cached under `$XDG_CACHE_HOME/brett/index/`.
 - A separate **opening-tree file** can be indexed for the Tree tab. Choose a
-  PGN, SCID, or classic CBH database with **Choose…**; the path is saved in
-  `display.json` and loaded on the next launch. **Current DB** switches back to
-  the open database. The Tree tab also shows a Lichess **Masters** or full
-  **Lichess** reference table for the current position, plus **Lichess top
-  games**. Top games live in the Tree tab (not Refs) and open a read-only
-  preview when clicked.
+  PGN, SCID, or classic CBH database with **Choose…** or set its default in
+  **Settings → Databases & sources**; the path is saved in `display.json` and
+  loaded on the next launch. **Current DB** switches back to the open database.
+  **Reference DB** switches the tree to the configured preparation reference.
+- A source selector keeps one human-reference view in focus: the local database
+  tree, Lichess Masters/All (with top games), live ChessABC, or a native opening
+  book. Lichess games open as read-only previews. **Scout online…** opens the
+  account-game panel for Lichess, Chess.com, or ChessABC.
 - Native opening books: Polyglot `.bin`, ChessBase `.ctg` (with `.cto`/`.ctb`),
   Arena `.abk`, and Shredder `.bkt`. The Tree tab exposes each format through
   the same opening-book path and shows games, weight, score, W/D/B, and
@@ -139,7 +146,7 @@ ICCF server games under ICCF's terms, and comply with ICCF's terms. See
 
 - Select a player on the **Players** tab and choose **Prepare as White** or
   **Prepare as Black**. Brett creates a scratch preparation game and opens the
-  Tree tab.
+  **Preparation** tab, which is only shown while the session is active.
 - For each opponent turn, the prediction panel shows likely replies, their
   posterior mean and approximate 90% credible interval, the player's
   games/recent games/last-seen date/trend, and the matching database tree
@@ -150,8 +157,8 @@ ICCF server games under ICCF's terms, and comply with ICCF's terms. See
 - At your turn the panel switches to the prepared player's moves so far in the
   current line, with each move's date, database score, and the likelihood and
   interval it had before it was played.
-- The normal opening tree for the current position is always visible below the
-  preparation section.
+- The normal opening tree remains available in the separate **Tree** tab
+  while the opponent-specific repertoire stays in **Preparation**.
 - **Recent games** lists the newest games in the player book that reached the
   current position. The limit is configurable (default 10). Clicking a game
   opens a read-only view; closing it returns to the same preparation position.
@@ -183,16 +190,15 @@ ICCF server games under ICCF's terms, and comply with ICCF's terms. See
 
 - **File → Import from Lichess…**, **Import from Chess.com…**, or **Import
   from ChessABC…** opens the single import dialog. It downloads public games
-  for a username using the unauthenticated APIs. The Refs tab's **Online
-  accounts** buttons are for scouting an opponent, not for importing; each
-  service appears once.
+  for a username using public APIs. **Tree → Scout online…** is for
+  browsing an opponent's recent games, not importing them.
 - Lichess exports up to the requested number of games in one request.
   Chess.com has no bulk PGN endpoint, so Brett combines up to 36 recent monthly
   archives. ChessABC searches by player name or FIDE id.
 - Imports are capped at 5,000 games and cached under
   `$XDG_CACHE_HOME/brett/online/`. Nothing is written next to a source database.
 
-### References, cloud evaluation, and online accounts
+### Tree, cloud evaluation, and online accounts
 
 - The **Cloud Engine** in the Engine tab combines chessdb.cn and the Lichess
   cloud evaluation. Its columns are **chessdb eval**, **Lichess eval (depth)**,
@@ -201,23 +207,25 @@ ICCF server games under ICCF's terms, and comply with ICCF's terms. See
 - Rows are sorted by the average of the available chessdb/Lichess scores, best
   first for the side to move: White descending, Black ascending. Rows without
   an evaluation stay last. The best eight rows are always visible; the rest
-  are under **More moves (N)**. Chessdb-only rows are grouped compactly, say
-  once that they have no Lichess evaluation, and truncate after one ply.
+  are under **More moves (N)**. Trailing chessdb-only rows are collapsed by
+  default behind an expand control; Lichess and local-cache lines always stay
+  visible. Chessdb-only rows say once that they have no Lichess evaluation and
+  truncate after one ply.
 - Colour is the delta to the best move for the side to move, not absolute White
   advantage: best green, worst red, missing evaluation grey, and mates dominate
   centipawns. chessdb.cn scores are normalised to White's point of view.
   Castling is matched across UCI encodings, and SAN uses `O-O`/`O-O-O`.
-- The **Refs** tab configures reference sources: the current database, a
-  separate reference database (Mega Database by default when present), and
-  online opponent lookups. Cloud variations are not duplicated there; the
-  Cloud Engine owns them. Online accounts are listed once, and importing is
-  **File → Import**.
-- The **Tree** tab shows the local opening tree, the Lichess Masters/Lichess
-  reference table, and **Lichess top games**. Clicking a top game opens a
-  read-only preview.
-- A configured local correspondence SCID database is used automatically as an
-  Engine-tab reference. Its inclusion and path are set in **Settings →
-  Correspondence database** (not in Refs). The bundled snapshot is
+- **Tree** is for human practice: choose the current/configured database,
+  Lichess Masters/All, ChessABC, or an opening book; compare move statistics,
+  trends, and available games. Set the persistent reference base and tree/book
+  defaults in **Settings → Databases & sources**. **Scout online…** browses
+  player games; importing remains **File → Import**.
+- **Preparation** is an independent opponent repertoire workspace, so starting
+  a preparation no longer replaces the normal Tree view; its tab is only shown
+  while the session is active.
+- A configured local correspondence SCID database is used automatically in the
+  **Engine** tab. Its inclusion and path are set in **Settings →
+  Correspondence database**. The bundled snapshot is
   `databases/iccf/Correspondence_2350.si4` in a source checkout; a copy at
   `~/Downloads/Brett Resources/Correspondence Database/Correspondence_2350.si4`
   is also found, and `BRETT_CORRESPONDENCE` overrides both. When no reference
@@ -265,22 +273,26 @@ ICCF server games under ICCF's terms, and comply with ICCF's terms. See
 - The **Show** selector switches the Engine tab between **Local**, **Cloud**,
   and **Both**. **Both** keeps local UCI analysis and the **Cloud Engine**
   table visible together. **Cloud** is a true Cloud-only mode: the local
-  engine is stopped, and local engine/hardware settings, local analysis, and
-  Game review are hidden, not merely replaced by an eval. **Enable local
-  engine** returns to Both.
-- **Game review** is a toggle to the right of **Engine and hardware**. It opens
-  a panel beside local analysis; it is hidden in Cloud-only mode because game
-  review runs on the local engine.
+  engine is stopped and local engine/hardware settings and local analysis are
+  hidden, not merely replaced by an eval. **Enable local engine** returns to
+  Both.
+- Cached Stockfish and Leela evaluations join chessdb.cn and Lichess in the
+  Cloud Engine comparison. The local correspondence database is a separate
+  section in Engine because it contains human correspondence games, not engine
+  analysis.
 - The worker performs the UCI handshake off the UI thread, waits for `readyok`,
   kills the engine cleanly on exit, and reports protocol or process errors in
   the panel.
 
 ### Game review
 
-- The **Game review** panel, opened from the **Engine** tab, analyzes every
-  mainline position with a second local process using the same selected engine,
-  thread count, and hash size, by depth or time per move, with a progress bar
-  and cancel button. It is unavailable in Cloud-only mode.
+- **Game review** sits at the top of the **Engine** tab and starts a dedicated
+  local process using the selected engine, thread count, and hash size, by depth
+  or time per move, with a progress bar and cancel button. It remains available
+  when local auto-analysis is off and also works while Engine is in Cloud-only
+  mode. Review checks Lichess Cloud Eval first up to the configured depth (or a
+  sensible breakoff depth in time mode) and finishes any remaining positions
+  locally.
 - Each move is graded from the centipawn change between the engine evaluation
   before and after the move: best move, excellent (≤20 cp lost), good
   (≤50), inaccuracy (≤100), mistake (≤250), or blunder (>250). Forced moves
@@ -300,13 +312,22 @@ ICCF server games under ICCF's terms, and comply with ICCF's terms. See
   a king dragged to its destination square (`g1`/`c1`/`g8`/`c8`) as well as to
   the rook.
 - Player names, optional title badges (`WhiteTitle`/`BlackTitle`), and ratings
-  are shown above and below the board on their playing side. When an optional
+  are shown above and below the board on their playing side. Wikipedia/Wikidata
+  title history can replace a tag with the title actually held on the game's
+  date when an award year is known. When an optional
   local Scid photo pack is available, a portrait appears beside each player;
   **Settings → Show player photos** hides or shows it, and **Settings → Photo
-  size** selects Small (38 px), Medium (54 px), or Large (72 px). Clicking a
-  portrait opens a standalone 240×300 view. The Players tab shows a fixed 34 px
-  thumbnail in the list and the selected size in the player header. No photo
-  data is redistributed with Brett — see [docs/PHOTOS.md](docs/PHOTOS.md).
+  size** selects Small (38 px), Medium (54 px), or Large (72 px). Clicking an
+  existing portrait opens a standalone 240×300 view; clicking an empty
+  silhouette opens an image picker and stores the chosen image as a 400 px
+  lossless WebP under `$XDG_CONFIG_HOME/brett/portraits/`, overriding the photo
+  pack for that player. The profile's **Change…** and **Remove** actions replace
+  or clear a custom portrait. The Players tab shows a fixed 34 px thumbnail in the
+  list and the selected size in the player header. No photo data is
+  redistributed with Brett — see [docs/PHOTOS.md](docs/PHOTOS.md).
+  Federation flags appear on the board strips, Players list, and profile
+  (hover for the country and available federation years); game lists omit
+  player-nationality flags and show only a conclusive venue flag.
   **Settings → Player ratings** chooses the Elo/DWZ/USCF priority and can show
   every available rating instead of only the preferred one.
 - Recognized world champions carry a gold crown (👑) in the board strips, the
@@ -357,8 +378,8 @@ ICCF server games under ICCF's terms, and comply with ICCF's terms. See
   strips** controls the remaining time at the right of each board strip.
 - Hovering a move in the open game's move list previews the resulting
   position. This is controlled by **Settings → Preview moves on hover** and is
-  off by default; tree, engine, reference, and read-only preview hovers are
-  always available.
+  off by default; tree, engine, and read-only preview hovers are always
+  available.
 - Chess figurines are used for piece moves. The embedded DejaVu Sans fallback
   provides the chess and annotation glyphs.
 - Clicking an annotation opens the inline annotation editor. Right-clicking a
@@ -366,10 +387,10 @@ ICCF server games under ICCF's terms, and comply with ICCF's terms. See
   `∞`, `□`, and the other standard symbols. Comments are editable in the same
   panel.
 - Keyboard: `←`/`→` previous/next move, `↑`/`↓` previous/next game,
-  `Home`/`End` or `PageUp`/`PageDown` start/end, `F` flip board, `T` tree,
-  `M` moves, `E` engine, `R` review (under Engine), `C` references, `P`
-  players, `A` annotate the selected move, `O` online opponent panel, `D` date
-  calendar, `V` database views, `Escape` closes the calendar, annotation
+  `Home`/`End` or `PageUp`/`PageDown` start/end, `F` flip board, `T` or `C`
+  Tree, `Shift+P` Preparation, `M` Moves, `E` Engine, `R` Game review in Engine, `P` Players,
+  `A` annotate the selected move, `O` online opponent panel, `D` date calendar,
+  `Escape` closes the calendar, annotation
   editor, or board selection.
 - At a position with more than one continuation, `→` opens a branch popup
   instead of silently following the mainline. The mainline is selected first
@@ -392,9 +413,21 @@ ICCF server games under ICCF's terms, and comply with ICCF's terms. See
   default). Photo data is not redistributed with Brett; see
   [docs/PHOTOS.md](docs/PHOTOS.md) and
   [docs/CHAMPIONS.md](docs/CHAMPIONS.md).
+- **Player profiles** — load Wikipedia summaries on demand, or run **Enrich
+  metadata** for top players by game count, players with 10+/3+ games, or every
+  player. The batch UI shows the selected and pending counts, an estimated time,
+  progress, and cancellation. Wikidata `P2962` title claims and `P580` award
+  years feed current profile badges and dated historical game rows. Compact
+  title histories are stored separately from the bounded article cache and
+  restored to player lists at indexing time without another lookup.
 - **Correspondence database** — include or exclude the local correspondence
   database in the Engine tab, choose its file, or restore the conventional
-  location. This section is no longer duplicated in Refs.
+  location. The database appears as a dedicated human-game reference section in
+  Engine, separate from engine evaluations.
+- **Databases & sources** — choose the persistent preparation reference base,
+  opening-tree database, and optional native opening book. A blank tree source
+  uses the current database; a disabled/blank preparation reference uses the
+  current database as its visible fallback.
 - **Lichess API** — create-token link, token field, and the
   `BRETT_LICHESS_TOKEN` override. The token is stored in `references.json`
   only if you save it here.
@@ -506,12 +539,12 @@ never writes to the source database.
   drawing tokens, custom starts, and Chess960. See
   [docs/CBH.md](docs/CBH.md) and the component audit in
   [docs/PROVENANCE.md](docs/PROVENANCE.md).
-- **Cloud references (done).** The **Refs** tab configures the current/reference
-  database and online opponent lookups; the **Tree** tab shows the Lichess
-  opening explorer (Masters by default, full Lichess optional) and Lichess top
-  games. The **Cloud Engine** in the Engine tab combines chessdb.cn and Lichess
-  cloud evaluations with clickable Lichess variations. All requests are
-  asynchronous and cached per position.
+- **Tree workspace (done).** The **Tree** tab stacks the local database tree,
+  Lichess Masters/All, ChessABC, native opening books, and Lichess top games.
+  The online opponent scout remains available there; source defaults live in
+  Settings. The **Cloud Engine** in Engine combines chessdb.cn, Lichess, and the
+  local analysis cache. The **Preparation** tab appears only during an active
+  preparation session, and **Game review** lives at the top of Engine.
 - **UI and release polish (done).** Cloud Engine columns, average-eval sorting,
   top-eight/More moves, Cloud-only guards, multi-section right panel, My player
   names and auto-orientation, persistent FEN strip and full-move counter,
@@ -537,11 +570,10 @@ never writes to the source database.
   Save As, and closing a modified database asks whether to save, discard, or
   cancel.
 - **Opening-tree files and reference sources (done).** A separate PGN, SCID,
-  or classic CBH opening-tree database can be indexed for the Tree tab and
-  saved as the default. The Refs tab can point preparation at the current
-  database, a Mega-style reference database, or a Lichess/Chess.com/ChessABC
-  account. Native Polyglot `.bin`, ChessBase `.ctg`, Arena `.abk`, and
-  Shredder `.bkt` books are supported.
+  or classic CBH database can be indexed in **Tree** and saved as the
+  default. Settings configure the preparation reference base; online account
+  scouting remains a game-focused action. Native Polyglot `.bin`, ChessBase
+  `.ctg`, Arena `.abk`, and Shredder `.bkt` books are supported.
 
 The detailed queue and acceptance criteria are in
 [docs/BACKLOG.md](docs/BACKLOG.md).

@@ -62,8 +62,14 @@ Game rows never print text category labels (`Classical OTB`, `Online`, etc.); th
    - **Selected Player Profile Card (top of Players view):**
      - Left: Square portrait (`64x64`, rounded `6px`, silhouette fallback).
      - Right: `[Gold Title Pill]` `[Name]` `[Country Flag]`, prominent `FIDE Rating` (latest OTB Elo), `W/D/B` horizontal stacked bar + win/draw/loss counts, and a single **`Prepare`** action bar with clickable **White (`⬜`)** and **Black (`⬛`)** squares that immediately launch preparation against that player with the chosen color.
-3. **Unified Tree / Reference / Preparation Table:**
-   - Single scannable grid per position: `Move` | `Prob / Share` | `Games` | `W/D/B Bar` (`White`/`Grey`/`Black` horizontal bar) | `Ref Games & W/D/B` | `Trend` | `Eval`.
+3. **Reference and Preparation Tables:**
+   - **Reference** selects one human-data source at a time—local database,
+     Lichess, ChessABC, or a native book—and keeps its move statistics, trends,
+     and available games together. Persistent source paths live in Settings.
+   - **Prep** keeps opponent probabilities and game history in its own tab so
+     starting preparation never replaces the general Reference view.
+   - Scannable move grids keep `Move` | `Prob / Share` | `Games` | `W/D/B Bar`
+     (`White`/`Grey`/`Black` horizontal bar) | `Reference stats` | `Trend` |
+     `Eval` aligned where the active workflow supports them.
 4. **Hover-to-Preview Overlay:**
    - Hovering any game row in `Games`, `Players`, or `Recent Games` highlights the row, steps moves with `←`/`→`/`Home`/`End`, updates the board + player strips, and overlays the hovered game's move sheet and header metadata in the right-hand Moves view with a subtle `Previewing hovered game` pill.
-

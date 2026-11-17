@@ -242,8 +242,25 @@ pub fn fetch_player_games_filtered(
     filter: Option<&crate::players::AccountFilter>,
     as_of: u32,
 ) -> Result<Vec<domain::Game>> {
+    fetch_player_games_filtered_with_token(source, username, max_games, filter, as_of, None)
+}
+
+/// Download games with an optional Lichess bearer token. The credential is
+/// only attached to Lichess requests; it is never sent to Chess.com or
+/// ChessABC.
+pub fn fetch_player_games_filtered_with_token(
+    source: OnlineSource,
+    username: &str,
+    max_games: usize,
+    filter: Option<&crate::players::AccountFilter>,
+    as_of: u32,
+    lichess_token: Option<&str>,
+) -> Result<Vec<domain::Game>> {
     let username = validate_query(source, username)?;
     let max_games = normalized_max_games(max_games);
+    let lichess_token = lichess_token
+        .map(str::trim)
+        .filter(|token| !token.is_empty());
     let agent = ureq::AgentBuilder::new()
         .user_agent(USER_AGENT)
         .timeout_connect(Duration::from_secs(15))
@@ -265,6 +282,7 @@ pub fn fetch_player_games_filtered(
                         username,
                         usize::MAX,
                         Some(newest + 1000),
+                        lichess_token,
                     ) {
                         Ok(delta) if !delta.is_empty() => {
                             let mut seen: std::collections::HashSet<String> =
@@ -294,7 +312,8 @@ pub fn fetch_player_games_filtered(
                 merged
             } else if max_games == usize::MAX || max_games > 500 {
                 // Full unfiltered history (paged at 10000) populates cache.
-                let full = fetch_lichess_games_paged(&agent, username, usize::MAX, None)?;
+                let full =
+                    fetch_lichess_games_paged(&agent, username, usize::MAX, None, lichess_token)?;
                 if full.is_empty() {
                     bail!("Lichess returned no parseable games for {username}");
                 }
@@ -304,7 +323,7 @@ pub fn fetch_player_games_filtered(
             } else {
                 // Probe (<=500, no cache yet): capped unfiltered fetch, no
                 // partial cache is written (Start will populate the full one).
-                fetch_lichess_games_paged(&agent, username, max_games, None)?
+                fetch_lichess_games_paged(&agent, username, max_games, None, lichess_token)?
             };
             if games.is_empty() {
                 bail!("Lichess returned no parseable games for {username}");
@@ -1900,6 +1919,7 @@ fn fetch_lichess_games_paged(
     username: &str,
     max_games: usize,
     since_ms: Option<u64>,
+    token: Option<&str>,
 ) -> Result<Vec<domain::Game>> {
     const PAGE: usize = 10_000;
     let mut collected: Vec<domain::Game> = Vec::new();
@@ -1915,9 +1935,11 @@ fn fetch_lichess_games_paged(
             break;
         }
         let url = lichess_url_unfiltered(username, Some(remaining), since_ms, until_ms);
-        let response = agent
-            .get(&url)
-            .set("Accept", "application/x-chess-pgn")
+        let mut request = agent.get(&url).set("Accept", "application/x-chess-pgn");
+        if let Some(token) = token {
+            request = request.set("Authorization", &format!("Bearer {token}"));
+        }
+        let response = request
             .call()
             .with_context(|| format!("requesting {url}"))?;
         let reader = std::io::BufReader::new(response.into_reader());

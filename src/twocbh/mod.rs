@@ -850,6 +850,14 @@ impl TwoCbhLibrary {
             let mut indices = Vec::with_capacity(ids.len());
             let mut white_games = 0u32;
             let mut black_games = 0u32;
+            let mut wins = 0u32;
+            let mut draws = 0u32;
+            let mut losses = 0u32;
+            let mut elo_sum = 0u64;
+            let mut elo_count = 0u32;
+            let mut elo_max = 0u32;
+            let mut first_year = 0u16;
+            let mut last_year = 0u16;
             for record_id in ids {
                 let Some(index) = self.game_index_for_record(record_id) else {
                     continue;
@@ -858,15 +866,61 @@ impl TwoCbhLibrary {
                 let Ok(record) = self.file.record(record_id) else {
                     continue;
                 };
-                if record.len() >= 0x24 {
-                    let white = le_u32(&record[0x18..0x1c]);
-                    let black = le_u32(&record[0x20..0x24]);
-                    if white == entity {
-                        white_games += 1;
+                if record.len() < 0xc0 {
+                    continue;
+                }
+                let white = le_u32(&record[0x18..0x1c]);
+                let black = le_u32(&record[0x20..0x24]);
+                let played_white = white == entity;
+                let played_black = black == entity;
+                if played_white {
+                    white_games += 1;
+                }
+                if played_black {
+                    black_games += 1;
+                }
+
+                // Result is from White's perspective: 2 = White win,
+                // 1 = draw, 0 = Black win. Translate to our player's outcome.
+                let packed = le_u32(&record[0x58..0x5c]);
+                let result = (packed & 0xffff) as u16;
+                if played_white || played_black {
+                    let white_win = result == 2;
+                    let black_win = result == 0;
+                    let our_win = (played_white && white_win) || (played_black && black_win);
+                    let our_loss = (played_white && black_win) || (played_black && white_win);
+                    if result == 1 {
+                        draws += 1;
+                    } else if our_win {
+                        wins += 1;
+                    } else if our_loss {
+                        losses += 1;
                     }
-                    if black == entity {
-                        black_games += 1;
+                }
+
+                // Own and opponent Elo. Only count a rating we actually have.
+                let white_elo = le_u16(&record[0x60..0x62]) as u32;
+                let black_elo = le_u16(&record[0x70..0x72]) as u32;
+                let own_elo = if played_white && !played_black {
+                    white_elo
+                } else if played_black && !played_white {
+                    black_elo
+                } else {
+                    0
+                };
+                if own_elo > 0 {
+                    elo_sum += u64::from(own_elo);
+                    elo_count += 1;
+                    elo_max = elo_max.max(own_elo);
+                }
+
+                // Game date → first/last year (date packs year in bits 9..21).
+                let year = ((le_u32(&record[0xbc..0xc0]) >> 9) & 0xfff) as u16;
+                if year > 0 {
+                    if first_year == 0 || year < first_year {
+                        first_year = year;
                     }
+                    last_year = last_year.max(year);
                 }
             }
             if indices.is_empty() {
@@ -879,7 +933,14 @@ impl TwoCbhLibrary {
                 indices,
                 white_games,
                 black_games,
-                ..crate::library::AcceleratedPlayer::default()
+                wins,
+                draws,
+                losses,
+                elo_max,
+                elo_sum,
+                elo_count,
+                first_year,
+                last_year,
             });
         }
         if out.is_empty() { None } else { Some(out) }

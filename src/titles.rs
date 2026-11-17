@@ -68,6 +68,32 @@ impl PlayerTitle {
     }
 }
 
+/// A title together with the year it was awarded, when the source states it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TitleAward {
+    pub title: PlayerTitle,
+    pub year: Option<i32>,
+}
+
+/// Strongest title in a history, preferring the highest rank. Used for the
+/// current profile badge so a GM who was once an IM still reads `GM`.
+pub fn strongest(awards: &[TitleAward]) -> Option<PlayerTitle> {
+    awards
+        .iter()
+        .map(|award| award.title)
+        .max_by_key(|title| title.rank())
+}
+
+/// Strongest title that had already been awarded in `year`. Undated awards are
+/// deliberately ignored: they must never be guessed onto an earlier game.
+pub fn at_year(awards: &[TitleAward], year: u32) -> Option<PlayerTitle> {
+    awards
+        .iter()
+        .filter(|award| award.year.is_some_and(|awarded| year >= awarded as u32))
+        .map(|award| award.title)
+        .max_by_key(|title| title.rank())
+}
+
 /// Map a raw title tag to a canonical title, or `None` when it is absent,
 /// empty, or not a recognized chess title.
 pub fn normalize(raw: &str) -> Option<PlayerTitle> {
@@ -259,5 +285,28 @@ mod tests {
         assert_eq!(PlayerTitle::Ccm.short(), "CCM");
         assert!(PlayerTitle::Gm.rank() > PlayerTitle::Im.rank());
         assert!(PlayerTitle::Im.rank() > PlayerTitle::Wgm.rank());
+    }
+
+    #[test]
+    fn strongest_and_dated_titles_are_chosen_by_rank_and_year() {
+        let awards = [
+            TitleAward {
+                title: PlayerTitle::Im,
+                year: Some(2003),
+            },
+            TitleAward {
+                title: PlayerTitle::Gm,
+                year: Some(2004),
+            },
+            TitleAward {
+                title: PlayerTitle::Fm,
+                year: None,
+            },
+        ];
+        assert_eq!(strongest(&awards), Some(PlayerTitle::Gm));
+        assert_eq!(at_year(&awards, 2000), None);
+        assert_eq!(at_year(&awards, 2003), Some(PlayerTitle::Im));
+        assert_eq!(at_year(&awards, 2004), Some(PlayerTitle::Gm));
+        assert_eq!(at_year(&awards, 2010), Some(PlayerTitle::Gm));
     }
 }

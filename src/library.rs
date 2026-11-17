@@ -180,6 +180,8 @@ pub struct AcceleratedPlayer {
     pub draws: u32,
     pub losses: u32,
     pub elo_max: u32,
+    pub elo_sum: u64,
+    pub elo_count: u32,
     pub first_year: u16,
     pub last_year: u16,
 }
