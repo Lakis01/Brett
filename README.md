@@ -4,15 +4,8 @@
   <img src="assets/brett.webp" alt="Brett logo" width="180">
 </p>
 
-Brett is a Chess Preparation and Database Suite. It is built for fast opening
-preparation, game review, database management, and deep position analysis.
-
-> **Alpha software.** Brett is currently in an early alpha stage, with
-> development focused largely on implementing core functionality, database
-> capabilities, and deep engine analysis rather than a pretty UI. The visual
-> interface and UI polish will be optimized once all functional components and
-> workflows are firmly in place. Expect rough edges and evolving features in
-> this phase. Back up important databases before editing them in place.
+Brett is a Chess Preparation and Database Suite. It is built for opening
+preparation, database management, and deep position analysis.
 
 ## Screenshots
 
@@ -87,8 +80,8 @@ there.
 Brett can use an optional ICCF correspondence database as a local, read-only
 reference. A compiled snapshot is redistributed in this repository under
 [`databases/iccf/`](databases/iccf/). Downloading or using it is optional, but
-encouraged for correspondence preparation. The snapshot is refreshed between
-releases.
+encouraged for correspondence preparation. The snapshot is refreshed sporadically.
+You may star that repository to be reminded of updates.
 
 > **The ICCF database is provided for personal use only and may not be sold or
 > re-sold to any third party.**
