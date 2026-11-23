@@ -334,11 +334,11 @@ pub fn default_path() -> Option<PathBuf> {
 pub fn custom_dir() -> Option<PathBuf> {
     #[cfg(test)]
     {
-        return Some(
+        Some(
             std::env::temp_dir()
                 .join(format!("brett-test-config-{}", std::process::id()))
                 .join("portraits"),
-        );
+        )
     }
     #[cfg(not(test))]
     {

@@ -147,7 +147,7 @@ pub fn materialize_with_progress(
 pub fn cache_root() -> PathBuf {
     #[cfg(test)]
     {
-        return std::env::temp_dir().join(format!("brett-test-cbv-{}", std::process::id()));
+        std::env::temp_dir().join(format!("brett-test-cbv-{}", std::process::id()))
     }
     #[cfg(not(test))]
     {

@@ -1,6 +1,6 @@
 # Maintainer: Lakis01 <contact@brett.chess>
 pkgname=brett
-pkgver=0.3.0
+pkgver=0.3.1
 pkgrel=1
 pkgdesc="Chess Preparation and Database Suite"
 arch=('x86_64')

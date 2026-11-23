@@ -343,6 +343,11 @@ enum LiveSubSource {
     ChessComLive,
 }
 
+type ChessAbcPosMsg = (u64, Result<Vec<position::MoveStat>, String>);
+type LiveAvatarMsg = (String, Option<(Vec<u8>, u32, u32)>);
+type PositionSearchTarget = Result<(Option<Arc<dyn GameLibrary>>, Option<PathBuf>), &'static str>;
+
+#[allow(clippy::large_enum_variant)]
 enum LiveMsg {
     Broadcasts(Result<Vec<crate::live::LiveBroadcastSummary>, String>),
     Entries(Result<Vec<crate::live::LiveGameEntry>, String>),
@@ -877,6 +882,7 @@ impl WikiBatchScope {
 
 /// State of the Wikipedia card for the profile currently on screen.
 #[derive(Clone, Debug)]
+#[allow(clippy::large_enum_variant)]
 enum WikiState {
     Idle,
     Loading,
@@ -1873,7 +1879,7 @@ pub struct App {
     chessabc_live_rx: Option<mpsc::Receiver<Result<crate::recent::RecentTree, String>>>,
     chessabc_live_status: String,
     chessabc_pos_cache: HashMap<u64, Vec<position::MoveStat>>,
-    chessabc_pos_rx: Option<mpsc::Receiver<(u64, Result<Vec<position::MoveStat>, String>)>>,
+    chessabc_pos_rx: Option<mpsc::Receiver<ChessAbcPosMsg>>,
     chessabc_pos_pending: Option<u64>,
     chessabc_pos_error: Option<(u64, String)>,
     explorer_since_cache: HashMap<(cloud::ExplorerSource, String, u32, u32), cloud::Explorer>,
@@ -1984,8 +1990,8 @@ pub struct App {
     live_watching_meta: Option<(crate::live::LivePlayerInfo, crate::live::LivePlayerInfo)>,
     live_last_refresh: Option<Instant>,
     live_avatar_cache: HashMap<String, egui::TextureHandle>,
-    live_avatar_rx: Option<mpsc::Receiver<(String, Option<(Vec<u8>, u32, u32)>)>>,
-    live_avatar_tx: mpsc::Sender<(String, Option<(Vec<u8>, u32, u32)>)>,
+    live_avatar_rx: Option<mpsc::Receiver<LiveAvatarMsg>>,
+    live_avatar_tx: mpsc::Sender<LiveAvatarMsg>,
     live_avatar_in_flight: HashSet<String>,
     twic_open: bool,
     twic_tab: TwicTab,
@@ -18311,17 +18317,16 @@ impl App {
                             Some(Ok((url, title))) => {
                                 paint_wiki_pill(ui, url, title);
                             }
-                            Some(Err(is_ambiguous)) => {
+                            Some(Err(is_ambiguous))
                                 if ui
                                     .small_button("↻")
                                     .on_hover_text("Retry Wikipedia lookup")
-                                    .clicked()
-                                {
-                                    clear_wiki_ambiguous = *is_ambiguous;
-                                    wiki_retry = true;
-                                }
+                                    .clicked() =>
+                            {
+                                clear_wiki_ambiguous = *is_ambiguous;
+                                wiki_retry = true;
                             }
-                            None => {}
+                            Some(Err(_)) | None => {}
                         }
                         if ui
                             .small_button("🔍 Find")
@@ -27675,9 +27680,7 @@ impl App {
         self.pos_search_open = true;
     }
 
-    fn resolve_position_search_target(
-        &self,
-    ) -> Result<(Option<Arc<dyn GameLibrary>>, Option<PathBuf>), &'static str> {
+    fn resolve_position_search_target(&self) -> PositionSearchTarget {
         let existing_lib: Option<Arc<dyn GameLibrary>> = match self.pos_search_scope {
             PositionSearchScope::ActiveDb => self.library.clone(),
             PositionSearchScope::ReferenceDb => self.tree_library.clone(),
@@ -28169,7 +28172,7 @@ impl App {
                                 "Precomputed .brettstruct sidecar accelerates structure, endgame & partial searches.",
                             );
                         }
-                        Some(false) => {
+                        Some(false)
                             if ui
                                 .add_enabled(
                                     !running,
@@ -28178,12 +28181,11 @@ impl App {
                                 .on_hover_text(
                                     "Build a compact .brettstruct sidecar (56 B/game) so Mega-scale structure & endgame searches skip non-matching games in O(1).",
                                 )
-                                .clicked()
-                            {
-                                start_struct_build = true;
-                            }
+                                .clicked() =>
+                        {
+                            start_struct_build = true;
                         }
-                        None => {}
+                        Some(false) | None => {}
                     }
                 });
 
@@ -28248,13 +28250,13 @@ impl App {
                                 }
                                 for fam in StructureFamily::ALL {
                                     let fam_selected = self.pos_search_structure_family == fam;
-                                    if ui.selectable_label(fam_selected, fam.label()).clicked() {
-                                        if self.pos_search_structure_family != fam {
-                                            self.pos_search_structure_family = fam;
-                                            self.pos_search_selected_plan = 0;
-                                            self.pos_search_hover_plan = None;
-                                            self.pos_search_plan_anim_start = Some(Instant::now());
-                                        }
+                                    if ui.selectable_label(fam_selected, fam.label()).clicked()
+                                        && self.pos_search_structure_family != fam
+                                    {
+                                        self.pos_search_structure_family = fam;
+                                        self.pos_search_selected_plan = 0;
+                                        self.pos_search_hover_plan = None;
+                                        self.pos_search_plan_anim_start = Some(Instant::now());
                                     }
                                 }
                             });

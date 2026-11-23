@@ -37,6 +37,8 @@ impl AccountFinderConfidence {
 
 /// Position-indexed opening move frequencies extracted from the target player's
 /// known OTB / classical games.
+pub type ColorPositionMap = HashMap<u64, (u32, HashMap<u32, u32>)>;
+
 #[derive(Clone, Debug)]
 pub struct RepertoireFingerprint {
     pub target_key: String,
@@ -44,7 +46,7 @@ pub struct RepertoireFingerprint {
     pub total_games: usize,
     /// `by_color[0]` = White positions, `by_color[1]` = Black positions.
     /// Each entry maps `position_key` -> `(total_pos_games, map<encoded_move, count>)`.
-    pub by_color: [HashMap<u64, (u32, HashMap<u32, u32>)>; 2],
+    pub by_color: [ColorPositionMap; 2],
     /// Global move samples at shared plies (used for rarity / specificity bonus).
     pub distinct_lines: HashSet<(u64, u32)>,
 }
@@ -52,8 +54,7 @@ pub struct RepertoireFingerprint {
 impl RepertoireFingerprint {
     #[must_use]
     pub fn from_games(target_key: &str, target_elo: Option<u32>, games: &[Game]) -> Self {
-        let mut by_color: [HashMap<u64, (u32, HashMap<u32, u32>)>; 2] =
-            [HashMap::new(), HashMap::new()];
+        let mut by_color: [ColorPositionMap; 2] = [HashMap::new(), HashMap::new()];
         let mut distinct_lines = HashSet::new();
         let mut total_games = 0usize;
 

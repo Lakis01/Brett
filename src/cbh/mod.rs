@@ -325,7 +325,7 @@ impl CbhLibrary {
                 let size = (usize::from(head[1]) << 16)
                     | (usize::from(head[2]) << 8)
                     | usize::from(head[3]);
-                if size >= 4 && size <= MAX_MOVE_RECORD && off + size <= mmap.len() {
+                if (4..=MAX_MOVE_RECORD).contains(&size) && off + size <= mmap.len() {
                     return f(head[0], &mmap[off + 4..off + size]);
                 }
             }

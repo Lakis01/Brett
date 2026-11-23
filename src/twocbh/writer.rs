@@ -1580,10 +1580,8 @@ impl TargetLidState {
             if let Some(block) = layout.raw_slice(bytes, id_u32, 0) {
                 next_id[0] = id_u32 + 1;
                 if let Some((last, first, fide, fide_off)) = parse_player_raw(block) {
-                    if last.is_empty() && first.is_empty() {
-                        if id_u32 == 2 || empty_player_id.is_none() {
-                            empty_player_id = Some(id_u32);
-                        }
+                    if last.is_empty() && first.is_empty() && (id_u32 == 2 || empty_player_id.is_none()) {
+                        empty_player_id = Some(id_u32);
                     }
                     if let Some(f) = fide {
                         player_by_fide.entry(f).or_insert(id_u32);
@@ -1593,12 +1591,12 @@ impl TargetLidState {
                         .or_insert((id_u32, fide, fide_off));
                 }
             }
-            if id < layout.counts[1] as usize || layout.counts[1] == 0 {
-                if let Some(block) = layout.raw_slice(bytes, id_u32, 1) {
-                    next_id[1] = id_u32 + 1;
-                    if let Some(key) = parse_two_string_key(block) {
-                        event_by_key.entry(key).or_insert(id_u32);
-                    }
+            if (id < layout.counts[1] as usize || layout.counts[1] == 0)
+                && let Some(block) = layout.raw_slice(bytes, id_u32, 1)
+            {
+                next_id[1] = id_u32 + 1;
+                if let Some(key) = parse_two_string_key(block) {
+                    event_by_key.entry(key).or_insert(id_u32);
                 }
             }
             if let Some(block) = layout.raw_slice(bytes, id_u32, 2) {

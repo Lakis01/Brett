@@ -402,10 +402,8 @@ pub struct DiscoveredPgnLink {
 fn url_scheme_and_origin(url: &str) -> Option<(&str, &str, &str)> {
     let (scheme, rest) = if let Some(r) = url.strip_prefix("https://") {
         ("https", r)
-    } else if let Some(r) = url.strip_prefix("http://") {
-        ("http", r)
     } else {
-        return None;
+        ("http", url.strip_prefix("http://")?)
     };
     let (authority, path_and_query) = match rest.find(['/', '?', '#']) {
         Some(idx) => (&rest[..idx], &rest[idx..]),

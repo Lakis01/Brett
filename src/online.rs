@@ -2320,7 +2320,7 @@ fn output_path(source: OnlineSource, username: &str) -> PathBuf {
 fn cache_root() -> PathBuf {
     #[cfg(test)]
     {
-        return std::env::temp_dir().join(format!("brett-test-online-{}", std::process::id()));
+        std::env::temp_dir().join(format!("brett-test-online-{}", std::process::id()))
     }
     #[cfg(not(test))]
     {

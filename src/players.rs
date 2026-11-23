@@ -953,7 +953,7 @@ pub fn players_sidecar_path(source: &Path) -> PathBuf {
 fn players_cache_dir() -> PathBuf {
     #[cfg(test)]
     {
-        return std::env::temp_dir().join(format!("brett-test-players-{}", std::process::id()));
+        std::env::temp_dir().join(format!("brett-test-players-{}", std::process::id()))
     }
     #[cfg(not(test))]
     {
@@ -8296,7 +8296,7 @@ mod tests {
 pub fn prep_cache_dir() -> PathBuf {
     #[cfg(test)]
     {
-        return std::env::temp_dir().join(format!("brett-test-prep-cache-{}", std::process::id()));
+        std::env::temp_dir().join(format!("brett-test-prep-cache-{}", std::process::id()))
     }
     #[cfg(not(test))]
     {

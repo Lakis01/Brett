@@ -950,7 +950,7 @@ fn cache_path_tagged(source: &Path, tag: Option<&str>) -> PathBuf {
 fn cache_dir() -> PathBuf {
     #[cfg(test)]
     {
-        return std::env::temp_dir().join(format!("brett-test-index-{}", std::process::id()));
+        std::env::temp_dir().join(format!("brett-test-index-{}", std::process::id()))
     }
     #[cfg(not(test))]
     {

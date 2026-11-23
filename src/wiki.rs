@@ -94,9 +94,7 @@ fn parse_json_year(value: &Value, key: &str) -> Option<i32> {
 /// Extract a 4-digit calendar year (`1400..=2100`) embedded as a standalone token
 /// at the end of a lifespan half-segment (e.g. `"31 October 1892"` -> `Some(1892)`).
 fn extract_trailing_year(segment: &str) -> Option<i32> {
-    let trimmed = segment
-        .trim()
-        .trim_end_matches(|c: char| matches!(c, ',' | ';' | '.'));
+    let trimmed = segment.trim().trim_end_matches([',', ';', '.']);
     let token = trimmed.split_whitespace().last()?;
     if token.len() == 4 && token.chars().all(|c| c.is_ascii_digit()) {
         let year = token.parse::<i32>().ok()?;
@@ -1235,7 +1233,7 @@ fn upgrade_periods_for_lifespan(
     deduped
 }
 
-fn sort_country_periods(periods: &mut Vec<CountryPeriod>, text_codes: &[String]) {
+fn sort_country_periods(periods: &mut [CountryPeriod], text_codes: &[String]) {
     let text_pos = |code: &str| -> usize {
         text_codes
             .iter()
@@ -1818,6 +1816,7 @@ fn enrich_with_wikidata(
 
 /// The result of looking up a player name.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
 pub enum Lookup {
     /// A confidently matched chess player, ready to display.
     Summary(Summary),
@@ -2490,10 +2489,7 @@ fn fold_transliteration_digraphs(token: &str) -> String {
         .replace("uj", "ui")
         .replace('y', "i")
         .replace("ii", "i");
-    if folded.len() > 3 && folded.ends_with("ow") {
-        folded.pop();
-        folded.push('v');
-    } else if folded.len() > 3 && folded.ends_with("ew") {
+    if folded.len() > 3 && (folded.ends_with("ow") || folded.ends_with("ew")) {
         folded.pop();
         folded.push('v');
     }
@@ -2969,11 +2965,11 @@ fn entity_char(entity: &str) -> Option<char> {
 fn cache_path() -> Option<PathBuf> {
     #[cfg(test)]
     {
-        return Some(
+        Some(
             std::env::temp_dir()
                 .join(format!("brett-test-wiki-{}", std::process::id()))
                 .join("wikipedia.json"),
-        );
+        )
     }
     #[cfg(not(test))]
     {

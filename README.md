@@ -9,9 +9,8 @@ It is built for opening preparation, multi-source opponent scouting,
 database management, game review, and deep position analysis.
 
 It supports reading and writing common database formats (`.2cbh`, `.cbh`,
-`.si4`, `.pgn`) and opening books (`.bin`, `.ctg`, `.bkt`, `.abk`) through
-independently reverse-engineered codecs—no proprietary runtime or royalty code
-is used—and handles multi-million-game archives such as Mega Database 2026
+`.si4`, `.pgn`) and opening books (`.bin`, `.ctg`, `.bkt`, `.abk`)
+and handles multi-million-game archives such as Mega Database 2026
 (~12M games; the initial load/indexing pass runs in the background so the
 workspace stays responsive). Brett also integrates Lichess (opening explorer &
 cloud evaluation), `chessdb.cn` (deep cloud analysis), ChessABC, and
@@ -19,31 +18,29 @@ Wikipedia/Wikidata metadata.
 
 ## Screenshots
 
-### Opponent preparation & Smart Predictor
+### Opponent preparation & Smart predictor
 
 ![Opponent preparation workspace](assets/screenshots/opponent-preparation.webp)
 
-Preparing as Black against Hikaru Nakamura across **79,360 merged games** (Current DB + ChessABC + Chess.com). The left panel shows the **Player Profile** card (portrait with **Change…** / **Remove**, quick White/Black **Prepare** squares, Wikipedia/Wikidata biography with CC BY-SA attribution, and filtered opponent games). The right **Prep** tab shows the **Smart Predictor** table with Bayesian move probabilities and visual likely-range bars, opponent vs. reference horizontal W/D/B bars, move-popularity trend sparklines, merged multi-source engine evaluations, and resizable, virtualized **Recent games**.
+The **Players** tab provides a direct preparation shortcut (White/Black squares right below the portrait) to launch scouting from any profile. Additional online accounts (**Lichess**, **Chess.com**, **ChessABC**) can be combined alongside local OTB databases and compiled into a single deduplicated player base cached on disk until its decay date by default—so restarting your device does not require recompiling the player base. In the right **Prep** tab, the **Off your public record** notice indicates that you have never reached this position over the board in public games (so an opponent cannot trace your public games to here), while the **Smart predictor** incorporates all available sources, recency trends, rating/speed priors, and Bayesian likelihoods to predict which move your opponent is most likely to play at the board.
 
-### Multi-source preparation setup
+### Player view, color-coded games & multi-provider Tree
 
-<p align="center">
-  <img src="assets/screenshots/preparation-setup.webp" alt="Preparation setup dialog" width="480">
-</p>
+![Player view and multi-provider Tree workspace](assets/screenshots/tree-workspace.webp)
 
-The **Start preparation** dialog combines over-the-board and online sources in one place: the active database, the configured reference database (`Mega + prior`), live **ChessABC** games, any number of extra database files, and linked **Lichess** / **Chess.com** accounts with live incremental cache probes, independent OTB and online time-control/date filters, and **Classic Stats** vs. **Smart Predictor** modes.
+The **Players** card shows biography metadata from Wikipedia/Wikidata, FIDE lookup, Rapid/Blitz/Peak ratings, lifetime score bars, and a game list **color-coded by game category** (Classical, Rapid, Blitz, Online). The **Tree** tab stacks every reference provider in one scrollable workspace: the local opening tree, the configured native `.bin`/`.ctg`/`.abk`/`.bkt` or live **ChessABC** opening book, and the **Lichess reference** explorer (**Masters**, **Lichess**, or **Both**) with clickable top games.
 
-### Stacked Tree workspace
+### Local & Cloud Engine Analysis, Correspondence Reference
 
-![Tree workspace](assets/screenshots/tree-workspace.webp)
+![Engine tab, Cloud Engine, and Correspondence Reference](assets/screenshots/engine-review-workspace.webp)
 
-The **Tree** tab stacks all three human-reference layers in a single scrollable view: the **Local opening tree** (current database or separate opening-tree file), the configured **Opening book** (native `.bin`/`.ctg`/`.abk`/`.bkt` or live ChessABC with horizontal W/D/B bars), and the **Lichess reference** explorer (**Masters**, **Lichess**, or **Both**) with clickable **Lichess top games** at the bottom.
+The **Engine** tab combines **Game review** (reusing cached cloud evaluations up to target depth before invoking a local review engine), hot-swappable local UCI engine slots (`1`, `2`, `3`), the unified **Cloud Engine** table (`chessdb.cn` + Lichess Cloud Eval + local SQLite `analysis.db` cache), and the automatic local **Correspondence** reference database—shown alongside the filtered **My Games** tree on the left.
 
-### Engine workspace, Cloud Eval & Game Review
+### Moves, PGN Fields & Annotations
 
-![Engine and Game Review workspace](assets/screenshots/engine-review-workspace.webp)
+![Moves, PGN tags, and Annotations workspace](assets/screenshots/moves-annotations-workspace.webp)
 
-The **Engine** tab places **Game review** directly at the top (reusing Lichess Cloud Eval up to the target depth before invoking a dedicated local review engine), followed by up to three hot-swappable local UCI engine slots (`1`, `2`, `3`), the unified **Cloud Engine** table (`chessdb.cn` + Lichess Cloud Eval + local `analysis.db` cache with trailing chessdb-only moves collapsed behind `+ N chessdb-only moves`), and the automatic local **Correspondence** reference.
+A complete game-analysis view featuring editable **PGN tags** (event, site, date, round, board, ECO, opening, ratings, crosstable jump), the interactive **Moves** score sheet with collapsible variations and inline board diagrams, and a compact **Annotations** card (hidden by default to maximize notation space; toggle with **Annotate** or `A`) providing color-coded move-quality symbols, evaluation NAGs, structural motifs, and automatic comment saving.
 
 ## Licensing
 
@@ -403,9 +400,10 @@ terms. See [ICCF_NOTICE.md](ICCF_NOTICE.md).
   Lichess. Drawings round-trip through PGN `%csl`/`%cal`, SCID `%draw` input,
   and classic CBH `.cba` annotations.
 - The right-side PGN panel has a styled game header, an editable tag table,
-  result badge, move cards, selected-move highlighting, variation cards, and
-  clickable comment previews. **Settings → Show PGN tags** hides the whole
-  editable tag card when you want more room for the move list. WhiteElo and
+  result badge, unified `21px` move/NAG tokens, inline variation delimiters, and
+  single-line clickable comment chips. **Settings → Show PGN tags** hides the whole
+  editable tag card when you want more room for the move list, while **Show annotations**
+  is hidden by default and toggles via **Annotate** (or `A`). WhiteElo and
   BlackElo are separate editable fields to the right of the White/Black name
   boxes; Elo is not appended to the name and there is no derived rating chip.
   Fields that are absent or empty are hidden by default; **Show empty** reveals
@@ -450,26 +448,32 @@ terms. See [ICCF_NOTICE.md](ICCF_NOTICE.md).
 
 - **Player ratings** — choose Elo, DWZ, or USCF as the priority and optionally
   show all available ratings.
-- **My player names** — one alias per line, highest priority first. The first
-  alias is labelled **You** in the Players tab, replaces the literal `You` in
-  preparation tag fields, and drives auto-orientation when a game contains one
-  of the aliases.
+- **My player names & unified My Games identities** — one alias per line,
+  highest priority first. The first alias is labelled **You** in the Players
+  tab, replaces the literal `You` in preparation tag fields, and automatically
+  merges linked Lichess, Chess.com, and ChessABC online usernames under that
+  single **You** player profile (sharing your custom portrait across all
+  aliases). Matching games automatically orient the board to your side on open
+  and during hover preview.
 - **Display** — **Show player photos** (enabled when a local pack is present),
   **Photo size** (Small/Medium/Large), **Champion lineage** (FIDE/inclusive by
   default, or Classical/PCA), **Show navigation buttons** (off by default),
-  **Show PGN tags** (on by default), and **Preview moves on hover** (off by
-  default). Photo data is not redistributed with Brett; see
-  [docs/PHOTOS.md](docs/PHOTOS.md) and
+  **Show PGN tags** (on by default), **Show annotations** (off by default; toggle
+  anytime via **Annotate** or `A`), **Game category colors** (Classical, Rapid,
+  Blitz, Online), and **Preview moves on hover** (off by default). Custom player
+  portraits live in `$XDG_CONFIG_HOME/brett/portraits/` and custom position
+  presets live in `$XDG_CONFIG_HOME/brett/custom_structures.json`, so both
+  persist across builds and updates. Photo data is not redistributed with Brett;
+  see [docs/PHOTOS.md](docs/PHOTOS.md) and
   [docs/CHAMPIONS.md](docs/CHAMPIONS.md).
-- **Player profiles** — load Wikipedia summaries on demand, or click **Enrich…**
-  in the **Players** tab (or **Settings → Enrich player metadata…** / **Settings
-  → Player profiles → Enrich metadata**) to batch-enrich top players by game
-  count, players with 10+/3+ games, or every player. The batch UI shows the
-  selected and pending counts, an estimated time, progress, and cancellation.
-  Wikidata `P2962` title claims and `P580` award years feed current profile
-  badges and dated historical game rows. Compact title histories are stored
-  separately from the bounded article cache and restored to player lists at
-  indexing time without another lookup.
+- **Player profiles & historical federations** — load Wikipedia/Wikidata summaries
+  on demand, or click **Enrich…** in the **Players** tab (or **Settings → Enrich
+  player metadata…**) to batch-enrich top players, 10+/3+ game players, or an
+  entire database with progress and cancellation. Enrichment handles
+  generational suffixes (`Jr`/`Sr`), historical spelling variants (`William` /
+  `Wilhelm`), and multi-flag historical federations from 1800 to the present
+  (`AUE`, `AUH`, `BOH`, `DEI`, `PRU`, `RUE`, `TCH`, `URS`, `YUG`, `GDR`, `FRG`,
+  `SCG`, etc.) alongside Wikidata `P2962` title timelines.
 - **Correspondence database** — include or exclude the local correspondence
   database in the Engine tab, choose its file, or restore the conventional
   location. The database appears as a dedicated human-game reference section in
@@ -529,25 +533,33 @@ never writes to the source database.
 | `src/library.rs` | `GameLibrary` interface, streaming PGN index, shared source metadata |
 | `src/scid.rs` | Native SCID3/SCID4 reader and `ScidLibrary` |
 | `src/scid/writer.rs` | Native SCID4 writer, namebase/index construction, rollback-safe export |
-| `src/cbh/` | Native classic ChessBase CBH reader and `CbhLibrary` |
+| `src/cbh/` | Native classic ChessBase CBH reader and writer |
+| `src/twocbh/` | Native ChessBase 2CBH reader, `.2lgd` accelerator, and writer |
 | `src/position.rs` | Position index, opening-tree statistics, shared library builder |
-| `src/players.rs` | Player directory, per-player position books, Bayesian prediction |
+| `src/players.rs` | Player directory, alias grouping, per-player books, Bayesian prediction |
 | `src/evaluation.rs` | Held-out log loss, Brier score, top-k accuracy, calibration |
 | `src/online.rs` | Public Lichess, Chess.com, and ChessABC imports |
+| `src/my_games.rs` | Unified My Games configuration, categorized sub-shelves, online startup sync |
+| `src/account_finder.rs` | Repertoire-fingerprint matching to locate online accounts in clubs/teams |
+| `src/twic.rs` & `src/league_import.rs` | Automated TWIC & regional league/broadcast tournament importers |
 | `src/cloud.rs` | chessdb.cn, Lichess opening explorer, and Lichess cloud eval |
+| `src/live.rs` | Live game broadcast & online follower streams |
 | `src/domain.rs` | Game tree, PGN parsing, move lines, figurines, NAG palette, clocks |
-| `src/engine.rs` | Asynchronous UCI process, handshake, options, parser, worker threads |
-| `src/book.rs` | Native Polyglot, ChessBase, Arena, and Shredder opening-book readers |
-| `src/book/` | Shredder `.bkt` reader implementation |
+| `src/engine.rs` | Asynchronous UCI process, multi-slot orchestration, parser, worker threads |
+| `src/analysis_cache.rs` | Persistent SQLite `analysis.db` cache across engine families |
+| `src/book.rs` & `src/book/` | Native Polyglot (`.bin`), ChessBase (`.ctg`), Arena (`.abk`), Shredder (`.bkt`) readers |
 | `src/cbv.rs` | ChessBase `.cbv` container extraction into a classic CBH library |
+| `src/search.rs` & `src/structure_plans.rs` | Clean-room 64-square bitboard position search, 40 *Chess Structures* presets, custom overrides, and animated strategic plans |
+| `src/repertoire.rs` | Opening Repertoire Builder & SM-2+ spaced-repetition trainer |
 | `src/recent.rs` | In-memory recent-game trees and move-trend statistics |
-| `src/photos.rs` | Optional BPF1 player-photo pack reader, folded/short-name lookup, and WebP decoding |
+| `src/wiki.rs`, `src/country.rs`, `src/flags.rs`, `src/titles.rs`, `src/fide.rs` | Wikipedia/Wikidata enrichment, historical 1800–present federations & 4:3 flags, title timelines, live FIDE ratings |
+| `src/photos.rs` | Optional BPF1 player-photo pack reader, alias/custom WebP portrait resolver |
 | `src/champions.rs` | World-champion table and classical/FIDE lineage matching for the crown |
 | `src/session.rs` | Editable ordered session, database views, reorder/merge, PGN export |
 | `src/settings.rs` | Persistent engine, cloud, reference-database, display, and preparation settings |
-| `src/review.rs` | Sequential game review, move grading, accuracy, eval chart data |
+| `src/review.rs` | Sequential game review, clock-pacing summaries, move grading, eval chart data |
 | `src/print/` | Backend-neutral print document, SVG board diagrams, Typst renderer and bundle writer |
-| `src/app.rs` | egui application, tabs, preparation flow, annotation editor |
+| `src/app.rs` | egui application, tabs, preparation flow, `Operate`-mode UI cards |
 | `src/ui/fonts.rs` | Embedded DejaVu Sans fallback for chess symbols |
 | `docs/` | Data safety, position-index format, preparation model, SCID/CBH readers, provenance audit, photo provenance, backlog |
 
@@ -627,15 +639,12 @@ never writes to the source database.
 
 - **Unified My Games database & startup online sync (done).** Configure a personal My Games database in any writable format (`.2cbh` by default, `.si4`, `.cbh`, `.pgn`) with expandable subsections (`Classical`, `Rapid`, `Blitz`, and `Online → Lichess / Chess.com` across multiple accounts), multi-section checkbox filtering, direct drag-and-drop / file merging into any subsection, and automatic startup online sync.
 - **Automatic TWIC downloader (done).** Fetch weekly issues (`https://theweekinchess.com/twic`) by explicit list/ranges (e.g. `645, 653, 664-672`), presets (`Latest`, `Since last fetched`, `Last 4`, `Last 12`), or date intervals, as well as the searchable/filterable tournament archive (`https://theweekinchess.com/a-year-of-pgn-game-files`), merging directly into the active DB, My Games, or a new database.
-- **Partial & exact bitboard position search (done).** Clean-room MIT 64-square pattern matcher (**Game → Position search…**) with piece/empty/`Any` brushes, structural presets (`Carlsbad`, `IQP`, `Hanging Pawns`, `Maróczy Bind`, `Stonewall`, `Boleslavsky`), color-flipped mirroring, ply bounds, Rayon scanning, hover preview at the matched ply, and direct game navigation.
+- **Partial & exact bitboard position search & Structure Plans (done).** Clean-room MIT 64-square pattern matcher (**Game → Position search…**) with piece/empty/`Any` brushes, 40 structural presets (including **Najdorf Type I/II/III**, **Panov**, **Semi-Slav**, **Grünfeld**, **Botvinnik Triangle**, **Stonewall**, **Carlsbad**, **IQP**, **Hedgehog**, **Badewanne**), persistent custom preset overrides (`custom_structures.json`), color-flipped mirroring, animated strategic plans, ply bounds, Rayon scanning, hover preview at the matched ply, and direct game navigation.
 - **Repertoire Builder & SM-2+ Train mode (done).** Clean-room MIT **Repertoire** workspace (`Build` with Zobrist transposition grouping and **"Jump to biggest gap"** against your Reference/Tree DB, plus `Train (SRS)` interactive move recall drills rated `1 Again`–`4 Easy`).
-- **Game review (in early stages).** Functional first-pass accuracy &
-  centipawn-loss grading with Lichess Cloud Eval reuse and NAG write-back;
-  clock-usage analytics and deeper review workflows are still maturing.
+- **Wikipedia, historical federations (1800–present) & Players identity grouping (done).** Resolves `Jr`/`Sr` suffixes and spelling variants (`Steinitz, William`), displays multi-era flags (`AUE`, `AUH`, `BOH`, `DEI`, `PRU`, `RUE`, `TCH`, `URS`, `YUG`, `GDR`, `FRG`, `SCG`), groups linked online accounts under **You** with shared custom portraits, and autoflips the board on game hover.
+- **Moves, Annotations & Clock analytics (done).** Clean `Operate`-mode unified move/NAG pills, collapsible variations, toggleable **Annotations** panel (hidden by default via **Annotate** / `A`), Game Review with Lichess Cloud Eval reuse and NAG write-back, and per-player clock pacing analytics in player profiles.
 - **Planned / upcoming.**
-  - Clock-usage analysis across games and player profiles.
-  - Visual UI overhaul once core database, preparation, and repertoire
-    workflows stabilize.
+  - Mega-scale (1M+ games) external-sort position indexer and continued predictor calibration.
 
 ## Data safety
 

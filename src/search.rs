@@ -558,10 +558,10 @@ pub fn save_custom_presets(presets: &[CustomStructurePreset]) -> anyhow::Result<
 /// Find a user-saved custom preset that overrides a built-in [`StructurePreset`]
 /// (matched case-insensitively by `preset.label()`).
 #[must_use]
-pub fn find_custom_override<'a>(
-    custom: &'a [CustomStructurePreset],
+pub fn find_custom_override(
+    custom: &[CustomStructurePreset],
     preset: StructurePreset,
-) -> Option<&'a CustomStructurePreset> {
+) -> Option<&CustomStructurePreset> {
     let target = preset.label();
     custom
         .iter()

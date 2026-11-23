@@ -337,9 +337,9 @@ impl AnalysisDb {
     pub fn default_path() -> PathBuf {
         #[cfg(test)]
         {
-            return std::env::temp_dir()
+            std::env::temp_dir()
                 .join(format!("brett-test-analysis-{}", std::process::id()))
-                .join("analysis.db");
+                .join("analysis.db")
         }
         #[cfg(not(test))]
         {

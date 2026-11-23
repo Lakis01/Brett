@@ -2221,37 +2221,39 @@ mod tests {
 
     #[test]
     fn engine_slots_round_trip() {
-        let mut prefs = EnginePrefs::default();
-        prefs.engines = vec![
-            EngineSlotConfig {
-                path: Some(PathBuf::from("/usr/bin/stockfish")),
-                label: Some("SF 17".to_string()),
-                threads: 4,
-                hash_mb: 256,
-                enabled: true,
-            },
-            EngineSlotConfig {
-                path: Some(PathBuf::from("/usr/bin/lc0")),
-                label: None,
-                threads: 2,
-                hash_mb: 128,
-                enabled: true,
-            },
-            EngineSlotConfig {
-                path: Some(PathBuf::from("/usr/bin/komodo")),
-                label: None,
-                threads: 2,
-                hash_mb: 64,
-                enabled: false,
-            },
-            EngineSlotConfig {
-                path: Some(PathBuf::from("/usr/bin/berserk")),
-                label: Some("Berserk 13".to_string()),
-                threads: 6,
-                hash_mb: 1024,
-                enabled: true,
-            },
-        ];
+        let prefs = EnginePrefs {
+            engines: vec![
+                EngineSlotConfig {
+                    path: Some(PathBuf::from("/usr/bin/stockfish")),
+                    label: Some("SF 17".to_string()),
+                    threads: 4,
+                    hash_mb: 256,
+                    enabled: true,
+                },
+                EngineSlotConfig {
+                    path: Some(PathBuf::from("/usr/bin/lc0")),
+                    label: None,
+                    threads: 2,
+                    hash_mb: 128,
+                    enabled: true,
+                },
+                EngineSlotConfig {
+                    path: Some(PathBuf::from("/usr/bin/komodo")),
+                    label: None,
+                    threads: 2,
+                    hash_mb: 64,
+                    enabled: false,
+                },
+                EngineSlotConfig {
+                    path: Some(PathBuf::from("/usr/bin/berserk")),
+                    label: Some("Berserk 13".to_string()),
+                    threads: 6,
+                    hash_mb: 1024,
+                    enabled: true,
+                },
+            ],
+            ..EnginePrefs::default()
+        };
         let json = prefs.to_json();
         let loaded = EnginePrefs::from_json(&json);
         assert_eq!(loaded, prefs);
