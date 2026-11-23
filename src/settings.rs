@@ -3,18 +3,84 @@
 //! Settings live under the XDG config directory so database folders stay
 //! untouched. The file is intentionally small and human-readable JSON.
 
+use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
 use crate::engine::EngineOptions;
 
-/// Configuration for an individual engine slot (Hotkeys 1, 2, 3).
+fn append_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut os = path.as_os_str().to_os_string();
+    os.push(suffix);
+    PathBuf::from(os)
+}
+
+/// Atomically write JSON configuration with `sync_all()` and a `.bak` fallback
+/// copy of the previous valid file so upgrades, crashes, or interrupted saves
+/// never leave a truncated settings file.
+pub fn write_atomic_with_backup(path: &Path, content: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp_path = append_suffix(path, &format!(".tmp.{}.{}", std::process::id(), nanos));
+    {
+        let mut file = fs::File::create(&tmp_path)
+            .with_context(|| format!("creating temporary {}", tmp_path.display()))?;
+        file.write_all(content.as_bytes())
+            .with_context(|| format!("writing temporary {}", tmp_path.display()))?;
+        let _ = file.sync_all();
+    }
+    if let Ok(existing) = fs::read_to_string(path)
+        && !existing.trim().is_empty()
+        && serde_json::from_str::<Value>(&existing).is_ok()
+    {
+        let bak_path = append_suffix(path, ".bak");
+        let _ = fs::write(&bak_path, existing.as_bytes());
+    }
+    if let Err(err) = fs::rename(&tmp_path, path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(err).with_context(|| format!("replacing {}", path.display()));
+    }
+    Ok(())
+}
+
+/// Read a JSON config file, automatically falling back to `<path>.bak` if the
+/// primary file is missing, empty, or corrupted.
+pub fn read_with_backup_json(path: &Path) -> Option<String> {
+    let is_valid = |text: &str| !text.trim().is_empty() && serde_json::from_str::<Value>(text).is_ok();
+    if let Ok(text) = fs::read_to_string(path)
+        && is_valid(&text)
+    {
+        return Some(text);
+    }
+    let bak_path = append_suffix(path, ".bak");
+    if let Ok(bak) = fs::read_to_string(&bak_path)
+        && is_valid(&bak)
+    {
+        tracing::warn!(
+            "recovered {} from backup {}",
+            path.display(),
+            bak_path.display()
+        );
+        return Some(bak);
+    }
+    None
+}
+
+/// Configuration for an individual local analysis engine (dynamically assigned hotkeys `1..=9`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EngineSlotConfig {
     pub path: Option<PathBuf>,
+    pub label: Option<String>,
     pub threads: u32,
     pub hash_mb: u32,
     pub enabled: bool,
@@ -24,10 +90,404 @@ impl Default for EngineSlotConfig {
     fn default() -> Self {
         Self {
             path: None,
+            label: None,
             threads: 1,
             hash_mb: 16,
             enabled: false,
         }
+    }
+}
+
+/// Detected GPU / accelerator family used for neural-network engine sizing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GpuKind {
+    None,
+    Nvidia,
+    Amd,
+    Intel,
+    Apple,
+    Other,
+}
+
+impl GpuKind {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::None => "CPU / unknown GPU",
+            Self::Nvidia => "NVIDIA GPU",
+            Self::Amd => "AMD GPU",
+            Self::Intel => "Intel Iris/Arc iGPU",
+            Self::Apple => "Apple GPU",
+            Self::Other => "Discrete GPU",
+        }
+    }
+
+    #[must_use]
+    pub const fn has_discrete_vram(self) -> bool {
+        matches!(self, Self::Nvidia | Self::Amd | Self::Apple)
+    }
+}
+
+/// Detected host hardware limits used to bound and tailor engine presets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SystemHardware {
+    pub logical_cpus: u32,
+    pub physical_cores: u32,
+    pub total_ram_mb: u32,
+    pub gpu_kind: GpuKind,
+}
+
+impl SystemHardware {
+    /// Detect host logical threads, physical cores, total physical memory, and GPU family.
+    #[must_use]
+    pub fn detect() -> Self {
+        let logical_cpus = std::thread::available_parallelism()
+            .map(|n| u32::try_from(n.get()).unwrap_or(256))
+            .unwrap_or(4)
+            .max(1);
+        let physical_cores = read_physical_cores()
+            .unwrap_or_else(|| (logical_cpus / 2).max(1))
+            .clamp(1, logical_cpus);
+        let total_ram_mb = read_proc_meminfo_mb().unwrap_or(8192).max(256);
+        let gpu_kind = detect_gpu_kind();
+        Self {
+            logical_cpus,
+            physical_cores,
+            total_ram_mb,
+            gpu_kind,
+        }
+    }
+
+    /// Parse `/proc/meminfo` `MemTotal` text into whole MiB.
+    #[must_use]
+    pub fn parse_meminfo_mb(text: &str) -> Option<u32> {
+        for line in text.lines() {
+            if let Some(rest) = line.strip_prefix("MemTotal:") {
+                let kb = rest
+                    .split_whitespace()
+                    .next()
+                    .and_then(|tok| tok.parse::<u64>().ok())?;
+                return u32::try_from(kb / 1024).ok().filter(|&mb| mb > 0);
+            }
+        }
+        None
+    }
+
+    /// Parse `/proc/cpuinfo` into distinct physical core count `(physical id, core id)`.
+    #[must_use]
+    pub fn parse_cpuinfo_physical_cores(text: &str) -> Option<u32> {
+        use std::collections::BTreeSet;
+        let mut pairs: BTreeSet<(String, String)> = BTreeSet::new();
+        let mut cur_phys = String::from("0");
+        let mut cur_core: Option<String> = None;
+        let mut cpu_cores_fallback: Option<u32> = None;
+
+        for line in text.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                if let Some(core) = cur_core.take() {
+                    pairs.insert((cur_phys.clone(), core));
+                }
+                cur_phys = String::from("0");
+                continue;
+            }
+            if let Some((key, val)) = trimmed.split_once(':') {
+                let k = key.trim();
+                let v = val.trim();
+                if k == "physical id" {
+                    cur_phys = v.to_string();
+                } else if k == "core id" {
+                    cur_core = Some(v.to_string());
+                } else if k == "cpu cores"
+                    && let Ok(n) = v.parse::<u32>()
+                    && n > 0
+                {
+                    cpu_cores_fallback = Some(cpu_cores_fallback.map_or(n, |cur| cur.max(n)));
+                }
+            }
+        }
+        if let Some(core) = cur_core {
+            pairs.insert((cur_phys, core));
+        }
+        if !pairs.is_empty() {
+            return u32::try_from(pairs.len()).ok();
+        }
+        cpu_cores_fallback
+    }
+
+    #[must_use]
+    pub fn max_threads(self) -> u32 {
+        self.logical_cpus.clamp(1, 256)
+    }
+
+    /// Maximum safe UCI Hash ceiling leaving headroom for the OS and GUI.
+    #[must_use]
+    pub fn max_hash_mb(self) -> u32 {
+        ((f64::from(self.total_ram_mb) * 0.88).round() as u32).clamp(256, 131_072)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn read_proc_meminfo_mb() -> Option<u32> {
+    let text = fs::read_to_string("/proc/meminfo").ok()?;
+    SystemHardware::parse_meminfo_mb(&text)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_proc_meminfo_mb() -> Option<u32> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn read_physical_cores() -> Option<u32> {
+    let text = fs::read_to_string("/proc/cpuinfo").ok()?;
+    SystemHardware::parse_cpuinfo_physical_cores(&text)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_physical_cores() -> Option<u32> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn detect_gpu_kind() -> GpuKind {
+    let Ok(entries) = fs::read_dir("/sys/class/drm") else {
+        return GpuKind::None;
+    };
+    let mut best = GpuKind::None;
+    for entry in entries.flatten() {
+        let vendor_path = entry.path().join("device").join("vendor");
+        let Ok(vendor) = fs::read_to_string(vendor_path) else {
+            continue;
+        };
+        let kind = match vendor.trim().to_ascii_lowercase().as_str() {
+            "0x10de" => GpuKind::Nvidia,
+            "0x1002" => GpuKind::Amd,
+            "0x8086" => GpuKind::Intel,
+            _ => GpuKind::Other,
+        };
+        best = match (best, kind) {
+            (GpuKind::Nvidia, _) | (_, GpuKind::Nvidia) => GpuKind::Nvidia,
+            (GpuKind::Amd, _) | (_, GpuKind::Amd) => GpuKind::Amd,
+            (GpuKind::Intel, _) | (_, GpuKind::Intel) => GpuKind::Intel,
+            (GpuKind::Other, _) | (_, GpuKind::Other) => GpuKind::Other,
+            _ => GpuKind::None,
+        };
+    }
+    best
+}
+
+#[cfg(target_os = "macos")]
+fn detect_gpu_kind() -> GpuKind {
+    if cfg!(target_arch = "aarch64") {
+        GpuKind::Apple
+    } else {
+        GpuKind::Other
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn detect_gpu_kind() -> GpuKind {
+    GpuKind::None
+}
+
+/// Engine compute architecture profile for smart multi-engine resource allocation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EngineComputeProfile {
+    /// Traditional CPU alpha-beta search (Stockfish, Berserk, Koivisto, Ethereal, ...).
+    CpuAlphaBeta,
+    /// GPU neural-net MCTS search (Leela Chess Zero / Lc0, Ceres) needing few CPU feeder
+    /// threads and modest tree/NNCache RAM so CPU engines can keep physical cores + TT Hash.
+    GpuNeural,
+}
+
+impl EngineComputeProfile {
+    #[must_use]
+    pub fn detect(path: &str, label: Option<&str>) -> Self {
+        let file_stem = Path::new(path)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(path)
+            .to_ascii_lowercase();
+        let label_lower = label.unwrap_or("").to_ascii_lowercase();
+        if file_stem.contains("lc0")
+            || file_stem.contains("leela")
+            || file_stem.contains("ceres")
+            || label_lower.contains("lc0")
+            || label_lower.contains("leela")
+            || label_lower.contains("ceres")
+        {
+            Self::GpuNeural
+        } else {
+            Self::CpuAlphaBeta
+        }
+    }
+}
+
+/// Largest power of two at most `mb`, clamped to `[16, 131_072]`.
+#[must_use]
+pub fn floor_power_of_two_mb(mb: u32) -> u32 {
+    let clamped = mb.clamp(16, 131_072);
+    1u32 << (31 - clamped.leading_zeros())
+}
+
+/// Hardware-scaled analysis presets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EnginePreset {
+    Light,
+    Balanced,
+    Performance,
+}
+
+impl EnginePreset {
+    pub const ALL: [Self; 3] = [Self::Light, Self::Balanced, Self::Performance];
+
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Light => "Light",
+            Self::Balanced => "Balanced",
+            Self::Performance => "Performance",
+        }
+    }
+
+    /// Compute `(threads, hash_mb)` tailored to `hw`, keeping Hash at a clean power of 2.
+    #[must_use]
+    pub fn compute(self, hw: SystemHardware) -> (u32, u32) {
+        let max_t = hw.max_threads();
+        let max_h = hw.max_hash_mb();
+        match self {
+            Self::Light => {
+                let threads = (hw.logical_cpus / 4).clamp(1, max_t);
+                let hash = floor_power_of_two_mb((hw.total_ram_mb / 16).clamp(64, 2048)).min(max_h);
+                (threads, hash.max(16))
+            }
+            Self::Balanced => {
+                let threads = (hw.logical_cpus / 2).clamp(1, max_t);
+                let hash = floor_power_of_two_mb((hw.total_ram_mb / 6).clamp(128, 8192)).min(max_h);
+                (threads, hash.max(16))
+            }
+            Self::Performance => {
+                let threads = if hw.logical_cpus > 2 {
+                    hw.logical_cpus - 2
+                } else {
+                    hw.logical_cpus
+                }
+                .clamp(1, max_t);
+                let raw_hash = ((u64::from(hw.total_ram_mb) * 55) / 100) as u32;
+                let hash = floor_power_of_two_mb(raw_hash.clamp(256, max_h)).min(max_h);
+                (threads, hash.max(16))
+            }
+        }
+    }
+
+    /// Compute single-engine `(threads, hash_mb)` aware of CPU vs GPU-neural architecture.
+    #[must_use]
+    pub fn compute_for_profile(
+        self,
+        hw: SystemHardware,
+        profile: EngineComputeProfile,
+    ) -> (u32, u32) {
+        match profile {
+            EngineComputeProfile::CpuAlphaBeta => self.compute(hw),
+            EngineComputeProfile::GpuNeural => {
+                let max_t = hw.max_threads();
+                let max_h = hw.max_hash_mb();
+                let (threads, desired_hash) = match self {
+                    EnginePreset::Light => (1, 64),
+                    EnginePreset::Balanced => (if hw.logical_cpus <= 2 { 1 } else { 2 }, 256),
+                    EnginePreset::Performance => {
+                        let t = if hw.physical_cores >= 16 { 3 } else if hw.logical_cpus <= 2 { 1 } else { 2 };
+                        let h = if hw.gpu_kind.has_discrete_vram() && hw.total_ram_mb >= 30_000 {
+                            1024
+                        } else if hw.total_ram_mb >= 16_000 {
+                            512
+                        } else {
+                            256
+                        };
+                        (t, h)
+                    }
+                };
+                (
+                    threads.clamp(1, max_t),
+                    floor_power_of_two_mb(desired_hash).min(max_h).max(16),
+                )
+            }
+        }
+    }
+
+    /// Allocate `(slot_idx, threads, hash_mb)` across simultaneously active engines so
+    /// heterogeneous setups (e.g. Lc0 GPU + Stockfish CPU) give each what it needs rather
+    /// than oversubscribing CPU cores or giving Lc0 half of system RAM.
+    #[must_use]
+    pub fn allocate_for_slots(
+        self,
+        hw: SystemHardware,
+        slots: &[(usize, EngineComputeProfile)],
+    ) -> Vec<(usize, u32, u32)> {
+        if slots.is_empty() {
+            return Vec::new();
+        }
+        if slots.len() == 1 {
+            let (idx, profile) = slots[0];
+            let (t, h) = self.compute_for_profile(hw, profile);
+            return vec![(idx, t, h)];
+        }
+
+        let (total_t_budget, total_h_budget) = self.compute(hw);
+        let cpu_count = slots
+            .iter()
+            .filter(|(_, p)| *p == EngineComputeProfile::CpuAlphaBeta)
+            .count() as u32;
+        let gpu_count = slots.len() as u32 - cpu_count;
+
+        let mut allocations: HashMap<usize, (u32, u32)> = HashMap::new();
+        let mut used_t = 0u32;
+        let mut used_h = 0u32;
+
+        // Pass 1: Give GPU neural engines lean CPU feeder threads + right-sized NNCache/tree hash.
+        for &(idx, profile) in slots {
+            if profile == EngineComputeProfile::GpuNeural {
+                let (mut gt, mut gh) = self.compute_for_profile(hw, EngineComputeProfile::GpuNeural);
+                if gpu_count > 1 {
+                    gt = 1;
+                    gh = floor_power_of_two_mb((gh / gpu_count).max(64));
+                }
+                if cpu_count > 0 && gt >= total_t_budget {
+                    gt = 1;
+                }
+                used_t = used_t.saturating_add(gt);
+                used_h = used_h.saturating_add(gh);
+                allocations.insert(idx, (gt, gh));
+            }
+        }
+
+        // Pass 2: Distribute remaining thread & hash budgets evenly across CPU alpha-beta engines.
+        if cpu_count > 0 {
+            let rem_t = total_t_budget.saturating_sub(used_t).max(cpu_count);
+            let rem_h = total_h_budget.saturating_sub(used_h).max(cpu_count * 64);
+            let base_t = (rem_t / cpu_count).max(1);
+            let extra_t = rem_t % cpu_count;
+            let per_h = floor_power_of_two_mb((rem_h / cpu_count).max(64))
+                .min(hw.max_hash_mb())
+                .max(16);
+            let mut cpu_ordinal = 0u32;
+            for &(idx, profile) in slots {
+                if profile == EngineComputeProfile::CpuAlphaBeta {
+                    let t = base_t + u32::from(cpu_ordinal < extra_t);
+                    allocations.insert(idx, (t.min(hw.max_threads()), per_h));
+                    cpu_ordinal += 1;
+                }
+            }
+        }
+
+        slots
+            .iter()
+            .map(|&(idx, _)| {
+                let (t, h) = allocations.get(&idx).copied().unwrap_or((1, 64));
+                (idx, t, h)
+            })
+            .collect()
     }
 }
 
@@ -42,8 +502,16 @@ impl EngineSlotConfig {
     pub fn options(&self) -> EngineOptions {
         EngineOptions {
             threads: self.threads.clamp(1, 256),
-            hash_mb: self.hash_mb.clamp(1, 32_768),
+            hash_mb: self.hash_mb.clamp(1, 131_072),
         }
+    }
+
+    #[must_use]
+    pub fn is_configured(&self, slot_idx: usize) -> bool {
+        self.path
+            .as_ref()
+            .is_some_and(|p| !p.as_os_str().is_empty())
+            || (slot_idx == 0 && self.enabled)
     }
 }
 
@@ -59,8 +527,8 @@ pub struct EnginePrefs {
     pub cache_engine_analysis: bool,
     /// Whether fine-grained Stockfish quality comparison is used to supersede entries.
     pub heuristic_supersede: bool,
-    /// Up to 3 parallel engine slots, bound to hotkeys 1, 2, 3.
-    pub engines: [EngineSlotConfig; 3],
+    /// Configured local engine slots (arbitrarily many).
+    pub engines: Vec<EngineSlotConfig>,
 }
 
 impl Default for EnginePrefs {
@@ -71,26 +539,13 @@ impl Default for EnginePrefs {
             hash_mb: 16,
             cache_engine_analysis: true,
             heuristic_supersede: true,
-            engines: [
-                EngineSlotConfig {
-                    path: None,
-                    threads: 1,
-                    hash_mb: 16,
-                    enabled: true,
-                },
-                EngineSlotConfig {
-                    path: None,
-                    threads: 1,
-                    hash_mb: 16,
-                    enabled: false,
-                },
-                EngineSlotConfig {
-                    path: None,
-                    threads: 1,
-                    hash_mb: 16,
-                    enabled: false,
-                },
-            ],
+            engines: vec![EngineSlotConfig {
+                path: None,
+                label: None,
+                threads: 1,
+                hash_mb: 16,
+                enabled: true,
+            }],
         }
     }
 }
@@ -103,16 +558,13 @@ impl EnginePrefs {
         cache_engine_analysis: bool,
         heuristic_supersede: bool,
     ) -> Self {
-        let engines = [
-            EngineSlotConfig {
-                path: path.clone(),
-                threads,
-                hash_mb,
-                enabled: true,
-            },
-            EngineSlotConfig::default(),
-            EngineSlotConfig::default(),
-        ];
+        let engines = vec![EngineSlotConfig {
+            path: path.clone(),
+            label: None,
+            threads,
+            hash_mb,
+            enabled: true,
+        }];
         Self {
             path,
             threads,
@@ -124,15 +576,21 @@ impl EnginePrefs {
     }
 
     pub fn resolved_path(&self) -> PathBuf {
-        self.engines[0]
-            .path
-            .clone()
+        self.engines
+            .first()
+            .and_then(|slot| slot.path.clone())
             .or_else(|| self.path.clone())
             .unwrap_or_else(crate::engine::default_engine_path)
     }
 
     pub fn options(&self) -> EngineOptions {
-        self.engines[0].options()
+        self.engines.first().map_or(
+            EngineOptions {
+                threads: self.threads.clamp(1, 256),
+                hash_mb: self.hash_mb.clamp(1, 131_072),
+            },
+            EngineSlotConfig::options,
+        )
     }
 
     /// Parse a config file. Unknown or malformed fields fall back to defaults;
@@ -164,25 +622,21 @@ impl EnginePrefs {
             .and_then(Value::as_bool)
             .unwrap_or(true);
 
-        let mut engines = [
-            EngineSlotConfig {
-                path: path.clone(),
-                threads,
-                hash_mb,
-                enabled: true,
-            },
-            EngineSlotConfig::default(),
-            EngineSlotConfig::default(),
-        ];
-
+        let mut engines = Vec::new();
         if let Some(arr) = value.get("engines").and_then(Value::as_array) {
-            for (i, item) in arr.iter().take(3).enumerate() {
+            for (i, item) in arr.iter().enumerate() {
                 let p = item
                     .get("path")
                     .and_then(Value::as_str)
                     .map(str::trim)
                     .filter(|p| !p.is_empty())
                     .map(PathBuf::from);
+                let label = item
+                    .get("label")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string);
                 let t = item
                     .get("threads")
                     .and_then(Value::as_u64)
@@ -192,18 +646,39 @@ impl EnginePrefs {
                     .get("hash_mb")
                     .and_then(Value::as_u64)
                     .unwrap_or(16)
-                    .clamp(1, 32_768) as u32;
+                    .clamp(1, 131_072) as u32;
                 let en = item
                     .get("enabled")
                     .and_then(Value::as_bool)
                     .unwrap_or(i == 0);
-                engines[i] = EngineSlotConfig {
+                engines.push(EngineSlotConfig {
                     path: p,
+                    label,
                     threads: t,
                     hash_mb: h,
                     enabled: en,
-                };
+                });
             }
+            // Trim trailing completely unconfigured placeholders migrated from the old fixed 3-slot schema.
+            while engines.len() > 1 {
+                let Some(last) = engines.last() else {
+                    break;
+                };
+                if last.path.is_none() && last.label.is_none() && !last.enabled {
+                    engines.pop();
+                } else {
+                    break;
+                }
+            }
+        }
+        if engines.is_empty() {
+            engines.push(EngineSlotConfig {
+                path: path.clone(),
+                label: None,
+                threads,
+                hash_mb,
+                enabled: true,
+            });
         }
 
         Self {
@@ -223,6 +698,7 @@ impl EnginePrefs {
             .map(|e| {
                 json!({
                     "path": e.path.as_ref().map(|path| path.display().to_string()),
+                    "label": e.label,
                     "threads": e.threads,
                     "hash_mb": e.hash_mb,
                     "enabled": e.enabled,
@@ -246,13 +722,9 @@ impl EnginePrefs {
     }
 
     fn load_from(path: &std::path::Path) -> Self {
-        match fs::read_to_string(path) {
-            Ok(text) => Self::from_json(&text),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Self::default(),
-            Err(err) => {
-                tracing::warn!("could not read {}: {err:#}", path.display());
-                Self::default()
-            }
+        match read_with_backup_json(path) {
+            Some(text) => Self::from_json(&text),
+            None => Self::default(),
         }
     }
 
@@ -262,11 +734,7 @@ impl EnginePrefs {
     }
 
     fn save_to(&self, path: &std::path::Path) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
-        }
-        fs::write(path, self.to_json()).with_context(|| format!("writing {}", path.display()))?;
-        Ok(())
+        write_atomic_with_backup(path, &self.to_json())
     }
 }
 
@@ -339,6 +807,10 @@ pub struct PreparationPrefs {
     pub prep_include_online: bool,
     /// Default preparation panel mode.
     pub prep_mode: PrepMode,
+    /// Temporary disk cache for compiled preparation playerbases (enabled by default).
+    pub prep_cache_enabled: bool,
+    /// Expiry TTL in hours for cached preparation playerbases (default 48h).
+    pub prep_cache_ttl_hours: u32,
     /// Online accounts per prepared player, keyed by canonical player key.
     pub prep_online_accounts:
         std::collections::HashMap<String, Vec<crate::players::PrepOnlineAccount>>,
@@ -359,6 +831,8 @@ impl Default for PreparationPrefs {
             reference_setup_dismissed: false,
             prep_include_online: true,
             prep_mode: PrepMode::default(),
+            prep_cache_enabled: true,
+            prep_cache_ttl_hours: 48,
             prep_online_accounts: std::collections::HashMap::new(),
         }
     }
@@ -432,6 +906,15 @@ impl PreparationPrefs {
             .and_then(Value::as_str)
             .map(PrepMode::from_config)
             .unwrap_or_default();
+        let prep_cache_enabled = value
+            .get("prep_cache_enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        let prep_cache_ttl_hours = value
+            .get("prep_cache_ttl_hours")
+            .and_then(Value::as_u64)
+            .unwrap_or(48)
+            .clamp(1, 168) as u32;
         let prep_online_accounts = value
             .get("prep_online_accounts")
             .and_then(Value::as_object)
@@ -466,6 +949,8 @@ impl PreparationPrefs {
             reference_setup_dismissed,
             prep_include_online,
             prep_mode,
+            prep_cache_enabled,
+            prep_cache_ttl_hours,
             prep_online_accounts,
         }
     }
@@ -495,6 +980,8 @@ impl PreparationPrefs {
             "reference_setup_dismissed": self.reference_setup_dismissed,
             "prep_include_online": self.prep_include_online,
             "prep_mode": self.prep_mode.config_value(),
+            "prep_cache_enabled": self.prep_cache_enabled,
+            "prep_cache_ttl_hours": self.prep_cache_ttl_hours,
             "prep_online_accounts": accounts,
         }))
         .unwrap_or_default()
@@ -505,13 +992,9 @@ impl PreparationPrefs {
     }
 
     fn load_from(path: &std::path::Path) -> Self {
-        match fs::read_to_string(path) {
-            Ok(text) => Self::from_json(&text),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Self::default(),
-            Err(err) => {
-                tracing::warn!("could not read {}: {err:#}", path.display());
-                Self::default()
-            }
+        match read_with_backup_json(path) {
+            Some(text) => Self::from_json(&text),
+            None => Self::default(),
         }
     }
 
@@ -521,11 +1004,7 @@ impl PreparationPrefs {
     }
 
     fn save_to(&self, path: &std::path::Path) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
-        }
-        fs::write(path, self.to_json()).with_context(|| format!("writing {}", path.display()))?;
-        Ok(())
+        write_atomic_with_backup(path, &self.to_json())
     }
 }
 
@@ -784,7 +1263,20 @@ pub struct DisplayPrefs {
     /// Folder of the last game exported for printing, used as the initial
     /// location for print exports.
     pub last_print_dir: Option<PathBuf>,
-    /// Last 5 loaded databases or opening books.
+    /// Default database format when creating new databases or saving without an
+    /// active format (`"2cbh"`, `"si4"`, `"cbh"`, `"pgn"`).
+    pub default_database_format: String,
+    /// Height in logical pixels of the Recent games box in the Prep panel.
+    pub prep_recent_games_height: u32,
+    /// Multi-section right panel layout toggle.
+    pub multi_view: bool,
+    /// Visible right-panel tab labels when `multi_view` is enabled.
+    pub visible_tab_names: Vec<String>,
+    /// Database paths kept open on the Open Databases shelf across sessions.
+    pub open_shelf_paths: Vec<PathBuf>,
+    /// Last TWIC weekly issue number fetched via Download from TWIC.
+    pub last_twic_issue: Option<u32>,
+    /// Last 15 loaded databases or opening books.
     pub recent_files: Vec<PathBuf>,
     /// Maximum number of recent preparation games shown for a position.
     pub prep_recent_limit: usize,
@@ -852,6 +1344,12 @@ impl Default for DisplayPrefs {
             opening_book_path: String::new(),
             last_database_dir: None,
             last_print_dir: None,
+            default_database_format: "2cbh".to_string(),
+            prep_recent_games_height: 260,
+            multi_view: false,
+            visible_tab_names: vec!["Moves".to_string()],
+            open_shelf_paths: Vec::new(),
+            last_twic_issue: None,
             recent_files: Vec::new(),
             prep_recent_limit: 10,
             show_empty_pgn_tags: false,
@@ -940,6 +1438,60 @@ impl DisplayPrefs {
             .map(str::trim)
             .filter(|path| !path.is_empty())
             .map(PathBuf::from);
+        let default_database_format = match value
+            .get("default_database_format")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            Some("si4" | "scid") => "si4",
+            Some("cbh") => "cbh",
+            Some("pgn") => "pgn",
+            _ => "2cbh",
+        }
+        .to_string();
+        let prep_recent_games_height = value
+            .get("prep_recent_games_height")
+            .and_then(Value::as_u64)
+            .unwrap_or(260)
+            .clamp(120, 900) as u32;
+        let multi_view = value
+            .get("multi_view")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let visible_tab_names = value
+            .get("visible_tab_names")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .take(8)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .filter(|v: &Vec<String>| !v.is_empty())
+            .unwrap_or_else(|| vec!["Moves".to_string()]);
+        let open_shelf_paths = value
+            .get("open_shelf_paths")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::trim)
+                    .filter(|path| !path.is_empty())
+                    .map(PathBuf::from)
+                    .take(8)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let last_twic_issue = value
+            .get("last_twic_issue")
+            .and_then(Value::as_u64)
+            .and_then(|v| u32::try_from(v).ok())
+            .filter(|&v| v > 0);
         let recent_files = value
             .get("recent_files")
             .and_then(Value::as_array)
@@ -949,7 +1501,7 @@ impl DisplayPrefs {
                     .map(str::trim)
                     .filter(|path| !path.is_empty())
                     .map(PathBuf::from)
-                    .take(5)
+                    .take(15)
                     .collect()
             })
             .unwrap_or_default();
@@ -1109,6 +1661,12 @@ impl DisplayPrefs {
             opening_book_path,
             last_database_dir,
             last_print_dir,
+            default_database_format,
+            prep_recent_games_height,
+            multi_view,
+            visible_tab_names,
+            open_shelf_paths,
+            last_twic_issue,
             recent_files,
             prep_recent_limit,
             show_empty_pgn_tags,
@@ -1137,39 +1695,87 @@ impl DisplayPrefs {
     }
 
     pub fn to_json(&self) -> String {
-        serde_json::to_string_pretty(&json!({
-            "rating_priority": self.rating_priority.config_value(),
-            "show_all_ratings": self.show_all_ratings,
-            "engine_view": self.engine_view,
-            "engine_auto": self.engine_auto,
-            "opening_tree_path": self.opening_tree_path,
-            "opening_book_path": self.opening_book_path,
-            "last_database_dir": self.last_database_dir.as_ref().map(|path| path.display().to_string()),
-            "last_print_dir": self.last_print_dir.as_ref().map(|path| path.display().to_string()),
-            "recent_files": self.recent_files.iter().map(|path| path.display().to_string()).collect::<Vec<_>>(),
-            "prep_recent_limit": self.prep_recent_limit,
-            "show_empty_pgn_tags": self.show_empty_pgn_tags,
-            "hover_moves": self.hover_moves,
-            "show_player_photos": self.show_player_photos,
-            "photo_size": self.photo_size.config_value(),
-            "champion_lineage": self.champion_lineage.config_value(),
-            "show_nav_buttons": self.show_nav_buttons,
-            "show_pgn_tags": self.show_pgn_tags,
-            "show_annotations": self.show_annotations,
-            "show_clocks": self.show_clocks,
-            "engine_bar": self.engine_bar,
-            "review_skip_book": self.review_skip_book,
-            "review_book_min_games": self.review_book_min_games,
-            "review_book_max_plies": self.review_book_max_plies,
-            "trend_window": self.trend_window.config_value(),
-            "trend_baseline": self.trend_baseline.config_value(),
-            "trend_min_games": self.trend_min_games,
-            "trend_source": self.trend_source.config_value(),
-            "engine_limit_mode": self.engine_limit_mode,
-            "engine_depth": self.engine_depth,
-            "engine_time_ms": self.engine_time_ms,
-            "prep_filter_facing_color": self.prep_filter_facing_color,
-            "category_colors": {
+        let mut map = serde_json::Map::new();
+        map.insert(
+            "rating_priority".to_string(),
+            json!(self.rating_priority.config_value()),
+        );
+        map.insert("show_all_ratings".to_string(), json!(self.show_all_ratings));
+        map.insert("engine_view".to_string(), json!(self.engine_view));
+        map.insert("engine_auto".to_string(), json!(self.engine_auto));
+        map.insert("opening_tree_path".to_string(), json!(self.opening_tree_path));
+        map.insert("opening_book_path".to_string(), json!(self.opening_book_path));
+        map.insert(
+            "last_database_dir".to_string(),
+            json!(self.last_database_dir.as_ref().map(|path| path.display().to_string())),
+        );
+        map.insert(
+            "last_print_dir".to_string(),
+            json!(self.last_print_dir.as_ref().map(|path| path.display().to_string())),
+        );
+        map.insert(
+            "default_database_format".to_string(),
+            json!(self.default_database_format),
+        );
+        map.insert(
+            "prep_recent_games_height".to_string(),
+            json!(self.prep_recent_games_height.clamp(120, 900)),
+        );
+        map.insert("multi_view".to_string(), json!(self.multi_view));
+        map.insert("visible_tab_names".to_string(), json!(self.visible_tab_names));
+        map.insert(
+            "open_shelf_paths".to_string(),
+            json!(
+                self.open_shelf_paths
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+            ),
+        );
+        map.insert("last_twic_issue".to_string(), json!(self.last_twic_issue));
+        map.insert(
+            "recent_files".to_string(),
+            json!(
+                self.recent_files
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+            ),
+        );
+        map.insert("prep_recent_limit".to_string(), json!(self.prep_recent_limit));
+        map.insert("show_empty_pgn_tags".to_string(), json!(self.show_empty_pgn_tags));
+        map.insert("hover_moves".to_string(), json!(self.hover_moves));
+        map.insert("show_player_photos".to_string(), json!(self.show_player_photos));
+        map.insert("photo_size".to_string(), json!(self.photo_size.config_value()));
+        map.insert(
+            "champion_lineage".to_string(),
+            json!(self.champion_lineage.config_value()),
+        );
+        map.insert("show_nav_buttons".to_string(), json!(self.show_nav_buttons));
+        map.insert("show_pgn_tags".to_string(), json!(self.show_pgn_tags));
+        map.insert("show_annotations".to_string(), json!(self.show_annotations));
+        map.insert("show_clocks".to_string(), json!(self.show_clocks));
+        map.insert("engine_bar".to_string(), json!(self.engine_bar));
+        map.insert("review_skip_book".to_string(), json!(self.review_skip_book));
+        map.insert("review_book_min_games".to_string(), json!(self.review_book_min_games));
+        map.insert("review_book_max_plies".to_string(), json!(self.review_book_max_plies));
+        map.insert("trend_window".to_string(), json!(self.trend_window.config_value()));
+        map.insert(
+            "trend_baseline".to_string(),
+            json!(self.trend_baseline.config_value()),
+        );
+        map.insert("trend_min_games".to_string(), json!(self.trend_min_games));
+        map.insert("trend_source".to_string(), json!(self.trend_source.config_value()));
+        map.insert("engine_limit_mode".to_string(), json!(self.engine_limit_mode));
+        map.insert("engine_depth".to_string(), json!(self.engine_depth));
+        map.insert("engine_time_ms".to_string(), json!(self.engine_time_ms));
+        map.insert(
+            "prep_filter_facing_color".to_string(),
+            json!(self.prep_filter_facing_color),
+        );
+        map.insert(
+            "category_colors".to_string(),
+            json!({
                 "otb_classical": rgb_to_hex(self.category_colors.otb_classical),
                 "otb_rapid": rgb_to_hex(self.category_colors.otb_rapid),
                 "otb_blitz": rgb_to_hex(self.category_colors.otb_blitz),
@@ -1179,9 +1785,9 @@ impl DisplayPrefs {
                 "online_bullet": rgb_to_hex(self.category_colors.online_bullet),
                 "correspondence": rgb_to_hex(self.category_colors.correspondence),
                 "unknown": rgb_to_hex(self.category_colors.unknown),
-            },
-        }))
-        .unwrap_or_default()
+            }),
+        );
+        serde_json::to_string_pretty(&Value::Object(map)).unwrap_or_default()
     }
 
     pub fn load() -> Self {
@@ -1189,22 +1795,15 @@ impl DisplayPrefs {
     }
 
     fn load_from(path: &std::path::Path) -> Self {
-        match fs::read_to_string(path) {
-            Ok(text) => Self::from_json(&text),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Self::default(),
-            Err(err) => {
-                tracing::warn!("could not read {}: {err:#}", path.display());
-                Self::default()
-            }
+        match read_with_backup_json(path) {
+            Some(text) => Self::from_json(&text),
+            None => Self::default(),
         }
     }
 
     pub fn save(&self) -> Result<()> {
         let path = display_path().context("no XDG config or HOME directory is available")?;
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
-        }
-        fs::write(&path, self.to_json()).with_context(|| format!("writing {}", path.display()))
+        write_atomic_with_backup(&path, &self.to_json())
     }
 }
 
@@ -1299,11 +1898,7 @@ impl CloudPrefs {
 
     pub fn save(&self) -> Result<()> {
         let path = cloud_path().context("no XDG config or HOME directory is available")?;
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
-        }
-        fs::write(&path, self.to_json()).with_context(|| format!("writing {}", path.display()))?;
-        Ok(())
+        write_atomic_with_backup(&path, &self.to_json())
     }
 
     /// Persist only the explorer choice, leaving the token from the config
@@ -1311,61 +1906,42 @@ impl CloudPrefs {
     /// disk just because the corpus was changed.
     pub fn save_explorer_source(source: crate::cloud::ExplorerSource) -> Result<()> {
         let path = cloud_path().context("no XDG config or HOME directory is available")?;
-        let mut prefs = match fs::read_to_string(&path) {
-            Ok(text) => Self::from_json(&text),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Self::default(),
-            Err(err) => return Err(err).with_context(|| format!("reading {}", path.display())),
-        };
+        let mut prefs = read_with_backup_json(&path)
+            .map(|text| Self::from_json(&text))
+            .unwrap_or_default();
         prefs.explorer_source = source;
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
-        }
-        fs::write(&path, prefs.to_json()).with_context(|| format!("writing {}", path.display()))
+        write_atomic_with_backup(&path, &prefs.to_json())
     }
 
     /// Persist only the Wikipedia-summary choice, leaving credentials and the
     /// explorer choice untouched.
     pub fn save_wikipedia_summaries(enabled: bool) -> Result<()> {
         let path = cloud_path().context("no XDG config or HOME directory is available")?;
-        let mut prefs = match fs::read_to_string(&path) {
-            Ok(text) => Self::from_json(&text),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Self::default(),
-            Err(err) => return Err(err).with_context(|| format!("reading {}", path.display())),
-        };
+        let mut prefs = read_with_backup_json(&path)
+            .map(|text| Self::from_json(&text))
+            .unwrap_or_default();
         prefs.wikipedia_summaries = enabled;
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
-        }
-        fs::write(&path, prefs.to_json()).with_context(|| format!("writing {}", path.display()))
+        write_atomic_with_backup(&path, &prefs.to_json())
     }
 
     /// Persist only the Lichess token, leaving the explorer and account
     /// choices untouched. Passing `None` removes the token from the file.
     pub fn save_token(token: Option<&str>) -> Result<()> {
         let path = cloud_path().context("no XDG config or HOME directory is available")?;
-        let mut prefs = match fs::read_to_string(&path) {
-            Ok(text) => Self::from_json(&text),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Self::default(),
-            Err(err) => return Err(err).with_context(|| format!("reading {}", path.display())),
-        };
+        let mut prefs = read_with_backup_json(&path)
+            .map(|text| Self::from_json(&text))
+            .unwrap_or_default();
         prefs.lichess_token = token
             .map(str::trim)
             .filter(|token| !token.is_empty())
             .map(str::to_string);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
-        }
-        fs::write(&path, prefs.to_json()).with_context(|| format!("writing {}", path.display()))
+        write_atomic_with_backup(&path, &prefs.to_json())
     }
 
     fn load_from(path: &std::path::Path) -> Self {
-        match fs::read_to_string(path) {
-            Ok(text) => Self::from_json(&text),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Self::default(),
-            Err(err) => {
-                tracing::warn!("could not read {}: {err:#}", path.display());
-                Self::default()
-            }
+        match read_with_backup_json(path) {
+            Some(text) => Self::from_json(&text),
+            None => Self::default(),
         }
     }
 }
@@ -1390,16 +1966,22 @@ pub fn display_path() -> Option<PathBuf> {
     config_dir().map(|path| path.join("display.json"))
 }
 
-fn config_dir() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .filter(|path| !path.as_os_str().is_empty())
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .map(|home| home.join(".config"))
-        })?;
-    Some(base.join("brett"))
+pub fn config_dir() -> Option<PathBuf> {
+    #[cfg(test)]
+    {
+        Some(std::env::temp_dir().join(format!("brett-test-config-{}", std::process::id())))
+    }
+    #[cfg(not(test))]
+    {
+        if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .filter(|path| !path.as_os_str().is_empty())
+        {
+            return Some(xdg.join("brett"));
+        }
+        let home = std::env::var_os("HOME").map(PathBuf::from)?;
+        Some(home.join(".config").join("brett"))
+    }
 }
 
 /// Unified bundle containing all configuration files for seamless migration
@@ -1518,35 +2100,108 @@ mod tests {
     #[test]
     fn engine_slots_round_trip() {
         let mut prefs = EnginePrefs::default();
-        prefs.engines[0] = EngineSlotConfig {
-            path: Some(PathBuf::from("/usr/bin/stockfish")),
-            threads: 4,
-            hash_mb: 256,
-            enabled: true,
-        };
-        prefs.engines[1] = EngineSlotConfig {
-            path: Some(PathBuf::from("/usr/bin/lc0")),
-            threads: 2,
-            hash_mb: 128,
-            enabled: true,
-        };
-        prefs.engines[2] = EngineSlotConfig {
-            path: Some(PathBuf::from("/usr/bin/komodo")),
-            threads: 2,
-            hash_mb: 64,
-            enabled: false,
-        };
+        prefs.engines = vec![
+            EngineSlotConfig {
+                path: Some(PathBuf::from("/usr/bin/stockfish")),
+                label: Some("SF 17".to_string()),
+                threads: 4,
+                hash_mb: 256,
+                enabled: true,
+            },
+            EngineSlotConfig {
+                path: Some(PathBuf::from("/usr/bin/lc0")),
+                label: None,
+                threads: 2,
+                hash_mb: 128,
+                enabled: true,
+            },
+            EngineSlotConfig {
+                path: Some(PathBuf::from("/usr/bin/komodo")),
+                label: None,
+                threads: 2,
+                hash_mb: 64,
+                enabled: false,
+            },
+            EngineSlotConfig {
+                path: Some(PathBuf::from("/usr/bin/berserk")),
+                label: Some("Berserk 13".to_string()),
+                threads: 6,
+                hash_mb: 1024,
+                enabled: true,
+            },
+        ];
         let json = prefs.to_json();
         let loaded = EnginePrefs::from_json(&json);
         assert_eq!(loaded, prefs);
-        assert_eq!(
-            loaded.engines[0].path,
-            Some(PathBuf::from("/usr/bin/stockfish"))
-        );
-        assert!(loaded.engines[0].enabled);
-        assert_eq!(loaded.engines[1].path, Some(PathBuf::from("/usr/bin/lc0")));
-        assert!(loaded.engines[1].enabled);
+        assert_eq!(loaded.engines.len(), 4);
+        assert_eq!(loaded.engines[3].label.as_deref(), Some("Berserk 13"));
         assert!(!loaded.engines[2].enabled);
+    }
+
+    #[test]
+    fn system_hardware_presets_use_power_of_two_hash_and_tailored_threads() {
+        let hw = SystemHardware {
+            logical_cpus: 12,
+            physical_cores: 10,
+            total_ram_mb: 31_729,
+            gpu_kind: GpuKind::Intel,
+        };
+        assert_eq!(EnginePreset::Light.compute(hw), (3, 1024));
+        assert_eq!(EnginePreset::Balanced.compute(hw), (6, 4096));
+        assert_eq!(EnginePreset::Performance.compute(hw), (10, 16384));
+        assert_eq!(floor_power_of_two_mb(27_728), 16_384);
+        assert!(hw.max_hash_mb() >= 27_728 && hw.max_hash_mb() < hw.total_ram_mb);
+        assert_eq!(
+            SystemHardware::parse_meminfo_mb("MemTotal:       32490840 kB\n"),
+            Some(31_729)
+        );
+    }
+
+    #[test]
+    fn cpuinfo_parser_and_heterogeneous_multi_engine_presets() {
+        let cpuinfo = "\
+processor\t: 0\nphysical id\t: 0\ncore id\t\t: 0\n\n\
+processor\t: 1\nphysical id\t: 0\ncore id\t\t: 0\n\n\
+processor\t: 2\nphysical id\t: 0\ncore id\t\t: 4\n\n\
+processor\t: 3\nphysical id\t: 0\ncore id\t\t: 4\n\n\
+processor\t: 4\nphysical id\t: 0\ncore id\t\t: 8\n";
+        assert_eq!(SystemHardware::parse_cpuinfo_physical_cores(cpuinfo), Some(3));
+
+        assert_eq!(
+            EngineComputeProfile::detect("/usr/bin/lc0", None),
+            EngineComputeProfile::GpuNeural
+        );
+        assert_eq!(
+            EngineComputeProfile::detect("/usr/bin/stockfish", None),
+            EngineComputeProfile::CpuAlphaBeta
+        );
+
+        let hw = SystemHardware {
+            logical_cpus: 12,
+            physical_cores: 10,
+            total_ram_mb: 31_729,
+            gpu_kind: GpuKind::Nvidia,
+        };
+        // Lc0 + Stockfish active together under Performance:
+        // Lc0 keeps 2 CPU feeder threads + 1024 MB NNCache, giving Stockfish 8T + 8192 MB!
+        let alloc = EnginePreset::Performance.allocate_for_slots(
+            hw,
+            &[
+                (0, EngineComputeProfile::CpuAlphaBeta),
+                (1, EngineComputeProfile::GpuNeural),
+            ],
+        );
+        assert_eq!(alloc, vec![(0, 8, 8192), (1, 2, 1024)]);
+
+        // Two CPU engines active simultaneously split budget evenly without oversubscription:
+        let dual_cpu = EnginePreset::Performance.allocate_for_slots(
+            hw,
+            &[
+                (0, EngineComputeProfile::CpuAlphaBeta),
+                (1, EngineComputeProfile::CpuAlphaBeta),
+            ],
+        );
+        assert_eq!(dual_cpu, vec![(0, 5, 8192), (1, 5, 8192)]);
     }
 
     #[test]
@@ -1575,16 +2230,21 @@ mod tests {
             reference_setup_dismissed: true,
             prep_include_online: true,
             prep_mode: PrepMode::Smart,
+            prep_cache_enabled: false,
+            prep_cache_ttl_hours: 24,
             prep_online_accounts: std::collections::HashMap::new(),
         };
         assert_eq!(PreparationPrefs::from_json(&prefs.to_json()), prefs);
+        assert!(PreparationPrefs::default().prep_cache_enabled);
+        assert_eq!(PreparationPrefs::default().prep_cache_ttl_hours, 48);
 
         let parsed = PreparationPrefs::from_json(
-            r#"{"reference_path":" /tmp/ref.pgn ","reference_enabled":true,"rating_band":9999,"rating_offset":-9999}"#,
+            r#"{"reference_path":" /tmp/ref.pgn ","reference_enabled":true,"rating_band":9999,"rating_offset":-9999,"prep_cache_ttl_hours":999}"#,
         );
         assert_eq!(parsed.reference_path, Some(PathBuf::from("/tmp/ref.pgn")));
         assert_eq!(parsed.rating_band, 1_000);
         assert_eq!(parsed.rating_offset, -1_000);
+        assert_eq!(parsed.prep_cache_ttl_hours, 168);
     }
 
     #[test]
@@ -1634,6 +2294,12 @@ mod tests {
             opening_book_path: "/tmp/perfect.abk".to_string(),
             last_database_dir: Some(PathBuf::from("/tmp/databases")),
             last_print_dir: Some(PathBuf::from("/tmp/prints")),
+            default_database_format: "si4".to_string(),
+            prep_recent_games_height: 340,
+            multi_view: true,
+            visible_tab_names: vec!["Moves".to_string(), "Engine".to_string()],
+            open_shelf_paths: vec![PathBuf::from("/tmp/my.2cbh")],
+            last_twic_issue: Some(1671),
             recent_files: vec![PathBuf::from("/tmp/game.pgn")],
             prep_recent_limit: 25,
             show_empty_pgn_tags: true,
@@ -1902,5 +2568,36 @@ mod tests {
             colors.set_color_for(cat, rgb);
             assert_eq!(colors.color_for(cat), rgb);
         }
+    }
+
+    #[test]
+    fn atomic_write_recovers_from_corrupt_primary_using_bak() {
+        let dir = std::env::temp_dir().join(format!(
+            "brett-settings-atomic-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = dir.join("display.json");
+        let first = DisplayPrefs {
+            default_database_format: "si4".to_string(),
+            last_twic_issue: Some(1660),
+            ..DisplayPrefs::default()
+        };
+        write_atomic_with_backup(&path, &first.to_json()).unwrap();
+        let second = DisplayPrefs {
+            default_database_format: "2cbh".to_string(),
+            last_twic_issue: Some(1671),
+            ..DisplayPrefs::default()
+        };
+        write_atomic_with_backup(&path, &second.to_json()).unwrap();
+        // Corrupt primary file; read_with_backup_json must recover first's valid JSON.
+        fs::write(&path, "{corrupt json").unwrap();
+        let recovered = DisplayPrefs::load_from(&path);
+        assert_eq!(recovered.last_twic_issue, Some(1660));
+        assert_eq!(recovered.default_database_format, "si4");
+        fs::remove_dir_all(dir).unwrap();
     }
 }

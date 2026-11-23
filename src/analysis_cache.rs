@@ -302,6 +302,9 @@ impl AnalysisDb {
         let conn = Connection::open(path)
             .with_context(|| format!("opening analysis database at {}", path.display()))?;
 
+        conn.busy_timeout(Duration::from_secs(5))
+            .with_context(|| format!("configuring busy_timeout at {}", path.display()))?;
+
         // WAL mode enables fast non-blocking reads and concurrent transactions.
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
@@ -332,16 +335,25 @@ impl AnalysisDb {
     }
 
     pub fn default_path() -> PathBuf {
-        if let Some(dir) = std::env::var_os("XDG_CACHE_HOME") {
-            return PathBuf::from(dir).join("brett").join("analysis.db");
-        }
-        if let Some(home) = std::env::var_os("HOME") {
-            return PathBuf::from(home)
-                .join(".cache")
-                .join("brett")
+        #[cfg(test)]
+        {
+            return std::env::temp_dir()
+                .join(format!("brett-test-analysis-{}", std::process::id()))
                 .join("analysis.db");
         }
-        std::env::temp_dir().join("brett-analysis.db")
+        #[cfg(not(test))]
+        {
+            if let Some(dir) = std::env::var_os("XDG_CACHE_HOME") {
+                return PathBuf::from(dir).join("brett").join("analysis.db");
+            }
+            if let Some(home) = std::env::var_os("HOME") {
+                return PathBuf::from(home)
+                    .join(".cache")
+                    .join("brett")
+                    .join("analysis.db");
+            }
+            std::env::temp_dir().join("brett-analysis.db")
+        }
     }
 
     pub fn open_default() -> Result<Self> {

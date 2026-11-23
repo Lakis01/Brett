@@ -49,6 +49,8 @@ struct GameSpec {
     white_elo: u16,
     black_elo: u16,
     eco: u16,
+    medals: u16,
+    vcs_flags: u32,
     mainline_moves: u8,
 }
 
@@ -120,6 +122,8 @@ impl Database {
         record[31..33].copy_from_slice(&game.white_elo.to_be_bytes());
         record[33..35].copy_from_slice(&game.black_elo.to_be_bytes());
         record[35..37].copy_from_slice(&game.eco.to_be_bytes());
+        record[37..39].copy_from_slice(&game.medals.to_be_bytes());
+        record[39..43].copy_from_slice(&game.vcs_flags.to_be_bytes());
         record[45] = game.mainline_moves;
         self.games.push(record);
         id
@@ -488,6 +492,7 @@ fn headers_entities_tree_variations_comments_and_nags() {
         black_elo: 2400,
         eco: 221 * 128,
         mainline_moves: 8,
+        ..GameSpec::default()
     });
     let path = db.finish();
 
@@ -1092,4 +1097,119 @@ fn player_entity_lookup_uses_avl_with_linear_fallback() {
         library.event_entity_stats("Test Open").map(|stat| stat.0),
         Some(0)
     );
+}
+
+#[test]
+fn game_record_meta_medals_vcs_and_scan_mainline_positions_match_load() {
+    use crate::library::{medals, vcs_flags};
+    use crate::search::{PositionQuery, search_library};
+    use std::sync::atomic::AtomicBool;
+
+    let mut db = Database::new();
+    let mut moves = Compact::new(&tables::MODE_0, true);
+    moves.mv("e2", "e4");
+    moves.mv("e7", "e5");
+    moves.mv("g1", "f3");
+    moves.mv("b8", "c6");
+    moves.start_variation();
+    moves.mv("f1", "c4");
+    moves.mv("f8", "c5");
+    moves.end_line();
+    moves.mv("f1", "b5");
+    moves.mv("a7", "a6");
+    db.add(GameSpec {
+        cbh_flags: 0x01,
+        cbg_flags: 0x00,
+        body: moves.finish(),
+        date: date(2025, 6, 15),
+        result: 2,
+        white_elo: 2650,
+        black_elo: 2610,
+        medals: medals::MODEL_GAME | medals::SACRIFICE,
+        vcs_flags: vcs_flags::COMMENTARY | vcs_flags::VARIATIONS,
+        mainline_moves: 6,
+        ..GameSpec::default()
+    });
+
+    let mut plain = Compact::new(&tables::MODE_0, true);
+    plain.mv("d2", "d4");
+    plain.mv("d7", "d5");
+    plain.mv("c2", "c4");
+    plain.mv("e7", "e6");
+    db.add(GameSpec {
+        cbh_flags: 0x01,
+        cbg_flags: 0x00,
+        body: plain.finish(),
+        date: date(2025, 6, 16),
+        result: 1,
+        mainline_moves: 4,
+        ..GameSpec::default()
+    });
+
+    let path = db.finish();
+    let library = CbhLibrary::open(&path).unwrap();
+
+    let meta0 = library.game_record_meta(0);
+    assert_eq!(meta0.medals, medals::MODEL_GAME | medals::SACRIFICE);
+    assert_eq!(
+        meta0.vcs_flags,
+        vcs_flags::COMMENTARY | vcs_flags::VARIATIONS
+    );
+    assert!(meta0.annotated);
+    assert_eq!(meta0.white_elo, 2650);
+    assert_eq!(meta0.black_elo, 2610);
+    assert_eq!(meta0.year, 2025);
+    assert_eq!(meta0.result, 2);
+
+    let meta1 = library.game_record_meta(1);
+    assert_eq!(meta1.medals, 0);
+    assert_eq!(meta1.vcs_flags, 0);
+    assert!(!meta1.annotated);
+
+    let mut q = PositionQuery::default();
+    q.metadata.medals_mask = medals::MODEL_GAME;
+    let cancel = AtomicBool::new(false);
+    let hits = search_library(&library, &q, 50, |_, _, _| {}, &cancel);
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].game_index, 0);
+    assert_eq!(hits[0].medals, medals::MODEL_GAME | medals::SACRIFICE);
+
+    let loaded = library.load(0).unwrap();
+    let expected: Vec<_> = std::iter::once(0usize)
+        .chain(loaded.mainline())
+        .enumerate()
+        .map(|(ply, nid)| {
+            (
+                ply as u32,
+                crate::chess::Fen::from_position(
+                    &loaded.nodes[nid].pos,
+                    crate::chess::EnPassantMode::Legal,
+                )
+                .to_string(),
+            )
+        })
+        .collect();
+
+    let mut streamed = Vec::new();
+    let ok = library
+        .scan_mainline_positions(0, 200, &mut |ply, p| {
+            streamed.push((
+                ply,
+                crate::chess::Fen::from_position(p, crate::chess::EnPassantMode::Legal)
+                    .to_string(),
+            ));
+            true
+        })
+        .unwrap();
+    assert!(ok);
+    assert_eq!(streamed, expected);
+
+    let mut early = Vec::new();
+    library
+        .scan_mainline_positions(0, 200, &mut |ply, _| {
+            early.push(ply);
+            ply < 2
+        })
+        .unwrap();
+    assert_eq!(early, vec![0, 1, 2]);
 }

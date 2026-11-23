@@ -236,10 +236,10 @@ fn chess960_start_and_castling_round_trip() {
 }
 
 #[test]
-fn rejects_custom_fen_and_unsupported_variants() {
+fn allows_custom_fen_and_rejects_unsupported_variants() {
     let custom = parse_one("[FEN \"8/8/8/8/8/8/4K3/7k w - - 0 1\"]\n\n*");
-    let err = encode_game_moves(&custom).unwrap_err();
-    assert!(format!("{err:#}").contains("standard chess or Chess960"));
+    let encoded = encode_game_moves(&custom).unwrap();
+    assert!(encoded.custom_start.is_some());
 
     let crazyhouse = parse_one("[Variant \"Crazyhouse\"]\n\n1. e4 *");
     let err = encode_game_moves(&crazyhouse).unwrap_err();
@@ -541,4 +541,49 @@ fn records_are_aligned_and_framed() {
             &[0xff, 0x7f]
         );
     }
+}
+
+#[test]
+fn from_position_games_encode_decode_and_round_trip_through_2cbh() {
+    use crate::library::GameLibrary as _;
+    let pgn = concat!(
+        "[Event \"Live Practice\"]\n",
+        "[White \"fettaberfit1510\"]\n",
+        "[Black \"Trainingsmaterial\"]\n",
+        "[Result \"*\"]\n",
+        "[Variant \"From Position\"]\n",
+        "[SetUp \"1\"]\n",
+        "[FEN \"2r1kbnr/1b1p1ppp/p3p3/qp6/4P3/1PNR4/PBP1QPPP/1K3B1R b k - 0 12\"]\n\n",
+        "12... b4 13. Nd1 Nf6 14. f3 Be7 *\n"
+    );
+    let game = parse_one(pgn);
+    let dir = TempDir::new();
+    let path = dir.path().join("from_pos.2cbh");
+    write_database(&path, vec![Ok(game.clone())]).unwrap();
+
+    let library = TwoCbhLibrary::open(&path).unwrap();
+    assert_eq!(library.len(), 1);
+    let loaded = library.load(0).unwrap();
+    assert_eq!(loaded.white(), "fettaberfit1510");
+    assert_eq!(loaded.black(), "Trainingsmaterial");
+    assert_eq!(
+        crate::twocbh::moves::start_fen(&loaded.nodes[0].pos),
+        crate::twocbh::moves::start_fen(&game.nodes[0].pos)
+    );
+    assert_eq!(uci_line(&loaded), uci_line(&game));
+
+    let mut scanned_plies = Vec::new();
+    assert!(
+        library
+            .scan_mainline_positions(0, 10, &mut |ply, _pos| {
+                scanned_plies.push(ply);
+                true
+            })
+            .unwrap()
+    );
+    assert_eq!(scanned_plies, vec![0, 1, 2, 3, 4, 5]);
+
+    let crazyhouse = parse_one("[Variant \"Crazyhouse\"]\n[White \"A\"]\n[Black \"B\"]\n\n1. e4 e5 *\n");
+    let err = encode_game_moves(&crazyhouse).unwrap_err();
+    assert!(err.to_string().contains("crazyhouse"), "{err:#}");
 }

@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>com.lakis01.brett</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <name>Brett</name>
+  <summary>Chess Preparation and Database Suite</summary>
+  <description>
+    <p>
+      Brett is a native chess preparation workstation and database suite for
+      opening study, game review, and position analysis.
+    </p>
+    <p>
+      It unifies local databases (.2cbh, .cbh, .si4, .pgn, .bin, .ctg, .abk,
+      .bkt) with live reference sources, UCI engine evaluation, and opponent
+      repertoire modeling.
+    </p>
+  </description>
+  <launchable type="desktop-id">brett.desktop</launchable>
+  <url type="homepage">https://github.com/Lakis01/Brett</url>
+  <provides>
+    <binary>brett</binary>
+  </provides>
+  <developer id="com.lakis01">
+    <name>Lakis01</name>
+  </developer>
+  <releases>
+    <release version="0.3.0" date="2026-11-23" />
+  </releases>
+  <content_rating type="oars-1.1" />
+</component>

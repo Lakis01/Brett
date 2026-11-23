@@ -654,6 +654,188 @@ impl Game {
         self.nodes[parent].children.push(id);
         id
     }
+
+    /// Root node of the variation containing `node`, or `None` when `node` lies
+    /// on the top-level mainline (or is the root).
+    pub fn variation_root(&self, mut node: usize) -> Option<usize> {
+        if node >= self.nodes.len() {
+            return None;
+        }
+        while let Some(parent) = self.nodes[node].parent {
+            if self.nodes[parent].children.first().copied() != Some(node) {
+                return Some(node);
+            }
+            node = parent;
+        }
+        None
+    }
+
+    pub fn can_promote_variation(&self, node: usize) -> bool {
+        self.variation_root(node).is_some()
+    }
+
+    pub fn can_move_variation_up(&self, node: usize) -> bool {
+        let Some(var_root) = self.variation_root(node) else {
+            return false;
+        };
+        let Some(parent) = self.nodes[var_root].parent else {
+            return false;
+        };
+        self.nodes[parent]
+            .children
+            .iter()
+            .position(|&c| c == var_root)
+            .is_some_and(|idx| idx >= 2)
+    }
+
+    pub fn can_move_variation_down(&self, node: usize) -> bool {
+        let Some(var_root) = self.variation_root(node) else {
+            return false;
+        };
+        let Some(parent) = self.nodes[var_root].parent else {
+            return false;
+        };
+        let children = &self.nodes[parent].children;
+        children
+            .iter()
+            .position(|&c| c == var_root)
+            .is_some_and(|idx| idx >= 1 && idx + 1 < children.len())
+    }
+
+    fn sync_ply_count_header(&mut self) {
+        let mainline_len = self.mainline_len().to_string();
+        if let Some((_, value)) = self
+            .headers
+            .iter_mut()
+            .find(|(name, _)| name.eq_ignore_ascii_case("PlyCount"))
+        {
+            *value = mainline_len;
+        }
+    }
+
+    /// Promote the innermost variation containing `node` one level up (it
+    /// becomes the primary continuation at its branch point, while the previous
+    /// primary continuation becomes variation 1).
+    pub fn promote_variation(&mut self, node: usize) -> bool {
+        let Some(var_root) = self.variation_root(node) else {
+            return false;
+        };
+        let Some(parent) = self.nodes[var_root].parent else {
+            return false;
+        };
+        let children = &mut self.nodes[parent].children;
+        let Some(pos) = children.iter().position(|&c| c == var_root) else {
+            return false;
+        };
+        if pos == 0 {
+            return false;
+        }
+        let item = children.remove(pos);
+        children.insert(0, item);
+        self.sync_ply_count_header();
+        true
+    }
+
+    /// Promote `node` through every enclosing branch point all the way up to
+    /// the top-level mainline.
+    pub fn promote_to_mainline(&mut self, node: usize) -> bool {
+        let mut changed = false;
+        while self.promote_variation(node) {
+            changed = true;
+        }
+        changed
+    }
+
+    /// Swap the variation containing `node` with the sibling variation before it.
+    pub fn move_variation_up(&mut self, node: usize) -> bool {
+        let Some(var_root) = self.variation_root(node) else {
+            return false;
+        };
+        let Some(parent) = self.nodes[var_root].parent else {
+            return false;
+        };
+        let children = &mut self.nodes[parent].children;
+        let Some(pos) = children.iter().position(|&c| c == var_root) else {
+            return false;
+        };
+        if pos < 2 {
+            return false;
+        }
+        children.swap(pos, pos - 1);
+        true
+    }
+
+    /// Swap the variation containing `node` with the sibling variation after it.
+    pub fn move_variation_down(&mut self, node: usize) -> bool {
+        let Some(var_root) = self.variation_root(node) else {
+            return false;
+        };
+        let Some(parent) = self.nodes[var_root].parent else {
+            return false;
+        };
+        let children = &mut self.nodes[parent].children;
+        let Some(pos) = children.iter().position(|&c| c == var_root) else {
+            return false;
+        };
+        if pos == 0 || pos + 1 >= children.len() {
+            return false;
+        }
+        children.swap(pos, pos + 1);
+        true
+    }
+
+    fn compact_reachable(&mut self) -> Vec<Option<usize>> {
+        let old = std::mem::take(&mut self.nodes);
+        let mut new = Vec::with_capacity(old.len());
+        let mut map = vec![None; old.len()];
+        if !old.is_empty() {
+            copy_subtree_mapped(&old, 0, None, &mut new, &mut map);
+        }
+        self.nodes = new;
+        self.sync_ply_count_header();
+        map
+    }
+
+    /// Delete the variation containing `node`. Returns the remapped branch parent
+    /// node id and the full `old_node -> Option<new_node>` index table.
+    pub fn delete_variation(&mut self, node: usize) -> Option<(usize, Vec<Option<usize>>)> {
+        let var_root = self.variation_root(node)?;
+        let parent = self.nodes[var_root].parent?;
+        self.nodes[parent].children.retain(|&c| c != var_root);
+        let map = self.compact_reachable();
+        let new_parent = map.get(parent).and_then(|&x| x).unwrap_or(0);
+        Some((new_parent, map))
+    }
+
+    /// Remove all continuations after `node`, returning the compacted node
+    /// index mapping when any children were removed.
+    pub fn truncate_after(&mut self, node: usize) -> Option<Vec<Option<usize>>> {
+        if node >= self.nodes.len() || self.nodes[node].children.is_empty() {
+            return None;
+        }
+        self.nodes[node].children.clear();
+        Some(self.compact_reachable())
+    }
+}
+
+fn copy_subtree_mapped(
+    old: &[Node],
+    id: usize,
+    parent: Option<usize>,
+    out: &mut Vec<Node>,
+    map: &mut [Option<usize>],
+) -> usize {
+    let new_id = out.len();
+    map[id] = Some(new_id);
+    let mut node = old[id].clone();
+    node.parent = parent;
+    node.children.clear();
+    out.push(node);
+    for &child in &old[id].children {
+        let child_id = copy_subtree_mapped(old, child, Some(new_id), out, map);
+        out[new_id].children.push(child_id);
+    }
+    new_id
 }
 
 /// Deepest node below `node`, measured in plies from the root.
@@ -1647,5 +1829,61 @@ mod tests {
         let targets = legal_targets(&pos, Square::E1);
         assert!(targets.iter().any(|(square, _)| *square == Square::G1));
         assert!(targets.iter().any(|(square, _)| *square == Square::C1));
+    }
+
+    #[test]
+    fn nested_variation_promote_reorder_delete_and_truncate() {
+        let mut game = parse_pgn(
+            br#"[Event "VarTest"]
+
+1. e4 e5 (1... c5 2. Nf3 d6 (2... Nc6 3. Bb5) 3. d4) (1... e6 2. d4) 2. Nf3 *
+"#,
+        )
+        .unwrap()
+        .remove(0);
+
+        let e4 = game.mainline()[0];
+        let c5 = game.nodes[e4].children[1];
+        let e6 = game.nodes[e4].children[2];
+        let nf3_sic = game.nodes[c5].children[0];
+        let nc6 = game.nodes[nf3_sic].children[1];
+        let bb5 = game.nodes[nc6].children[0];
+
+        assert!(!game.can_promote_variation(e4));
+        assert!(game.can_promote_variation(bb5));
+        assert!(!game.can_move_variation_up(c5));
+        assert!(game.can_move_variation_down(c5));
+        assert!(game.can_move_variation_up(e6));
+
+        // Promote nested Bb5 one level: Nc6 replaces d6 inside the c5 variation.
+        assert!(game.promote_variation(bb5));
+        assert_eq!(game.nodes[nf3_sic].children[0], nc6);
+        // Top-level mainline is still e5 until promoted again.
+        assert_eq!(game.nodes[e4].children.len(), 3);
+        assert_ne!(game.nodes[e4].children[0], c5);
+
+        // Make main line promotes all remaining levels up to the root mainline.
+        assert!(game.promote_to_mainline(bb5));
+        assert_eq!(game.nodes[e4].children[0], c5);
+        assert!(!game.can_promote_variation(bb5));
+
+        // Swap remaining variations (previous mainline e5 vs e6) under e4.
+        let v1 = game.nodes[e4].children[1];
+        let v2 = game.nodes[e4].children[2];
+        assert!(game.move_variation_down(v1));
+        assert_eq!(game.nodes[e4].children[1], v2);
+        assert_eq!(game.nodes[e4].children[2], v1);
+        assert!(game.move_variation_up(v1));
+        assert_eq!(game.nodes[e4].children[1], v1);
+
+        // Truncate after Nc6 removes Bb5.
+        let map = game.truncate_after(nc6).unwrap();
+        let nc6_new = map[nc6].unwrap();
+        assert!(game.nodes[nc6_new].children.is_empty());
+
+        // Delete one sibling variation under e4.
+        let v2_new = map[v2].unwrap();
+        let (parent_new, _) = game.delete_variation(v2_new).unwrap();
+        assert_eq!(game.nodes[parent_new].children.len(), 2);
     }
 }

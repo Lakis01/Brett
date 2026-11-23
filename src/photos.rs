@@ -180,9 +180,16 @@ impl PhotoLibrary {
         if let Some(&index) = self.folded.get(&folded_key(name)) {
             return Some(index);
         }
-        self.entries
-            .iter()
-            .position(|entry| entry_matches_name(&entry.key, name))
+        let mut unique: Option<usize> = None;
+        for (index, entry) in self.entries.iter().enumerate() {
+            if entry_matches_name(&entry.key, name) {
+                if unique.is_some() {
+                    return None;
+                }
+                unique = Some(index);
+            }
+        }
+        unique
     }
 
     /// Find a player's encoded WebP bytes by canonical key.
@@ -228,13 +235,6 @@ fn surname(name: &str) -> Option<String> {
     }
 }
 
-fn common_prefix(left: &str, right: &str) -> usize {
-    left.chars()
-        .zip(right.chars())
-        .take_while(|(left, right)| left == right)
-        .count()
-}
-
 fn entry_matches_name(entry_key: &str, name: &str) -> bool {
     let Some(surname) = surname(name) else {
         return false;
@@ -257,7 +257,6 @@ fn entry_matches_name(entry_key: &str, name: &str) -> bool {
             *display_token == *token
                 || (token.len() == 1 && display_token.starts_with(token))
                 || (display_token.len() == 1 && token.starts_with(display_token))
-                || common_prefix(display_token, token) >= 3
         });
         if !matched {
             return false;
@@ -333,15 +332,26 @@ pub fn default_path() -> Option<PathBuf> {
 /// canonical player identity. Lives beside the other Brett config files so it
 /// survives application updates.
 pub fn custom_dir() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .filter(|path| !path.as_os_str().is_empty())
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .map(|home| home.join(".config"))
-        })?;
-    Some(base.join("brett").join("portraits"))
+    #[cfg(test)]
+    {
+        return Some(
+            std::env::temp_dir()
+                .join(format!("brett-test-config-{}", std::process::id()))
+                .join("portraits"),
+        );
+    }
+    #[cfg(not(test))]
+    {
+        let base = std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .filter(|path| !path.as_os_str().is_empty())
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .map(PathBuf::from)
+                    .map(|home| home.join(".config"))
+            })?;
+        Some(base.join("brett").join("portraits"))
+    }
 }
 
 /// Path of a player's custom portrait file.
@@ -493,6 +503,38 @@ mod tests {
         assert_eq!(library.bytes("Magnus Carlsen Jr"), None);
         assert_eq!(library.bytes("Ding Liren Fan"), None);
         assert_eq!(library.bytes("Hikaru Nakamura"), Some(&b"nakamura"[..]));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn short_name_matching_rejects_prefix_only_and_ambiguous_entries() {
+        let path = std::env::temp_dir().join(format!(
+            "brett-photos-ambig-{}-{}.bin",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        write_pack(
+            &path,
+            &[
+                ("hinterreiter martin", b"martin"),
+                ("svane frederik", b"frederik"),
+                ("svane rasmus", b"rasmus"),
+                ("svane robert", b"robert"),
+            ],
+        );
+        let library = PhotoLibrary::open(&path).unwrap();
+        // Shared 3-letter prefix ("Mar") must not cross-match distinct given names.
+        assert_eq!(library.bytes("Hinterreiter, Markus"), None);
+        assert_eq!(library.full_name("Hinterreiter, Markus"), None);
+        // Unique initial match works, while ambiguous initial match returns None.
+        assert_eq!(library.bytes("Svane, F"), Some(&b"frederik"[..]));
+        assert_eq!(library.full_name("Svane, F").as_deref(), Some("Frederik Svane"));
+        assert_eq!(library.bytes("Svane, R"), None);
+        assert_eq!(library.full_name("Svane, R"), None);
+        assert_eq!(library.full_name("Hinterreiter, M").as_deref(), Some("Martin Hinterreiter"));
         let _ = std::fs::remove_file(path);
     }
 

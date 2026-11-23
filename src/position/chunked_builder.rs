@@ -88,148 +88,164 @@ where
     let completed_games = Arc::new(AtomicUsize::new(0));
     let completed_edges = Arc::new(AtomicUsize::new(0));
 
-    let segment_results: Result<Vec<ChunkResult>> = chunk_ranges
-        .into_par_iter()
-        .map(|(chunk_id, start, end)| {
-            let mut records: HashMap<(u64, u32), EdgeRecord> = HashMap::new();
-            let mut chunk_games = 0usize;
+    // Bound indexing concurrency so a 12M-game build leaves CPU headroom for the
+    // egui/Wayland render thread.
+    let threads = std::thread::available_parallelism()
+        .map(|n| (n.get() / 2).clamp(1, 4))
+        .unwrap_or(2);
+    let process_chunks = || -> Result<Vec<ChunkResult>> {
+        chunk_ranges
+            .into_par_iter()
+            .map(|(chunk_id, start, end)| {
+                let mut records: HashMap<(u64, u32), EdgeRecord> = HashMap::new();
+                let mut chunk_games = 0usize;
 
-            for game_idx in start..end {
-                let headers_vec;
-                let tags = if let Some(indexed_game) = library.games().get(game_idx) {
-                    indexed_game.headers()
-                } else {
-                    headers_vec = library.game_headers(game_idx);
-                    &headers_vec
-                };
-                let game_meta = GameMeta::from_shared_tags(tags);
-                if options
-                    .build_options
-                    .rating_filter
-                    .is_some_and(|filter| !filter.accepts(&game_meta))
-                {
-                    continue;
-                }
-
-                let mut game_keys = HashSet::new();
-                let streamed = match library.stream_mainline(
-                    game_idx,
-                    options.build_options.max_plies,
-                    &mut |key, mv| {
-                        if !game_keys.insert(key) {
-                            return;
-                        }
-                        let record = records.entry((key, mv)).or_default();
-                        record.key = key;
-                        record.mv = mv;
-                        game_meta.add_to(record);
-                    },
-                ) {
-                    Ok(streamed) => streamed,
-                    Err(err) => {
-                        tracing::debug!("position index skipped game {game_idx}: {err:#}");
+                for game_idx in start..end {
+                    let headers_vec;
+                    let tags = if let Some(indexed_game) = library.games().get(game_idx) {
+                        indexed_game.headers()
+                    } else {
+                        headers_vec = library.game_headers(game_idx);
+                        &headers_vec
+                    };
+                    let game_meta = GameMeta::from_shared_tags(tags);
+                    if options
+                        .build_options
+                        .rating_filter
+                        .is_some_and(|filter| !filter.accepts(&game_meta))
+                    {
                         continue;
                     }
-                };
 
-                if !streamed {
-                    let game = match library.load(game_idx) {
-                        Ok(game) => game,
+                    let mut game_keys = HashSet::new();
+                    let streamed = match library.stream_mainline(
+                        game_idx,
+                        options.build_options.max_plies,
+                        &mut |key, mv| {
+                            if !game_keys.insert(key) {
+                                return;
+                            }
+                            let record = records.entry((key, mv)).or_default();
+                            record.key = key;
+                            record.mv = mv;
+                            game_meta.add_to(record);
+                        },
+                    ) {
+                        Ok(streamed) => streamed,
                         Err(err) => {
                             tracing::debug!("position index skipped game {game_idx}: {err:#}");
                             continue;
                         }
                     };
-                    let mut node = 0usize;
-                    let mut plies = 0u32;
-                    while let Some(&child) = game.nodes[node].children.first() {
-                        let parent = &game.nodes[node];
-                        let Some(ply) = game.nodes[child].mv.as_ref() else {
-                            break;
+
+                    if !streamed {
+                        let game = match library.load(game_idx) {
+                            Ok(game) => game,
+                            Err(err) => {
+                                tracing::debug!("position index skipped game {game_idx}: {err:#}");
+                                continue;
+                            }
                         };
-                        if ply.uci == "0000" {
-                            break;
+                        let mut node = 0usize;
+                        let mut plies = 0u32;
+                        while let Some(&child) = game.nodes[node].children.first() {
+                            let parent = &game.nodes[node];
+                            let Some(ply) = game.nodes[child].mv.as_ref() else {
+                                break;
+                            };
+                            if ply.uci == "0000" {
+                                break;
+                            }
+                            let Ok(ucimove) = crate::chess::UciMove::from_ascii(ply.uci.as_bytes())
+                            else {
+                                break;
+                            };
+                            let Ok(mv) = ucimove.to_move(&parent.pos) else {
+                                break;
+                            };
+                            let Some(code) = crate::position::encode_move(mv) else {
+                                break;
+                            };
+                            let key = parent.pos.position_hash();
+                            if !game_keys.insert(key) {
+                                break;
+                            }
+                            let record = records.entry((key, code)).or_default();
+                            record.key = key;
+                            record.mv = code;
+                            game_meta.add_to(record);
+                            node = child;
+                            plies += 1;
+                            if plies >= options.build_options.max_plies {
+                                break;
+                            }
                         }
-                        let Ok(ucimove) = crate::chess::UciMove::from_ascii(ply.uci.as_bytes())
-                        else {
-                            break;
-                        };
-                        let Ok(mv) = ucimove.to_move(&parent.pos) else {
-                            break;
-                        };
-                        let Some(code) = crate::position::encode_move(mv) else {
-                            break;
-                        };
-                        let key = parent.pos.position_hash();
-                        if !game_keys.insert(key) {
-                            break;
-                        }
-                        let record = records.entry((key, code)).or_default();
-                        record.key = key;
-                        record.mv = code;
-                        game_meta.add_to(record);
-                        node = child;
-                        plies += 1;
-                        if plies >= options.build_options.max_plies {
-                            break;
-                        }
+                    }
+
+                    chunk_games += 1;
+                }
+
+                // Sort edges by (key, mv)
+                let mut sorted_records: Vec<EdgeRecord> = records.into_values().collect();
+                sorted_records.sort_unstable_by(|a, b| a.key.cmp(&b.key).then(a.mv.cmp(&b.mv)));
+
+                let mut unique_positions = 0usize;
+                let mut last_key = None;
+                for r in &sorted_records {
+                    if last_key != Some(r.key) {
+                        unique_positions += 1;
+                        last_key = Some(r.key);
                     }
                 }
 
-                chunk_games += 1;
-            }
+                let seg_path = cache_base.with_extension(format!("tmp_segment_{chunk_id:04}.bpx"));
 
-            // Sort edges by (key, mv)
-            let mut sorted_records: Vec<EdgeRecord> = records.into_values().collect();
-            sorted_records.sort_unstable_by(|a, b| a.key.cmp(&b.key).then(a.mv.cmp(&b.mv)));
+                let seg_header = IndexHeader {
+                    source_len: meta.len,
+                    source_mtime_secs: meta.mtime_secs,
+                    source_mtime_nanos: meta.mtime_nanos,
+                    max_plies: options.build_options.max_plies,
+                    edge_count: sorted_records.len() as u64,
+                    game_count: chunk_games as u64,
+                    position_count: unique_positions as u64,
+                    build_millis: started.elapsed().as_millis() as u64,
+                };
 
-            let mut unique_positions = 0usize;
-            let mut last_key = None;
-            for r in &sorted_records {
-                if last_key != Some(r.key) {
-                    unique_positions += 1;
-                    last_key = Some(r.key);
+                IndexSegment::write_records(&seg_path, seg_header, &sorted_records)?;
+
+                let seg = IndexSegment::open(&seg_path)?;
+                if let Some(target) = live_index {
+                    target.add_segment(seg);
                 }
-            }
 
-            let seg_path = cache_base.with_extension(format!("tmp_segment_{chunk_id:04}.bpx"));
+                let games_done =
+                    completed_games.fetch_add(chunk_games, Ordering::Relaxed) + chunk_games;
+                let edges_done = completed_edges.fetch_add(sorted_records.len(), Ordering::Relaxed)
+                    + sorted_records.len();
 
-            let seg_header = IndexHeader {
-                source_len: meta.len,
-                source_mtime_secs: meta.mtime_secs,
-                source_mtime_nanos: meta.mtime_nanos,
-                max_plies: options.build_options.max_plies,
-                edge_count: sorted_records.len() as u64,
-                game_count: chunk_games as u64,
-                position_count: unique_positions as u64,
-                build_millis: started.elapsed().as_millis() as u64,
-            };
+                progress(BuildProgress {
+                    games: games_done,
+                    edges: edges_done,
+                    elapsed: started.elapsed(),
+                });
 
-            IndexSegment::write_records(&seg_path, seg_header, &sorted_records)?;
-
-            let seg = IndexSegment::open(&seg_path)?;
-            if let Some(target) = live_index {
-                target.add_segment(seg);
-            }
-
-            let games_done =
-                completed_games.fetch_add(chunk_games, Ordering::Relaxed) + chunk_games;
-            let edges_done = completed_edges.fetch_add(sorted_records.len(), Ordering::Relaxed)
-                + sorted_records.len();
-
-            progress(BuildProgress {
-                games: games_done,
-                edges: edges_done,
-                elapsed: started.elapsed(),
-            });
-
-            Ok(ChunkResult {
-                games: chunk_games,
-                edges: sorted_records.len(),
-                unique_positions,
+                Ok(ChunkResult {
+                    games: chunk_games,
+                    edges: sorted_records.len(),
+                    unique_positions,
+                })
             })
-        })
-        .collect();
+            .collect()
+    };
+
+    let segment_results: Result<Vec<ChunkResult>> = match rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .thread_name(|idx| format!("brett-pos-idx-{idx}"))
+        .build()
+    {
+        Ok(pool) => pool.install(process_chunks),
+        Err(_) => process_chunks(),
+    };
 
     let segments = segment_results?;
     let total_indexed_games: usize = segments.iter().map(|s| s.games).sum();

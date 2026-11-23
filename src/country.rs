@@ -213,6 +213,72 @@ pub fn from_site_tag(site: Option<&str>) -> Option<Country> {
     None
 }
 
+fn is_national_championship_suffix(suffix: &str) -> bool {
+    let lower = suffix.trim_end_matches(['.', ':']).to_ascii_lowercase();
+    if matches!(lower.as_str(), "ch" | "cht" | "chw" | "chm" | "chf" | "cup") {
+        return true;
+    }
+    if let Some(rest) = lower.strip_prefix("ch") {
+        if !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()) {
+            return true;
+        }
+        if let Some(age) = rest.strip_prefix('u') {
+            return !age.is_empty() && age.bytes().all(|b| b.is_ascii_digit());
+        }
+    }
+    false
+}
+
+/// Resolve the host country from a conventional PGN `Event` tag when it names
+/// a national championship or cup (e.g. `"RUS-ch"`, `"ITA-ch 79th"`,
+/// `"GER-chT"`, `"URS-ch45"`, `"USA-ch Women"`, `"NED-ch U20"`).
+///
+/// Supranational prefixes (`EUR`, `INT`, `WRL`, `FID`, `PAN`, `AFR`, `ASI`,
+/// `OCE`, `AME`), non-championship suffixes, placeholders, and online events
+/// yield `None`.
+pub fn from_event_tag(event: Option<&str>) -> Option<Country> {
+    let raw = event?.trim();
+    if is_placeholder(raw) || is_online_site(raw) {
+        return None;
+    }
+    for token in raw
+        .split([' ', '\t', '\n', ',', ';', '(', ')'])
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+    {
+        let Some((prefix, suffix)) = token.split_once('-') else {
+            continue;
+        };
+        if prefix.len() != 3 || !prefix.bytes().all(|b| b.is_ascii_alphabetic()) {
+            continue;
+        }
+        let upper = prefix.to_ascii_uppercase();
+        if matches!(
+            upper.as_str(),
+            "EUR" | "INT" | "WRL" | "FID" | "PAN" | "AFR" | "ASI" | "OCE" | "AME"
+        ) {
+            continue;
+        }
+        if !is_national_championship_suffix(suffix) {
+            continue;
+        }
+        if let Some(country) = normalize(&upper) {
+            return Some(country);
+        }
+    }
+    None
+}
+
+/// Resolve a game's venue country from its PGN `Site` tag, falling back to
+/// national-championship `Event` tags (e.g. `RUS-ch`, `ITA-ch`) when `Site`
+/// does not identify a country. Online sites or online events always yield `None`.
+pub fn from_site_or_event(site: Option<&str>, event: Option<&str>) -> Option<Country> {
+    if site.is_some_and(is_online_site) || event.is_some_and(is_online_site) {
+        return None;
+    }
+    from_site_tag(site).or_else(|| from_event_tag(event))
+}
+
 fn find_by_code(code: &str) -> Option<Country> {
     COUNTRIES
         .iter()
@@ -829,5 +895,78 @@ mod tests {
     #[test]
     fn wikidata_map_covers_at_least_thirty_countries() {
         assert!(WIKIDATA_QIDS.len() >= 30);
+    }
+
+    #[test]
+    fn from_event_tag_resolves_national_championships() {
+        assert_eq!(from_event_tag(Some("RUS-ch")).map(|c| c.code), Some("RUS"));
+        assert_eq!(
+            from_event_tag(Some("ITA-ch 79th")).map(|c| c.code),
+            Some("ITA")
+        );
+        assert_eq!(from_event_tag(Some("GER-chT")).map(|c| c.code), Some("GER"));
+        assert_eq!(
+            from_event_tag(Some("URS-ch45")).map(|c| c.code),
+            Some("URS")
+        );
+        assert_eq!(
+            from_event_tag(Some("USA-ch Women")).map(|c| c.code),
+            Some("USA")
+        );
+        assert_eq!(
+            from_event_tag(Some("NED-ch U20")).map(|c| c.code),
+            Some("NED")
+        );
+        assert_eq!(
+            from_event_tag(Some("FRA-chU20")).map(|c| c.code),
+            Some("FRA")
+        );
+        assert_eq!(
+            from_event_tag(Some("ESP-Cup")).map(|c| c.code),
+            Some("ESP")
+        );
+    }
+
+    #[test]
+    fn from_event_tag_rejects_supranational_online_and_ambiguous_events() {
+        for event in [
+            "",
+            "?",
+            "EU-ch",
+            "EUR-ch",
+            "Wch",
+            "RUS-ch Online",
+            "Lichess",
+            "Titled Tuesday",
+            "World Championship",
+            "INT-ch",
+            "RUS-open",
+        ] {
+            assert_eq!(from_event_tag(Some(event)), None, "event {event:?}");
+        }
+    }
+
+    #[test]
+    fn from_site_or_event_prefers_site_and_blocks_online() {
+        assert_eq!(
+            from_site_or_event(Some("Sochi RUS"), Some("ITA-ch")).map(|c| c.code),
+            Some("RUS")
+        );
+        assert_eq!(
+            from_site_or_event(Some("Sochi"), Some("RUS-ch")).map(|c| c.code),
+            Some("RUS")
+        );
+        assert_eq!(
+            from_site_or_event(None, Some("ITA-ch")).map(|c| c.code),
+            Some("ITA")
+        );
+        assert_eq!(
+            from_site_or_event(Some("lichess.org"), Some("RUS-ch")),
+            None
+        );
+        assert_eq!(
+            from_site_or_event(Some("Moscow"), Some("RUS-ch Online")),
+            None
+        );
     }
 }

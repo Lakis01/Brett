@@ -337,3 +337,215 @@ pub(super) fn to_stored_square(square: Square) -> u8 {
 pub(super) fn start_fen(pos: &Chess) -> String {
     Fen::from_position(pos, EnPassantMode::Legal).to_string()
 }
+
+const CUSTOM_PIECE_BASE: u16 = 49_197;
+
+fn custom_non_pawn_kind(piece: Piece) -> Option<u16> {
+    Some(match (piece.color, piece.role) {
+        (Color::White, Role::King) => 0,
+        (Color::White, Role::Queen) => 1,
+        (Color::White, Role::Knight) => 2,
+        (Color::White, Role::Bishop) => 3,
+        (Color::White, Role::Rook) => 4,
+        (Color::Black, Role::King) => 5,
+        (Color::Black, Role::Queen) => 6,
+        (Color::Black, Role::Knight) => 7,
+        (Color::Black, Role::Bishop) => 8,
+        (Color::Black, Role::Rook) => 9,
+        (_, Role::Pawn) => return None,
+    })
+}
+
+fn piece_from_custom_non_pawn_kind(kind: u16) -> Option<Piece> {
+    Some(match kind {
+        0 => Piece::new(Color::White, Role::King),
+        1 => Piece::new(Color::White, Role::Queen),
+        2 => Piece::new(Color::White, Role::Knight),
+        3 => Piece::new(Color::White, Role::Bishop),
+        4 => Piece::new(Color::White, Role::Rook),
+        5 => Piece::new(Color::Black, Role::King),
+        6 => Piece::new(Color::Black, Role::Queen),
+        7 => Piece::new(Color::Black, Role::Knight),
+        8 => Piece::new(Color::Black, Role::Bishop),
+        9 => Piece::new(Color::Black, Role::Rook),
+        _ => return None,
+    })
+}
+
+/// Encode a standard-chess custom start position into the 2CBH `kind = 1`
+/// prefix words `[0xfffb, fullmoves, turn_and_castling, ep_file, ...pieces, 0xfffc]`.
+pub(super) fn encode_custom_start(pos: &Chess) -> Result<Vec<u16>> {
+    if pos.castling_mode().is_chess960() {
+        bail!("cannot encode a Chess960 position as a standard custom start");
+    }
+    let fullmoves = pos.fullmoves().get().min(u32::from(u16::MAX)) as u16;
+    let turn_bit: u16 = if pos.turn() == Color::Black { 1 } else { 0 };
+    let castles = pos.castles();
+    let mut castling_bits: u16 = 0;
+    if castles.has(Color::White, CastlingSide::QueenSide) {
+        castling_bits |= 0x01;
+    }
+    if castles.has(Color::White, CastlingSide::KingSide) {
+        castling_bits |= 0x02;
+    }
+    if castles.has(Color::Black, CastlingSide::QueenSide) {
+        castling_bits |= 0x04;
+    }
+    if castles.has(Color::Black, CastlingSide::KingSide) {
+        castling_bits |= 0x08;
+    }
+    let turn_and_castling = (castling_bits << 8) | turn_bit;
+    let ep_word = pos
+        .maybe_ep_square()
+        .map_or(0u16, |sq| (sq.file().to_u32() as u16) + 1);
+
+    let mut out = vec![START_960, fullmoves, turn_and_castling, ep_word];
+    let board = pos.board();
+    for idx in 0..64u8 {
+        let sq = Square::new(u32::from(idx));
+        let Some(piece) = board.piece_at(sq) else {
+            continue;
+        };
+        let stored_sq = u16::from(to_stored_square(sq));
+        if let Some(kind) = custom_non_pawn_kind(piece) {
+            out.push(CUSTOM_PIECE_BASE + kind * 64 + stored_sq);
+        } else {
+            let rank = sq.rank().to_u32();
+            if !(1..=6).contains(&rank) {
+                bail!(
+                    "cannot encode pawn on rank {} in 2CBH custom start",
+                    rank + 1
+                );
+            }
+            let pawn_base = if piece.color == Color::White {
+                CUSTOM_PIECE_BASE + 640
+            } else {
+                CUSTOM_PIECE_BASE + 688
+            };
+            let file = sq.file().to_u32() as u16;
+            out.push(pawn_base + file * 6 + (rank as u16 - 1));
+        }
+    }
+    out.push(START);
+    Ok(out)
+}
+
+/// Decode a `kind = 1` `0xfffb ... 0xfffc` custom start prefix into `(Chess, rest_tokens)`.
+pub(super) fn decode_custom_start(words: &[u16]) -> Result<(Chess, &[u16])> {
+    if words.first() != Some(&START_960) || words.len() < 5 {
+        bail!("2CBH custom start header is truncated");
+    }
+    let start_end = words[4..]
+        .iter()
+        .position(|&word| word == START)
+        .map(|pos| pos + 4)
+        .context("2CBH custom start has no terminating 0xfffc marker")?;
+
+    let fullmoves = NonZeroU32::new(u32::from(words[1]).max(1)).unwrap_or(NonZeroU32::MIN);
+    let turn_and_castling = words[2];
+    let turn = if (turn_and_castling & 0x00ff) != 0 {
+        Color::Black
+    } else {
+        Color::White
+    };
+    let castling_bits = (turn_and_castling >> 8) as u8;
+    let ep_word = words[3];
+
+    let mut board = Board::empty();
+    for &word in &words[4..start_end] {
+        let rel = word
+            .checked_sub(CUSTOM_PIECE_BASE)
+            .with_context(|| format!("unknown 2CBH custom start token {word}"))?;
+        if rel < 640 {
+            let kind = rel / 64;
+            let sq = from_stored_square((rel % 64) as u8);
+            let piece = piece_from_custom_non_pawn_kind(kind)
+                .with_context(|| format!("unknown 2CBH custom start piece kind {kind}"))?;
+            board.set_piece_at(sq, piece);
+        } else if rel < 688 {
+            let p = rel - 640;
+            let file = File::new(u32::from(p / 6));
+            let rank = Rank::new(u32::from(p % 6) + 1);
+            board.set_piece_at(
+                Square::from_coords(file, rank),
+                Piece::new(Color::White, Role::Pawn),
+            );
+        } else if rel < 736 {
+            let p = rel - 688;
+            let file = File::new(u32::from(p / 6));
+            let rank = Rank::new(u32::from(p % 6) + 1);
+            board.set_piece_at(
+                Square::from_coords(file, rank),
+                Piece::new(Color::Black, Role::Pawn),
+            );
+        } else {
+            bail!("unknown 2CBH custom start token {word}");
+        }
+    }
+
+    let mut castling_rights = Bitboard::EMPTY;
+    let white_king_ok = board.piece_at(Square::E1) == Some(Piece::new(Color::White, Role::King));
+    let black_king_ok = board.piece_at(Square::E8) == Some(Piece::new(Color::Black, Role::King));
+    if white_king_ok {
+        if (castling_bits & 0x01) != 0
+            && board.piece_at(Square::A1) == Some(Piece::new(Color::White, Role::Rook))
+        {
+            castling_rights |= Bitboard::from_square(Square::A1);
+        }
+        if (castling_bits & 0x02) != 0
+            && board.piece_at(Square::H1) == Some(Piece::new(Color::White, Role::Rook))
+        {
+            castling_rights |= Bitboard::from_square(Square::H1);
+        }
+    }
+    if black_king_ok {
+        if (castling_bits & 0x04) != 0
+            && board.piece_at(Square::A8) == Some(Piece::new(Color::Black, Role::Rook))
+        {
+            castling_rights |= Bitboard::from_square(Square::A8);
+        }
+        if (castling_bits & 0x08) != 0
+            && board.piece_at(Square::H8) == Some(Piece::new(Color::Black, Role::Rook))
+        {
+            castling_rights |= Bitboard::from_square(Square::H8);
+        }
+    }
+
+    let ep_square = if (1..=8).contains(&ep_word) {
+        let file = File::new(u32::from(ep_word - 1));
+        let rank = if turn == Color::White {
+            Rank::Sixth
+        } else {
+            Rank::Third
+        };
+        Some(Square::from_coords(file, rank))
+    } else {
+        None
+    };
+
+    let setup = Setup {
+        board: board.clone(),
+        turn,
+        castling_rights,
+        ep_square,
+        halfmoves: 0,
+        fullmoves,
+    };
+    let pos = match Chess::from_setup(setup, CastlingMode::Standard) {
+        Ok(pos) => pos,
+        Err(_) if ep_square.is_some() => {
+            let fallback = Setup {
+                board,
+                turn,
+                castling_rights,
+                ep_square: None,
+                halfmoves: 0,
+                fullmoves,
+            };
+            Chess::from_setup(fallback, CastlingMode::Standard)
+                .context("decoding 2CBH custom start position")?
+        }
+        Err(err) => return Err(err).context("decoding 2CBH custom start position"),
+    };
+    Ok((pos, &words[start_end + 1..]))
+}

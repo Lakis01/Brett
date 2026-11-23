@@ -59,6 +59,9 @@ struct GameSpec {
     black_elo: u32,
     game_id: u64,
     beauty: u64,
+    eco_raw: u16,
+    medals: u16,
+    vcs_flags: u32,
     start_id: Option<u16>,
     tokens: Vec<u16>,
 }
@@ -80,6 +83,9 @@ impl Default for GameSpec {
             black_elo: 0,
             game_id: 0,
             beauty: 0,
+            eco_raw: 0,
+            medals: 0,
+            vcs_flags: 0,
             start_id: None,
             tokens: Vec::new(),
         }
@@ -144,6 +150,14 @@ impl Database {
         record[0x70..0x74].copy_from_slice(&game.black_elo.to_le_bytes());
         if let Some(start_id) = game.start_id {
             record[0x80..0x84].copy_from_slice(&(0xFC40u32 + u32::from(start_id)).to_le_bytes());
+        } else if game.eco_raw != 0 {
+            record[0x80..0x82].copy_from_slice(&game.eco_raw.to_le_bytes());
+        }
+        if game.medals != 0 {
+            record[0x82..0x84].copy_from_slice(&game.medals.to_le_bytes());
+        }
+        if game.vcs_flags != 0 {
+            record[0x84..0x88].copy_from_slice(&game.vcs_flags.to_le_bytes());
         }
         record[0x98..0xa0].copy_from_slice(&game.game_id.to_le_bytes());
         record[0xb0..0xb8].copy_from_slice(&game.beauty.to_le_bytes());
@@ -764,4 +778,212 @@ fn testing_for_markus_chessbase17_decodes_names_and_metadata() {
         assert_ne!(g.white(), "?", "Game {i} white player must not be ?");
         assert_ne!(g.black(), "?", "Game {i} black player must not be ?");
     }
+}
+
+#[test]
+fn merge_updates_into_2cbh_appends_games_deduplicates_entities_and_rebuilds_lgd() {
+    let mut base_dir = std::env::temp_dir();
+    base_dir.push(format!(
+        "brett-2cbh-merge-test-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&base_dir).unwrap();
+
+    let target_cbh = base_dir.join("target.2cbh");
+    let update1_cbh = base_dir.join("upd1.2cbh");
+    let update2_cbh = base_dir.join("upd2.2cbh");
+
+    let target_pgn = "\
+[Event \"Tata Steel\"]
+[Site \"Wijk aan Zee\"]
+[Date \"2025.01.20\"]
+[Round \"1\"]
+[White \"Carlsen, Magnus\"]
+[Black \"Nakamura, Hikaru\"]
+[Result \"1-0\"]
+[WhiteElo \"2832\"]
+[BlackElo \"2802\"]
+
+1. e4 e5 2. Nf3 Nc6 1-0
+";
+    let upd1_pgn = "\
+[Event \"Tata Steel\"]
+[Site \"Wijk aan Zee\"]
+[Date \"2025.01.20\"]
+[Round \"1\"]
+[White \"Carlsen, Magnus\"]
+[Black \"Nakamura, Hikaru\"]
+[Result \"1-0\"]
+[WhiteElo \"2832\"]
+[BlackElo \"2802\"]
+
+1. e4 e5 2. Nf3 Nc6 1-0
+
+[Event \"Norway Chess\"]
+[Site \"Stavanger\"]
+[Date \"2026.05.28\"]
+[Round \"2\"]
+[White \"Carlsen, Magnus\"]
+[WhiteFideId \"1503014\"]
+[Black \"Gukesh, D\"]
+[BlackFideId \"46616543\"]
+[Result \"1/2-1/2\"]
+[WhiteElo \"2839\"]
+[BlackElo \"2787\"]
+
+1. d4 d5 2. c4 e6 1/2-1/2
+";
+    let upd2_pgn = "\
+[Event \"Freestyle Rapid\"]
+[Site \"Weissenhaus\"]
+[Date \"2026.06.10\"]
+[Round \"3\"]
+[White \"Gukesh, D\"]
+[Black \"Nakamura, Hikaru\"]
+[Result \"0-1\"]
+[WhiteElo \"2787\"]
+[BlackElo \"2792\"]
+
+1. c4 e5 2. Nc3 Nf6 0-1
+";
+
+    super::writer::write_database(
+        &target_cbh,
+        crate::domain::parse_pgn(target_pgn.as_bytes())
+            .unwrap()
+            .into_iter()
+            .map(Ok),
+    )
+    .unwrap();
+    super::writer::write_database(
+        &update1_cbh,
+        crate::domain::parse_pgn(upd1_pgn.as_bytes())
+            .unwrap()
+            .into_iter()
+            .map(Ok),
+    )
+    .unwrap();
+    super::writer::write_database(
+        &update2_cbh,
+        crate::domain::parse_pgn(upd2_pgn.as_bytes())
+            .unwrap()
+            .into_iter()
+            .map(Ok),
+    )
+    .unwrap();
+
+    let report = super::writer::merge_updates_into_2cbh(
+        &target_cbh,
+        &[update1_cbh.clone(), update2_cbh.clone()],
+    )
+    .unwrap();
+    // Duplicate of game 0 in upd1 is skipped; 2 new games are appended.
+    assert_eq!(report.games, 2);
+    assert!(target_cbh.with_extension("2lgd").is_file());
+
+    let lib = TwoCbhLibrary::open(&target_cbh).unwrap();
+    assert_eq!(lib.len(), 3);
+    assert_eq!(lib.get(1).unwrap().white(), "Carlsen, Magnus");
+    assert_eq!(lib.get(1).unwrap().black(), "Gukesh, D.");
+    assert_eq!(lib.get(2).unwrap().white(), "Gukesh, D.");
+    assert_eq!(lib.get(2).unwrap().black(), "Nakamura, Hikaru");
+
+    // Re-running with the same updates is idempotent.
+    let rerun =
+        super::writer::merge_updates_into_2cbh(&target_cbh, &[update1_cbh, update2_cbh]).unwrap();
+    assert_eq!(rerun.games, 0);
+
+    // Accelerated players include FIDE backfill on Carlsen and classical-only elo_max on Gukesh.
+    let acc_players = lib.accelerated_players().unwrap();
+    let carlsen = acc_players
+        .iter()
+        .find(|p| p.name == "Carlsen, Magnus")
+        .unwrap();
+    assert_eq!(carlsen.fide_id.as_deref(), Some("1503014"));
+    assert_eq!(carlsen.latest_otb_elo, Some(2839));
+    let gukesh = acc_players.iter().find(|p| p.name == "Gukesh, D.").unwrap();
+    assert_eq!(gukesh.fide_id.as_deref(), Some("46616543"));
+
+    let _ = std::fs::remove_dir_all(&base_dir);
+}
+
+#[test]
+fn game_record_meta_medals_vcs_and_scan_mainline_positions_match_load() {
+    use crate::library::{medals, vcs_flags};
+    use crate::search::{PositionQuery, search_library};
+    use std::sync::atomic::AtomicBool;
+
+    let mut db = Database::new();
+    db.add_game(GameSpec {
+        white_elo: 2750,
+        black_elo: 2720,
+        medals: medals::MODEL_GAME | medals::ENDGAME,
+        vcs_flags: vcs_flags::COMMENTARY | vcs_flags::TRAINING,
+        tokens: game_tokens(),
+        ..GameSpec::default()
+    });
+    db.add_game(GameSpec {
+        tokens: game_tokens(),
+        ..GameSpec::default()
+    });
+    let path = db.finish();
+    let library = TwoCbhLibrary::open(&path).unwrap();
+
+    let meta0 = library.game_record_meta(0);
+    assert_eq!(meta0.medals, medals::MODEL_GAME | medals::ENDGAME);
+    assert_eq!(meta0.vcs_flags, vcs_flags::COMMENTARY | vcs_flags::TRAINING);
+    assert_eq!(meta0.white_elo, 2750);
+    assert_eq!(meta0.black_elo, 2720);
+    assert!(meta0.annotated);
+
+    let meta1 = library.game_record_meta(1);
+    assert_eq!(meta1.medals, 0);
+    assert_eq!(meta1.vcs_flags, 0);
+    assert!(!meta1.annotated);
+
+    let mut q = PositionQuery::default();
+    q.metadata.medals_mask = medals::MODEL_GAME;
+    let cancel = AtomicBool::new(false);
+    let hits = search_library(&library, &q, 50, |_, _, _| {}, &cancel);
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].game_index, 0);
+    assert_eq!(hits[0].medals, medals::MODEL_GAME | medals::ENDGAME);
+
+    let loaded = library.load(0).unwrap();
+    let expected: Vec<_> = std::iter::once(0usize)
+        .chain(loaded.mainline())
+        .enumerate()
+        .map(|(ply, nid)| {
+            (
+                ply as u32,
+                Fen::from_position(&loaded.nodes[nid].pos, EnPassantMode::Legal).to_string(),
+            )
+        })
+        .collect();
+
+    let mut streamed = Vec::new();
+    let ok = library
+        .scan_mainline_positions(0, 200, &mut |ply, p| {
+            streamed.push((
+                ply,
+                Fen::from_position(p, EnPassantMode::Legal).to_string(),
+            ));
+            true
+        })
+        .unwrap();
+    assert!(ok);
+    assert_eq!(streamed, expected);
+
+    let mut early = Vec::new();
+    library
+        .scan_mainline_positions(0, 200, &mut |ply, _| {
+            early.push(ply);
+            ply < 2
+        })
+        .unwrap();
+    assert_eq!(early, vec![0, 1, 2]);
 }

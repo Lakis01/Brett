@@ -124,6 +124,18 @@ impl<'a> BoardRef<'a> {
     pub fn role_at(&self, square: Square) -> Option<Role> {
         self.0.piece_on(square.into()).map(Role::from)
     }
+
+    /// Bitmask of all occupied squares (`1u64 << square.to_u32()`).
+    #[must_use]
+    pub fn occupied_mask(&self) -> u64 {
+        self.0.occupied().0
+    }
+
+    /// Bitmask of pieces matching `color` and `role` (`1u64 << square.to_u32()`).
+    #[must_use]
+    pub fn colored_pieces_mask(&self, color: Color, role: Role) -> u64 {
+        self.0.colored_pieces(color.into(), role.into()).0
+    }
 }
 
 /// Everything needed to validate or play from a position: the board, the side

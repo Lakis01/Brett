@@ -23,8 +23,10 @@ Brett is a precision analytical instrument (`Operate` mode). The interface reced
 | `ACCENT_PRIMARY` | `#4C9AFF` | Active tab indicator, primary selection |
 | `GOLD_TITLE` | `#E6B450` | FIDE title pill (`GM`, `IM`, `FM`, etc.) |
 | `WDL_WHITE` | `#E8ECF2` | White wins segment in horizontal W/D/B bars |
-| `WDL_DRAW` | `#6C7380` | Draws segment in horizontal W/D/B bars |
+| `WDL_DRAW` | `#6C7380` | Draws segment in horizontal W/D/B and W/D/L bars |
 | `WDL_BLACK` | `#20242C` | Black wins segment in horizontal W/D/B bars (with `#383E4C` 1px stroke) |
+| `PLAYER_WIN` | `#3B8C4E` / `#7ED38A` | Player wins bar segment / `W` counter in color-blind W/D/L stats |
+| `PLAYER_LOSS` | `#B8444A` / `#E06C75` | Player losses bar segment / `L` counter in color-blind W/D/L stats |
 
 ### Configurable Game-Category Font Palette (`GameCategoryColors`)
 
@@ -61,7 +63,7 @@ Game rows never print text category labels (`Classical OTB`, `Online`, etc.); th
    - **Player List Row:** `[Portrait (optional)]` `[Gold Title Pill]` `[Player Name]` `[Latest OTB Elo (prominent)]` on the top line, with `N games · score X% · YYYY–YYYY` below, and the **Country Flag** right-aligned.
    - **Selected Player Profile Card (top of Players view):**
      - Left: Square portrait (`64x64`, rounded `6px`, silhouette fallback).
-     - Right: `[Gold Title Pill]` `[Name]` `[Country Flag]`, prominent `FIDE Rating` (latest OTB Elo), `W/D/B` horizontal stacked bar + win/draw/loss counts, and a single **`Prepare`** action bar with clickable **White (`⬜`)** and **Black (`⬛`)** squares that immediately launch preparation against that player with the chosen color.
+     - Right: `[Gold Title Pill]` `[Name]` `[Country Flag]`, prominent `FIDE Rating` (latest OTB Elo), `W/D/L` horizontal stacked bar (green/grey/red) + color-coded win/draw/loss counts, and a single **`Prepare`** action bar with clickable **White (`⬜`)** and **Black (`⬛`)** squares that immediately launch preparation against that player with the chosen color.
 3. **Reference and Preparation Tables:**
    - **Reference** selects one human-data source at a time—local database,
      Lichess, ChessABC, or a native book—and keeps its move statistics, trends,

@@ -948,16 +948,23 @@ fn cache_path_tagged(source: &Path, tag: Option<&str>) -> PathBuf {
 }
 
 fn cache_dir() -> PathBuf {
-    if let Some(dir) = std::env::var_os("XDG_CACHE_HOME") {
-        return PathBuf::from(dir).join("brett").join("index");
+    #[cfg(test)]
+    {
+        return std::env::temp_dir().join(format!("brett-test-index-{}", std::process::id()));
     }
-    if let Some(home) = std::env::var_os("HOME") {
-        return PathBuf::from(home)
-            .join(".cache")
-            .join("brett")
-            .join("index");
+    #[cfg(not(test))]
+    {
+        if let Some(dir) = std::env::var_os("XDG_CACHE_HOME") {
+            return PathBuf::from(dir).join("brett").join("index");
+        }
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home)
+                .join(".cache")
+                .join("brett")
+                .join("index");
+        }
+        std::env::temp_dir().join("brett-index")
     }
-    std::env::temp_dir().join("brett-index")
 }
 
 fn temp_path(index_path: &Path) -> PathBuf {

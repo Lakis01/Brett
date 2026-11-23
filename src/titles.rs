@@ -45,6 +45,26 @@ impl PlayerTitle {
         }
     }
 
+    /// Full human-readable title name used in hover tooltips.
+    pub const fn full_name(self) -> &'static str {
+        match self {
+            Self::Gm => "Grandmaster",
+            Self::Igm => "International Grandmaster",
+            Self::Cgm => "Correspondence Grandmaster",
+            Self::Im => "International Master",
+            Self::Sim => "Senior International Master",
+            Self::Ccm => "Correspondence Candidate Master",
+            Self::Fm => "FIDE Master",
+            Self::Cm => "Candidate Master",
+            Self::Wgm => "Woman Grandmaster",
+            Self::Wim => "Woman International Master",
+            Self::Wfm => "Woman FIDE Master",
+            Self::Wcm => "Woman Candidate Master",
+            Self::Nm => "National Master",
+            Self::Lm => "Life Master",
+        }
+    }
+
     /// Rough ordering used when a player's games carry different titles.
     /// Open titles outrank women's titles, and correspondence titles sit
     /// between the corresponding open title and the next one down.

@@ -83,6 +83,22 @@ pub fn has(code: &str) -> bool {
     index_for_code(code).is_some()
 }
 
+/// Returns `true` when `code` has a bespoke vector flag painting for a
+/// dissolved historical federation (`URS`, `YUG`, `GDR`, `TCH`, `SCG`).
+pub fn has_former_flag(code: &str) -> bool {
+    matches!(
+        code.trim().to_ascii_uppercase().as_str(),
+        "URS" | "YUG" | "GDR" | "TCH" | "SCG"
+    )
+}
+
+/// Returns `true` when `country` renders as a 4:3 visual flag (either from
+/// the WebP atlas or from the dissolved-federation vector painter) rather
+/// than a wide fallback text pill.
+pub fn has_visual_flag(country: Country) -> bool {
+    has_flag(country) || has_former_flag(country.code)
+}
+
 /// UV rectangle in normalized 0..1 atlas space for a FIDE code.
 pub fn uv_for_code(code: &str) -> Option<Rect> {
     let index = index_for_code(code)?;
@@ -245,46 +261,169 @@ pub fn paint_german_war_ensign(painter: &Painter, rect: Rect) {
     painter.rect_stroke(rect, 0.0, Stroke::new(1.0, hairline()), StrokeKind::Inside);
 }
 
-/// Simplified tricolor paintings for dissolved federations, drawn at the
-/// same display size so they appear as real flags rather than text pills.
-fn paint_former_flag(painter: &Painter, code: &str, rect: Rect) -> bool {
-    let colors: &[Color32] = match code {
-        "URS" => &[
-            Color32::from_rgb(0xDA, 0x29, 0x1C),
-            Color32::from_rgb(0xDA, 0x29, 0x1C),
-            Color32::from_rgb(0xDA, 0x29, 0x1C),
-        ],
-        "YUG" => &[
-            Color32::from_rgb(0x0C, 0x3C, 0x7C),
-            Color32::from_rgb(0xF1, 0xF1, 0xF1),
-            Color32::from_rgb(0xE6, 0x3E, 0x2A),
-        ],
-        "GDR" => &[
-            Color32::from_rgb(0x00, 0x00, 0x00),
-            Color32::from_rgb(0xDD, 0x00, 0x00),
-            Color32::from_rgb(0xFF, 0xCC, 0x00),
-        ],
-        "TCH" => &[
-            Color32::from_rgb(0xF1, 0xF1, 0xF1),
-            Color32::from_rgb(0xD9, 0x14, 0x4C),
-            Color32::from_rgb(0x11, 0x40, 0x74),
-        ],
-        "SCG" => &[
-            Color32::from_rgb(0x0C, 0x3C, 0x7C),
-            Color32::from_rgb(0xF1, 0xF1, 0xF1),
-            Color32::from_rgb(0xE6, 0x3E, 0x2A),
-        ],
-        _ => return false,
-    };
+fn paint_star(painter: &Painter, center: egui::Pos2, outer_r: f32, inner_r: f32, fill: Color32) {
+    let mut mesh = egui::epaint::Mesh::default();
+    mesh.colored_vertex(center, fill);
+    for i in 0..10 {
+        let angle = -std::f32::consts::FRAC_PI_2 + i as f32 * (std::f32::consts::PI / 5.0);
+        let r = if i % 2 == 0 { outer_r } else { inner_r };
+        let pt = egui::pos2(center.x + r * angle.cos(), center.y + r * angle.sin());
+        mesh.colored_vertex(pt, fill);
+    }
+    for i in 0..10u32 {
+        let next = (i + 1) % 10;
+        mesh.add_triangle(0, 1 + i, 1 + next);
+    }
+    painter.add(egui::Shape::mesh(mesh));
+}
+
+fn paint_tricolor(painter: &Painter, rect: Rect, colors: [Color32; 3]) {
     let h = rect.height() / 3.0;
-    for (i, color) in colors.iter().enumerate() {
+    for (i, color) in colors.into_iter().enumerate() {
         let r = Rect::from_min_size(
             egui::pos2(rect.min.x, rect.min.y + h * i as f32),
             vec2(rect.width(), h),
         );
-        painter.rect_filled(r, 0.0, *color);
+        painter.rect_filled(r, 0.0, color);
     }
-    true
+}
+
+/// Vector flag paintings for dissolved federations, drawn at 4:3 flag size
+/// so historical federations read as flags rather than wide text pills.
+fn paint_former_flag(painter: &Painter, code: &str, rect: Rect) -> bool {
+    match code.trim().to_ascii_uppercase().as_str() {
+        "URS" => {
+            // Crimson Soviet field + gold star and crossed hammer & sickle in the canton.
+            painter.rect_filled(rect, 0.0, Color32::from_rgb(0xC8, 0x10, 0x2E));
+            let gold = Color32::from_rgb(0xFF, 0xD7, 0x00);
+            let w = rect.width();
+            let h = rect.height();
+            let stroke_w = (h * 0.085).max(1.0);
+            let star_center = egui::pos2(rect.left() + w * 0.24, rect.top() + h * 0.18);
+            let star_r = (h * 0.095).max(1.2);
+            paint_star(painter, star_center, star_r, star_r * 0.42, gold);
+
+            let arc_center = egui::pos2(rect.left() + w * 0.23, rect.top() + h * 0.37);
+            let arc_r = (h * 0.13).max(1.5);
+            let mut sickle_pts = Vec::with_capacity(7);
+            for step in 0..=6 {
+                let t = step as f32 / 6.0;
+                let angle = -2.25 + t * 3.55;
+                sickle_pts.push(egui::pos2(
+                    arc_center.x + arc_r * angle.cos(),
+                    arc_center.y + arc_r * angle.sin(),
+                ));
+            }
+            painter.add(egui::Shape::line(sickle_pts, Stroke::new(stroke_w, gold)));
+            painter.line_segment(
+                [
+                    egui::pos2(rect.left() + w * 0.14, rect.top() + h * 0.46),
+                    egui::pos2(rect.left() + w * 0.30, rect.top() + h * 0.30),
+                ],
+                Stroke::new(stroke_w, gold),
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(rect.left() + w * 0.26, rect.top() + h * 0.27),
+                    egui::pos2(rect.left() + w * 0.33, rect.top() + h * 0.33),
+                ],
+                Stroke::new((stroke_w * 1.25).max(1.2), gold),
+            );
+            true
+        }
+        "YUG" => {
+            paint_tricolor(
+                painter,
+                rect,
+                [
+                    Color32::from_rgb(0x0C, 0x3C, 0x7C),
+                    Color32::from_rgb(0xF1, 0xF1, 0xF1),
+                    Color32::from_rgb(0xE6, 0x3E, 0x2A),
+                ],
+            );
+            let outer = (rect.height() * 0.24).max(2.6);
+            paint_star(
+                painter,
+                rect.center(),
+                outer,
+                outer * 0.40,
+                Color32::from_rgb(0xFC, 0xD1, 0x16),
+            );
+            let inner = outer * 0.78;
+            paint_star(
+                painter,
+                rect.center(),
+                inner,
+                inner * 0.40,
+                Color32::from_rgb(0xD8, 0x1E, 0x28),
+            );
+            true
+        }
+        "GDR" => {
+            paint_tricolor(
+                painter,
+                rect,
+                [
+                    Color32::from_rgb(0x00, 0x00, 0x00),
+                    Color32::from_rgb(0xDD, 0x00, 0x00),
+                    Color32::from_rgb(0xFF, 0xCC, 0x00),
+                ],
+            );
+            let gold = Color32::from_rgb(0xFF, 0xCC, 0x00);
+            let r = (rect.height() * 0.16).max(1.8);
+            painter.circle_filled(rect.center(), r, gold);
+            painter.circle_filled(
+                rect.center(),
+                (r * 0.55).max(0.9),
+                Color32::from_rgb(0xDD, 0x00, 0x00),
+            );
+            painter.circle_stroke(
+                rect.center(),
+                r,
+                Stroke::new((rect.height() * 0.06).max(0.9), gold),
+            );
+            true
+        }
+        "TCH" => {
+            let half_h = rect.height() * 0.5;
+            painter.rect_filled(
+                Rect::from_min_size(rect.min, vec2(rect.width(), half_h)),
+                0.0,
+                Color32::from_rgb(0xF1, 0xF1, 0xF1),
+            );
+            painter.rect_filled(
+                Rect::from_min_size(
+                    egui::pos2(rect.min.x, rect.min.y + half_h),
+                    vec2(rect.width(), rect.height() - half_h),
+                ),
+                0.0,
+                Color32::from_rgb(0xD7, 0x14, 0x1A),
+            );
+            painter.add(egui::Shape::convex_polygon(
+                vec![
+                    rect.left_top(),
+                    egui::pos2(rect.left() + rect.width() * 0.5, rect.center().y),
+                    rect.left_bottom(),
+                ],
+                Color32::from_rgb(0x11, 0x45, 0x7E),
+                Stroke::NONE,
+            ));
+            true
+        }
+        "SCG" => {
+            paint_tricolor(
+                painter,
+                rect,
+                [
+                    Color32::from_rgb(0x0C, 0x3C, 0x7C),
+                    Color32::from_rgb(0xF1, 0xF1, 0xF1),
+                    Color32::from_rgb(0xE6, 0x3E, 0x2A),
+                ],
+            );
+            true
+        }
+        _ => false,
+    }
 }
 
 /// Alias of [`paint_flag`].
@@ -324,7 +463,7 @@ fn paint_pill(painter: &Painter, country: Country, rect: Rect) -> f32 {
 /// label never overlaps. The returned response carries hover text
 /// `"{Name} ({CODE})"`.
 pub fn flag(ui: &mut Ui, country: Country, size: egui::Vec2) -> Response {
-    let alloc = if has_flag(country) {
+    let alloc = if has_visual_flag(country) {
         size
     } else {
         // Measure the pill width the same way `paint_pill` does.
@@ -403,6 +542,24 @@ mod tests {
             assert_eq!(uv_for_code(code), None, "{code} must not be in atlas");
             assert!(!has(code));
         }
+    }
+
+    #[test]
+    fn dissolved_federations_render_as_visual_flags_at_4_3() {
+        for code in ["URS", "YUG", "GDR", "TCH", "SCG"] {
+            assert!(
+                has_former_flag(code),
+                "{code} must have a vector former-flag painting"
+            );
+            let country = crate::country::normalize(code).expect("historical country");
+            assert!(
+                has_visual_flag(country),
+                "{code} must allocate 4:3 flag geometry instead of wide pill"
+            );
+        }
+        assert!(!has_former_flag("FID"));
+        let fid = crate::country::normalize("FID").expect("FIDE country");
+        assert!(!has_visual_flag(fid));
     }
 
     #[test]

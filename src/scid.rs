@@ -16,9 +16,13 @@ use crate::chess::{
     CastlingMode, Chess, Color, EnPassantMode, Fen, File as ChessFile, Move, Position, Role, Square,
 };
 use anyhow::{Context, Result, bail};
+use memmap2::Mmap;
 
 use crate::domain::{Game, Node, Ply};
-use crate::library::{GameLibrary, IndexedGame, SourceMeta, StringPool, intern_headers};
+use crate::library::{
+    GameLibrary, GameRecordMeta, IndexedGame, SourceMeta, StringPool, intern_headers,
+    medals as db_medals, vcs_flags,
+};
 
 mod accelerator;
 mod writer;
@@ -52,6 +56,8 @@ const COMMON_TAGS: [&str; 10] = [
 struct Entry {
     offset: u64,
     length: u32,
+    flags: u32,
+    var_counts: u16,
     white: u32,
     black: u32,
     event: u32,
@@ -70,6 +76,7 @@ pub struct ScidLibrary {
     path: PathBuf,
     name_path: PathBuf,
     game_path: PathBuf,
+    game_mmap: Option<Mmap>,
     game_len: u64,
     file_len: u64,
     entries: Vec<Entry>,
@@ -171,6 +178,10 @@ impl ScidLibrary {
             games.push(IndexedGame::scid(headers, entry.offset, entry.length));
         }
 
+        let game_mmap = File::open(&game_path)
+            .ok()
+            .and_then(|file| unsafe { Mmap::map(&file) }.ok());
+
         // Best-effort `.brettacc` CSR sidecar for O(1) event/player lookups.
         let accelerator = ScidAccelerator::load(path).ok().flatten().or_else(|| {
             let sidecar = ScidAccelerator::path_for(path);
@@ -178,6 +189,7 @@ impl ScidLibrary {
                 path: path.to_path_buf(),
                 name_path: name_path.clone(),
                 game_path: game_path.clone(),
+                game_mmap: None,
                 game_len,
                 file_len: index_len + name_len + game_len,
                 entries: entries.clone(),
@@ -196,6 +208,7 @@ impl ScidLibrary {
             path: path.to_path_buf(),
             name_path,
             game_path,
+            game_mmap,
             game_len,
             file_len: index_len + name_len + game_len,
             entries,
@@ -347,6 +360,270 @@ impl GameLibrary for ScidLibrary {
         crate::library::filter_games(&self.games, needle)
     }
 
+    fn game_record_meta(&self, index: usize) -> GameRecordMeta {
+        let Some(entry) = self.entries.get(index) else {
+            return GameRecordMeta::default();
+        };
+        let year = ((entry.date >> 9) & 0x7FFF) as u16;
+        let result = match entry.result {
+            1 => 2,
+            2 => 0,
+            3 => 1,
+            _ => 3,
+        };
+        let eco_code = if entry.eco == 0 {
+            0
+        } else {
+            let basic = (u32::from(entry.eco) - 1) / 131;
+            if basic <= 499 {
+                (basic + 1) as u16
+            } else {
+                0
+            }
+        };
+        let mut medals = 0u16;
+        if entry.flags & (1 << 7) != 0 {
+            medals |= db_medals::ENDGAME;
+        }
+        if entry.flags & (1 << 8) != 0 {
+            medals |= db_medals::NOVELTY;
+        }
+        if entry.flags & (1 << 9) != 0 {
+            medals |= db_medals::PAWN_STRUCTURE;
+        }
+        if entry.flags & (1 << 10) != 0 {
+            medals |= db_medals::TACTICS;
+        }
+        if entry.flags & (1 << 13) != 0 {
+            medals |= db_medals::BEST_GAME;
+        }
+        if entry.flags & (1 << 14) != 0 {
+            medals |= db_medals::TACTICAL_BLUNDER;
+        }
+        if entry.flags & (1 << 15) != 0 {
+            medals |= db_medals::USER;
+        }
+        let mut vcs = 0u32;
+        if entry.flags & 1 != 0 {
+            vcs |= vcs_flags::CUSTOM_START;
+        }
+        if entry.var_counts & 0x000F != 0 {
+            vcs |= vcs_flags::VARIATIONS;
+        }
+        if (entry.var_counts >> 4) & 0x000F != 0 {
+            vcs |= vcs_flags::COMMENTARY;
+        }
+        if (entry.var_counts >> 8) & 0x000F != 0 {
+            vcs |= vcs_flags::SYMBOLS;
+        }
+        GameRecordMeta {
+            white_elo: entry.white_elo,
+            black_elo: entry.black_elo,
+            year,
+            result,
+            eco_code,
+            medals,
+            vcs_flags: vcs,
+            annotated: (entry.var_counts & 0x0FFF) != 0 || medals != 0,
+            deleted: (entry.flags & (1 << 3)) != 0,
+        }
+    }
+
+    fn accelerated_games_matching_player(&self, needle_lower: &str) -> Option<Vec<usize>> {
+        let needle = needle_lower.trim();
+        if needle.is_empty() {
+            return None;
+        }
+        let accelerator = self.accelerator.as_ref()?;
+        let mut indices = Vec::new();
+        for (id, name) in self.names.players.iter().enumerate() {
+            if crate::library::contains_case_insensitive(name, needle) {
+                indices.extend(
+                    accelerator
+                        .player_games(id as u32)
+                        .iter()
+                        .map(|&index| index as usize),
+                );
+            }
+        }
+        indices.sort_unstable();
+        indices.dedup();
+        Some(indices)
+    }
+
+    fn scan_mainline_positions(
+        &self,
+        index: usize,
+        max_ply: u32,
+        visitor: &mut dyn FnMut(u32, &Chess) -> bool,
+    ) -> Result<bool> {
+        let entry = self
+            .entries
+            .get(index)
+            .with_context(|| format!("SCID game index {index} is out of range"))?;
+        if entry.length == 0 {
+            let _ = visitor(0, &Chess::default());
+            return Ok(true);
+        }
+        let end = entry
+            .offset
+            .checked_add(u64::from(entry.length))
+            .context("SCID game offset overflow")?;
+        if end > self.game_len {
+            bail!(
+                "SCID game {index} points outside {} ({}..{})",
+                self.game_path.display(),
+                entry.offset,
+                end
+            );
+        }
+        let owned;
+        let bytes: &[u8] = if let Some(mmap) = &self.game_mmap
+            && let (Ok(s), Ok(e)) = (usize::try_from(entry.offset), usize::try_from(end))
+            && let Some(slice) = mmap.get(s..e)
+        {
+            slice
+        } else {
+            let mut file = File::open(&self.game_path)
+                .with_context(|| format!("opening SCID game file {}", self.game_path.display()))?;
+            file.seek(SeekFrom::Start(entry.offset))
+                .with_context(|| format!("seeking to SCID byte {}", entry.offset))?;
+            let mut buf = vec![0u8; entry.length as usize];
+            file.read_exact(&mut buf)
+                .with_context(|| format!("reading SCID game {index}"))?;
+            owned = buf;
+            &owned
+        };
+        let mut header_fen: Option<String> = None;
+        if let Some(g) = self.games.get(index) {
+            if let Some(var) = g.header("Variant") {
+                let lower = var.to_ascii_lowercase();
+                if lower.contains("960") || lower.contains("chess960") {
+                    return Ok(false);
+                }
+            }
+            header_fen = g.header("FEN").map(str::to_string);
+        }
+
+        let mut cursor = 0usize;
+        for (key, value) in read_tags(bytes, &mut cursor)? {
+            if key.eq_ignore_ascii_case("Variant") {
+                let lower = value.to_ascii_lowercase();
+                if lower.contains("960") || lower.contains("chess960") {
+                    return Ok(false);
+                }
+            } else if key.eq_ignore_ascii_case("FEN") {
+                header_fen = Some(value);
+            }
+        }
+        let start_flags = *bytes
+            .get(cursor)
+            .context("truncated start-position flags")?;
+        cursor += 1;
+        let (start_pos, custom_start) = if start_flags & 1 != 0 {
+            let fen = read_cstring(bytes, &mut cursor)?;
+            if fen.trim().is_empty() {
+                bail!("SCID game has a custom start but no FEN");
+            }
+            (parse_fen(&fen)?, true)
+        } else if let Some(fen) = header_fen {
+            (parse_fen(&fen)?, true)
+        } else {
+            (Chess::default(), false)
+        };
+
+        let mut cur_pos = start_pos;
+        let mut cur_lists = if custom_start {
+            PieceLists::from_fen(&cur_pos)
+        } else {
+            PieceLists::standard()
+        };
+        if !visitor(0, &cur_pos) || max_ply == 0 {
+            return Ok(true);
+        }
+        let mut parent_pos: Option<Chess> = None;
+        let mut parent_lists: Option<PieceLists> = None;
+        let mut stack: Vec<(Chess, PieceLists, Option<Chess>, Option<PieceLists>)> = Vec::new();
+        let mut mainline_ply = 0u32;
+        let mut total = 0usize;
+
+        while let Some(&val) = bytes.get(cursor) {
+            cursor += 1;
+            match val {
+                11 => {
+                    cursor = cursor.saturating_add(1);
+                }
+                12 => {}
+                13 => {
+                    let Some(p_pos) = parent_pos.take() else {
+                        bail!("variation starts before the first move");
+                    };
+                    let Some(p_lists) = parent_lists.take() else {
+                        bail!("variation starts before the first move");
+                    };
+                    let saved_parent_pos = Some(p_pos.clone());
+                    let saved_parent_lists = Some(p_lists.clone());
+                    stack.push((cur_pos, cur_lists, saved_parent_pos, saved_parent_lists));
+                    cur_pos = p_pos;
+                    cur_lists = p_lists;
+                }
+                14 => {
+                    let (saved_cur, saved_lists, saved_ppos, saved_plists) =
+                        stack.pop().context("variation end without a start")?;
+                    cur_pos = saved_cur;
+                    cur_lists = saved_lists;
+                    parent_pos = saved_ppos;
+                    parent_lists = saved_plists;
+                }
+                15 => break,
+                _ => {
+                    let decoded = decode_move(&cur_pos, &cur_lists, val, bytes, &mut cursor)?;
+                    let (next_pos, next_lists) = match decoded.special {
+                        Special::Null => {
+                            let next = cur_pos
+                                .clone()
+                                .swap_turn()
+                                .context("illegal null move")?;
+                            (next, cur_lists.clone())
+                        }
+                        Special::Castle(kingside) => {
+                            let mv = find_castle(&cur_pos, decoded.from, kingside)
+                                .context("illegal SCID castling move")?;
+                            let next = cur_pos.clone().play(mv).context("illegal SCID move")?;
+                            let mut nl = cur_lists.clone();
+                            nl.apply(&cur_pos, mv)?;
+                            (next, nl)
+                        }
+                        Special::Normal => {
+                            let to = decoded.to.context("move has no destination")?;
+                            let mv = find_normal(&cur_pos, decoded.from, to, decoded.promotion)
+                                .context("illegal SCID move")?;
+                            let next = cur_pos.clone().play(mv).context("illegal SCID move")?;
+                            let mut nl = cur_lists.clone();
+                            nl.apply(&cur_pos, mv)?;
+                            (next, nl)
+                        }
+                    };
+                    parent_pos = Some(cur_pos);
+                    parent_lists = Some(cur_lists);
+                    cur_pos = next_pos;
+                    cur_lists = next_lists;
+                    total += 1;
+                    if total > 100_000 {
+                        bail!("move stream is implausibly long");
+                    }
+                    if stack.is_empty() {
+                        mainline_ply += 1;
+                        if !visitor(mainline_ply, &cur_pos) || mainline_ply >= max_ply {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(true)
+    }
+
     fn event_game_indices(&self, event: &str, site: &str, year: Option<u32>) -> Option<Vec<usize>> {
         let accelerator = self.accelerator.as_ref()?;
         let event_id = self.event_id_for_title(event)?;
@@ -377,7 +654,7 @@ impl GameLibrary for ScidLibrary {
         let accelerator = self.accelerator.as_ref()?;
         let mut out = Vec::new();
         for (id, name) in self.names.players.iter().enumerate() {
-            if name.is_empty() || name == "?" {
+            if crate::players::player_key(name).is_none() {
                 continue;
             }
             let slice = accelerator.player_games(id as u32);
@@ -390,6 +667,7 @@ impl GameLibrary for ScidLibrary {
                 .unwrap_or_default();
             out.push(crate::library::AcceleratedPlayer {
                 name: name.clone(),
+                fide_id: None,
                 indices: slice.iter().map(|&index| index as usize).collect(),
                 white_games: stats.white_games,
                 black_games: stats.black_games,
@@ -399,6 +677,8 @@ impl GameLibrary for ScidLibrary {
                 elo_max: u32::from(stats.max_elo),
                 elo_sum: 0,
                 elo_count: 0,
+                latest_otb_elo: None,
+                latest_otb_date: 0,
                 first_year: stats.first_year,
                 last_year: stats.last_year,
             });
@@ -415,10 +695,10 @@ impl GameLibrary for ScidLibrary {
         let mut exact = Vec::new();
         let mut loose = Vec::new();
         for (id, name) in self.names.players.iter().enumerate() {
-            if name.is_empty() || name == "?" {
+            let Some(key) = crate::players::player_key(name) else {
                 continue;
-            }
-            if crate::players::player_key(name).as_deref() == Some(player_key) {
+            };
+            if key == player_key {
                 exact.push(id as u32);
             } else if crate::players::matches_truncated_or_enumerated_name(canonical_name, name) {
                 loose.push(id as u32);
@@ -647,7 +927,6 @@ fn decode_entry(buf: &[u8], version: u16) -> Entry {
     } else {
         (len_low, u32::from(be_u16(&buf[6..8])), 8usize)
     };
-    let _ = flags;
 
     let white_black_high = u32::from(buf[p]);
     p += 1;
@@ -687,6 +966,8 @@ fn decode_entry(buf: &[u8], version: u16) -> Entry {
     Entry {
         offset,
         length,
+        flags,
+        var_counts,
         white,
         black,
         event,
@@ -1516,5 +1797,65 @@ mod tests {
         let date = (1957 << 9) | (10 << 5) | 13;
         let packed = (4u32 << 9) | (10 << 5) | 13;
         assert_eq!(decode_event_date(date, packed) >> 9, 1957);
+    }
+
+    #[test]
+    fn scan_mainline_positions_matches_load_on_opera_game() {
+        use crate::chess::{EnPassantMode, Fen};
+        use crate::library::vcs_flags;
+
+        let database = OperaScid::new();
+        let library = ScidLibrary::open(&database.path).unwrap();
+
+        let meta = library.game_record_meta(0);
+        assert!(meta.annotated);
+        assert_eq!(meta.result, 2);
+        assert_eq!(
+            meta.vcs_flags & (vcs_flags::VARIATIONS | vcs_flags::COMMENTARY | vcs_flags::SYMBOLS),
+            vcs_flags::VARIATIONS | vcs_flags::COMMENTARY | vcs_flags::SYMBOLS
+        );
+
+        let loaded = library.load(0).unwrap();
+        let expected: Vec<_> = std::iter::once(0usize)
+            .chain(loaded.mainline())
+            .enumerate()
+            .map(|(ply, nid)| {
+                (
+                    ply as u32,
+                    Fen::from_position(&loaded.nodes[nid].pos, EnPassantMode::Legal).to_string(),
+                )
+            })
+            .collect();
+
+        let mut streamed = Vec::new();
+        let ok = library
+            .scan_mainline_positions(0, 200, &mut |ply, p| {
+                streamed.push((
+                    ply,
+                    Fen::from_position(p, EnPassantMode::Legal).to_string(),
+                ));
+                true
+            })
+            .unwrap();
+        assert!(ok);
+        assert_eq!(streamed, expected);
+
+        let mut capped = Vec::new();
+        library
+            .scan_mainline_positions(0, 5, &mut |ply, _| {
+                capped.push(ply);
+                true
+            })
+            .unwrap();
+        assert_eq!(capped, vec![0, 1, 2, 3, 4, 5]);
+
+        let mut early = Vec::new();
+        library
+            .scan_mainline_positions(0, 200, &mut |ply, _| {
+                early.push(ply);
+                ply < 3
+            })
+            .unwrap();
+        assert_eq!(early, vec![0, 1, 2, 3]);
     }
 }

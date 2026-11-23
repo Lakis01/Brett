@@ -3,6 +3,7 @@
 //! The library crate exists so the domain model and UI can be tested without
 //! starting a window. The binary is a thin wrapper around [`app::App`].
 
+pub mod account_finder;
 pub mod analysis_cache;
 pub mod app;
 pub mod book;
@@ -21,7 +22,9 @@ pub mod evaluation;
 pub mod fide;
 pub mod flags;
 pub mod guiding;
+pub mod league_import;
 pub mod library;
+pub mod my_games;
 pub mod online;
 pub mod pgn;
 pub mod photos;
@@ -29,15 +32,18 @@ pub mod players;
 pub mod position;
 pub mod print;
 pub mod recent;
+pub mod repertoire;
 pub mod review;
 pub mod review_book;
 pub mod scid;
+pub mod search;
 pub mod session;
 pub mod settings;
 pub mod setup;
 #[doc(hidden)]
 pub mod test_data;
 pub mod titles;
+pub mod twic;
 pub mod twocbh;
 pub mod ui;
 pub mod wiki;

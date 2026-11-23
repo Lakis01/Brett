@@ -145,13 +145,20 @@ pub fn materialize_with_progress(
 
 /// The extracted cache directory, for diagnostics and cleanup commands.
 pub fn cache_root() -> PathBuf {
-    if let Some(dir) = std::env::var_os("XDG_CACHE_HOME") {
-        return PathBuf::from(dir).join("brett").join("cbv");
+    #[cfg(test)]
+    {
+        return std::env::temp_dir().join(format!("brett-test-cbv-{}", std::process::id()));
     }
-    if let Some(home) = std::env::var_os("HOME") {
-        return PathBuf::from(home).join(".cache").join("brett").join("cbv");
+    #[cfg(not(test))]
+    {
+        if let Some(dir) = std::env::var_os("XDG_CACHE_HOME") {
+            return PathBuf::from(dir).join("brett").join("cbv");
+        }
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home).join(".cache").join("brett").join("cbv");
+        }
+        std::env::temp_dir().join("brett-cbv")
     }
-    std::env::temp_dir().join("brett-cbv")
 }
 
 fn extension(name: &str) -> String {

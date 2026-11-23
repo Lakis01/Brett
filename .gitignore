@@ -3,6 +3,7 @@
 .DS_Store
 *.brettpos
 *.brettacc
+*.brettstruct
 
 # Local test data: never redistributed, may be copyrighted
 fixtures/local/
@@ -11,6 +12,15 @@ fixtures/local/
 databases/iccf/*.si4
 databases/iccf/*.sg4
 databases/iccf/*.sn4
+
+# Personal databases under databases/ (keep tracked databases/iccf/README.md)
+databases/*.2cb*
+databases/*.2l*
+databases/*.pgn
+databases/*.cb*
+databases/*.si*
+databases/*.sg*
+databases/*.sn*
 
 # Optional player-photo pack derived from Scid's Player_photos.zip (or any
 # analogous compiled player portrait database/archive). Strict copyright &

@@ -16,6 +16,58 @@ const VARIATION: u16 = 0xfffd;
 const START: u16 = 0xfffc;
 const START_960: u16 = 0xfffb;
 
+/// Stream mainline board positions from raw little-endian `.2cbg` token bytes
+/// without allocating a `Vec<u16>`, `Game` tree, or SAN strings.
+///
+/// Calls `visitor(ply, &pos)` starting at `ply = 0` (`start_pos`). Stops as
+/// soon as `visitor` returns `false`, `max_ply` is reached, or `END_LINE` is hit.
+pub fn scan_2cbh_mainline_positions<F>(
+    start_pos: &Chess,
+    token_bytes: &[u8],
+    max_ply: u32,
+    visitor: &mut F,
+) -> Result<()>
+where
+    F: FnMut(u32, &Chess) -> bool + ?Sized,
+{
+    let mut current_pos = start_pos.clone();
+    if !visitor(0, &current_pos) || max_ply == 0 {
+        return Ok(());
+    }
+    let mut ply = 0u32;
+    for pair in token_bytes.as_chunks::<2>().0 {
+        let token = u16::from_le_bytes(*pair);
+        if token == END_LINE || ply >= max_ply {
+            break;
+        }
+        match token {
+            VARIATION | START | START_960 => continue,
+            0 => {
+                current_pos = current_pos
+                    .swap_turn()
+                    .context("null move leaves the side to move in check")?;
+                ply += 1;
+                if !visitor(ply, &current_pos) || ply >= max_ply {
+                    break;
+                }
+            }
+            code => {
+                let entry = tokens::table().entry(code);
+                let mv = moves::move_from_token(&current_pos, entry)
+                    .with_context(|| format!("decoding 2CBH token {code}"))?;
+                current_pos = current_pos
+                    .play(mv)
+                    .with_context(|| format!("playing 2CBH token {code}"))?;
+                ply += 1;
+                if !visitor(ply, &current_pos) || ply >= max_ply {
+                    break;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Stream mainline moves from a raw 2CBH token slice without allocating game trees.
 ///
 /// Calls `consumer(position_key, move_code)` for each mainline move up to `max_plies`.

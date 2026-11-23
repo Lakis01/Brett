@@ -4,8 +4,18 @@
   <img src="assets/brett.webp" alt="Brett logo" width="180">
 </p>
 
-Brett is a Chess Preparation and Database Suite. It is built for opening
-preparation, database management, and deep position analysis.
+Brett is a free, open-source pure-Rust chess preparation and database suite.
+It is built for opening preparation, multi-source opponent scouting,
+database management, game review, and deep position analysis.
+
+It supports reading and writing common database formats (`.2cbh`, `.cbh`,
+`.si4`, `.pgn`) and opening books (`.bin`, `.ctg`, `.bkt`, `.abk`) through
+independently reverse-engineered codecs—no proprietary runtime or royalty code
+is used—and handles multi-million-game archives such as Mega Database 2026
+(~12M games; the initial load/indexing pass runs in the background so the
+workspace stays responsive). Brett also integrates Lichess (opening explorer &
+cloud evaluation), `chessdb.cn` (deep cloud analysis), ChessABC, and
+Wikipedia/Wikidata metadata.
 
 ## Screenshots
 
@@ -13,7 +23,7 @@ preparation, database management, and deep position analysis.
 
 ![Opponent preparation workspace](assets/screenshots/opponent-preparation.webp)
 
-Preparing as Black against Hikaru Nakamura across **79,360 merged games** (Current DB + ChessABC + Chess.com). The left panel shows the **Player Profile** card (portrait with **Change…** / **Remove**, quick White/Black **Prepare** squares, Wikipedia/Wikidata biography with CC BY-SA attribution, and filtered opponent games). The right **Prep** tab shows the **Smart Predictor** table with Dirichlet-smoothed move probabilities and 90% credible intervals, opponent vs. reference horizontal W/D/B bars, move-popularity trend sparklines, engine evaluations, and virtualized **Recent games**.
+Preparing as Black against Hikaru Nakamura across **79,360 merged games** (Current DB + ChessABC + Chess.com). The left panel shows the **Player Profile** card (portrait with **Change…** / **Remove**, quick White/Black **Prepare** squares, Wikipedia/Wikidata biography with CC BY-SA attribution, and filtered opponent games). The right **Prep** tab shows the **Smart Predictor** table with Bayesian move probabilities and visual likely-range bars, opponent vs. reference horizontal W/D/B bars, move-popularity trend sparklines, merged multi-source engine evaluations, and resizable, virtualized **Recent games**.
 
 ### Multi-source preparation setup
 
@@ -38,7 +48,7 @@ The **Engine** tab places **Game review** directly at the top (reusing Lichess C
 ## Licensing
 
 * **Source Code:** Licensed under the [MIT License](LICENSE).
-* **Optional ICCF Reference Database:** Not covered by the MIT License. Game data is provided courtesy of the ICCF and is subject to a strict **Non-Commercial / No-Resale License** (see [LICENSE-CRB.txt](https://github.com/Lakis01/brett-correspondence_reference_base/blob/main/LICENSE-CRB.txt) and `LICENSE-ICCF.txt` upon download).
+* **[Optional ICCF Reference Database](https://github.com/Lakis01/brett-correspondence_reference_base):** Not covered by the MIT License. Game data is provided courtesy of the ICCF and is subject to a strict **Non-Commercial / No-Resale License** (see [LICENSE-CRB.txt](https://github.com/Lakis01/brett-correspondence_reference_base/blob/main/LICENSE-CRB.txt) and `LICENSE-ICCF.txt` upon download).
 
 ## Quick start (Linux)
 
@@ -77,20 +87,23 @@ there.
 
 ## ICCF database notice
 
-Brett can use an optional ICCF correspondence database as a local, read-only
-reference. A compiled snapshot is redistributed under https://github.com/Lakis01/brett-correspondence_reference_base).
-Downloading or using it is optional, but encouraged as an additional resource
-beside Lichess Cloud Eval and chessdb.cn. The snapshot is refreshed sporadically.
-You may star that repository to be reminded of updates.
+Brett can download and use an optional, curated
+[ICCF Correspondence Reference Base](https://github.com/Lakis01/brett-correspondence_reference_base)
+(~10 MB; games from 2021–present with both players rated 2350+), displayed as a
+dedicated reference in the Engine tab beside Lichess Cloud Eval and chessdb.cn.
+Because serious correspondence players back their choices with multi-day deep
+engine analysis, moves heavily favoured there serve as a high-trust practical
+indicator. The snapshot is refreshed sporadically — you may star that
+repository to be reminded of updates. Permission was granted under ICCF's terms
+for personal use only:
 
 > **The ICCF database is provided for personal use only and may not be sold or
 > re-sold to any third party.**
 
 This notice applies to the ICCF database, the copy in `databases/iccf/`, and
-any copy or derived data made from it. It does not change the MIT licence of
-Brett's source code. Obtain newer snapshots from ICCF, or compile them from
-ICCF server games under ICCF's terms, and comply with ICCF's terms. See
-[ICCF_NOTICE.md](ICCF_NOTICE.md).
+any derived copy. It does not alter the MIT licence of Brett's source code.
+Obtain newer snapshots from ICCF or the companion repository above under ICCF's
+terms. See [ICCF_NOTICE.md](ICCF_NOTICE.md).
 
 ## What works
 
@@ -165,13 +178,23 @@ ICCF server games under ICCF's terms, and comply with ICCF's terms. See
 
 ### Preparation
 
-- Select a player on the **Players** tab and choose **Prepare as White** or
-  **Prepare as Black**. Brett creates a scratch preparation game and opens the
-  **Preparation** tab, which is only shown while the session is active.
-- For each opponent turn, the prediction panel shows likely replies, their
-  posterior mean and approximate 90% credible interval, the player's
-  games/recent games/last-seen date/trend, and the matching database tree
-  columns (games, W/D/L, score, Elo, and years). Click a row to play that reply.
+- Select a player on the **Players** tab (or start from **File → Prepare…**
+  without a database open) and compile a deduplicated player book across local
+  databases, ChessABC, and multiple Lichess / Chess.com accounts.
+- Includes **Exclude online games** to strip Titled Tuesday and online
+  fast-time-control experiments that would otherwise pollute an OTB repertoire,
+  plus a reverse-colour warning when preparing a line your opponent frequently
+  plays from the other side.
+- For each opponent turn, **Smart Predictor** combines a background prior
+  (ideally Mega Database, Lichess Masters, or another representative reference
+  base) with the opponent's compiled games using a time-decayed Bayesian
+  model weighting recency, time control, and OTB vs. online origin (parameters
+  are under active calibration). It displays predicted move probabilities with
+  visual likely-range bars, sample vs. recent game counts, emerging-trend
+  sparklines, opponent vs. reference horizontal W/D/B bars, and merged engine
+  evaluations (`chessdb.cn` + Lichess Cloud Eval + local cache). Experimental
+  repertoire-style indicators (such as Booked-up / Freestyler and Kantian /
+  Explorer) are also included in prototype form and under continued refinement.
 - Probability mass is reserved for legal moves that do not appear in the data,
   so a move seen in 2/2 games is not shown as certain. The panel also shows a
   sample-size confidence label.
@@ -181,13 +204,14 @@ ICCF server games under ICCF's terms, and comply with ICCF's terms. See
 - The normal opening tree remains available in the separate **Tree** tab
   while the opponent-specific repertoire stays in **Preparation**.
 - **Recent games** lists the newest games in the player book that reached the
-  current position. The limit is configurable (default 10). Clicking a game
-  opens a read-only view; closing it returns to the same preparation position.
+  current position. The limit is configurable (default 10) and the list box
+  height is vertically resizable. Clicking a game opens a read-only view;
+  closing it returns to the same preparation position.
 - The model is a time-decayed Dirichlet estimate with a background prior, a
   recent-window mixture, and an explicit residual for unobserved legal moves.
   Defaults: 18-month half-life, 24-month recent window, a sample-size-scaled
   background prior, and a 2-pseudo-game recent mixture.
-- A separate reference PGN, SCID, or classic CBH database can supply the
+- A separate reference PGN, SCID, classic CBH, or 2CBH database can supply the
   background prior.
   Brett indexes only the chosen rating window (default ±200 Elo, with a
   configurable rating offset) and caches it separately from the player index.
@@ -297,10 +321,13 @@ ICCF server games under ICCF's terms, and comply with ICCF's terms. See
   engine is stopped and local engine/hardware settings and local analysis are
   hidden, not merely replaced by an eval. **Enable local engine** returns to
   Both.
-- Cached Stockfish and Leela evaluations join chessdb.cn and Lichess in the
-  Cloud Engine comparison. The local correspondence database is a separate
-  section in Engine because it contains human correspondence games, not engine
-  analysis.
+- Local engine runs and Deep Cloud evaluations are cached automatically in a
+  compact local SQLite database (`analysis.db`, typically staying within a few
+  megabytes even across heavy daily prep). Lichess Cloud Eval itself is
+  read-only from Lichess's API side—compute contributions go through Fishnet to
+  prevent unverified or injected evaluations—so Brett keeps your personal
+  analysis history locally and lets you export/import cache snapshots across
+  machines.
 - The worker performs the UCI handshake off the UI thread, waits for `readyok`,
   kills the engine cleanly on exit, and reports protocol or process errors in
   the panel.
@@ -598,8 +625,17 @@ never writes to the source database.
   scouting remains a game-focused action. Native Polyglot `.bin`, ChessBase
   `.ctg`, Arena `.abk`, and Shredder `.bkt` books are supported.
 
-The detailed queue and acceptance criteria are in
-[docs/BACKLOG.md](docs/BACKLOG.md).
+- **Unified My Games database & startup online sync (done).** Configure a personal My Games database in any writable format (`.2cbh` by default, `.si4`, `.cbh`, `.pgn`) with expandable subsections (`Classical`, `Rapid`, `Blitz`, and `Online → Lichess / Chess.com` across multiple accounts), multi-section checkbox filtering, direct drag-and-drop / file merging into any subsection, and automatic startup online sync.
+- **Automatic TWIC downloader (done).** Fetch weekly issues (`https://theweekinchess.com/twic`) by explicit list/ranges (e.g. `645, 653, 664-672`), presets (`Latest`, `Since last fetched`, `Last 4`, `Last 12`), or date intervals, as well as the searchable/filterable tournament archive (`https://theweekinchess.com/a-year-of-pgn-game-files`), merging directly into the active DB, My Games, or a new database.
+- **Partial & exact bitboard position search (done).** Clean-room MIT 64-square pattern matcher (**Game → Position search…**) with piece/empty/`Any` brushes, structural presets (`Carlsbad`, `IQP`, `Hanging Pawns`, `Maróczy Bind`, `Stonewall`, `Boleslavsky`), color-flipped mirroring, ply bounds, Rayon scanning, hover preview at the matched ply, and direct game navigation.
+- **Repertoire Builder & SM-2+ Train mode (done).** Clean-room MIT **Repertoire** workspace (`Build` with Zobrist transposition grouping and **"Jump to biggest gap"** against your Reference/Tree DB, plus `Train (SRS)` interactive move recall drills rated `1 Again`–`4 Easy`).
+- **Game review (in early stages).** Functional first-pass accuracy &
+  centipawn-loss grading with Lichess Cloud Eval reuse and NAG write-back;
+  clock-usage analytics and deeper review workflows are still maturing.
+- **Planned / upcoming.**
+  - Clock-usage analysis across games and player profiles.
+  - Visual UI overhaul once core database, preparation, and repertoire
+    workflows stabilize.
 
 ## Data safety
 
@@ -635,9 +671,12 @@ published on-disk formats. The SCID source tree and the AGPL ChessBase bridge
 were used as format references only; no code from either is linked or copied.
 See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
-The optional player-photo pack is derived from Scid's `Player_photos.zip`
-(`scid/PlayerData/Player_photos.zip`). It has no explicit redistribution
-licence, so no photo data is committed or bundled with Brett; see
+The optional player-photo pack can be generated from Scid's
+`Player_photos.zip` (`scid/PlayerData/Player_photos.zip`), which remains
+strictly uncommitted due to copyright and attribution concerns—even when
+free-to-use portraits exist (for example on Wikipedia), scraping batches of
+images without ironclad, verified attribution carries strict legal liability
+in jurisdictions with aggressive copyright enforcement. See
 [docs/PHOTOS.md](docs/PHOTOS.md) and
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md#scid-player-photos-optional-not-distributed).
 

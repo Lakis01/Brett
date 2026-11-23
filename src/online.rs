@@ -400,7 +400,7 @@ pub fn fetch_recent_chessabc_games(max_games: usize) -> Result<Vec<domain::Game>
         .timeout_read(Duration::from_secs(30))
         .build();
 
-    let target_pages = max_games.div_ceil(PAGE_SIZE).min(5);
+    let target_pages = max_games.div_ceil(PAGE_SIZE).min(15);
     let page_results: Vec<Result<Vec<String>>> = std::thread::scope(|s| {
         let mut handles = Vec::with_capacity(target_pages);
         for page in 0..target_pages {
@@ -463,6 +463,135 @@ pub fn fetch_recent_chessabc_games(max_games: usize) -> Result<Vec<domain::Game>
         bail!("ChessABC returned no parseable recent games");
     }
     Ok(games)
+}
+
+/// Query ChessABC's full opening-tree statistics for `pos` using `POST /positions/moves`.
+pub fn fetch_chessabc_position_moves(
+    pos: &crate::chess::Chess,
+) -> Result<Vec<crate::position::MoveStat>> {
+    use crate::chess::{EnPassantMode, Fen, Position};
+
+    let full_fen = Fen::from_position(pos, EnPassantMode::Legal).to_string();
+    let board_fen = full_fen
+        .split(' ')
+        .next()
+        .context("missing board placement in FEN")?;
+    let white_to_move = pos.turn() == crate::chess::Color::White;
+    let payload = serde_json::json!({
+        "fen": board_fen,
+        "whiteToMove": white_to_move,
+    })
+    .to_string();
+
+    let url = "https://api.chessabc.com/positions/moves";
+    let agent = ureq::AgentBuilder::new()
+        .user_agent(USER_AGENT)
+        .timeout_connect(Duration::from_secs(12))
+        .timeout_read(Duration::from_secs(20))
+        .build();
+    let response = agent
+        .post(url)
+        .set("Accept", "application/json")
+        .set("Content-Type", "application/json")
+        .send_string(&payload)
+        .with_context(|| format!("requesting {url}"))?;
+    let mut body = String::new();
+    response
+        .into_reader()
+        .read_to_string(&mut body)
+        .with_context(|| format!("reading response from {url}"))?;
+    parse_chessabc_position_moves_json(pos, &body)
+}
+
+/// Parse ChessABC's `POST /positions/moves` JSON payload into sorted [`crate::position::MoveStat`] rows.
+pub(crate) fn parse_chessabc_position_moves_json(
+    pos: &crate::chess::Chess,
+    body: &str,
+) -> Result<Vec<crate::position::MoveStat>> {
+    use std::collections::HashMap;
+
+    let value: Value =
+        serde_json::from_str(body).context("ChessABC returned invalid position statistics")?;
+    let rows = value
+        .get("result")
+        .and_then(Value::as_array)
+        .context("ChessABC position response has no result array")?;
+    let key = crate::position::position_key(pos);
+    let mut by_move: HashMap<u32, crate::position::MoveStat> = HashMap::with_capacity(rows.len());
+
+    for row in rows {
+        let Some(san_str) = row.get("move").and_then(Value::as_str) else {
+            continue;
+        };
+        let Ok(san) = crate::chess::SanPlus::from_ascii(san_str.as_bytes()) else {
+            continue;
+        };
+        let Ok(mv) = san.san.to_move(pos) else {
+            continue;
+        };
+        let Some(encoded) = crate::position::encode_move(mv) else {
+            continue;
+        };
+        let white = row.get("white_win").and_then(Value::as_u64).unwrap_or(0) as u32;
+        let black = row.get("black_win").and_then(Value::as_u64).unwrap_or(0) as u32;
+        let draw = row.get("draw").and_then(Value::as_u64).unwrap_or(0) as u32;
+        let games = row
+            .get("total")
+            .and_then(Value::as_u64)
+            .map(|v| v as u32)
+            .unwrap_or_else(|| white.saturating_add(draw).saturating_add(black));
+        if games == 0 {
+            continue;
+        }
+        let avg_elo = match (
+            row.get("white_rating").and_then(Value::as_f64),
+            row.get("black_rating").and_then(Value::as_f64),
+        ) {
+            (Some(w), Some(b)) if w > 0.0 && b > 0.0 => Some(((w + b) * 0.5).round() as u64),
+            (Some(w), _) if w > 0.0 => Some(w.round() as u64),
+            (_, Some(b)) if b > 0.0 => Some(b.round() as u64),
+            _ => None,
+        };
+        let (elo_sum, elo_count) = match avg_elo {
+            Some(avg) => (avg.saturating_mul(u64::from(games)), games),
+            None => (0, 0),
+        };
+        let year = row.get("year").and_then(Value::as_u64).unwrap_or(0) as u32;
+        let last_date = if (1000..=3000).contains(&year) {
+            year * 10_000 + 101
+        } else {
+            0
+        };
+        let stat = crate::position::MoveStat {
+            key,
+            mv: encoded,
+            games,
+            white,
+            draw,
+            black,
+            elo_sum,
+            elo_count,
+            first_date: 0,
+            last_date,
+            anchor_quarter: crate::position::date_to_quarter(last_date).unwrap_or(0),
+            older_dated: 0,
+            buckets: [0; crate::position::TREND_BUCKETS],
+        };
+        by_move
+            .entry(encoded)
+            .and_modify(|existing| {
+                // ChessABC occasionally emits disambiguated SAN aliases with identical counts;
+                // keep whichever row has more games instead of double-counting.
+                if stat.games > existing.games {
+                    *existing = stat;
+                }
+            })
+            .or_insert(stat);
+    }
+
+    let mut out: Vec<_> = by_move.into_values().collect();
+    out.sort_by(|a, b| b.games.cmp(&a.games).then_with(|| a.mv.cmp(&b.mv)));
+    Ok(out)
 }
 
 /// Treat `0` and very large limits as "uncapped" and leave small limits
@@ -1836,6 +1965,28 @@ fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
     era * 146097 + doe - 719468
 }
 
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m as u32, d as u32)
+}
+
+fn ym_from_epoch_ms(ms: u64) -> Option<String> {
+    let days = (ms / 86_400_000) as i64;
+    let (y, m, _) = civil_from_days(days);
+    (1970..=2100)
+        .contains(&y)
+        .then(|| format!("{y:04}-{m:02}"))
+}
+
 fn parse_ymd(text: &str) -> Option<(i64, u32, u32)> {
     let text = text.trim();
     let parts: Vec<&str> = text
@@ -2044,6 +2195,115 @@ fn chesscom_year_month_from_url(url: &str) -> Option<String> {
     None
 }
 
+/// Lightweight account summary fetched without downloading full game archives.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AccountSummary {
+    pub total_games: Option<usize>,
+    pub earliest_ym: Option<String>,
+    pub latest_ym: Option<String>,
+}
+
+fn parse_lichess_user_summary_json(body: &str) -> Option<AccountSummary> {
+    let value: Value = serde_json::from_str(body).ok()?;
+    let total_games = value
+        .get("count")
+        .and_then(|c| c.get("all"))
+        .and_then(Value::as_u64)
+        .and_then(|n| usize::try_from(n).ok());
+    let earliest_ym = value
+        .get("createdAt")
+        .and_then(Value::as_u64)
+        .and_then(ym_from_epoch_ms);
+    let latest_ym = value
+        .get("seenAt")
+        .and_then(Value::as_u64)
+        .and_then(ym_from_epoch_ms);
+    Some(AccountSummary {
+        total_games,
+        earliest_ym,
+        latest_ym,
+    })
+}
+
+fn parse_chesscom_stats_total_json(body: &str) -> Option<usize> {
+    let value: Value = serde_json::from_str(body).ok()?;
+    let mut sum = 0usize;
+    let mut saw_any = false;
+    for key in [
+        "chess_bullet",
+        "chess_blitz",
+        "chess_rapid",
+        "chess_daily",
+        "chess960_daily",
+    ] {
+        if let Some(rec) = value.get(key).and_then(|v| v.get("record")) {
+            let w = rec.get("win").and_then(Value::as_u64).unwrap_or(0);
+            let l = rec.get("loss").and_then(Value::as_u64).unwrap_or(0);
+            let d = rec.get("draw").and_then(Value::as_u64).unwrap_or(0);
+            sum += (w + l + d) as usize;
+            saw_any = true;
+        }
+    }
+    saw_any.then_some(sum)
+}
+
+/// Fetch lightweight game count and active time frame (`YYYY-MM`) for a
+/// Lichess or Chess.com account without downloading the full game archive.
+/// Best-effort with short timeouts; returns `None` on errors or ChessABC.
+pub fn fetch_account_summary(
+    source: OnlineSource,
+    username: &str,
+    lichess_token: Option<&str>,
+) -> Option<AccountSummary> {
+    let username = validate_query(source, username).ok()?;
+    let agent = ureq::AgentBuilder::new()
+        .user_agent(USER_AGENT)
+        .timeout_connect(Duration::from_secs(3))
+        .timeout(Duration::from_secs(4))
+        .build();
+    match source {
+        OnlineSource::Lichess => {
+            let url = format!("https://lichess.org/api/user/{username}");
+            let mut request = agent.get(&url).set("Accept", "application/json");
+            if let Some(token) = lichess_token.map(str::trim).filter(|t| !t.is_empty()) {
+                request = request.set("Authorization", &format!("Bearer {token}"));
+            }
+            let response = request.call().ok()?;
+            let mut body = String::new();
+            response.into_reader().take(256 * 1024).read_to_string(&mut body).ok()?;
+            parse_lichess_user_summary_json(&body)
+        }
+        OnlineSource::ChessCom => {
+            let lower = username.to_ascii_lowercase();
+            let archives_url =
+                format!("https://api.chess.com/pub/player/{lower}/games/archives");
+            let mut earliest_ym = None;
+            let mut latest_ym = None;
+            if let Ok(archives_body) = get_text(&agent, &archives_url, Some("application/json"))
+                && let Ok(val) = serde_json::from_str::<Value>(&archives_body)
+                && let Ok(urls) = archive_urls(&val)
+            {
+                earliest_ym = urls.first().and_then(|u| chesscom_year_month_from_url(u));
+                latest_ym = urls.last().and_then(|u| chesscom_year_month_from_url(u));
+            }
+            let stats_url = format!("https://api.chess.com/pub/player/{lower}/stats");
+            let total_games = get_text(&agent, &stats_url, Some("application/json"))
+                .ok()
+                .and_then(|body| parse_chesscom_stats_total_json(&body));
+            if total_games.is_none() && earliest_ym.is_none() && latest_ym.is_none() {
+                None
+            } else {
+                Some(AccountSummary {
+                    total_games,
+                    earliest_ym,
+                    latest_ym,
+                })
+            }
+        }
+        OnlineSource::ChessAbc => None,
+    }
+}
+
 fn output_path(source: OnlineSource, username: &str) -> PathBuf {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2057,13 +2317,294 @@ fn output_path(source: OnlineSource, username: &str) -> PathBuf {
 }
 
 fn cache_root() -> PathBuf {
-    if let Some(dir) = std::env::var_os("XDG_CACHE_HOME") {
-        return PathBuf::from(dir).join("brett");
+    #[cfg(test)]
+    {
+        return std::env::temp_dir().join(format!("brett-test-online-{}", std::process::id()));
     }
-    if let Some(home) = std::env::var_os("HOME") {
-        return PathBuf::from(home).join(".cache").join("brett");
+    #[cfg(not(test))]
+    {
+        if let Some(dir) = std::env::var_os("XDG_CACHE_HOME") {
+            return PathBuf::from(dir).join("brett");
+        }
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home).join(".cache").join("brett");
+        }
+        std::env::temp_dir().join("brett")
     }
-    std::env::temp_dir().join("brett")
+}
+
+/// Parsed Lichess team or Chess.com club identifier from a pasted URL or slug.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TeamClubTarget {
+    LichessTeam(String),
+    ChessComClub(String),
+}
+
+impl TeamClubTarget {
+    #[must_use]
+    pub fn source(&self) -> OnlineSource {
+        match self {
+            Self::LichessTeam(_) => OnlineSource::Lichess,
+            Self::ChessComClub(_) => OnlineSource::ChessCom,
+        }
+    }
+
+    #[must_use]
+    pub fn slug(&self) -> &str {
+        match self {
+            Self::LichessTeam(id) | Self::ChessComClub(id) => id,
+        }
+    }
+}
+
+/// Parse a pasted Lichess team URL (`https://lichess.org/team/...`) or Chess.com
+/// club URL (`https://www.chess.com/club/...` or `api.chess.com/pub/club/...`).
+#[must_use]
+pub fn parse_team_or_club_url(raw: &str) -> Option<TeamClubTarget> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let clean = trimmed
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(trimmed)
+        .trim_end_matches('/');
+    let lower = clean.to_ascii_lowercase();
+    if let Some(idx) = lower.find("lichess.org/team/") {
+        let rest = &clean[idx + "lichess.org/team/".len()..];
+        let slug = rest.split('/').next().unwrap_or("").trim();
+        if !slug.is_empty()
+            && slug
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+        {
+            return Some(TeamClubTarget::LichessTeam(slug.to_string()));
+        }
+    }
+    if let Some(idx) = lower
+        .find("chess.com/club/")
+        .or_else(|| lower.find("chess.com/clubs/"))
+    {
+        let marker_len = if lower[idx..].starts_with("chess.com/clubs/") {
+            "chess.com/clubs/".len()
+        } else {
+            "chess.com/club/".len()
+        };
+        let rest = &clean[idx + marker_len..];
+        let slug = rest.split('/').next().unwrap_or("").trim();
+        if !slug.is_empty()
+            && slug
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+        {
+            return Some(TeamClubTarget::ChessComClub(slug.to_string()));
+        }
+    }
+    if let Some(idx) = lower.find("api.chess.com/pub/club/") {
+        let rest = &clean[idx + "api.chess.com/pub/club/".len()..];
+        let slug = rest.split('/').next().unwrap_or("").trim();
+        if !slug.is_empty()
+            && slug
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+        {
+            return Some(TeamClubTarget::ChessComClub(slug.to_string()));
+        }
+    }
+    None
+}
+
+/// Candidate account extracted from a Lichess team or Chess.com club roster.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TeamMemberInfo {
+    pub source: OnlineSource,
+    pub username: String,
+    pub blitz_rating: Option<u32>,
+    pub rapid_rating: Option<u32>,
+    pub classical_rating: Option<u32>,
+    pub seen_recently: bool,
+}
+
+impl TeamMemberInfo {
+    #[must_use]
+    pub fn best_rating(&self) -> Option<u32> {
+        self.classical_rating
+            .or(self.rapid_rating)
+            .or(self.blitz_rating)
+    }
+}
+
+/// Parse NDJSON returned by `GET https://lichess.org/api/team/{teamId}/users`.
+#[must_use]
+pub fn parse_lichess_team_members_ndjson(ndjson: &str) -> Vec<TeamMemberInfo> {
+    let mut members = Vec::new();
+    let cutoff_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .saturating_sub(180u128 * 24 * 3600 * 1000);
+    for line in ndjson.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(val) = serde_json::from_str::<Value>(trimmed) else {
+            continue;
+        };
+        if val
+            .get("disabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+            || val
+                .get("tosViolation")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        {
+            continue;
+        }
+        let username = val
+            .get("username")
+            .or_else(|| val.get("id"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let Some(username) = username else {
+            continue;
+        };
+        let rating_for = |perf: &str| -> Option<u32> {
+            val.get("perfs")
+                .and_then(|p| p.get(perf))
+                .and_then(|p| {
+                    let games = p.get("games").and_then(Value::as_u64).unwrap_or(0);
+                    if games == 0 {
+                        return None;
+                    }
+                    p.get("rating")
+                        .and_then(Value::as_u64)
+                        .and_then(|r| u32::try_from(r).ok())
+                })
+        };
+        let seen_recently = val
+            .get("seenAt")
+            .and_then(Value::as_u64)
+            .is_some_and(|ms| u128::from(ms) >= cutoff_ms);
+        members.push(TeamMemberInfo {
+            source: OnlineSource::Lichess,
+            username,
+            blitz_rating: rating_for("blitz"),
+            rapid_rating: rating_for("rapid"),
+            classical_rating: rating_for("classical"),
+            seen_recently,
+        });
+    }
+    members
+}
+
+/// Fetch roster members of a public Lichess team (`api/team/{id}/users`).
+pub fn fetch_lichess_team_members(
+    team_id: &str,
+    lichess_token: Option<&str>,
+) -> Result<Vec<TeamMemberInfo>> {
+    let url = format!("https://lichess.org/api/team/{team_id}/users");
+    let agent = ureq::AgentBuilder::new()
+        .user_agent(USER_AGENT)
+        .timeout_connect(Duration::from_secs(6))
+        .timeout(Duration::from_secs(20))
+        .build();
+    let mut req = agent.get(&url).set("Accept", "application/x-ndjson");
+    if let Some(token) = lichess_token.map(str::trim).filter(|t| !t.is_empty()) {
+        req = req.set("Authorization", &format!("Bearer {token}"));
+    }
+    let resp = req
+        .call()
+        .with_context(|| format!("fetching Lichess team roster '{team_id}'"))?;
+    let mut body = String::new();
+    resp.into_reader()
+        .take(16 * 1024 * 1024)
+        .read_to_string(&mut body)
+        .context("reading Lichess team members NDJSON")?;
+    let members = parse_lichess_team_members_ndjson(&body);
+    if members.is_empty() {
+        bail!("No members found in Lichess team '{team_id}'");
+    }
+    Ok(members)
+}
+
+/// Parse JSON returned by `GET https://api.chess.com/pub/club/{clubId}/members`.
+#[must_use]
+pub fn parse_chesscom_club_members_json(json_str: &str) -> Vec<TeamMemberInfo> {
+    let Ok(val) = serde_json::from_str::<Value>(json_str) else {
+        return Vec::new();
+    };
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for (bucket, recent) in [
+        ("weekly", true),
+        ("monthly", true),
+        ("all_time", false),
+    ] {
+        let Some(arr) = val.get(bucket).and_then(Value::as_array) else {
+            continue;
+        };
+        for item in arr {
+            let Some(user) = item
+                .get("username")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            else {
+                continue;
+            };
+            if seen.insert(user.to_ascii_lowercase()) {
+                out.push(TeamMemberInfo {
+                    source: OnlineSource::ChessCom,
+                    username: user.to_string(),
+                    blitz_rating: None,
+                    rapid_rating: None,
+                    classical_rating: None,
+                    seen_recently: recent,
+                });
+            }
+        }
+    }
+    out
+}
+
+/// Fetch roster members of a public Chess.com club (`pub/club/{id}/members`).
+pub fn fetch_chesscom_club_members(club_id: &str) -> Result<Vec<TeamMemberInfo>> {
+    let url = format!("https://api.chess.com/pub/club/{club_id}/members");
+    let agent = ureq::AgentBuilder::new()
+        .user_agent(USER_AGENT)
+        .timeout_connect(Duration::from_secs(6))
+        .timeout(Duration::from_secs(15))
+        .build();
+    let body = get_text(&agent, &url, Some("application/json"))
+        .with_context(|| format!("fetching Chess.com club roster '{club_id}'"))?;
+    let members = parse_chesscom_club_members_json(&body);
+    if members.is_empty() {
+        bail!("No members found in Chess.com club '{club_id}'");
+    }
+    Ok(members)
+}
+
+/// Fetch up to `max_games` recent games for one candidate account during an
+/// Account Finder scan without failing the whole scan on transient rate limits.
+pub fn fetch_candidate_sample_games(
+    source: OnlineSource,
+    username: &str,
+    max_games: usize,
+    lichess_token: Option<&str>,
+) -> Result<Vec<crate::domain::Game>> {
+    fetch_player_games_filtered_with_token(
+        source,
+        username,
+        max_games.clamp(20, 400),
+        None,
+        0,
+        lichess_token,
+    )
 }
 
 #[cfg(test)]
@@ -2457,5 +2998,87 @@ mod tests {
         assert!(game_timestamp_ms(&games[0]).is_some());
         // Days-from-civil sanity: 1970-01-01 is 0
         assert_eq!(days_from_civil(1970, 1, 1), 0);
+    }
+
+    #[test]
+    fn parse_chessabc_position_moves_json_parses_and_deduplicates_moves() {
+        use crate::chess::{Chess, Position, Role, Square};
+        let after_e4 = Chess::default()
+            .play(crate::chess::Move::Normal {
+                role: Role::Pawn,
+                from: Square::E2,
+                capture: None,
+                to: Square::E4,
+                promotion: None,
+            })
+            .unwrap();
+        let json = r#"{
+            "result": [
+                {"move":"e5","white_win":100,"black_win":80,"draw":70,"total":250,"white_rating":2280.4,"black_rating":2290.6,"year":2026},
+                {"move":"c5","white_win":200,"black_win":190,"draw":110,"total":500,"white_rating":2230.0,"black_rating":2250.0,"year":2025},
+                {"move":"Ngf6","white_win":10,"black_win":5,"draw":5,"total":20,"white_rating":2100.0,"black_rating":2100.0,"year":2024},
+                {"move":"Nf6","white_win":10,"black_win":5,"draw":5,"total":20,"white_rating":2100.0,"black_rating":2100.0,"year":2024}
+            ]
+        }"#;
+        let stats = parse_chessabc_position_moves_json(&after_e4, json).unwrap();
+        assert_eq!(stats.len(), 3);
+        assert_eq!(stats[0].san(&after_e4).as_deref(), Some("c5"));
+        assert_eq!(stats[0].games, 500);
+        assert_eq!(stats[0].white, 200);
+        assert_eq!(stats[0].draw, 110);
+        assert_eq!(stats[0].black, 190);
+        assert_eq!(stats[0].elo_avg(), Some(2240.0));
+        assert_eq!(stats[0].last_date, 20250101);
+        assert_eq!(stats[1].san(&after_e4).as_deref(), Some("e5"));
+        assert_eq!(stats[2].san(&after_e4).as_deref(), Some("Nf6"));
+        assert_eq!(stats[2].games, 20);
+    }
+
+    #[test]
+    fn account_summary_parsers_extract_counts_and_time_frames() {
+        let lichess = r#"{"id":"test","createdAt":1546300800000,"seenAt":1735689600000,"count":{"all":1482}}"#;
+        let summary = parse_lichess_user_summary_json(lichess).unwrap();
+        assert_eq!(summary.total_games, Some(1482));
+        assert_eq!(summary.earliest_ym.as_deref(), Some("2019-01"));
+        assert_eq!(summary.latest_ym.as_deref(), Some("2025-01"));
+
+        let chesscom = r#"{
+            "chess_rapid":{"record":{"win":100,"loss":80,"draw":20}},
+            "chess_blitz":{"record":{"win":300,"loss":250,"draw":50}},
+            "chess_bullet":{"record":{"win":10,"loss":5,"draw":0}}
+        }"#;
+        assert_eq!(parse_chesscom_stats_total_json(chesscom), Some(815));
+    }
+
+    #[test]
+    fn team_club_urls_and_rosters_parse_cleanly() {
+        assert_eq!(
+            parse_team_or_club_url("https://lichess.org/team/sc-erlangen-1"),
+            Some(TeamClubTarget::LichessTeam("sc-erlangen-1".to_string()))
+        );
+        assert_eq!(
+            parse_team_or_club_url("https://www.chess.com/club/bayern-muenchen?tab=members"),
+            Some(TeamClubTarget::ChessComClub("bayern-muenchen".to_string()))
+        );
+        assert_eq!(parse_team_or_club_url("just_a_username"), None);
+
+        let ndjson = concat!(
+            r#"{"id":"alice","username":"AliceGM","perfs":{"blitz":{"games":120,"rating":2480},"classical":{"games":20,"rating":2390}},"seenAt":1800000000000}"#,
+            "\n",
+            r#"{"id":"disabled_u","username":"Banned","disabled":true,"perfs":{"blitz":{"games":10,"rating":2500}}}"#,
+            "\n",
+            r#"{"id":"bob","username":"BobClub","perfs":{"rapid":{"games":5,"rating":1950}}}"#,
+        );
+        let l_members = parse_lichess_team_members_ndjson(ndjson);
+        assert_eq!(l_members.len(), 2);
+        assert_eq!(l_members[0].username, "AliceGM");
+        assert_eq!(l_members[0].best_rating(), Some(2390));
+        assert_eq!(l_members[1].best_rating(), Some(1950));
+
+        let club_json = r#"{"weekly":[{"username":"PlayerOne"}],"monthly":[{"username":"PlayerTwo"},{"username":"playerone"}],"all_time":[{"username":"PlayerThree"}]}"#;
+        let c_members = parse_chesscom_club_members_json(club_json);
+        assert_eq!(c_members.len(), 3);
+        assert!(c_members[0].seen_recently);
+        assert!(!c_members[2].seen_recently);
     }
 }

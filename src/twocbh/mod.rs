@@ -36,8 +36,8 @@ mod tests;
 
 pub use writer::{
     ALL_EXTENSIONS, CORE_EXTENSIONS, DERIVED_EXTENSIONS, TwoCbhWriteOptions, TwoCbhWriteReport,
-    core_companion_files, existing_companion_files, has_unsupported_annotations, write_database,
-    write_database_with_options,
+    core_companion_files, existing_companion_files, has_unsupported_annotations,
+    merge_updates_into_2cbh, write_database, write_database_with_options,
 };
 
 use std::ffi::OsString;
@@ -376,6 +376,11 @@ impl Content<'_> {
     /// Encoding kind: 1 for standard chess, 2 for Chess960.
     pub fn kind(&self) -> u16 {
         self.kind
+    }
+
+    /// Raw little-endian `.2cbg` token bytes (after the kind word, ending in `ff ff`).
+    pub(crate) fn raw_bytes(&self) -> &[u8] {
+        self.bytes
     }
 
     /// Little-endian token words, after the kind word.
@@ -788,10 +793,10 @@ impl TwoCbhLibrary {
         let mut loose = Vec::new();
         for entity in 0..bound {
             let player = self.names.player(entity);
-            if player.name == "?" {
+            let Some(key) = crate::players::player_key(&player.name) else {
                 continue;
-            }
-            if crate::players::player_key(&player.name).as_deref() == Some(player_key) {
+            };
+            if key == player_key {
                 exact.push(entity);
             } else if crate::players::matches_truncated_or_enumerated_name(
                 canonical_name,
@@ -829,15 +834,77 @@ impl TwoCbhLibrary {
         Some(indices)
     }
 
+    /// Targeted substring player search using `.2lid` + `.2lgd` without scanning
+    /// every game record.
+    pub fn accelerated_games_matching_player(&self, needle_lower: &str) -> Option<Vec<usize>> {
+        let needle = needle_lower.trim();
+        if needle.is_empty() {
+            return None;
+        }
+        let acc = self.accelerator.as_ref()?;
+        let bound = self.entity_bound() as u32;
+        let mut indices = Vec::new();
+        for entity in 0..bound {
+            let player = self.names.player(entity);
+            if !crate::library::contains_case_insensitive(&player.name, needle) {
+                continue;
+            }
+            let Ok(ids) = acc.player_games(entity) else {
+                continue;
+            };
+            for record_id in ids {
+                if let Some(index) = self.game_index_for_record(record_id) {
+                    indices.push(index);
+                }
+            }
+        }
+        indices.sort_unstable();
+        indices.dedup();
+        Some(indices)
+    }
+
     /// Per-player game lists resolved through the `.2lgd` accelerator.
     /// Each entity id with a non-empty player posting list contributes one
     /// entry named from the `.2lid`; record ids map to game indices.
     pub fn accelerated_players(&self) -> Option<Vec<crate::library::AcceleratedPlayer>> {
+        struct EntityAgg {
+            indices: Vec<usize>,
+            white_games: u32,
+            black_games: u32,
+            wins: u32,
+            draws: u32,
+            losses: u32,
+            classical_elo_max: u32,
+            any_elo_max: u32,
+            elo_sum: u64,
+            elo_count: u32,
+            latest_otb_elo: Option<u16>,
+            latest_otb_date: u32,
+            first_year: u16,
+            last_year: u16,
+        }
+
+        let mut event_cache = vec![0u8; self.names.entity_count()];
+        let is_classical_event = |event_id: u32, cache: &mut [u8]| -> bool {
+            let idx = event_id as usize;
+            if let Some(&cached) = cache.get(idx)
+                && cached != 0
+            {
+                return cached == 1;
+            }
+            let (place, title) = self.names.event(event_id);
+            let classical = !crate::players::is_online_game(&title, &place)
+                && !crate::players::is_non_classical_event(&title);
+            if let Some(slot) = cache.get_mut(idx) {
+                *slot = if classical { 1 } else { 2 };
+            }
+            classical
+        };
+
         if self.games.is_empty() && !self.entries.is_empty() {
             let bound = self.names.entity_count();
             if bound > 0 {
-                let mut by_entity: Vec<Option<crate::library::AcceleratedPlayer>> =
-                    (0..bound).map(|_| None).collect();
+                let mut by_entity: Vec<Option<EntityAgg>> = (0..bound).map(|_| None).collect();
                 for (index, entry) in self.entries.iter().enumerate() {
                     let Ok(record) = self.file.record(entry.id) else {
                         continue;
@@ -847,31 +914,34 @@ impl TwoCbhLibrary {
                     }
                     let white = le_u32(&record[0x18..0x1c]) as usize;
                     let black = le_u32(&record[0x20..0x24]) as usize;
+                    let event_id = le_u32(&record[0x28..0x2c]);
+                    let is_classical = is_classical_event(event_id, &mut event_cache);
                     let result = (le_u32(&record[0x58..0x5c]) & 0xffff) as u16;
                     let white_elo = le_u16(&record[0x60..0x62]) as u32;
                     let black_elo = le_u16(&record[0x70..0x72]) as u32;
-                    let year = ((le_u32(&record[0xbc..0xc0]) >> 9) & 0xfff) as u16;
+                    let (year, date_num) = decode_packed_date(le_u32(&record[0xbc..0xc0]));
 
                     let mut update =
                         |entity: usize, is_white: bool, own_elo: u32, push_idx: bool| {
                             let Some(slot) = by_entity.get_mut(entity) else {
                                 return;
                             };
-                            let agg =
-                                slot.get_or_insert_with(|| crate::library::AcceleratedPlayer {
-                                    name: String::new(),
-                                    indices: Vec::new(),
-                                    white_games: 0,
-                                    black_games: 0,
-                                    wins: 0,
-                                    draws: 0,
-                                    losses: 0,
-                                    elo_max: 0,
-                                    elo_sum: 0,
-                                    elo_count: 0,
-                                    first_year: 0,
-                                    last_year: 0,
-                                });
+                            let agg = slot.get_or_insert_with(|| EntityAgg {
+                                indices: Vec::new(),
+                                white_games: 0,
+                                black_games: 0,
+                                wins: 0,
+                                draws: 0,
+                                losses: 0,
+                                classical_elo_max: 0,
+                                any_elo_max: 0,
+                                elo_sum: 0,
+                                elo_count: 0,
+                                latest_otb_elo: None,
+                                latest_otb_date: 0,
+                                first_year: 0,
+                                last_year: 0,
+                            });
                             if push_idx {
                                 agg.indices.push(index);
                             }
@@ -890,7 +960,14 @@ impl TwoCbhLibrary {
                             if own_elo > 0 {
                                 agg.elo_sum += u64::from(own_elo);
                                 agg.elo_count += 1;
-                                agg.elo_max = agg.elo_max.max(own_elo);
+                                agg.any_elo_max = agg.any_elo_max.max(own_elo);
+                                if is_classical {
+                                    agg.classical_elo_max = agg.classical_elo_max.max(own_elo);
+                                    if date_num >= agg.latest_otb_date {
+                                        agg.latest_otb_elo = Some(own_elo as u16);
+                                        agg.latest_otb_date = date_num;
+                                    }
+                                }
                             }
                             if year > 0 {
                                 if agg.first_year == 0 || year < agg.first_year {
@@ -909,18 +986,37 @@ impl TwoCbhLibrary {
                 }
                 let mut out = Vec::new();
                 for (entity, slot) in by_entity.into_iter().enumerate() {
-                    let Some(mut agg) = slot else {
+                    let Some(agg) = slot else {
                         continue;
                     };
                     if agg.indices.is_empty() {
                         continue;
                     }
                     let player = self.names.player(entity as u32);
-                    if player.name == "?" {
+                    if crate::players::player_key(&player.name).is_none() {
                         continue;
                     }
-                    agg.name = player.name;
-                    out.push(agg);
+                    out.push(crate::library::AcceleratedPlayer {
+                        name: player.name,
+                        fide_id: player.fide.map(|f| f.to_string()),
+                        indices: agg.indices,
+                        white_games: agg.white_games,
+                        black_games: agg.black_games,
+                        wins: agg.wins,
+                        draws: agg.draws,
+                        losses: agg.losses,
+                        elo_max: if agg.classical_elo_max > 0 {
+                            agg.classical_elo_max
+                        } else {
+                            agg.any_elo_max
+                        },
+                        elo_sum: agg.elo_sum,
+                        elo_count: agg.elo_count,
+                        latest_otb_elo: agg.latest_otb_elo,
+                        latest_otb_date: agg.latest_otb_date,
+                        first_year: agg.first_year,
+                        last_year: agg.last_year,
+                    });
                 }
                 if !out.is_empty() {
                     return Some(out);
@@ -938,7 +1034,7 @@ impl TwoCbhLibrary {
                 continue;
             }
             let player = self.names.player(entity);
-            if player.name == "?" {
+            if crate::players::player_key(&player.name).is_none() {
                 continue;
             }
             let mut indices = Vec::with_capacity(ids.len());
@@ -949,7 +1045,10 @@ impl TwoCbhLibrary {
             let mut losses = 0u32;
             let mut elo_sum = 0u64;
             let mut elo_count = 0u32;
-            let mut elo_max = 0u32;
+            let mut classical_elo_max = 0u32;
+            let mut any_elo_max = 0u32;
+            let mut latest_otb_elo = None;
+            let mut latest_otb_date = 0u32;
             let mut first_year = 0u16;
             let mut last_year = 0u16;
             for record_id in ids {
@@ -965,6 +1064,8 @@ impl TwoCbhLibrary {
                 }
                 let white = le_u32(&record[0x18..0x1c]);
                 let black = le_u32(&record[0x20..0x24]);
+                let event_id = le_u32(&record[0x28..0x2c]);
+                let is_classical = is_classical_event(event_id, &mut event_cache);
                 let played_white = white == entity;
                 let played_black = black == entity;
                 if played_white {
@@ -1002,14 +1103,21 @@ impl TwoCbhLibrary {
                 } else {
                     0
                 };
+                let (year, date_num) = decode_packed_date(le_u32(&record[0xbc..0xc0]));
                 if own_elo > 0 {
                     elo_sum += u64::from(own_elo);
                     elo_count += 1;
-                    elo_max = elo_max.max(own_elo);
+                    any_elo_max = any_elo_max.max(own_elo);
+                    if is_classical {
+                        classical_elo_max = classical_elo_max.max(own_elo);
+                        if date_num >= latest_otb_date {
+                            latest_otb_elo = Some(own_elo as u16);
+                            latest_otb_date = date_num;
+                        }
+                    }
                 }
 
-                // Game date → first/last year (date packs year in bits 9..21).
-                let year = ((le_u32(&record[0xbc..0xc0]) >> 9) & 0xfff) as u16;
+                // Game date → first/last year.
                 if year > 0 {
                     if first_year == 0 || year < first_year {
                         first_year = year;
@@ -1024,15 +1132,22 @@ impl TwoCbhLibrary {
             indices.dedup();
             out.push(crate::library::AcceleratedPlayer {
                 name: player.name,
+                fide_id: player.fide.map(|f| f.to_string()),
                 indices,
                 white_games,
                 black_games,
                 wins,
                 draws,
                 losses,
-                elo_max,
+                elo_max: if classical_elo_max > 0 {
+                    classical_elo_max
+                } else {
+                    any_elo_max
+                },
                 elo_sum,
                 elo_count,
+                latest_otb_elo,
+                latest_otb_date,
                 first_year,
                 last_year,
             });
@@ -1072,6 +1187,116 @@ impl GameLibrary for TwoCbhLibrary {
 
     fn game_players(&self, index: usize) -> (String, String) {
         TwoCbhLibrary::game_players(self, index)
+    }
+
+    fn game_record_meta(&self, index: usize) -> crate::library::GameRecordMeta {
+        let Some(entry) = self.entries.get(index) else {
+            return crate::library::GameRecordMeta::default();
+        };
+        let Ok(record) = self.file.record(entry.id) else {
+            return crate::library::GameRecordMeta {
+                deleted: entry.deleted,
+                ..Default::default()
+            };
+        };
+        let white_elo = le_u16(&record[0x60..0x62]);
+        let black_elo = le_u16(&record[0x70..0x72]);
+        let year = decode_packed_date(le_u32(&record[0xbc..0xc0])).0;
+        let raw_res = le_u32(&record[0x58..0x5c]) & 0xffff;
+        let result = match raw_res {
+            0 => 0,
+            1 => 1,
+            2 => 2,
+            _ => 3,
+        };
+        let raw_eco = le_u16(&record[0x80..0x82]);
+        let eco_code = if (128..=64127).contains(&raw_eco) {
+            let code = raw_eco / 128 - 1;
+            if code <= 499 { code + 1 } else { 0 }
+        } else {
+            0
+        };
+        let medals = le_u16(&record[0x82..0x84]);
+        let vcs_flags = le_u32(&record[0x84..0x88]);
+        let cba_off = le_u64(&record[0x10..0x18]);
+        crate::library::GameRecordMeta {
+            white_elo,
+            black_elo,
+            year,
+            result,
+            eco_code,
+            medals,
+            vcs_flags,
+            annotated: cba_off > 12 || (vcs_flags & 0x0e) != 0 || medals != 0,
+            deleted: entry.deleted,
+        }
+    }
+
+    fn accelerated_games_matching_player(&self, needle_lower: &str) -> Option<Vec<usize>> {
+        TwoCbhLibrary::accelerated_games_matching_player(self, needle_lower)
+    }
+
+    fn scan_mainline_positions(
+        &self,
+        index: usize,
+        max_ply: u32,
+        visitor: &mut dyn FnMut(u32, &crate::chess::Chess) -> bool,
+    ) -> Result<bool> {
+        let entry = self
+            .entries
+            .get(index)
+            .with_context(|| format!("2CBH game index {index} is out of range"))?;
+        let content = self.file.content(entry.id)?;
+        let raw = content.raw_bytes();
+        match content.kind {
+            1 => {
+                if raw.len() >= 2 && raw[0] == 0xfc && raw[1] == 0xff {
+                    let start_pos = crate::chess::Chess::default();
+                    fast_index::scan_2cbh_mainline_positions(
+                        &start_pos,
+                        &raw[2..],
+                        max_ply,
+                        visitor,
+                    )?;
+                    Ok(true)
+                } else if raw.len() >= 2 && raw[0] == 0xfb && raw[1] == 0xff {
+                    let words = content.words();
+                    let Ok((start_pos, rest)) = moves::decode_custom_start(&words) else {
+                        return Ok(false);
+                    };
+                    let consumed_bytes = (words.len() - rest.len()) * 2;
+                    fast_index::scan_2cbh_mainline_positions(
+                        &start_pos,
+                        &raw[consumed_bytes..],
+                        max_ply,
+                        visitor,
+                    )?;
+                    Ok(true)
+                } else {
+                    Ok(false)
+                }
+            }
+            2 => {
+                if raw.len() < 6 {
+                    return Ok(false);
+                }
+                let m0 = u16::from_le_bytes([raw[0], raw[1]]);
+                let start_id = u16::from_le_bytes([raw[2], raw[3]]);
+                let m1 = u16::from_le_bytes([raw[4], raw[5]]);
+                if m0 != 0xfffb || m1 != 0xfffc {
+                    return Ok(false);
+                }
+                let start_pos = moves::start_position_960(start_id)?;
+                fast_index::scan_2cbh_mainline_positions(
+                    &start_pos,
+                    &raw[6..],
+                    max_ply,
+                    visitor,
+                )?;
+                Ok(true)
+            }
+            kind => bail!("2CBH game {} uses unknown encoding kind {kind}", entry.id),
+        }
     }
 
     fn stream_mainline(
@@ -1212,12 +1437,17 @@ fn load_game(
     let content = file.content(id)?;
     let words = content.words();
     let record_start = start_id_from_record(file.record(id)?);
-    let (chess960, start_id, move_tokens) = match content.kind {
+    let (chess960, start_id, custom_start, move_tokens) = match content.kind {
         1 => {
-            if words.first() != Some(&0xfffc) {
+            if words.first() == Some(&0xfffc) {
+                (false, None, None, &words[1..])
+            } else if words.first() == Some(&0xfffb) {
+                let (pos, rest) = moves::decode_custom_start(&words)
+                    .with_context(|| format!("decoding 2CBH game {id} custom start"))?;
+                (false, None, Some(pos), rest)
+            } else {
                 bail!("2CBH game {id} has no standard start marker");
             }
-            (false, None, &words[1..])
         }
         2 => {
             if words.first() != Some(&0xfffb) || words.get(2) != Some(&0xfffc) {
@@ -1232,7 +1462,7 @@ fn load_game(
                      but {record_start} in its header"
                 );
             }
-            (true, Some(start_id), &words[3..])
+            (true, Some(start_id), None, &words[3..])
         }
         kind => bail!("2CBH game {id} uses unknown encoding kind {kind}"),
     };
@@ -1249,6 +1479,11 @@ fn load_game(
         game.set_header("SetUp", "1".to_string());
         game.set_header("FEN", fen);
         game.set_header("Variant", "Chess960".to_string());
+    } else if let Some(pos) = custom_start {
+        let fen = moves::start_fen(&pos);
+        game.nodes[0].pos = pos;
+        game.set_header("SetUp", "1".to_string());
+        game.set_header("FEN", fen);
     }
     if deleted {
         game.errors
@@ -1397,7 +1632,7 @@ impl NameBase {
         if self.stride == 0 || bytes.len() <= self.first_offset {
             return 0;
         }
-        (bytes.len() - self.first_offset) / self.stride
+        (bytes.len() - self.first_offset).div_ceil(self.stride)
     }
 
     /// Single-string title block used by text records (offset `0xE82`):
@@ -1662,6 +1897,16 @@ pub(crate) fn decode_text(bytes: &[u8]) -> String {
             })
             .collect(),
     }
+}
+
+fn decode_packed_date(raw: u32) -> (u16, u32) {
+    let year = ((raw >> 9) & 0xfff) as u16;
+    if year == 0 {
+        return (0, 0);
+    }
+    let month = (raw >> 5) & 15;
+    let day = raw & 31;
+    (year, u32::from(year) * 10_000 + month * 100 + day)
 }
 
 fn start_id_from_record(record: &[u8]) -> Option<u16> {

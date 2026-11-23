@@ -34,7 +34,7 @@ Unlike browser tools that fragment OTB databases and online accounts or legacy d
   2. **Center — Board Canvas** (warm wood/stone board, slim left evaluation bar, compact top/bottom player strips with photo, title badge, latest OTB Elo, country flag, and clock).
   3. **Right — Analysis & Preparation Workspace** (`Moves`, `Reference`, `Prep`, `Engine`, `Review`).
 - Game-category identity is communicated exclusively via user-configurable font colors (differentiating OTB Classical/Rapid/Blitz, Online Classical/Rapid/Blitz/Bullet, and Correspondence) rather than noisy text badges.
-- All W/D/B statistics render as compact horizontal stacked bars (White wins = white, Draws = neutral slate/grey, Black wins = dark charcoal/black).
+- Side-relevant W/D/B statistics render as compact horizontal stacked bars (White wins = white, Draws = neutral slate/grey, Black wins = dark charcoal/black), while color-blind player W/D/L statistics (such as on the Player Profile) are color-coded green (win), neutral slate/grey (draw), and red (loss).
 
 ## Product Principles
 

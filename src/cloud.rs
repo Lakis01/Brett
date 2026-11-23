@@ -10,7 +10,8 @@
 //! scopes is sufficient); the token is supplied by the caller.
 
 use std::io::Read;
-use std::time::Duration;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::Value;
@@ -318,7 +319,7 @@ pub fn fetch_with_cached_eval(
         ExplorerSource::Both => fetch_both_explorers(&agent, fen, token),
     };
     let cloud_eval = cached_cloud_eval
-        .unwrap_or_else(|| fetch_cloud_eval(&agent, fen).map_err(|err| format!("{err:#}")));
+        .unwrap_or_else(|| fetch_cloud_eval(&agent, fen, token).map_err(|err| format!("{err:#}")));
 
     Snapshot {
         fen: fen.to_string(),
@@ -329,32 +330,71 @@ pub fn fetch_with_cached_eval(
     }
 }
 
+static CLOUD_EVAL_COOLDOWN_UNTIL: Mutex<Option<Instant>> = Mutex::new(None);
+
+fn cooldown_remaining_from(slot: &mut Option<Instant>, now: Instant) -> Option<Duration> {
+    let until = (*slot)?;
+    if until > now {
+        Some(until.saturating_duration_since(now))
+    } else {
+        *slot = None;
+        None
+    }
+}
+
+fn note_cooldown_until(slot: &mut Option<Instant>, now: Instant, wait: Duration) {
+    let candidate = now + wait;
+    *slot = Some(slot.map_or(candidate, |existing| existing.max(candidate)));
+}
+
+fn parse_retry_after_seconds(header: Option<&str>) -> Duration {
+    let secs = header
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .map(|s| s.clamp(5, 300))
+        .unwrap_or(60);
+    Duration::from_secs(secs)
+}
+
+/// Remaining Lichess Cloud Eval HTTP 429 cooldown duration, if active.
+pub fn cloud_eval_cooldown_remaining() -> Option<Duration> {
+    let mut guard = CLOUD_EVAL_COOLDOWN_UNTIL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    cooldown_remaining_from(&mut guard, Instant::now())
+}
+
+fn note_cloud_eval_cooldown(wait: Duration) {
+    let mut guard = CLOUD_EVAL_COOLDOWN_UNTIL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    note_cooldown_until(&mut guard, Instant::now(), wait);
+}
+
+/// Fetch only the Lichess cloud evaluation (`multiPv=5`) for the evaluation bar
+/// and Cloud Engine reuse, authenticating with an optional Lichess Bearer token.
+///
+/// Returns `Ok(None)` when Lichess does not have a cached cloud evaluation for
+/// `fen` (HTTP 404). Records a shared cooldown and returns `Err` on HTTP 429.
+pub fn fetch_eval_only_with_token(
+    fen: &str,
+    lichess_token: Option<&str>,
+) -> Result<Option<CloudEval>, String> {
+    let agent = ureq::AgentBuilder::new()
+        .user_agent(USER_AGENT)
+        .timeout_connect(Duration::from_secs(5))
+        .timeout(Duration::from_secs(6))
+        .build();
+    let token = lichess_token.map(str::trim).filter(|t| !t.is_empty());
+    fetch_cloud_eval_core(&agent, fen, token).map_err(|err| format!("{err:#}"))
+}
+
 /// Fetch only the Lichess cloud evaluation (`multiPv=5`) for the evaluation bar
 /// and Cloud Engine reuse.
 ///
 /// Returns `Ok(None)` when Lichess does not have a cached cloud evaluation for
 /// `fen` (HTTP 404).
 pub fn fetch_eval_only(fen: &str) -> Result<Option<CloudEval>, String> {
-    let agent = ureq::AgentBuilder::new()
-        .user_agent(USER_AGENT)
-        .timeout_connect(Duration::from_secs(5))
-        .timeout(Duration::from_secs(6))
-        .build();
-    let url = format!(
-        "https://lichess.org/api/cloud-eval?fen={}&multiPv=5",
-        encode_component(fen)
-    );
-    match agent.get(&url).set("Accept", "application/json").call() {
-        Ok(response) => read_body(response)
-            .and_then(|body| parse_cloud_eval(&body))
-            .map(Some)
-            .map_err(|err| format!("{err:#}")),
-        Err(ureq::Error::Status(404, _)) => Ok(None),
-        Err(err) => Err(format!(
-            "{:#}",
-            anyhow::Error::new(err).context("querying the Lichess cloud evaluation")
-        )),
-    }
+    fetch_eval_only_with_token(fen, None)
 }
 
 /// Query the public Lichess Masters opening explorer with a caller-supplied timeout.
@@ -539,17 +579,44 @@ fn fetch_explorer(
     parse_explorer(&text)
 }
 
-fn fetch_cloud_eval(agent: &ureq::Agent, fen: &str) -> Result<CloudEval> {
+fn fetch_cloud_eval_core(
+    agent: &ureq::Agent,
+    fen: &str,
+    token: Option<&str>,
+) -> Result<Option<CloudEval>> {
+    if let Some(wait) = cloud_eval_cooldown_remaining() {
+        bail!(
+            "Lichess cloud evaluation rate-limited (retry in {}s)",
+            wait.as_secs().max(1)
+        );
+    }
     let url = format!(
         "https://lichess.org/api/cloud-eval?fen={}&multiPv=5",
         encode_component(fen)
     );
-    match agent.get(&url).set("Accept", "application/json").call() {
-        Ok(response) => parse_cloud_eval(&read_body(response)?),
-        Err(ureq::Error::Status(404, _)) => {
-            bail!("Lichess has no cloud evaluation for this position")
+    let mut request = agent.get(&url).set("Accept", "application/json");
+    if let Some(t) = token.map(str::trim).filter(|t| !t.is_empty()) {
+        request = request.set("Authorization", &format!("Bearer {t}"));
+    }
+    match request.call() {
+        Ok(response) => parse_cloud_eval(&read_body(response)?).map(Some),
+        Err(ureq::Error::Status(404, _)) => Ok(None),
+        Err(ureq::Error::Status(429, response)) => {
+            let wait = parse_retry_after_seconds(response.header("retry-after"));
+            note_cloud_eval_cooldown(wait);
+            bail!(
+                "Lichess cloud evaluation rate-limited (HTTP 429; retry in {}s)",
+                wait.as_secs()
+            );
         }
         Err(err) => Err(err).context("querying the Lichess cloud evaluation"),
+    }
+}
+
+fn fetch_cloud_eval(agent: &ureq::Agent, fen: &str, token: Option<&str>) -> Result<CloudEval> {
+    match fetch_cloud_eval_core(agent, fen, token)? {
+        Some(eval) => Ok(eval),
+        None => bail!("Lichess has no cloud evaluation for this position"),
     }
 }
 
@@ -1075,5 +1142,41 @@ mod tests {
             ..pruned
         };
         assert!(!with_data.is_verified_empty());
+    }
+
+    #[test]
+    fn retry_after_parser_handles_missing_and_clamped_seconds() {
+        assert_eq!(parse_retry_after_seconds(None), Duration::from_secs(60));
+        assert_eq!(parse_retry_after_seconds(Some("abc")), Duration::from_secs(60));
+        assert_eq!(parse_retry_after_seconds(Some("2")), Duration::from_secs(5));
+        assert_eq!(parse_retry_after_seconds(Some("45")), Duration::from_secs(45));
+        assert_eq!(parse_retry_after_seconds(Some("999")), Duration::from_secs(300));
+    }
+
+    #[test]
+    fn cooldown_state_tracks_monotonic_deadlines_and_expiry() {
+        let base = Instant::now();
+        let mut slot = None;
+        assert_eq!(cooldown_remaining_from(&mut slot, base), None);
+
+        note_cooldown_until(&mut slot, base, Duration::from_secs(30));
+        assert_eq!(
+            cooldown_remaining_from(&mut slot, base + Duration::from_secs(10)),
+            Some(Duration::from_secs(20))
+        );
+
+        // Shorter note does not shrink an active longer cooldown.
+        note_cooldown_until(&mut slot, base + Duration::from_secs(10), Duration::from_secs(5));
+        assert_eq!(
+            cooldown_remaining_from(&mut slot, base + Duration::from_secs(10)),
+            Some(Duration::from_secs(20))
+        );
+
+        // Once expired, remaining becomes None and clears the slot.
+        assert_eq!(
+            cooldown_remaining_from(&mut slot, base + Duration::from_secs(35)),
+            None
+        );
+        assert!(slot.is_none());
     }
 }

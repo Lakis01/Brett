@@ -128,10 +128,19 @@ impl TwoCbhAccelerator {
                 Backing::Mapped(mmap)
             }
             Err(err) => {
-                tracing::warn!(
-                    "2LGD mmap failed for {} ({err:#}); falling back to read",
-                    path.display()
-                );
+                let not_found = err.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|io_err| io_err.kind() == std::io::ErrorKind::NotFound)
+                });
+                if not_found {
+                    tracing::debug!("2LGD sidecar not present at {}; falling back to read", path.display());
+                } else {
+                    tracing::warn!(
+                        "2LGD mmap failed for {} ({err:#}); falling back to read",
+                        path.display()
+                    );
+                }
                 let bytes = fs::read(path)
                     .with_context(|| format!("reading 2LGD sidecar {}", path.display()))?;
                 return Self::from_bytes(path.to_path_buf(), bytes);
@@ -342,33 +351,55 @@ impl TwoCbhAccelerator {
         let mut annotator: HashMap<u32, Vec<u32>> = HashMap::new();
         let mut max_entity = 0u32;
 
+        let entity_limit = super::NameBase::open(&cbh.lid_path)
+            .ok()
+            .map(|n| n.entity_count() as u32)
+            .filter(|&c| c > 0);
+        let valid_entity = |record: &[u8], off: usize| -> Option<u32> {
+            let lo = le_u32(&record[off..off + 4]);
+            let hi = le_u32(&record[off + 4..off + 8]);
+            if hi != 0 || lo == u32::MAX || entity_limit.is_some_and(|limit| lo >= limit) {
+                None
+            } else {
+                Some(lo)
+            }
+        };
+
         for id in 1..cbh.slot_count() as u32 {
             let Ok(record) = cbh.record(id) else {
                 continue;
             };
-            if record[0] & 1 == 0 || record[0] & 2 != 0 {
+            if record[0] & 1 == 0 || record[0] & 2 != 0 || record[0] & 0x80 != 0 {
                 continue;
             }
-            if record.len() < OFF_SOURCE + 4 {
+            if record.len() < OFF_SOURCE + 8 {
                 continue;
             }
-            let white = le_u32(&record[OFF_WHITE..OFF_WHITE + 4]);
-            let black = le_u32(&record[OFF_BLACK..OFF_BLACK + 4]);
-            let event_id = le_u32(&record[OFF_EVENT..OFF_EVENT + 4]);
-            let annot_id = le_u32(&record[OFF_ANNOTATOR..OFF_ANNOTATOR + 4]);
-            let source_id = le_u32(&record[OFF_SOURCE..OFF_SOURCE + 4]);
-            for entity in [white, black, event_id, annot_id, source_id] {
+            let white = valid_entity(record, OFF_WHITE);
+            let black = valid_entity(record, OFF_BLACK);
+            let event_id = valid_entity(record, OFF_EVENT);
+            let annot_id = valid_entity(record, OFF_ANNOTATOR);
+            let source_id = valid_entity(record, OFF_SOURCE);
+            for entity in [white, black, event_id, annot_id, source_id].into_iter().flatten() {
                 max_entity = max_entity.max(entity);
             }
-            if white == black {
-                player.entry(white).or_default().push(id);
-            } else {
-                player.entry(white).or_default().push(id);
-                player.entry(black).or_default().push(id);
+            if let Some(w) = white {
+                player.entry(w).or_default().push(id);
             }
-            event.entry(event_id).or_default().push(id);
-            source.entry(source_id).or_default().push(id);
-            annotator.entry(annot_id).or_default().push(id);
+            if let Some(b) = black
+                && Some(b) != white
+            {
+                player.entry(b).or_default().push(id);
+            }
+            if let Some(e) = event_id {
+                event.entry(e).or_default().push(id);
+            }
+            if let Some(s) = source_id {
+                source.entry(s).or_default().push(id);
+            }
+            if let Some(a) = annot_id {
+                annotator.entry(a).or_default().push(id);
+            }
         }
 
         // Compress every posting list to RLE tokens. A run of two or more
@@ -493,8 +524,8 @@ impl TwoCbhAccelerator {
             let at = LGD_HEADER_LEN + (*entity as usize) * LGD_BLOCK_LEN;
             file[at + role * 8..at + role * 8 + 8].copy_from_slice(&start.to_le_bytes());
             file[at + 80 + role * 8..at + 80 + role * 8 + 8].copy_from_slice(&end.to_le_bytes());
-            file[at + 160 + role * 4..at + 160 + role * 4 + 4]
-                .copy_from_slice(&count.to_le_bytes());
+            file[at + 160 + role * 8..at + 160 + role * 8 + 8]
+                .copy_from_slice(&u64::from(*count).to_le_bytes());
         }
 
         let mut next_block = dir_blocks;
@@ -508,8 +539,8 @@ impl TwoCbhAccelerator {
             let at = LGD_HEADER_LEN + (entity as usize) * LGD_BLOCK_LEN;
             file[at + role * 8..at + role * 8 + 8].copy_from_slice(&first.to_le_bytes());
             file[at + 80 + role * 8..at + 80 + role * 8 + 8].copy_from_slice(&last.to_le_bytes());
-            file[at + 160 + role * 4..at + 160 + role * 4 + 4]
-                .copy_from_slice(&count.to_le_bytes());
+            file[at + 160 + role * 8..at + 160 + role * 8 + 8]
+                .copy_from_slice(&u64::from(count).to_le_bytes());
             for (i, chunk) in chunks.iter().enumerate() {
                 let block_id = next_block + i;
                 let bat = LGD_HEADER_LEN + block_id * LGD_BLOCK_LEN;
@@ -727,5 +758,39 @@ mod tests {
         let cloned = acc.clone();
         assert_eq!(cloned.bytes().len(), len);
         assert_eq!(cloned.block_count(), acc.block_count());
+    }
+
+    #[test]
+    fn build_to_ignores_nonzero_high_word_in_annotator_slot() {
+        let (path, dir) = temp_stem("high-annot");
+        let games = vec![Ok(test_game("Alpha, A", "Beta, B", "High Annot Test"))];
+        crate::twocbh::writer::write_database_with_options(
+            &path,
+            crate::twocbh::writer::TwoCbhWriteOptions {
+                allow_annotation_loss: true,
+            },
+            games,
+        )
+        .unwrap();
+
+        // Simulate a ChessBase 64-bit packed value at OFF_ANNOTATOR (`0x30..0x38`).
+        {
+            use std::io::{Seek, SeekFrom, Write};
+            let mut file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap();
+            file.seek(SeekFrom::Start(192 + OFF_ANNOTATOR as u64)).unwrap();
+            file.write_all(&0x8a27_2176u32.to_le_bytes()).unwrap();
+            file.write_all(&0x0007_f181u32.to_le_bytes()).unwrap();
+        }
+
+        let cbh = TwoCbhFile::open(&path).unwrap();
+        let sidecar = TwoCbhAccelerator::path_for(&path);
+        TwoCbhAccelerator::build_to(&cbh, &sidecar).unwrap();
+        let acc = TwoCbhAccelerator::open(&sidecar).unwrap();
+        assert!(acc.block_count() < 16);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -12,6 +12,11 @@ use super::tables;
 use crate::chess::{CastlingSide, Chess, Color, Move, Position, Role, Square};
 use crate::position::encode_move;
 
+enum WalkOutput<'a, F: ?Sized> {
+    Moves(&'a mut F),
+    Positions(&'a mut dyn FnMut(u32, &Chess) -> bool),
+}
+
 /// Stream mainline moves from a raw CBH move stream without allocating game trees.
 ///
 /// Calls `consumer(position_key, move_code)` for each mainline move up to `max_plies`.
@@ -45,7 +50,49 @@ where
         plies: 0,
         max_plies,
         ended: false,
-        consumer,
+        output: WalkOutput::Moves(consumer),
+    };
+    walker.walk(stream)
+}
+
+/// Stream mainline board positions (`ply = 0..=max_ply`) from a raw CBH move
+/// stream without allocating a `Game` AST or SAN strings, stopping early as soon
+/// as `visitor` returns `false`.
+pub fn scan_cbh_mainline_positions<F>(
+    start_pos: &Chess,
+    mode: u8,
+    stream: &[u8],
+    chess960: bool,
+    max_ply: u32,
+    visitor: &mut F,
+) -> Result<()>
+where
+    F: FnMut(u32, &Chess) -> bool + ?Sized,
+{
+    let (table, pre, simple) = match mode {
+        0 => (&tables::MODE_0, true, false),
+        4 => (&tables::MODE_4, false, false),
+        5 => (&tables::MODE_5, false, true),
+        10 => (&tables::MODE_10, false, false),
+        other => bail!("move encoding mode {other} is not supported"),
+    };
+    let mut visited = visitor;
+    if !visited(0, start_pos) || max_ply == 0 {
+        return Ok(());
+    }
+    let pieces = PieceLists::scan(start_pos).context("scanning start position")?;
+    let mut walker = FastMainlineWalker::<fn(u64, u32)> {
+        table,
+        pre,
+        simple,
+        chess960,
+        pieces,
+        current_pos: start_pos.clone(),
+        total: 0,
+        plies: 0,
+        max_plies: max_ply,
+        ended: false,
+        output: WalkOutput::Positions(&mut visited),
     };
     walker.walk(stream)
 }
@@ -61,7 +108,7 @@ struct FastMainlineWalker<'a, F: ?Sized> {
     plies: u32,
     max_plies: u32,
     ended: bool,
-    consumer: &'a mut F,
+    output: WalkOutput<'a, F>,
 }
 
 impl<F: ?Sized + FnMut(u64, u32)> FastMainlineWalker<'_, F> {
@@ -152,27 +199,38 @@ impl<F: ?Sized + FnMut(u64, u32)> FastMainlineWalker<'_, F> {
             bail!("move stream is implausibly long");
         }
 
-        let key = self.current_pos.position_hash();
-        if let Some(move_code) = encode_move(mv) {
-            (self.consumer)(key, move_code);
-        }
-        self.plies += 1;
-
         let before = self.current_pos.clone();
-        self.current_pos = before.clone().play(mv).map_err(|_| {
+        let after = before.clone().play(mv).map_err(|_| {
             anyhow::anyhow!(
                 "illegal move {} (word {code:#06x}) at ply {}",
                 mv,
                 self.total + 1
             )
         })?;
+        match &mut self.output {
+            WalkOutput::Moves(consumer) => {
+                let key = before.position_hash();
+                if let Some(move_code) = encode_move(mv) {
+                    consumer(key, move_code);
+                }
+                self.plies += 1;
+                self.current_pos = after;
+                if self.plies >= self.max_plies {
+                    self.ended = true;
+                }
+            }
+            WalkOutput::Positions(visitor) => {
+                self.plies += 1;
+                self.current_pos = after;
+                if !visitor(self.plies, &self.current_pos) || self.plies >= self.max_plies {
+                    self.ended = true;
+                }
+            }
+        }
         self.pieces
             .update(&before, mv)
             .with_context(|| format!("piece list at ply {}", self.total + 1))?;
         self.total += 1;
-        if self.plies >= self.max_plies {
-            self.ended = true;
-        }
         Ok(())
     }
 
@@ -186,7 +244,12 @@ impl<F: ?Sized + FnMut(u64, u32)> FastMainlineWalker<'_, F> {
             .swap_turn()
             .context("null move leaves the side to move in check")?;
         self.total += 1;
-        if self.plies >= self.max_plies {
+        if let WalkOutput::Positions(visitor) = &mut self.output {
+            self.plies += 1;
+            if !visitor(self.plies, &self.current_pos) || self.plies >= self.max_plies {
+                self.ended = true;
+            }
+        } else if self.plies >= self.max_plies {
             self.ended = true;
         }
         Ok(())

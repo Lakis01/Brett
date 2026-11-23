@@ -6,13 +6,14 @@
 //! and replaced atomically, rolling back on error.  Derived `.2lcd`/`.2lgd`
 //! indexes are removed with the backups so ChessBase rebuilds them.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
+use memmap2::Mmap;
 
 use crate::chess::{
     CastlingMode, Chess, Color, EnPassantMode, Fen, File as ChessFile, Move, Position, Rank, Role,
@@ -24,7 +25,8 @@ use super::moves;
 use super::tokens::table;
 
 use super::{
-    CBG_MAGIC, LID_EVENT, LID_FIRST, LID_SOURCE, LID_STRIDE, RECORD_SIZE, START_ID_BASE, sibling,
+    CBG_MAGIC, LID_EVENT, LID_FIRST, LID_SOURCE, LID_STRIDE, RECORD_SIZE, START_ID_BASE, be_u32,
+    decode_text, le_u32, le_u64, sibling,
 };
 
 const LID_PLAYER: usize = 0;
@@ -223,11 +225,13 @@ fn record_key(index: u64, content: &[u8]) -> u64 {
 enum Start {
     Standard,
     Chess960(u16),
+    Custom(Box<Chess>),
 }
 
 #[derive(Debug)]
 struct EncodedMoves {
     start_id: Option<u16>,
+    custom_start: Option<Vec<u16>>,
     tokens: Vec<u16>,
 }
 
@@ -241,7 +245,11 @@ fn detect_start(game: &Game) -> Result<Start> {
         .trim()
         .to_ascii_lowercase();
     let variant_960 = variant.contains("960") || variant.contains("fischer");
-    let variant_standard = variant.is_empty() || variant == "standard" || variant == "chess";
+    let variant_from_pos = variant == "from position" || variant == "fromposition";
+    let variant_standard = variant.is_empty()
+        || variant == "standard"
+        || variant == "chess"
+        || variant_from_pos;
     if !variant_960 && !variant_standard {
         bail!("2CBH export does not support variant {variant:?}");
     }
@@ -258,9 +266,12 @@ fn detect_start(game: &Game) -> Result<Start> {
         bail!("2CBH export start position is not standard chess or Chess960: {fen}");
     }
 
-    if root.castling_mode() != CastlingMode::Standard || fen != start_fen_prefix(&Chess::default())
+    if root.castling_mode() != CastlingMode::Standard {
+        bail!("2CBH export start position uses unsupported castling mode: {fen}");
+    }
+    if variant_from_pos || fen != start_fen_prefix(&Chess::default()) || root.fullmoves().get() != 1
     {
-        bail!("2CBH export start position is not standard chess or Chess960: {fen}");
+        return Ok(Start::Custom(Box::new(root.clone())));
     }
     Ok(Start::Standard)
 }
@@ -277,15 +288,20 @@ fn start_fen_prefix(pos: &Chess) -> String {
 
 fn encode_game_moves(game: &Game) -> Result<EncodedMoves> {
     let start = detect_start(game)?;
-    let start_id = match start {
-        Start::Standard => None,
-        Start::Chess960(id) => Some(id),
+    let (start_id, custom_start) = match start {
+        Start::Standard => (None, None),
+        Start::Chess960(id) => (Some(id), None),
+        Start::Custom(pos) => (None, Some(moves::encode_custom_start(&pos)?)),
     };
     let mut tokens = Vec::new();
     if let Some(&first) = game.nodes[0].children.first() {
         encode_line(game, first, false, start_id, &mut tokens)?;
     }
-    Ok(EncodedMoves { start_id, tokens })
+    Ok(EncodedMoves {
+        start_id,
+        custom_start,
+        tokens,
+    })
 }
 
 fn encode_move(before: &Chess, mv: Move, chess960_start: Option<u16>) -> Result<u16> {
@@ -834,6 +850,37 @@ impl TwoCbhWriter {
         })
     }
 
+    fn build_cbg_content(
+        start_id: Option<u16>,
+        custom_start: Option<&[u16]>,
+        tokens: &[u16],
+    ) -> Vec<u8> {
+        let prefix_words = custom_start.map_or(if start_id.is_some() { 3 } else { 1 }, |w| w.len());
+        let mut content = Vec::with_capacity((1 + prefix_words + tokens.len()) * 2);
+        match (start_id, custom_start) {
+            (Some(id), _) => {
+                content.extend_from_slice(&2u16.to_le_bytes());
+                content.extend_from_slice(&0xfffbu16.to_le_bytes());
+                content.extend_from_slice(&id.to_le_bytes());
+                content.extend_from_slice(&0xfffcu16.to_le_bytes());
+            }
+            (None, Some(prefix)) => {
+                content.extend_from_slice(&1u16.to_le_bytes());
+                for word in prefix {
+                    content.extend_from_slice(&word.to_le_bytes());
+                }
+            }
+            (None, None) => {
+                content.extend_from_slice(&1u16.to_le_bytes());
+                content.extend_from_slice(&0xfffcu16.to_le_bytes());
+            }
+        }
+        for token in tokens {
+            content.extend_from_slice(&token.to_le_bytes());
+        }
+        content
+    }
+
     /// Encode, stream, and index one game.
     fn add_game(&mut self, game: &Game) -> Result<()> {
         let index = self.games;
@@ -850,6 +897,7 @@ impl TwoCbhWriter {
         }
         let EncodedMoves {
             start_id,
+            custom_start,
             mut tokens,
         } = encode_game_moves(game).with_context(|| {
             format!(
@@ -870,22 +918,7 @@ impl TwoCbhWriter {
             98
         };
 
-        let mut content = Vec::with_capacity(8 + tokens.len() * 2);
-        match start_id {
-            None => {
-                content.extend_from_slice(&1u16.to_le_bytes());
-                content.extend_from_slice(&0xfffcu16.to_le_bytes());
-            }
-            Some(id) => {
-                content.extend_from_slice(&2u16.to_le_bytes());
-                content.extend_from_slice(&0xfffbu16.to_le_bytes());
-                content.extend_from_slice(&id.to_le_bytes());
-                content.extend_from_slice(&0xfffcu16.to_le_bytes());
-            }
-        }
-        for token in &tokens {
-            content.extend_from_slice(&token.to_le_bytes());
-        }
+        let content = Self::build_cbg_content(start_id, custom_start.as_deref(), &tokens);
 
         let cbg_offset = self.cbg_offset;
         let key = record_key(u64::from(index), &content);
@@ -1183,6 +1216,1039 @@ fn temp_path(target: &Path, unique: &str) -> PathBuf {
         .and_then(|s| s.to_str())
         .unwrap_or("2cbh-export");
     target.with_file_name(format!(".{name}.{unique}.tmp"))
+}
+
+// ---------------------------------------------------------------------------
+// Incremental merge into an existing 2CBH database
+// ---------------------------------------------------------------------------
+
+const LID_TEAM_SEC: usize = 4;
+const DEFAULT_MAX_FIDE_PROBE: usize = 128;
+
+/// Merge every `.2cbh` update directory/file and `.cbv` classic archive in
+/// `update_sources` into `target_cbh`, deduplicating entities and games,
+/// backfilling missing FIDE IDs, and rebuilding the `.2lgd` accelerator.
+///
+/// The returned `TwoCbhWriteReport::games` holds the count of newly appended
+/// games. When 0 new games are appended, derived files are left untouched;
+/// otherwise stale `.2lcd` is removed and `.2lgd` is rebuilt in place.
+pub fn merge_updates_into_2cbh(
+    target_cbh: &Path,
+    update_sources: &[PathBuf],
+) -> Result<TwoCbhWriteReport> {
+    let stem = normalize_stem(target_cbh)?;
+    let target_cbh_path = core_path(&stem, ".2cbh");
+    let target_cbg_path = core_path(&stem, ".2cbg");
+    let target_cba_path = core_path(&stem, ".2cba");
+    let target_lid_path = core_path(&stem, ".2lid");
+    for path in [&target_cbh_path, &target_cbg_path, &target_cba_path, &target_lid_path] {
+        if !path.is_file() {
+            bail!("missing target 2CBH companion file {}", path.display());
+        }
+    }
+
+    // Scan existing target `.2lid` and `.2cbh`/`.2cbg` through read-only mmaps,
+    // then drop the mmaps before opening the target files for read-write append.
+    let (mut lid_state, mut seen_games, mut cbh_slots, mut cbg_end, mut cba_end) = {
+        let lid_map = map_readonly(&target_lid_path, "target 2LID")?;
+        let lid_state = TargetLidState::scan(&lid_map, &target_lid_path)?;
+
+        let cbh_map = map_readonly(&target_cbh_path, "target 2CBH")?;
+        let cbg_map = map_readonly(&target_cbg_path, "target 2CBG")?;
+        let cba_map = map_readonly(&target_cba_path, "target 2CBA")?;
+        if cbh_map.len() < RECORD_SIZE {
+            bail!("{} is shorter than one 2CBH header record", target_cbh_path.display());
+        }
+        if cbg_map.len() < CBG_HEADER as usize {
+            bail!("{} is shorter than a 2CBG header", target_cbg_path.display());
+        }
+        if cba_map.len() < CBG_HEADER as usize {
+            bail!("{} is shorter than a 2CBA header", target_cba_path.display());
+        }
+
+        let file_slots = cbh_map.len() / RECORD_SIZE;
+        let stored_slots = le_u32(&cbh_map[0x10..0x14]) as usize;
+        let cbh_slots = if stored_slots > 0 && stored_slots <= file_slots {
+            stored_slots
+        } else {
+            file_slots
+        };
+        let cbg_end = le_u64(&cbg_map[0..8]).max(CBG_HEADER).min(cbg_map.len() as u64);
+        let cba_end = le_u64(&cba_map[0..8]).max(CBG_HEADER).min(cba_map.len() as u64);
+
+        let mut seen = HashSet::with_capacity(cbh_slots);
+        for slot in 1..cbh_slots {
+            let rec = &cbh_map[slot * RECORD_SIZE..(slot + 1) * RECORD_SIZE];
+            if rec[0] & 0x82 != 0 {
+                continue;
+            }
+            let white = le_u32(&rec[0x18..0x1c]);
+            let black = le_u32(&rec[0x20..0x24]);
+            let cbg_off = le_u64(&rec[0x08..0x10]) as usize;
+            let (slice, a_len) = cbg_content_prefix(&cbg_map, cbg_off);
+            seen.insert(game_fingerprint(white, black, rec, slice, a_len));
+        }
+
+        (lid_state, seen, cbh_slots, cbg_end, cba_end)
+    };
+
+    let initial_cbg_end = cbg_end;
+    let initial_cba_end = cba_end;
+    let initial_slots = cbh_slots;
+
+    let mut cbh_file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&target_cbh_path)
+        .with_context(|| format!("opening {} for merge", target_cbh_path.display()))?;
+    cbh_file.seek(SeekFrom::Start(cbh_slots as u64 * RECORD_SIZE as u64))?;
+    let mut cbh_writer = BufWriter::new(cbh_file);
+
+    let mut cbg_file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&target_cbg_path)
+        .with_context(|| format!("opening {} for merge", target_cbg_path.display()))?;
+    cbg_file.seek(SeekFrom::Start(cbg_end))?;
+    let mut cbg_writer = BufWriter::new(cbg_file);
+
+    let mut cba_file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&target_cba_path)
+        .with_context(|| format!("opening {} for merge", target_cba_path.display()))?;
+    cba_file.seek(SeekFrom::Start(cba_end))?;
+    let mut cba_writer = BufWriter::new(cba_file);
+
+    let mut lid_file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&target_lid_path)
+        .with_context(|| format!("opening {} for merge", target_lid_path.display()))?;
+    lid_state.pad_initial(&mut lid_file)?;
+
+    let mut appended_games = 0usize;
+    {
+        let mut sink = MergeSink {
+            lid_state: &mut lid_state,
+            lid_file: &mut lid_file,
+            cbh_writer: &mut cbh_writer,
+            cbg_writer: &mut cbg_writer,
+            cba_writer: &mut cba_writer,
+            seen_games: &mut seen_games,
+            cbg_offset: &mut cbg_end,
+            cba_offset: &mut cba_end,
+            cbh_slots: &mut cbh_slots,
+            appended_games: &mut appended_games,
+        };
+
+        for source in update_sources {
+            let ext = source
+                .extension()
+                .and_then(|s| s.to_str())
+                .map(|s| s.to_ascii_lowercase());
+            if ext.as_deref() == Some("cbv") && source.is_file() {
+                merge_cbv_source(source, &mut sink)
+                    .with_context(|| format!("merging CBV archive {}", source.display()))?;
+            } else if let Some(src_cbh) = resolve_2cbh_source(source)? {
+                merge_2cbh_source(&src_cbh, &mut sink)
+                    .with_context(|| format!("merging 2CBH update {}", src_cbh.display()))?;
+            } else {
+                bail!("unsupported update source {}", source.display());
+            }
+        }
+    }
+
+    let mut cbh_file = cbh_writer.into_inner().map_err(|e| e.into_error())?;
+    if appended_games > 0 {
+        let total_slots = u32::try_from(cbh_slots).context("merged 2CBH record count overflow")?;
+        cbh_file.seek(SeekFrom::Start(0x10))?;
+        cbh_file.write_all(&total_slots.to_le_bytes())?;
+    }
+    cbh_file.flush()?;
+    drop(cbh_file);
+
+    let mut cbg_file = cbg_writer.into_inner().map_err(|e| e.into_error())?;
+    if cbg_end > initial_cbg_end {
+        cbg_file.seek(SeekFrom::Start(0))?;
+        cbg_file.write_all(&cbg_end.to_le_bytes())?;
+    }
+    cbg_file.flush()?;
+    drop(cbg_file);
+
+    let mut cba_file = cba_writer.into_inner().map_err(|e| e.into_error())?;
+    if cba_end > initial_cba_end {
+        cba_file.seek(SeekFrom::Start(0))?;
+        cba_file.write_all(&cba_end.to_le_bytes())?;
+    }
+    cba_file.flush()?;
+    drop(cba_file);
+
+    lid_state.write_header_counts(&mut lid_file)?;
+    lid_file.flush()?;
+    drop(lid_file);
+
+    if appended_games > 0 {
+        let lcd = sibling(&stem, ".2lcd");
+        if lcd.exists() {
+            let _ = fs::remove_file(&lcd);
+        }
+        let lgd = sibling(&stem, ".2lgd");
+        let reopened = super::TwoCbhFile::open(&target_cbh_path)
+            .with_context(|| format!("reopening {} to build .2lgd", target_cbh_path.display()))?;
+        super::accelerator::TwoCbhAccelerator::build_to(&reopened, &lgd).with_context(|| {
+            format!("rebuilding .2lgd accelerator at {}", lgd.display())
+        })?;
+    }
+
+    let bytes = (cbh_slots.saturating_sub(initial_slots) as u64) * RECORD_SIZE as u64
+        + cbg_end.saturating_sub(initial_cbg_end)
+        + cba_end.saturating_sub(initial_cba_end);
+
+    Ok(TwoCbhWriteReport {
+        games: appended_games,
+        bytes,
+    })
+}
+
+struct MergeSink<'a> {
+    lid_state: &'a mut TargetLidState,
+    lid_file: &'a mut File,
+    cbh_writer: &'a mut BufWriter<File>,
+    cbg_writer: &'a mut BufWriter<File>,
+    cba_writer: &'a mut BufWriter<File>,
+    seen_games: &'a mut HashSet<u64>,
+    cbg_offset: &'a mut u64,
+    cba_offset: &'a mut u64,
+    cbh_slots: &'a mut usize,
+    appended_games: &'a mut usize,
+}
+
+#[derive(Clone, Debug)]
+struct LidLayout {
+    first_offset: usize,
+    stride: usize,
+    num_sections: usize,
+    offsets: [usize; 6],
+    sizes: [usize; 6],
+    counts: [u32; 6],
+}
+
+impl LidLayout {
+    fn parse(bytes: &[u8], path: &Path) -> Result<Self> {
+        if bytes.len() < 8 {
+            bail!("{} is shorter than a 2LID header", path.display());
+        }
+        let first_offset = be_u32(&bytes[0..4]) as usize;
+        let num_sections = be_u32(&bytes[4..8]) as usize;
+        if !(1..=16).contains(&num_sections) || bytes.len() < 8 + num_sections * 20 {
+            bail!("{} has an invalid 2LID section table", path.display());
+        }
+        let mut offsets = [0usize; 6];
+        let mut sizes = [0usize; 6];
+        let mut counts = [0u32; 6];
+        let mut running = 0usize;
+        for i in 0..num_sections {
+            let desc = 8 + i * 20;
+            let sz = be_u32(&bytes[desc..desc + 4]) as usize;
+            let cnt = be_u32(&bytes[desc + 8..desc + 12]);
+            if i < 6 {
+                offsets[i] = running;
+                sizes[i] = sz;
+                counts[i] = cnt;
+            }
+            running = running.saturating_add(sz);
+        }
+        if first_offset > bytes.len() || running == 0 {
+            bail!("{} has invalid 2LID geometry", path.display());
+        }
+        Ok(Self {
+            first_offset,
+            stride: running,
+            num_sections,
+            offsets,
+            sizes,
+            counts,
+        })
+    }
+
+    fn allocated_blocks(&self, len: usize) -> usize {
+        if self.stride == 0 || len <= self.first_offset {
+            0
+        } else {
+            (len - self.first_offset).div_ceil(self.stride)
+        }
+    }
+
+    fn raw_slice<'a>(&self, bytes: &'a [u8], id: u32, sec: usize) -> Option<&'a [u8]> {
+        let size = *self.sizes.get(sec)?;
+        let off = *self.offsets.get(sec)?;
+        if size < 4 {
+            return None;
+        }
+        let start = self
+            .first_offset
+            .checked_add(usize::try_from(id).ok()?.checked_mul(self.stride)?)?
+            .checked_add(off)?;
+        if start + 4 > bytes.len() {
+            return None;
+        }
+        let avail = (bytes.len() - start).min(size);
+        let total = le_u32(&bytes[start..start + 4]) as usize;
+        if total < 4 || total > avail {
+            return None;
+        }
+        Some(&bytes[start..start + total])
+    }
+}
+
+struct TargetLidState {
+    layout: LidLayout,
+    allocated_blocks: usize,
+    needs_initial_pad: bool,
+    next_id: [u32; 6],
+    player_by_name: HashMap<(String, String), (u32, Option<u32>, usize)>,
+    player_by_fide: HashMap<u32, u32>,
+    event_by_key: HashMap<(String, String), u32>,
+    source_by_key: HashMap<(String, String), u32>,
+    team_by_key: HashMap<String, u32>,
+    empty_player_id: Option<u32>,
+    backfilled_fide: bool,
+}
+
+impl TargetLidState {
+    fn scan(bytes: &[u8], path: &Path) -> Result<Self> {
+        let layout = LidLayout::parse(bytes, path)?;
+        let allocated_blocks = layout.allocated_blocks(bytes.len());
+        let expected_len = layout.first_offset + allocated_blocks * layout.stride;
+        let needs_initial_pad = bytes.len() != expected_len;
+
+        let mut next_id = [0u32; 6];
+        let mut player_by_name = HashMap::with_capacity(allocated_blocks);
+        let mut player_by_fide = HashMap::with_capacity(allocated_blocks / 2);
+        let mut event_by_key = HashMap::with_capacity(allocated_blocks / 4);
+        let mut source_by_key = HashMap::with_capacity(1024);
+        let mut team_by_key = HashMap::with_capacity(allocated_blocks / 6);
+        let mut empty_player_id = None;
+
+        for id in 0..allocated_blocks {
+            let id_u32 = id as u32;
+            if let Some(block) = layout.raw_slice(bytes, id_u32, 0) {
+                next_id[0] = id_u32 + 1;
+                if let Some((last, first, fide, fide_off)) = parse_player_raw(block) {
+                    if last.is_empty() && first.is_empty() {
+                        if id_u32 == 2 || empty_player_id.is_none() {
+                            empty_player_id = Some(id_u32);
+                        }
+                    }
+                    if let Some(f) = fide {
+                        player_by_fide.entry(f).or_insert(id_u32);
+                    }
+                    player_by_name
+                        .entry((last, first))
+                        .or_insert((id_u32, fide, fide_off));
+                }
+            }
+            if id < layout.counts[1] as usize || layout.counts[1] == 0 {
+                if let Some(block) = layout.raw_slice(bytes, id_u32, 1) {
+                    next_id[1] = id_u32 + 1;
+                    if let Some(key) = parse_two_string_key(block) {
+                        event_by_key.entry(key).or_insert(id_u32);
+                    }
+                }
+            }
+            if let Some(block) = layout.raw_slice(bytes, id_u32, 2) {
+                next_id[2] = id_u32 + 1;
+                if let Some(key) = parse_two_string_key(block) {
+                    source_by_key.entry(key).or_insert(id_u32);
+                }
+            }
+            if layout.sizes[LID_TEAM_SEC] >= 8
+                && let Some(block) = layout.raw_slice(bytes, id_u32, LID_TEAM_SEC)
+            {
+                next_id[LID_TEAM_SEC] = id_u32 + 1;
+                if let Some(key) = parse_one_string_key(block) {
+                    team_by_key.entry(key).or_insert(id_u32);
+                }
+            }
+        }
+        next_id[3] = layout.counts[3].min(allocated_blocks as u32);
+        next_id[5] = layout.counts[5].min(allocated_blocks as u32);
+
+        Ok(Self {
+            layout,
+            allocated_blocks,
+            needs_initial_pad,
+            next_id,
+            player_by_name,
+            player_by_fide,
+            event_by_key,
+            source_by_key,
+            team_by_key,
+            empty_player_id,
+            backfilled_fide: false,
+        })
+    }
+
+    fn pad_initial(&mut self, file: &mut File) -> Result<()> {
+        if !self.needs_initial_pad {
+            return Ok(());
+        }
+        let target_len = (self.layout.first_offset + self.allocated_blocks * self.layout.stride) as u64;
+        file.set_len(target_len)?;
+        self.needs_initial_pad = false;
+        Ok(())
+    }
+
+    fn ensure_block(&mut self, file: &mut File, id: u32) -> Result<()> {
+        let needed = id as usize + 1;
+        if needed > self.allocated_blocks {
+            let new_len = (self.layout.first_offset + needed * self.layout.stride) as u64;
+            file.set_len(new_len)?;
+            self.allocated_blocks = needed;
+        }
+        Ok(())
+    }
+
+    fn write_section_block(
+        &mut self,
+        file: &mut File,
+        id: u32,
+        sec: usize,
+        raw: &[u8],
+    ) -> Result<()> {
+        let size = self.layout.sizes[sec];
+        if size < 4 {
+            return Ok(());
+        }
+        self.ensure_block(file, id)?;
+        let start =
+            self.layout.first_offset + id as usize * self.layout.stride + self.layout.offsets[sec];
+        file.seek(SeekFrom::Start(start as u64))?;
+        if raw.len() <= size {
+            file.write_all(raw)?;
+        } else {
+            let mut clamped = raw[..size].to_vec();
+            clamped[0..4].copy_from_slice(&(size as u32).to_le_bytes());
+            file.write_all(&clamped)?;
+        }
+        Ok(())
+    }
+
+    fn write_header_counts(&self, file: &mut File) -> Result<()> {
+        for sec in [0usize, 1, 2, LID_TEAM_SEC] {
+            if sec < self.layout.num_sections && self.layout.sizes[sec] > 0 {
+                let at = 8 + sec * 20 + 8;
+                file.seek(SeekFrom::Start(at as u64))?;
+                file.write_all(&self.next_id[sec].to_be_bytes())?;
+            }
+        }
+        Ok(())
+    }
+
+    fn map_or_insert_player(
+        &mut self,
+        file: &mut File,
+        last: String,
+        first: String,
+        fide: Option<u32>,
+        raw_block: &[u8],
+    ) -> Result<u32> {
+        if last.is_empty() && first.is_empty() && fide.is_none()
+            && let Some(empty_id) = self.empty_player_id
+        {
+            return Ok(empty_id);
+        }
+        let key = (last, first);
+        if let Some(&(existing_id, existing_fide, existing_fide_off)) =
+            self.player_by_name.get(&key)
+        {
+            if let Some(new_fide) = fide {
+                if let Some(&fide_id) = self.player_by_fide.get(&new_fide) {
+                    return Ok(fide_id);
+                }
+                if existing_fide.is_none() {
+                    if existing_fide_off + 4 <= self.layout.sizes[0]
+                        && (existing_id as usize) < self.allocated_blocks
+                    {
+                        let at = self.layout.first_offset
+                            + existing_id as usize * self.layout.stride
+                            + self.layout.offsets[0]
+                            + existing_fide_off;
+                        file.seek(SeekFrom::Start(at as u64))?;
+                        file.write_all(&new_fide.to_le_bytes())?;
+                        self.backfilled_fide = true;
+                    }
+                    self.player_by_name
+                        .insert(key, (existing_id, Some(new_fide), existing_fide_off));
+                    self.player_by_fide.entry(new_fide).or_insert(existing_id);
+                    return Ok(existing_id);
+                }
+            } else {
+                return Ok(existing_id);
+            }
+        } else if let Some(new_fide) = fide
+            && let Some(&fide_id) = self.player_by_fide.get(&new_fide)
+        {
+            return Ok(fide_id);
+        }
+
+        let new_id = self.next_id[0];
+        self.next_id[0] = new_id.checked_add(1).context("2LID player table overflow")?;
+        if key.0.is_empty() && key.1.is_empty() && self.empty_player_id.is_none() {
+            self.empty_player_id = Some(new_id);
+        }
+        let new_fide_off = parse_player_raw(raw_block).map(|p| p.3).unwrap_or(28);
+        self.write_section_block(file, new_id, 0, raw_block)?;
+        self.player_by_name
+            .entry(key)
+            .or_insert((new_id, fide, new_fide_off));
+        if let Some(new_fide) = fide {
+            self.player_by_fide.entry(new_fide).or_insert(new_id);
+        }
+        Ok(new_id)
+    }
+
+    fn map_or_insert_event(
+        &mut self,
+        file: &mut File,
+        place: String,
+        title: String,
+        raw_block: Option<&[u8]>,
+    ) -> Result<u32> {
+        let key = (place, title);
+        if let Some(&id) = self.event_by_key.get(&key) {
+            return Ok(id);
+        }
+        let new_id = self.next_id[1];
+        self.next_id[1] = new_id.checked_add(1).context("2LID event table overflow")?;
+        let owned;
+        let bytes = if let Some(raw) = raw_block {
+            raw
+        } else {
+            owned = event_record(&(key.0.clone(), key.1.clone()))?;
+            &owned
+        };
+        self.write_section_block(file, new_id, 1, bytes)?;
+        self.event_by_key.insert(key, new_id);
+        Ok(new_id)
+    }
+
+    fn map_or_insert_source(
+        &mut self,
+        file: &mut File,
+        title: String,
+        publisher: String,
+        raw_block: Option<&[u8]>,
+    ) -> Result<u32> {
+        let key = (title, publisher);
+        if let Some(&id) = self.source_by_key.get(&key) {
+            return Ok(id);
+        }
+        let new_id = self.next_id[2];
+        self.next_id[2] = new_id.checked_add(1).context("2LID source table overflow")?;
+        let owned;
+        let bytes = if let Some(raw) = raw_block {
+            raw
+        } else {
+            owned = source_record(&(key.0.clone(), key.1.clone()))?;
+            &owned
+        };
+        self.write_section_block(file, new_id, 2, bytes)?;
+        self.source_by_key.insert(key, new_id);
+        Ok(new_id)
+    }
+
+    fn map_or_insert_team(
+        &mut self,
+        file: &mut File,
+        name_key: String,
+        raw_block: &[u8],
+    ) -> Result<u32> {
+        if self.layout.sizes[LID_TEAM_SEC] < 8 {
+            return Ok(u32::MAX);
+        }
+        if let Some(&id) = self.team_by_key.get(&name_key) {
+            return Ok(id);
+        }
+        let new_id = self.next_id[LID_TEAM_SEC];
+        self.next_id[LID_TEAM_SEC] = new_id
+            .checked_add(1)
+            .context("2LID team table overflow")?;
+        self.write_section_block(file, new_id, LID_TEAM_SEC, raw_block)?;
+        self.team_by_key.insert(name_key, new_id);
+        Ok(new_id)
+    }
+}
+
+fn map_readonly(path: &Path, kind: &str) -> Result<Mmap> {
+    let file = File::open(path).with_context(|| format!("opening {kind} {}", path.display()))?;
+    unsafe { Mmap::map(&file) }.with_context(|| format!("mapping {kind} {}", path.display()))
+}
+
+fn resolve_2cbh_source(source: &Path) -> Result<Option<PathBuf>> {
+    if source.is_file() {
+        let is_2cbh = source
+            .extension()
+            .and_then(|s| s.to_str())
+            .is_some_and(|s| s.eq_ignore_ascii_case("2cbh"));
+        return Ok(is_2cbh.then(|| source.to_path_buf()));
+    }
+    if source.is_dir() {
+        let mut found = None;
+        for entry in fs::read_dir(source)
+            .with_context(|| format!("reading update directory {}", source.display()))?
+        {
+            let path = entry?.path();
+            if path
+                .extension()
+                .and_then(|s| s.to_str())
+                .is_some_and(|s| s.eq_ignore_ascii_case("2cbh"))
+            {
+                found = Some(path);
+                break;
+            }
+        }
+        return Ok(found);
+    }
+    Ok(None)
+}
+
+fn parse_two_strings_raw(block: &[u8]) -> Option<([&[u8]; 2], usize)> {
+    let mut at = 4usize;
+    let mut texts = [&[][..]; 2];
+    for slot in &mut texts {
+        let len = le_u32(block.get(at..at + 4)?) as usize;
+        at += 4;
+        *slot = block.get(at..at.checked_add(len)?)?;
+        at += len;
+    }
+    Some((texts, at))
+}
+
+fn parse_player_raw(block: &[u8]) -> Option<(String, String, Option<u32>, usize)> {
+    let (texts, tail) = parse_two_strings_raw(block)?;
+    let last = decode_text(texts[0]).trim().to_lowercase();
+    let first = decode_text(texts[1]).trim().to_lowercase();
+    let fide_off = tail + 16;
+    let fide = block
+        .get(fide_off..fide_off + 4)
+        .map(le_u32)
+        .filter(|&v| v != 0 && v != u32::MAX);
+    Some((last, first, fide, fide_off))
+}
+
+fn parse_two_string_key(block: &[u8]) -> Option<(String, String)> {
+    let (texts, _) = parse_two_strings_raw(block)?;
+    Some((
+        decode_text(texts[0]).trim().to_lowercase(),
+        decode_text(texts[1]).trim().to_lowercase(),
+    ))
+}
+
+fn parse_one_string_key(block: &[u8]) -> Option<String> {
+    let len = le_u32(block.get(4..8)?) as usize;
+    let raw = block.get(8..8usize.checked_add(len)?)?;
+    Some(decode_text(raw).trim().to_lowercase())
+}
+
+fn cbg_content_prefix(cbg: &[u8], off: usize) -> (&[u8], u32) {
+    let Some(hdr) = cbg.get(off..off + 34) else {
+        return (&[], 0);
+    };
+    if hdr[..8] != CBG_MAGIC {
+        return (&[], 0);
+    }
+    let a = le_u32(&hdr[8..12]);
+    let content_end = off + 24 + (a as usize);
+    if content_end > cbg.len() {
+        return (&[], 0);
+    }
+    let slice_len = (a as usize).min(DEFAULT_MAX_FIDE_PROBE);
+    (&cbg[off + 24..off + 24 + slice_len], a)
+}
+
+fn game_fingerprint(white: u32, black: u32, rec: &[u8], content: &[u8], content_len: u32) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    let mix = |h: &mut u64, bytes: &[u8]| {
+        for &b in bytes {
+            *h ^= u64::from(b);
+            *h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    };
+    mix(&mut h, &white.to_le_bytes());
+    mix(&mut h, &black.to_le_bytes());
+    mix(&mut h, &rec[0x58..0x60]);
+    mix(&mut h, &rec[0x80..0x84]);
+    mix(&mut h, &rec[0xbc..0xc0]);
+    mix(&mut h, &content_len.to_le_bytes());
+    mix(&mut h, content);
+    h
+}
+
+fn copy_reframed_record(
+    src: &[u8],
+    offset: usize,
+    target_offset: u64,
+    out: &mut BufWriter<File>,
+) -> Result<u64> {
+    let hdr = src
+        .get(offset..offset + 24)
+        .with_context(|| format!("companion frame truncated at offset {offset}"))?;
+    if hdr[..8] != CBG_MAGIC {
+        bail!("companion frame at offset {offset} has invalid magic");
+    }
+    let a = le_u32(&hdr[8..12]) as usize;
+    let b = le_u32(&hdr[12..16]) as usize;
+    let key = &hdr[16..24];
+    let content_start = offset + 24;
+    let term_start = content_start
+        .checked_add(a)
+        .context("companion content overflow")?;
+    let body = src
+        .get(content_start..term_start + 2)
+        .with_context(|| format!("companion frame body truncated at offset {offset}"))?;
+
+    let base_b = b & !7;
+    let rem = ((target_offset + 34 + a as u64 + base_b as u64) % 8) as usize;
+    let new_b = base_b + ((8 - rem) % 8);
+    let new_total = 34u64 + a as u64 + new_b as u64;
+
+    out.write_all(&CBG_MAGIC)?;
+    out.write_all(&(a as u32).to_le_bytes())?;
+    out.write_all(&(new_b as u32).to_le_bytes())?;
+    out.write_all(key)?;
+    out.write_all(body)?;
+    if new_b > 0 {
+        const ZEROES: [u8; 64] = [0u8; 64];
+        let mut left = new_b;
+        while left > 0 {
+            let chunk = left.min(ZEROES.len());
+            out.write_all(&ZEROES[..chunk])?;
+            left -= chunk;
+        }
+    }
+    out.write_all(&new_total.to_le_bytes())?;
+    Ok(new_total)
+}
+
+fn merge_2cbh_source(src_cbh: &Path, sink: &mut MergeSink<'_>) -> Result<()> {
+    let src_stem = normalize_stem(src_cbh)?;
+    let src_cbh_path = core_path(&src_stem, ".2cbh");
+    let src_cbg_path = core_path(&src_stem, ".2cbg");
+    let src_cba_path = core_path(&src_stem, ".2cba");
+    let src_lid_path = core_path(&src_stem, ".2lid");
+
+    let cbh = map_readonly(&src_cbh_path, "source 2CBH")?;
+    let cbg = map_readonly(&src_cbg_path, "source 2CBG")?;
+    let cba = map_readonly(&src_cba_path, "source 2CBA")?;
+    let lid = map_readonly(&src_lid_path, "source 2LID")?;
+
+    let src_layout = LidLayout::parse(&lid, &src_lid_path)?;
+    let src_blocks = src_layout.allocated_blocks(lid.len());
+
+    let mut player_map: Vec<u32> = vec![u32::MAX; src_blocks];
+    let mut event_map: Vec<u32> = vec![u32::MAX; src_blocks];
+    let mut source_map: Vec<u32> = vec![u32::MAX; src_blocks];
+    let mut team_map: Vec<u32> = vec![u32::MAX; src_blocks];
+
+    for (id, slot) in player_map.iter_mut().enumerate() {
+        let id_u32 = id as u32;
+        if let Some(raw) = src_layout.raw_slice(&lid, id_u32, 0)
+            && let Some((last, first, fide, _fide_off)) = parse_player_raw(raw)
+        {
+            let target_id = sink.lid_state.map_or_insert_player(
+                sink.lid_file,
+                last,
+                first,
+                fide,
+                raw,
+            )?;
+            *slot = target_id;
+        }
+    }
+    for (id, slot) in event_map.iter_mut().enumerate() {
+        let id_u32 = id as u32;
+        if let Some(raw) = src_layout.raw_slice(&lid, id_u32, 1)
+            && let Some((place, title)) = parse_two_string_key(raw)
+        {
+            *slot = sink
+                .lid_state
+                .map_or_insert_event(sink.lid_file, place, title, Some(raw))?;
+        }
+    }
+    for (id, slot) in source_map.iter_mut().enumerate() {
+        let id_u32 = id as u32;
+        if let Some(raw) = src_layout.raw_slice(&lid, id_u32, 2)
+            && let Some((title, pub_name)) = parse_two_string_key(raw)
+        {
+            *slot = sink.lid_state.map_or_insert_source(
+                sink.lid_file,
+                title,
+                pub_name,
+                Some(raw),
+            )?;
+        }
+    }
+    if src_layout.sizes[LID_TEAM_SEC] >= 8 {
+        for (id, slot) in team_map.iter_mut().enumerate() {
+            let id_u32 = id as u32;
+            if let Some(raw) = src_layout.raw_slice(&lid, id_u32, LID_TEAM_SEC)
+                && let Some(key) = parse_one_string_key(raw)
+            {
+                *slot = sink
+                    .lid_state
+                    .map_or_insert_team(sink.lid_file, key, raw)?;
+            }
+        }
+    }
+
+    let file_slots = cbh.len() / RECORD_SIZE;
+    let stored_slots = if cbh.len() >= RECORD_SIZE {
+        le_u32(&cbh[0x10..0x14]) as usize
+    } else {
+        0
+    };
+    let src_slots = if stored_slots > 0 && stored_slots <= file_slots {
+        stored_slots
+    } else {
+        file_slots
+    };
+
+    for slot in 1..src_slots {
+        let src_rec = &cbh[slot * RECORD_SIZE..(slot + 1) * RECORD_SIZE];
+        if src_rec[0] & 0x82 != 0 {
+            continue;
+        }
+        let remap_entity = |raw_id: u32, map: &[u32], fallback: u32| -> u32 {
+            map.get(raw_id as usize)
+                .copied()
+                .filter(|&v| v != u32::MAX)
+                .unwrap_or(fallback)
+        };
+        let white_id = remap_entity(le_u32(&src_rec[0x18..0x1c]), &player_map, 0);
+        let black_id = remap_entity(le_u32(&src_rec[0x20..0x24]), &player_map, 0);
+        let event_id = remap_entity(le_u32(&src_rec[0x28..0x2c]), &event_map, 0);
+        let raw_annot_lo = le_u32(&src_rec[0x30..0x34]);
+        let raw_annot_hi = le_u32(&src_rec[0x34..0x38]);
+        let annot_id = if raw_annot_hi != 0 {
+            None
+        } else if raw_annot_lo == 0 || raw_annot_lo == 2 {
+            Some(sink.lid_state.empty_player_id.unwrap_or(raw_annot_lo))
+        } else {
+            Some(remap_entity(raw_annot_lo, &player_map, 2))
+        };
+        let source_id = remap_entity(le_u32(&src_rec[0x38..0x3c]), &source_map, 0);
+        let remap_team = |off: usize| -> u64 {
+            let lo = le_u32(&src_rec[off..off + 4]);
+            let hi = le_u32(&src_rec[off + 4..off + 8]);
+            if hi != 0 || lo == u32::MAX {
+                u64::MAX
+            } else {
+                team_map
+                    .get(lo as usize)
+                    .copied()
+                    .filter(|&v| v != u32::MAX)
+                    .map(u64::from)
+                    .unwrap_or(u64::MAX)
+            }
+        };
+        let white_team = remap_team(0x40);
+        let black_team = remap_team(0x48);
+
+        let src_cbg_off = le_u64(&src_rec[0x08..0x10]) as usize;
+        let src_cba_off = le_u64(&src_rec[0x10..0x18]) as usize;
+        let (slice, a_len) = cbg_content_prefix(&cbg, src_cbg_off);
+        if a_len == 0 {
+            continue;
+        }
+        let fp = game_fingerprint(white_id, black_id, src_rec, slice, a_len);
+        if !sink.seen_games.insert(fp) {
+            continue;
+        }
+
+        let new_cbg_off = *sink.cbg_offset;
+        let cbg_written = copy_reframed_record(&cbg, src_cbg_off, new_cbg_off, sink.cbg_writer)?;
+        *sink.cbg_offset += cbg_written;
+
+        let new_cba_off = *sink.cba_offset;
+        let cba_written = if src_cba_off >= CBG_HEADER as usize
+            && cba.get(src_cba_off..src_cba_off + 8) == Some(&CBG_MAGIC)
+        {
+            copy_reframed_record(&cba, src_cba_off, new_cba_off, sink.cba_writer)?
+        } else {
+            let empty_cba = frame_record(
+                &[0x00, 0x20, 0xff, 0xff],
+                [0xff, 0x7f],
+                194,
+                0x7fff_ffff,
+                new_cba_off,
+            );
+            sink.cba_writer.write_all(&empty_cba)?;
+            empty_cba.len() as u64
+        };
+        *sink.cba_offset += cba_written;
+
+        let mut new_rec = [0u8; RECORD_SIZE];
+        new_rec.copy_from_slice(src_rec);
+        new_rec[0x08..0x10].copy_from_slice(&new_cbg_off.to_le_bytes());
+        new_rec[0x10..0x18].copy_from_slice(&new_cba_off.to_le_bytes());
+        new_rec[0x18..0x1c].copy_from_slice(&white_id.to_le_bytes());
+        new_rec[0x20..0x24].copy_from_slice(&black_id.to_le_bytes());
+        new_rec[0x28..0x2c].copy_from_slice(&event_id.to_le_bytes());
+        if let Some(annot_id) = annot_id {
+            new_rec[0x30..0x34].copy_from_slice(&annot_id.to_le_bytes());
+        }
+        new_rec[0x38..0x3c].copy_from_slice(&source_id.to_le_bytes());
+        new_rec[0x40..0x48].copy_from_slice(&white_team.to_le_bytes());
+        new_rec[0x48..0x50].copy_from_slice(&black_team.to_le_bytes());
+        sink.cbh_writer.write_all(&new_rec)?;
+        *sink.cbh_slots += 1;
+        *sink.appended_games += 1;
+    }
+
+    Ok(())
+}
+
+fn merge_cbv_source(archive: &Path, sink: &mut MergeSink<'_>) -> Result<()> {
+    let lib = crate::cbh::CbhLibrary::open_cbv(archive)?;
+    for index in 0..lib.len() {
+        let Some(indexed) = lib.get(index) else {
+            continue;
+        };
+        if is_deleted_headers(indexed) {
+            continue;
+        }
+        let Ok(game) = lib.load(index) else {
+            continue;
+        };
+        if is_deleted(&game) {
+            continue;
+        }
+        let Ok(EncodedMoves {
+            start_id,
+            custom_start,
+            mut tokens,
+        }) = encode_game_moves(&game)
+        else {
+            continue;
+        };
+        let base_padding = if tokens.is_empty() {
+            194
+        } else {
+            let _ = tokens.pop();
+            98
+        };
+        let content = TwoCbhWriter::build_cbg_content(start_id, custom_start.as_deref(), &tokens);
+
+        let (w_last, w_first, w_fide) = player_key(game.header("White"), game.header("WhiteFideId"));
+        let w_raw = player_record(&(w_last.clone(), w_first.clone(), w_fide))?;
+        let white_id = sink.lid_state.map_or_insert_player(
+            sink.lid_file,
+            w_last.to_lowercase(),
+            w_first.to_lowercase(),
+            w_fide,
+            &w_raw,
+        )?;
+
+        let (b_last, b_first, b_fide) = player_key(game.header("Black"), game.header("BlackFideId"));
+        let b_raw = player_record(&(b_last.clone(), b_first.clone(), b_fide))?;
+        let black_id = sink.lid_state.map_or_insert_player(
+            sink.lid_file,
+            b_last.to_lowercase(),
+            b_first.to_lowercase(),
+            b_fide,
+            &b_raw,
+        )?;
+
+        let (e_place, e_title) = event_key(game.header("Site"), game.header("Event"));
+        let e_raw = event_record(&(e_place.clone(), e_title.clone()))?;
+        let event_id = sink.lid_state.map_or_insert_event(
+            sink.lid_file,
+            e_place.to_lowercase(),
+            e_title.to_lowercase(),
+            Some(&e_raw),
+        )?;
+
+        let (s_title, s_pub) = source_key(game.header("SourceTitle"), game.header("Source"));
+        let s_raw = source_record(&(s_title.clone(), s_pub.clone()))?;
+        let source_id = sink.lid_state.map_or_insert_source(
+            sink.lid_file,
+            s_title.to_lowercase(),
+            s_pub.to_lowercase(),
+            Some(&s_raw),
+        )?;
+
+        let (round, subround) = encode_round(game.header("Round"), game.header("Board"));
+        let mut record = [0u8; RECORD_SIZE];
+        record[0] = 0x01;
+        record[1..4].copy_from_slice(&[0, 1, 1]);
+        record[0x18..0x1c].copy_from_slice(&white_id.to_le_bytes());
+        record[0x20..0x24].copy_from_slice(&black_id.to_le_bytes());
+        record[0x28..0x2c].copy_from_slice(&event_id.to_le_bytes());
+        record[0x30..0x34]
+            .copy_from_slice(&sink.lid_state.empty_player_id.unwrap_or(2).to_le_bytes());
+        record[0x38..0x3c].copy_from_slice(&source_id.to_le_bytes());
+        record[0x40..0x50].fill(0xff);
+        let packed = (u32::from(round) << 16) | u32::from(encode_result(game.result()));
+        record[0x58..0x5c].copy_from_slice(&packed.to_le_bytes());
+        record[0x5c..0x60].copy_from_slice(&subround.to_le_bytes());
+        record[0x60..0x64].copy_from_slice(&parse_elo(game.header("WhiteElo")).to_le_bytes());
+        record[0x70..0x74].copy_from_slice(&parse_elo(game.header("BlackElo")).to_le_bytes());
+        if let Some(start_id) = start_id {
+            record[0x80..0x84]
+                .copy_from_slice(&(START_ID_BASE + u32::from(start_id)).to_le_bytes());
+        } else {
+            let eco = crate::cbh::writer::encode_eco(game.header("ECO"));
+            if eco > 0 {
+                record[0x80..0x82].copy_from_slice(&eco.to_le_bytes());
+            }
+        }
+        record[0x98..0xa0].copy_from_slice(&parse_u64_header(game.header("GameId")).to_le_bytes());
+        record[0xb0..0xb8].copy_from_slice(&parse_u64_header(game.header("Beauty")).to_le_bytes());
+        record[0xbc..0xc0].copy_from_slice(&encode_date(game.header("Date")).to_le_bytes());
+
+        let prefix_len = content.len().min(DEFAULT_MAX_FIDE_PROBE);
+        let fp = game_fingerprint(
+            white_id,
+            black_id,
+            &record,
+            &content[..prefix_len],
+            content.len() as u32,
+        );
+        if !sink.seen_games.insert(fp) {
+            continue;
+        }
+
+        let new_cbg_off = *sink.cbg_offset;
+        let key = record_key(*sink.cbh_slots as u64, &content);
+        let cbg_record = frame_record(&content, [0xff, 0xff], base_padding, key, new_cbg_off);
+        sink.cbg_writer.write_all(&cbg_record)?;
+        *sink.cbg_offset += cbg_record.len() as u64;
+
+        let new_cba_off = *sink.cba_offset;
+        let cba_record = frame_record(
+            &[0x00, 0x20, 0xff, 0xff],
+            [0xff, 0x7f],
+            194,
+            0x7fff_ffff,
+            new_cba_off,
+        );
+        sink.cba_writer.write_all(&cba_record)?;
+        *sink.cba_offset += cba_record.len() as u64;
+
+        record[0x08..0x10].copy_from_slice(&new_cbg_off.to_le_bytes());
+        record[0x10..0x18].copy_from_slice(&new_cba_off.to_le_bytes());
+        sink.cbh_writer.write_all(&record)?;
+        *sink.cbh_slots += 1;
+        *sink.appended_games += 1;
+    }
+    Ok(())
+}
+
+fn is_deleted_headers(game: &crate::library::IndexedGame) -> bool {
+    game.header("Deleted")
+        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
 }
 
 #[cfg(test)]

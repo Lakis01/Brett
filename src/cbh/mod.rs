@@ -31,9 +31,12 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use memmap2::Mmap;
 
 use crate::domain::Game;
-use crate::library::{GameLibrary, IndexedGame, SharedStr, SourceMeta, StringPool};
+use crate::library::{
+    GameLibrary, GameRecordMeta, IndexedGame, SharedStr, SourceMeta, StringPool,
+};
 
 /// Above this size the per-game lowercase search cache costs more memory than
 /// it saves. Searches then inspect the interned headers on demand.
@@ -55,6 +58,14 @@ struct Entry {
     moves_offset: u32,
     annotations_offset: u32,
     deleted: bool,
+    white_elo: u16,
+    black_elo: u16,
+    year: u16,
+    result: u8,
+    eco_code: u16,
+    medals: u16,
+    vcs_flags: u32,
+    annotated: bool,
 }
 
 /// A classic multi-file database opened through [`GameLibrary`].
@@ -65,6 +76,7 @@ pub struct CbhLibrary {
     cbh_path: PathBuf,
     cbg_path: PathBuf,
     cba_path: Option<PathBuf>,
+    cbg_mmap: Option<Mmap>,
     entity_paths: Vec<PathBuf>,
     wide: Option<Wide>,
     file_len: u64,
@@ -161,12 +173,40 @@ impl CbhLibrary {
             let moves_offset = be_u32(&record[1..5]);
             let annotations_offset = be_u32(&record[5..9]);
             let deleted = flags & 0x80 != 0;
+            let date = be_u24(&record[24..27]);
+            let year = ((date >> 9) & 0xfff) as u16;
+            let result = match record[27] {
+                0 | 4 => 0,
+                1 | 5 => 1,
+                2 | 6 => 2,
+                _ => 3,
+            };
+            let white_elo = be_u16(&record[31..33]);
+            let black_elo = be_u16(&record[33..35]);
+            let raw_eco = be_u16(&record[35..37]);
+            let eco_code = if (128..=64127).contains(&raw_eco) {
+                let code = raw_eco / 128 - 1;
+                if code <= 499 { code + 1 } else { 0 }
+            } else {
+                0
+            };
+            let medals = be_u16(&record[37..39]);
+            let vcs_flags = be_u32(&record[39..43]);
+            let annotated = annotations_offset != 0 || (vcs_flags & 0x0e) != 0 || medals != 0;
             let headers = base_headers(record, &entities, &mut strings);
             entries.push(Entry {
                 id,
                 moves_offset,
                 annotations_offset,
                 deleted,
+                white_elo,
+                black_elo,
+                year,
+                result,
+                eco_code,
+                medals,
+                vcs_flags,
+                annotated,
             });
             games.push(IndexedGame::cbh(
                 headers,
@@ -202,11 +242,16 @@ impl CbhLibrary {
             file_len += fs::metadata(path).map(|m| m.len()).unwrap_or(0);
         }
 
+        let cbg_mmap = File::open(&cbg_path)
+            .ok()
+            .and_then(|file| unsafe { Mmap::map(&file) }.ok());
+
         Ok(Self {
             path: cbh_path.clone(),
             cbh_path,
             cbg_path,
             cba_path,
+            cbg_mmap,
             entity_paths,
             wide,
             file_len,
@@ -265,6 +310,36 @@ impl CbhLibrary {
 
     pub fn filter(&self, needle: &str) -> Vec<usize> {
         crate::library::filter_games(&self.games, needle)
+    }
+
+    /// Fast zero-syscall access to one `.cbg` move record (uses mmap when
+    /// available, falling back to `read_record` otherwise).
+    fn with_cbg_record<T>(
+        &self,
+        moves_offset: u64,
+        id: u32,
+        f: impl FnOnce(u8, &[u8]) -> Result<T>,
+    ) -> Result<T> {
+        if let Some(mmap) = &self.cbg_mmap {
+            let off = usize::try_from(moves_offset).context("CBG offset overflow")?;
+            if off >= MIN_CBG_HEADER as usize && off + 4 <= mmap.len() {
+                let head = &mmap[off..off + 4];
+                let size =
+                    (usize::from(head[1]) << 16) | (usize::from(head[2]) << 8) | usize::from(head[3]);
+                if size >= 4 && size <= MAX_MOVE_RECORD && off + size <= mmap.len() {
+                    return f(head[0], &mmap[off + 4..off + size]);
+                }
+            }
+        }
+        let record = read_record(
+            &self.cbg_path,
+            moves_offset,
+            MAX_MOVE_RECORD,
+            "move",
+            id,
+            MIN_CBG_HEADER,
+        )?;
+        f(record.head[0], &record.bytes)
     }
 
     /// Decode one game on demand. A damaged move stream or annotation payload
@@ -490,29 +565,77 @@ impl GameLibrary for CbhLibrary {
                 u64::from(entry.annotations_offset),
             ),
         };
-        let record = read_record(
-            &self.cbg_path,
-            moves_offset,
-            MAX_MOVE_RECORD,
-            "move",
-            entry.id,
-            MIN_CBG_HEADER,
-        )?;
-        let (start, consumed) = moves::decode_start(record.head[0], &record.bytes)
-            .with_context(|| format!("decoding start of ChessBase game {}", entry.id))?;
-        let mode = record.head[0] & 0x3f;
-        if mode == 11 {
-            return Ok(true);
-        }
-        fast_index::stream_cbh_mainline(
-            &start.pos,
-            mode,
-            &record.bytes[consumed..],
-            start.chess960,
-            max_plies,
-            consumer,
-        )?;
+        self.with_cbg_record(moves_offset, entry.id, |head0, bytes| {
+            let (start, consumed) = moves::decode_start(head0, bytes)
+                .with_context(|| format!("decoding start of ChessBase game {}", entry.id))?;
+            let mode = head0 & 0x3f;
+            if mode == 11 {
+                return Ok(());
+            }
+            fast_index::stream_cbh_mainline(
+                &start.pos,
+                mode,
+                &bytes[consumed..],
+                start.chess960,
+                max_plies,
+                consumer,
+            )
+        })?;
         Ok(true)
+    }
+
+    fn game_record_meta(&self, index: usize) -> GameRecordMeta {
+        let Some(entry) = self.entries.get(index) else {
+            return GameRecordMeta::default();
+        };
+        GameRecordMeta {
+            white_elo: entry.white_elo,
+            black_elo: entry.black_elo,
+            year: entry.year,
+            result: entry.result,
+            eco_code: entry.eco_code,
+            medals: entry.medals,
+            vcs_flags: entry.vcs_flags,
+            annotated: entry.annotated,
+            deleted: entry.deleted,
+        }
+    }
+
+    fn scan_mainline_positions(
+        &self,
+        index: usize,
+        max_ply: u32,
+        visitor: &mut dyn FnMut(u32, &crate::chess::Chess) -> bool,
+    ) -> Result<bool> {
+        let entry = self
+            .entries
+            .get(index)
+            .with_context(|| format!("ChessBase game index {index} is out of range"))?;
+        let (moves_offset, _) = match &self.wide {
+            Some(wide) => wide.offsets(entry.id, (entry.moves_offset, entry.annotations_offset))?,
+            None => (
+                u64::from(entry.moves_offset),
+                u64::from(entry.annotations_offset),
+            ),
+        };
+        self.with_cbg_record(moves_offset, entry.id, |head0, bytes| {
+            let (start, consumed) = moves::decode_start(head0, bytes)
+                .with_context(|| format!("decoding start of ChessBase game {}", entry.id))?;
+            let mode = head0 & 0x3f;
+            if mode == 11 {
+                let _ = visitor(0, &start.pos);
+                return Ok(true);
+            }
+            fast_index::scan_cbh_mainline_positions(
+                &start.pos,
+                mode,
+                &bytes[consumed..],
+                start.chess960,
+                max_ply,
+                visitor,
+            )?;
+            Ok(true)
+        })
     }
 
     fn source_meta(&self) -> Result<SourceMeta> {

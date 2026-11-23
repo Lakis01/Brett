@@ -10,7 +10,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -20,13 +20,14 @@ use crate::country::{self, Country};
 use crate::titles::{self, PlayerTitle, TitleAward};
 
 const USER_AGENT: &str =
-    "Brett/0.1 (native Linux chess preparation app; Wikipedia player summaries)";
+    "Brett/0.2 (https://github.com/Lakis01/Brett; contact@brett.chess)";
 const SUMMARY_ENDPOINT: &str = "https://en.wikipedia.org/api/rest_v1/page/summary/";
 const SEARCH_ENDPOINT: &str = "https://en.wikipedia.org/w/rest.php/v1/search/page";
 const SEARCH_PAGE: &str = "https://en.wikipedia.org/w/index.php";
 const WIKIDATA_ENDPOINT: &str = "https://www.wikidata.org/wiki/Special:EntityData/";
-const MAX_SUMMARIES: usize = 256;
-const MAX_AMBIGUOUS: usize = 256;
+const CACHE_VERSION: u32 = 3;
+const MAX_SUMMARIES: usize = 10_000;
+const MAX_AMBIGUOUS: usize = 10_000;
 static TITLE_HISTORY_SAVE_LOCK: Mutex<()> = Mutex::new(());
 
 /// A cleaned Wikipedia article summary.
@@ -45,10 +46,22 @@ pub struct Summary {
     pub country_periods: Vec<CountryPeriod>,
     /// FIDE id from Wikidata `P1440`, when available.
     pub fide_id: Option<String>,
-    /// Birth year from Wikidata `P569`, when available.
+    /// Birth year from Wikidata `P569` (or conservative lead-text fallback), when available.
     pub birth_year: Option<i32>,
+    /// Death year from Wikidata `P570` (or conservative lead-text fallback), when available.
+    pub death_year: Option<i32>,
     /// Peak Elo from Wikidata `P1087`, when available.
     pub peak_elo: Option<u16>,
+    /// Latest dated Elo from Wikidata `P1087` (with `P585` point-in-time), when available.
+    pub latest_elo: Option<u16>,
+    /// Date of `latest_elo` encoded as `YYYYMMDD` (`0` if undated).
+    pub latest_elo_date: Option<u32>,
+    /// Live FIDE standard rating fetched via `ratings.fide.com`, when available.
+    pub fide_standard: Option<u16>,
+    /// Live FIDE rapid rating fetched via `ratings.fide.com`, when available.
+    pub fide_rapid: Option<u16>,
+    /// Live FIDE blitz rating fetched via `ratings.fide.com`, when available.
+    pub fide_blitz: Option<u16>,
     /// FIDE title history from Wikidata `P2962`, with award years when the
     /// source supplies them (`P580`, then `P585`).
     pub title_history: Vec<TitleAward>,
@@ -62,6 +75,126 @@ pub struct CountryPeriod {
     pub end_year: Option<i32>,
     /// Context label for historically specific cases such as wartime Germany.
     pub context: Option<String>,
+}
+
+fn parse_json_year(value: &Value, key: &str) -> Option<i32> {
+    value
+        .get(key)
+        .and_then(Value::as_i64)
+        .filter(|year| (0..=2100).contains(year))
+        .map(|year| year as i32)
+        .or_else(|| {
+            value
+                .get(key)
+                .and_then(Value::as_u64)
+                .filter(|year| *year <= 2100)
+                .map(|year| year as i32)
+        })
+}
+
+/// Extract a 4-digit calendar year (`1400..=2100`) embedded as a standalone token
+/// at the end of a lifespan half-segment (e.g. `"31 October 1892"` -> `Some(1892)`).
+fn extract_trailing_year(segment: &str) -> Option<i32> {
+    let trimmed = segment.trim().trim_end_matches(|c: char| matches!(c, ',' | ';' | '.'));
+    let token = trimmed.split_whitespace().last()?;
+    if token.len() == 4 && token.chars().all(|c| c.is_ascii_digit()) {
+        let year = token.parse::<i32>().ok()?;
+        return (1400..=2100).contains(&year).then_some(year);
+    }
+    None
+}
+
+/// Extract the first 4-digit calendar year (`1400..=2100`) on the right side
+/// of a lifespan dash (e.g. `"24 March 1946"`, `"March 24, 1946"`, or `"1946, aged 53"`).
+fn extract_death_year_from_right(segment: &str) -> Option<i32> {
+    let candidate = segment
+        .split([';', '('])
+        .next()
+        .unwrap_or(segment)
+        .trim();
+    for token in candidate.split_whitespace() {
+        let clean = token.trim_matches(|c: char| !c.is_ascii_digit());
+        if clean.len() == 4 && clean.chars().all(|c| c.is_ascii_digit()) {
+            let year = clean.parse::<i32>().ok()?;
+            return (1400..=2100).contains(&year).then_some(year);
+        }
+    }
+    None
+}
+
+/// Parse a conservative `(birth_year, death_year)` from a short parenthetical
+/// lifespan like `"(1916–1975)"` or `"(7 January 1916 – 5 June 1975)"`.
+fn parse_lifespan_paren(inner: &str) -> Option<(Option<i32>, Option<i32>)> {
+    let lower = inner.to_ascii_lowercase();
+    if lower.contains("tournament")
+        || lower.contains("championship")
+        || lower.contains("olympiad")
+        || lower.contains("rating")
+        || lower.contains("match")
+    {
+        return None;
+    }
+    for sep in ['–', '—', '−', '-'] {
+        if let Some((left, right)) = inner.split_once(sep) {
+            let left_part = left.rsplit(';').next().unwrap_or(left);
+            if let (Some(born), Some(died)) = (
+                extract_trailing_year(left_part),
+                extract_death_year_from_right(right),
+            ) && born <= died
+                && died - born <= 115
+                && died - born >= 10
+            {
+                return Some((Some(born), Some(died)));
+            }
+        }
+    }
+    for prefix in ["born ", "b. "] {
+        if let Some(pos) = lower.find(prefix) {
+            let tail = &inner[pos + prefix.len()..];
+            for token in tail.split([',', ';', ')']).next().unwrap_or(tail).split_whitespace() {
+                let clean = token.trim_matches(|c: char| !c.is_ascii_digit());
+                if clean.len() == 4
+                    && let Ok(year) = clean.parse::<i32>()
+                    && (1400..=2025).contains(&year)
+                {
+                    return Some((Some(year), None));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Conservatively extract biographical lifespan years from Wikipedia
+/// `description` and lead sentence before the copula (`" is "` / `" was "`).
+fn lifespan_years_from_texts(description: &str, extract: &str) -> (Option<i32>, Option<i32>) {
+    if let Some(open) = description.rfind('(')
+        && let Some(close) = description[open..].find(')')
+    {
+        let inner = &description[open + 1..open + close];
+        if let Some(years) = parse_lifespan_paren(inner) {
+            return years;
+        }
+    }
+    let lead_limit = [" is ", " was ", " were "]
+        .iter()
+        .filter_map(|verb| extract.to_ascii_lowercase().find(verb))
+        .min()
+        .unwrap_or_else(|| extract.len().min(180));
+    let lead = &extract[..lead_limit];
+    let mut rest = lead;
+    while let Some(open) = rest.find('(') {
+        let after = &rest[open + 1..];
+        let Some(close) = after.find(')') else {
+            break;
+        };
+        let inner = &after[..close];
+        if let Some(years) = parse_lifespan_paren(inner) {
+            return years;
+        }
+        rest = &after[close + 1..];
+    }
+    (None, None)
 }
 
 fn title_history_from_value(value: &Value) -> Vec<TitleAward> {
@@ -89,49 +222,182 @@ fn parse_title_history_entries(value: Option<&Value>) -> Vec<TitleAward> {
 
 /// Conservative fallback for articles without a Wikidata `P2962` claim. Only
 /// explicit FIDE-title phrases in the lead are accepted, so "grandmaster" in a
-/// non-chess context or a casual mention later in the article cannot add a
-/// badge.
-fn title_from_extract(extract: &str) -> Option<PlayerTitle> {
-    let lead = extract.chars().take(400).collect::<String>().to_lowercase();
-    let has = |phrase: &str| lead.contains(phrase);
-    let mut found = Vec::new();
-    if has("woman grandmaster") || has("women's grandmaster") || has("womens grandmaster") {
-        found.push(PlayerTitle::Wgm);
+/// Extract conservative title awards from Wikipedia's `description` and lead
+/// `extract`, requiring explicit chess/FIDE context so non-chess phrases (e.g.
+/// "grandmaster of the local lodge") are never misread.
+fn title_awards_from_texts(description: &str, extract: &str) -> Vec<TitleAward> {
+    let desc_lead: String = description.chars().take(240).collect::<String>().to_lowercase();
+    let extract_lead: String = extract.chars().take(600).collect::<String>().to_lowercase();
+    let has_chess_context = desc_lead.contains("chess")
+        || desc_lead.contains("fide")
+        || extract_lead.contains("chess")
+        || extract_lead.contains("fide");
+    if !has_chess_context {
+        return Vec::new();
     }
-    if has("woman international master")
-        || has("women's international master")
-        || has("womens international master")
-    {
-        found.push(PlayerTitle::Wim);
+
+    let is_word_boundary = |text: &str, idx: usize| -> bool {
+        idx == 0 || !text[..idx].chars().next_back().is_some_and(char::is_alphabetic)
+    };
+    let is_word_end = |text: &str, end: usize| -> bool {
+        end >= text.len() || !text[end..].chars().next().is_some_and(char::is_alphabetic)
+    };
+    let is_preceded_by_woman = |text: &str, idx: usize| -> bool {
+        let prefix = text[..idx].trim_end();
+        prefix.ends_with("woman")
+            || prefix.ends_with("women's")
+            || prefix.ends_with("womens")
+    };
+    let extract_award_year = |text: &str, match_end: usize| -> Option<i32> {
+        let rest = &text[match_end..];
+        let sentence_end = rest.find(['.', ';', '\n']).unwrap_or(rest.len()).min(64);
+        let window = &rest[..sentence_end];
+        let mut search_from = 0;
+        while let Some(rel) = window[search_from..].find("in ") {
+            let pos = search_from + rel;
+            let before = window[..pos].trim_end();
+            let digits_start = pos + 3;
+            let digits = &window[digits_start..];
+            if digits.len() >= 4
+                && digits.as_bytes()[..4].iter().all(u8::is_ascii_digit)
+                && digits[4..].chars().next().is_none_or(|c| !c.is_ascii_digit())
+                && !before.ends_with("born")
+                && let Ok(year) = digits[..4].parse::<i32>()
+                && (1940..=2100).contains(&year)
+            {
+                return Some(year);
+            }
+            search_from = pos + 3;
+        }
+        None
+    };
+
+    let find_best_in = |text: &str, phrases: &[&str], reject_woman: bool, parse_year: bool| -> Option<Option<i32>> {
+        let mut found: Option<Option<i32>> = None;
+        for phrase in phrases {
+            let mut start = 0;
+            while let Some(rel) = text[start..].find(phrase) {
+                let idx = start + rel;
+                let end = idx + phrase.len();
+                if is_word_boundary(text, idx)
+                    && is_word_end(text, end)
+                    && !(reject_woman && is_preceded_by_woman(text, idx))
+                    && !(phrase.contains("grandmaster")
+                        && text[..idx].trim_end().ends_with("correspondence"))
+                    && !(phrase.contains("international master")
+                        && text[..idx].trim_end().ends_with("senior"))
+                {
+                    let year = if parse_year {
+                        extract_award_year(text, end)
+                    } else {
+                        None
+                    };
+                    match found {
+                        None => found = Some(year),
+                        Some(None) if year.is_some() => found = Some(year),
+                        _ => {}
+                    }
+                }
+                start = end;
+            }
+        }
+        found
+    };
+
+    let candidates: &[(PlayerTitle, &[&str], bool)] = &[
+        (
+            PlayerTitle::Wgm,
+            &["woman grandmaster", "women's grandmaster", "womens grandmaster"],
+            false,
+        ),
+        (
+            PlayerTitle::Wim,
+            &[
+                "woman international master",
+                "women's international master",
+                "womens international master",
+            ],
+            false,
+        ),
+        (
+            PlayerTitle::Wfm,
+            &["woman fide master", "women's fide master", "womens fide master"],
+            false,
+        ),
+        (
+            PlayerTitle::Wcm,
+            &[
+                "woman candidate master",
+                "women's candidate master",
+                "womens candidate master",
+            ],
+            false,
+        ),
+        (
+            PlayerTitle::Gm,
+            &[
+                "chess grandmaster",
+                "fide grandmaster",
+                "grandmaster title",
+                "title of grandmaster",
+                "title of fide grandmaster",
+                "awarded the grandmaster",
+                "earned the grandmaster",
+                "became a grandmaster",
+                "become a grandmaster",
+                "international grandmaster",
+            ],
+            true,
+        ),
+        (
+            PlayerTitle::Im,
+            &[
+                "chess international master",
+                "fide international master",
+                "international master title",
+                "title of international master",
+                "awarded the international master",
+                "became an international master",
+                "international master",
+            ],
+            true,
+        ),
+        (
+            PlayerTitle::Fm,
+            &[
+                "chess fide master",
+                "fide master title",
+                "title of fide master",
+                "fide master",
+            ],
+            true,
+        ),
+        (
+            PlayerTitle::Cm,
+            &[
+                "chess candidate master",
+                "candidate master title",
+                "title of candidate master",
+                "candidate master",
+            ],
+            true,
+        ),
+    ];
+
+    let mut awards = Vec::new();
+    for &(title, phrases, reject_woman) in candidates {
+        let from_extract = find_best_in(&extract_lead, phrases, reject_woman, true);
+        let from_desc = find_best_in(&desc_lead, phrases, reject_woman, false);
+        if let Some(year) = from_extract.or(from_desc) {
+            let final_year = year.or_else(|| from_desc.flatten());
+            awards.push(TitleAward {
+                title,
+                year: final_year,
+            });
+        }
     }
-    if has("woman fide master") || has("women's fide master") || has("womens fide master") {
-        found.push(PlayerTitle::Wfm);
-    }
-    if has("woman candidate master")
-        || has("women's candidate master")
-        || has("womens candidate master")
-    {
-        found.push(PlayerTitle::Wcm);
-    }
-    if has("chess grandmaster") {
-        found.push(PlayerTitle::Gm);
-    }
-    let woman_im = has("woman international master")
-        || has("women's international master")
-        || has("womens international master");
-    let woman_cm = has("woman candidate master")
-        || has("women's candidate master")
-        || has("womens candidate master");
-    if has("chess international master") || (has("international master") && !woman_im) {
-        found.push(PlayerTitle::Im);
-    }
-    if has("chess fide master") {
-        found.push(PlayerTitle::Fm);
-    }
-    if has("chess candidate master") || (has("candidate master") && !woman_cm) {
-        found.push(PlayerTitle::Cm);
-    }
-    found.into_iter().max_by_key(|title| title.rank())
+    sort_title_history(&mut awards);
+    awards
 }
 
 fn sort_title_history(awards: &mut Vec<TitleAward>) {
@@ -225,7 +491,13 @@ impl Summary {
             })).collect::<Vec<_>>(),
             "fide_id": self.fide_id,
             "birth_year": self.birth_year,
+            "death_year": self.death_year,
             "peak_elo": self.peak_elo,
+            "latest_elo": self.latest_elo,
+            "latest_elo_date": self.latest_elo_date,
+            "fide_standard": self.fide_standard,
+            "fide_rapid": self.fide_rapid,
+            "fide_blitz": self.fide_blitz,
             "title_history": self.title_history.iter().map(|award| json!({
                 "title": award.title.short(),
                 "year": award.year,
@@ -339,18 +611,9 @@ impl Summary {
             .map(str::trim)
             .filter(|id| !id.is_empty())
             .map(str::to_string);
-        let birth_year = value
-            .get("birth_year")
-            .and_then(Value::as_i64)
-            .filter(|year| *year >= 0 && *year <= 2100)
-            .map(|year| year as i32)
-            .or_else(|| {
-                value
-                    .get("birth_year")
-                    .and_then(Value::as_u64)
-                    .filter(|year| *year <= 2100)
-                    .map(|year| year as i32)
-            });
+        let (text_birth_year, text_death_year) = lifespan_years_from_texts(&description, &extract);
+        let birth_year = parse_json_year(value, "birth_year").or(text_birth_year);
+        let death_year = parse_json_year(value, "death_year").or(text_death_year);
         let peak_elo = value
             .get("peak_elo")
             .and_then(Value::as_u64)
@@ -366,12 +629,36 @@ impl Summary {
             .or_else(|| {
                 peak_elo_from_text(value.get("extract").and_then(Value::as_str).unwrap_or(""))
             });
+        let parse_opt_elo = |key: &str| {
+            value
+                .get(key)
+                .and_then(Value::as_u64)
+                .filter(|elo| *elo > 0 && *elo <= 4000)
+                .map(|elo| elo as u16)
+        };
+        let latest_elo = parse_opt_elo("latest_elo");
+        let latest_elo_date = value
+            .get("latest_elo_date")
+            .and_then(Value::as_u64)
+            .and_then(|d| u32::try_from(d).ok())
+            .filter(|&d| d > 0);
+        let fide_standard = parse_opt_elo("fide_standard");
+        let fide_rapid = parse_opt_elo("fide_rapid");
+        let fide_blitz = parse_opt_elo("fide_blitz");
         let mut title_history = title_history_from_value(value);
-        if title_history.is_empty()
-            && let Some(title) = title_from_extract(&extract)
-        {
-            title_history.push(TitleAward { title, year: None });
+        for text_award in title_awards_from_texts(&description, &extract) {
+            if let Some(existing) = title_history
+                .iter_mut()
+                .find(|award| award.title == text_award.title)
+            {
+                if existing.year.is_none() && text_award.year.is_some() {
+                    existing.year = text_award.year;
+                }
+            } else {
+                title_history.push(text_award);
+            }
         }
+        sort_title_history(&mut title_history);
         Some(Self {
             title: title.to_string(),
             description,
@@ -381,7 +668,13 @@ impl Summary {
             country_periods,
             fide_id,
             birth_year,
+            death_year,
             peak_elo,
+            latest_elo,
+            latest_elo_date,
+            fide_standard,
+            fide_rapid,
+            fide_blitz,
             title_history,
         })
     }
@@ -904,6 +1197,16 @@ fn parse_qualifier_year(claim: &Value, qualifier: &str) -> Option<i32> {
     parse_wikidata_time_year(time)
 }
 
+fn parse_qualifier_date(claim: &Value, qualifier: &str) -> Option<u32> {
+    let time = claim
+        .pointer(&format!(
+            "/qualifiers/{qualifier}/0/mainsnak/datavalue/value/time"
+        ))
+        .or_else(|| claim.pointer(&format!("/qualifiers/{qualifier}/0/datavalue/value/time")))?
+        .as_str()?;
+    parse_wikidata_time_ymd(time)
+}
+
 fn parse_wikidata_time_year(time: &str) -> Option<i32> {
     let digits: String = time
         .trim()
@@ -916,6 +1219,31 @@ fn parse_wikidata_time_year(time: &str) -> Option<i32> {
     }
     let year: i32 = digits[..4].parse().ok()?;
     (0..=2100).contains(&year).then_some(year)
+}
+
+fn parse_wikidata_time_ymd(time: &str) -> Option<u32> {
+    let date_part = time
+        .trim()
+        .trim_start_matches('+')
+        .split('T')
+        .next()
+        .unwrap_or("");
+    let mut parts = date_part.split('-');
+    let year: u32 = parts.next()?.parse().ok()?;
+    if year == 0 || year > 2100 {
+        return None;
+    }
+    let month: u32 = parts
+        .next()
+        .and_then(|s| s.parse().ok())
+        .filter(|&m| (1..=12).contains(&m))
+        .unwrap_or(1);
+    let day: u32 = parts
+        .next()
+        .and_then(|s| s.parse().ok())
+        .filter(|&d| (1..=31).contains(&d))
+        .unwrap_or(1);
+    Some(year * 10_000 + month * 100 + day)
 }
 
 fn parse_quantity_elo(claim: &Value) -> Option<u16> {
@@ -949,7 +1277,10 @@ pub(crate) struct WikidataFields {
     pub country_periods: Vec<CountryPeriod>,
     pub fide_id: Option<String>,
     pub birth_year: Option<i32>,
+    pub death_year: Option<i32>,
     pub peak_elo: Option<u16>,
+    pub latest_elo: Option<u16>,
+    pub latest_elo_date: Option<u32>,
     pub title_history: Vec<TitleAward>,
 }
 
@@ -971,10 +1302,32 @@ fn title_from_wikidata_qid(qid: &str) -> Option<PlayerTitle> {
     })
 }
 
+/// Extract a year from a Wikidata time property, preferring `"preferred"` rank
+/// and falling back to `"normal"` while ignoring `"deprecated"` claims.
+fn parse_wikidata_claim_year(claims: &Value, property: &str) -> Option<i32> {
+    let snatched = claims.get(property).and_then(Value::as_array)?;
+    let mut fallback = None;
+    for claim in snatched {
+        let rank = claim_rank(claim);
+        if rank == "deprecated" {
+            continue;
+        }
+        if let Some(year) = parse_time_year(claim) {
+            if rank == "preferred" {
+                return Some(year);
+            }
+            if fallback.is_none() {
+                fallback = Some(year);
+            }
+        }
+    }
+    fallback
+}
+
 /// Parse Wikidata `EntityData` claims: `P1440` → `fide_id`, `P1532`/`P27`
-/// → `countries` (oldest → latest), `P569` → `birth_year`, `P1087` →
-/// `peak_elo`, and `P2962` → `title_history` (with the `P580` award year when
-/// stated). Malformed payloads yield defaults; this never panics.
+/// → `countries` (oldest → latest), `P569` → `birth_year`, `P570` → `death_year`,
+/// `P1087` → `peak_elo`, and `P2962` → `title_history` (with the `P580` award year
+/// when stated). Malformed payloads yield defaults; this never panics.
 pub(crate) fn parse_wikidata_value(value: &Value) -> WikidataFields {
     let mut fields = WikidataFields::default();
     let Some(entity) = wikidata_entity(value) else {
@@ -997,21 +1350,14 @@ pub(crate) fn parse_wikidata_value(value: &Value) -> WikidataFields {
             }
         }
     }
-    // P569 → birth_year.
-    if let Some(snatched) = claims.get("P569").and_then(Value::as_array) {
-        for claim in snatched {
-            if claim_rank(claim) == "deprecated" {
-                continue;
-            }
-            if let Some(year) = parse_time_year(claim) {
-                fields.birth_year = Some(year);
-                break;
-            }
-        }
-    }
-    // P1087 → peak_elo (max across non-deprecated claims).
+    // P569 → birth_year, P570 → death_year.
+    fields.birth_year = parse_wikidata_claim_year(claims, "P569");
+    fields.death_year = parse_wikidata_claim_year(claims, "P570");
+    // P1087 → peak_elo (max across non-deprecated claims) and latest_elo
+    // (preferring the latest P585 point-in-time date, then preferred rank).
     if let Some(snatched) = claims.get("P1087").and_then(Value::as_array) {
-        for claim in snatched {
+        let mut best_latest: Option<(u32, bool, usize, u16)> = None;
+        for (idx, claim) in snatched.iter().enumerate() {
             if claim_rank(claim) == "deprecated" {
                 continue;
             }
@@ -1020,7 +1366,19 @@ pub(crate) fn parse_wikidata_value(value: &Value) -> WikidataFields {
                     Some(current) => current.max(elo),
                     None => elo,
                 });
+                let date = parse_qualifier_date(claim, "P585")
+                    .or_else(|| parse_qualifier_date(claim, "P580"))
+                    .unwrap_or(0);
+                let is_preferred = claim_rank(claim) == "preferred";
+                let candidate = (date, is_preferred, idx, elo);
+                if best_latest.is_none_or(|cur| (candidate.0, candidate.1, candidate.2) > (cur.0, cur.1, cur.2)) {
+                    best_latest = Some(candidate);
+                }
             }
+        }
+        if let Some((date, _, _, elo)) = best_latest {
+            fields.latest_elo = Some(elo);
+            fields.latest_elo_date = (date > 0).then_some(date);
         }
     }
     // P2962 → chess titles. Every non-deprecated claim is a dated step in the
@@ -1156,6 +1514,19 @@ pub(crate) fn apply_wikidata_value(summary: &mut Summary, value: &Value) {
     if let Some(birth_year) = fields.birth_year {
         summary.birth_year = Some(birth_year);
     }
+    if let Some(death_year) = fields.death_year {
+        summary.death_year = Some(death_year);
+    }
+    if summary.birth_year.is_none() || summary.death_year.is_none() {
+        let (text_birth, text_death) =
+            lifespan_years_from_texts(&summary.description, &summary.extract);
+        if summary.birth_year.is_none() {
+            summary.birth_year = text_birth;
+        }
+        if summary.death_year.is_none() {
+            summary.death_year = text_death;
+        }
+    }
     if !fields.title_history.is_empty() {
         // Keep the undated lead-text title as a current-profile fallback even
         // when Wikidata has an incomplete, older title history. Historical
@@ -1171,6 +1542,10 @@ pub(crate) fn apply_wikidata_value(summary: &mut Summary, value: &Value) {
         if let Some(elo) = peak_elo_from_text(&summary.extract) {
             summary.peak_elo = Some(elo);
         }
+    }
+    if let Some(latest_elo) = fields.latest_elo {
+        summary.latest_elo = Some(latest_elo);
+        summary.latest_elo_date = fields.latest_elo_date;
     }
 }
 
@@ -1246,11 +1621,25 @@ impl Cache {
         {
             return Some(Lookup::Summary(summary.clone()));
         }
+        if let Some(summary) = self.summaries.values().find(|summary| {
+            query_key(&summary.title).as_deref() == Some(key.as_str())
+                && is_confident(summary)
+                && title_matches_name(name, &summary.title)
+        }) {
+            return Some(Lookup::Summary(summary.clone()));
+        }
         self.ambiguous
             .get(&key)
             .map(|search_url| Lookup::Ambiguous {
                 search_url: search_url.clone(),
             })
+    }
+
+    pub fn remove(&mut self, name: &str) {
+        if let Some(key) = query_key(name) {
+            self.queries.remove(&key);
+            self.ambiguous.remove(&key);
+        }
     }
 
     pub fn insert(&mut self, name: &str, lookup: &Lookup) {
@@ -1296,6 +1685,7 @@ impl Cache {
 
     pub fn from_json(text: &str) -> Self {
         let value: Value = serde_json::from_str(text).unwrap_or(Value::Null);
+        let version = value.get("version").and_then(Value::as_u64).unwrap_or(0);
         let summaries: BTreeMap<String, Summary> = value
             .get("summaries")
             .and_then(Value::as_object)
@@ -1310,19 +1700,33 @@ impl Cache {
             .and_then(Value::as_object)
             .map(|map| {
                 map.iter()
-                    .filter_map(|(key, value)| Some((key.clone(), value.as_str()?.to_string())))
+                    .filter_map(|(key, value)| {
+                        let title = value.as_str()?;
+                        let summary = summaries.get(title)?;
+                        if is_confident(summary) && title_matches_query_key(key, &summary.title) {
+                            Some((key.clone(), title.to_string()))
+                        } else {
+                            None
+                        }
+                    })
                     .collect()
             })
             .unwrap_or_default();
-        let ambiguous: BTreeMap<String, String> = value
-            .get("ambiguous")
-            .and_then(Value::as_object)
-            .map(|map| {
-                map.iter()
-                    .filter_map(|(key, value)| Some((key.clone(), value.as_str()?.to_string())))
-                    .collect()
-            })
-            .unwrap_or_default();
+        // Discard stale `ambiguous` entries from older cache versions so
+        // previously missed names (e.g. umlaut/digraph spellings) are retried.
+        let ambiguous: BTreeMap<String, String> = if version == u64::from(CACHE_VERSION) {
+            value
+                .get("ambiguous")
+                .and_then(Value::as_object)
+                .map(|map| {
+                    map.iter()
+                        .filter_map(|(key, value)| Some((key.clone(), value.as_str()?.to_string())))
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            BTreeMap::new()
+        };
         Self {
             summaries,
             queries,
@@ -1347,6 +1751,7 @@ impl Cache {
             .map(|(key, url)| (key.clone(), Value::String(url.clone())))
             .collect::<serde_json::Map<String, Value>>();
         json!({
+            "version": CACHE_VERSION,
             "summaries": Value::Object(summaries),
             "queries": Value::Object(queries),
             "ambiguous": Value::Object(ambiguous),
@@ -1398,33 +1803,115 @@ impl Cache {
     }
 }
 
+fn wiki_agent() -> &'static ureq::Agent {
+    static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+    AGENT.get_or_init(|| {
+        ureq::AgentBuilder::new()
+            .user_agent(USER_AGENT)
+            .timeout_connect(Duration::from_secs(6))
+            .timeout(Duration::from_secs(12))
+            .build()
+    })
+}
+
 /// Look up a player name on Wikipedia. Network errors are returned as
 /// human-readable strings so the profile can offer a retry and a search link.
 pub fn lookup(name: &str) -> std::result::Result<Lookup, String> {
-    let agent = ureq::AgentBuilder::new()
-        .user_agent(USER_AGENT)
-        .timeout_connect(Duration::from_secs(6))
-        .timeout(Duration::from_secs(12))
-        .build();
-    lookup_with(name, |url| get_json(&agent, url))
+    let agent = wiki_agent();
+    lookup_with(name, |url| get_json(agent, url))
+}
+
+/// Look up a player on Wikipedia/Wikidata and, when a FIDE ID is known from
+/// Wikidata (`P1440`) or the database (`known_fide_id`), fetch live FIDE
+/// classical, rapid, and blitz ratings.
+pub fn lookup_with_fide(
+    name: &str,
+    known_fide_id: Option<&str>,
+) -> std::result::Result<Lookup, String> {
+    let mut result = lookup(name);
+    if let Ok(Lookup::Summary(summary)) = &mut result {
+        enrich_fide_ratings(summary, known_fide_id);
+    }
+    result
+}
+
+/// Populate `summary.fide_standard`/`rapid`/`blitz` and missing FIDE title via
+/// FIDE when a FIDE ID is known. Returns `true` if any FIDE field was populated.
+pub fn enrich_fide_ratings(summary: &mut Summary, known_fide_id: Option<&str>) -> bool {
+    let Some(id) = summary
+        .fide_id
+        .as_deref()
+        .and_then(|s| crate::fide::from_tag(Some(s)))
+        .or_else(|| crate::fide::from_tag(known_fide_id))
+    else {
+        return false;
+    };
+    let Some(ratings) = crate::fide::fetch_ratings(id) else {
+        return false;
+    };
+    let mut updated = false;
+    if let Some(title) = ratings.title
+        && !summary
+            .title_history
+            .iter()
+            .any(|award| award.title == title)
+    {
+        summary.title_history.push(TitleAward { title, year: None });
+        sort_title_history(&mut summary.title_history);
+        updated = true;
+    }
+    if ratings.standard.is_some() {
+        summary.fide_standard = ratings.standard;
+        updated = true;
+    }
+    if ratings.rapid.is_some() {
+        summary.fide_rapid = ratings.rapid;
+        updated = true;
+    }
+    if ratings.blitz.is_some() {
+        summary.fide_blitz = ratings.blitz;
+        updated = true;
+    }
+    updated
 }
 
 fn lookup_with(
     name: &str,
     mut fetch: impl FnMut(&str) -> std::result::Result<Value, FetchError>,
 ) -> std::result::Result<Lookup, String> {
-    let primary = lookup_single(name.trim(), &mut fetch);
-    if matches!(primary, Ok(Lookup::Summary(_))) {
+    let trimmed = name.trim();
+    let primary = lookup_single(trimmed, &mut fetch);
+    if matches!(primary, Ok(Lookup::Summary(_)) | Err(_)) {
         return primary;
     }
     // Fallback: the database may spell a German umlaut as an ASCII digraph
     // (`Bluebaum` vs `Blübaum`). Retry with umlauts restored.
-    for variant in umlaut_variants(name.trim()) {
-        if variant.eq_ignore_ascii_case(name.trim()) {
+    for variant in umlaut_variants(trimmed) {
+        if variant.eq_ignore_ascii_case(trimmed) {
             continue;
         }
-        if let Ok(Lookup::Summary(summary)) = lookup_single(&variant, &mut fetch) {
-            return Ok(Lookup::Summary(summary));
+        match lookup_single(&variant, &mut fetch) {
+            Ok(Lookup::Summary(summary)) => return Ok(Lookup::Summary(summary)),
+            Ok(Lookup::Ambiguous { .. }) => {}
+            Err(err) => return Err(err),
+        }
+    }
+    // Fallback for patronymics/middle names (`Kortschnoj, Viktor Lvovich`):
+    // search Wikipedia with `Surname, FirstGiven` while still requiring
+    // `title_matches_name` on the original full query.
+    if let Some((surname, given)) = trimmed.split_once(',') {
+        let given_words: Vec<&str> = given.split_whitespace().collect();
+        if given_words.len() >= 2 && !surname.trim().is_empty() {
+            let shortened = format!("{}, {}", surname.trim(), given_words[0]);
+            if !shortened.eq_ignore_ascii_case(trimmed) {
+                match lookup_single(&shortened, &mut fetch) {
+                    Ok(Lookup::Summary(summary)) if title_matches_name(trimmed, &summary.title) => {
+                        return Ok(Lookup::Summary(summary));
+                    }
+                    Ok(_) => {}
+                    Err(err) => return Err(err),
+                }
+            }
         }
     }
     primary
@@ -1533,19 +2020,49 @@ enum FetchError {
     Other(String),
 }
 
+fn retry_delay(attempt: usize, retry_after: Option<&str>) -> Duration {
+    if let Some(raw) = retry_after
+        && let Ok(secs) = raw.trim().parse::<u64>()
+    {
+        return Duration::from_secs(secs.clamp(1, 10));
+    }
+    const BACKOFF_MS: [u64; 3] = [1_200, 2_500, 5_000];
+    Duration::from_millis(BACKOFF_MS.get(attempt).copied().unwrap_or(5_000))
+}
+
 fn get_json(agent: &ureq::Agent, url: &str) -> std::result::Result<Value, FetchError> {
-    let response = match agent.get(url).call() {
-        Ok(response) => response,
-        Err(ureq::Error::Status(404, _)) => return Err(FetchError::NotFound),
-        Err(ureq::Error::Status(code, _)) => {
-            return Err(FetchError::Other(format!(
-                "Wikipedia returned HTTP {code}."
-            )));
-        }
-        Err(err) => {
-            return Err(FetchError::Other(format!(
-                "Wikipedia request failed: {err}"
-            )));
+    let mut attempt = 0usize;
+    let response = loop {
+        match agent.get(url).call() {
+            Ok(response) => break response,
+            Err(ureq::Error::Status(404, _)) => return Err(FetchError::NotFound),
+            Err(ureq::Error::Status(code @ (429 | 503), response)) => {
+                if attempt < 3 {
+                    let delay = retry_delay(attempt, response.header("retry-after"));
+                    attempt += 1;
+                    std::thread::sleep(delay);
+                    continue;
+                }
+                return Err(FetchError::Other(format!(
+                    "Wikipedia returned HTTP {code}."
+                )));
+            }
+            Err(ureq::Error::Status(code, _)) => {
+                return Err(FetchError::Other(format!(
+                    "Wikipedia returned HTTP {code}."
+                )));
+            }
+            Err(err @ ureq::Error::Transport(_)) => {
+                if attempt < 3 {
+                    let delay = retry_delay(attempt, None);
+                    attempt += 1;
+                    std::thread::sleep(delay);
+                    continue;
+                }
+                return Err(FetchError::Other(format!(
+                    "Wikipedia request failed: {err}"
+                )));
+            }
         }
     };
     let text = response
@@ -1692,22 +2209,56 @@ fn has_word(text: &str, word: &str) -> bool {
         .any(|token| token == word)
 }
 
-/// Fold German ASCII transliteration digraphs to their single-letter base so
-/// PGN's `Bluebaum` matches Wikipedia's `Blübaum` (and `Müller`/`Mueller`,
-/// `Grosse`/`Große`). `deunicode` already maps real umlauts to single letters;
-/// this handles the ASCII-spelled variant found in many databases.
-fn fold_german_digraphs(token: &str) -> String {
-    token
+/// Fold ASCII transliteration digraphs and common Slavic/German romanizations
+/// so PGN names match Wikipedia titles (`Bluebaum` -> `Blübaum`,
+/// `Ivanchuk, Vassily` -> `Vasyl Ivanchuk`, `Kortschnoj, Viktor Lvovich` ->
+/// `Viktor Korchnoi`, `Indjic` -> `Inđić`, `Aleksey` -> `Alexey`).
+fn fold_transliteration_digraphs(token: &str) -> String {
+    let mut folded = token
+        .replace("schtsch", "shch")
+        .replace("tsch", "ch")
+        .replace("sch", "sh")
+        .replace("kh", "ch")
         .replace("ue", "u")
         .replace("ae", "a")
         .replace("oe", "o")
         .replace("ss", "s")
+        .replace("dj", "d")
+        .replace("ks", "x")
+        .replace("ja", "ia")
+        .replace("je", "ie")
+        .replace("ji", "i")
+        .replace("jo", "io")
+        .replace("ju", "iu")
+        .replace("aj", "ai")
+        .replace("ej", "ei")
+        .replace("ij", "i")
+        .replace("oj", "oi")
+        .replace("uj", "ui")
+        .replace('y', "i")
+        .replace("ii", "i");
+    if folded.len() > 3 && folded.ends_with("ow") {
+        folded.pop();
+        folded.push('v');
+    } else if folded.len() > 3 && folded.ends_with("ew") {
+        folded.pop();
+        folded.push('v');
+    }
+    match folded.as_str() {
+        "vasil" | "vasili" | "vasiliy" | "vasilii" => "vasili".to_string(),
+        "victor" => "viktor".to_string(),
+        "michail" | "mihail" => "michail".to_string(),
+        "wladimir" => "vladimir".to_string(),
+        "oleksandr" | "olexandr" => "aleksandr".to_string(),
+        "ievgeni" | "jevgeni" => "evgeni".to_string(),
+        _ => folded,
+    }
 }
 
 fn name_tokens(text: &str) -> Vec<String> {
-    text.split(|ch: char| !ch.is_alphanumeric())
+    text.split(|ch: char| !ch.is_alphabetic())
         .filter(|token| !token.is_empty())
-        .map(|token| fold_german_digraphs(&deunicode::deunicode(token).to_lowercase()))
+        .map(|token| fold_transliteration_digraphs(&deunicode::deunicode(token).to_lowercase()))
         .collect()
 }
 
@@ -1715,75 +2266,197 @@ fn name_tokens(text: &str) -> Vec<String> {
 /// Wikipedia searches when the ASCII-spelled database name finds no match
 /// (e.g. `Bluebaum, Matthias` → `Blübaum, Matthias`).
 fn umlaut_variants(name: &str) -> Vec<String> {
-    const DIGRAPHS: [(&str, char); 3] = [("ue", 'ü'), ("ae", 'ä'), ("oe", 'ö')];
-    let lower = name.to_lowercase();
+    const DIGRAPHS: [(&str, char, char); 4] = [
+        ("ue", 'ü', 'Ü'),
+        ("ae", 'ä', 'Ä'),
+        ("oe", 'ö', 'Ö'),
+        ("ss", 'ß', 'ß'),
+    ];
+    let mut matches: Vec<(usize, char)> = Vec::new();
+    let chars: Vec<(usize, char)> = name.char_indices().collect();
+    let mut i = 0usize;
+    while i + 1 < chars.len() {
+        let (idx0, c0) = chars[i];
+        let (idx1, c1) = chars[i + 1];
+        if idx1 == idx0 + c0.len_utf8() && c0.is_ascii() && c1.is_ascii() {
+            let pair = [c0.to_ascii_lowercase(), c1.to_ascii_lowercase()];
+            let mut matched = None;
+            for (digraph, lower_rep, upper_rep) in DIGRAPHS {
+                let bytes = digraph.as_bytes();
+                if pair[0] as u8 == bytes[0] && pair[1] as u8 == bytes[1] {
+                    if digraph == "ss" {
+                        if c0.is_ascii_lowercase() && c1.is_ascii_lowercase() {
+                            matched = Some(lower_rep);
+                        }
+                    } else if c0.is_ascii_uppercase() && c1.is_ascii_lowercase() {
+                        matched = Some(upper_rep);
+                    } else if c0.is_ascii_lowercase() && c1.is_ascii_lowercase() {
+                        matched = Some(lower_rep);
+                    }
+                    break;
+                }
+            }
+            if let Some(rep) = matched {
+                matches.push((idx0, rep));
+                i += 2;
+                continue;
+            }
+        }
+        i += 1;
+    }
+
     let mut variants = Vec::new();
-    for (digraph, umlaut) in DIGRAPHS {
-        let mut start = 0usize;
-        while let Some(offset) = lower[start..].find(digraph) {
-            let idx = start + offset;
-            let mut candidate = String::with_capacity(name.len());
-            candidate.push_str(&name[..idx]);
-            candidate.push(umlaut);
-            candidate.push_str(&name[idx + digraph.len()..]);
+    if matches.len() > 1 {
+        let mut combined = String::with_capacity(name.len());
+        let mut cursor = 0usize;
+        for &(idx, rep) in &matches {
+            combined.push_str(&name[cursor..idx]);
+            combined.push(rep);
+            cursor = idx + 2;
+        }
+        combined.push_str(&name[cursor..]);
+        variants.push(combined);
+    }
+    for &(idx, rep) in &matches {
+        let mut candidate = String::with_capacity(name.len());
+        candidate.push_str(&name[..idx]);
+        candidate.push(rep);
+        candidate.push_str(&name[idx + 2..]);
+        if !variants.contains(&candidate) {
             variants.push(candidate);
-            start = idx + digraph.len();
         }
     }
-    variants.sort();
-    variants.dedup();
-    variants.truncate(6);
+    variants.truncate(8);
     variants
 }
 
-/// Split a PGN name into tokens, putting `Surname, Given` back into
-/// given-name order so both spellings match the same article.
-fn query_name_tokens(name: &str) -> Vec<String> {
+const GENERATIONAL_SUFFIXES: &[&str] = &["jr", "sr", "ii", "iii", "iv"];
+
+/// Split a PGN name into primary given, primary surname, and ordered tokens,
+/// putting `Surname, Given` back into given-name order.
+fn split_primary_parts(name: &str) -> (Option<String>, Option<String>, Vec<String>) {
     let name = name.trim();
     if let Some((surname, given)) = name.split_once(',') {
-        let mut tokens = name_tokens(given);
-        tokens.extend(name_tokens(surname));
-        tokens
+        let given_tokens = name_tokens(given);
+        let surname_tokens = name_tokens(surname);
+        let primary_given = given_tokens.first().cloned();
+        let primary_surname = surname_tokens.first().cloned();
+        let mut all = given_tokens;
+        all.extend(surname_tokens);
+        (primary_given, primary_surname, all)
     } else {
-        name_tokens(name)
+        let all = name_tokens(name);
+        let primary_given = all.first().cloned();
+        let primary_surname = all.last().cloned();
+        (primary_given, primary_surname, all)
     }
+}
+
+/// Order-independent match used when validating cached `player_key -> title`
+/// entries whose tokens are sorted alphabetically.
+fn title_matches_query_key(key: &str, title: &str) -> bool {
+    let query = name_tokens(key);
+    let title = title.split('(').next().unwrap_or(title);
+    let title_tokens = name_tokens(title);
+    match_tokens(&query, &title_tokens, None, None)
+}
+
+fn match_tokens(
+    query: &[String],
+    title_tokens: &[String],
+    primary_given: Option<&String>,
+    primary_surname: Option<&String>,
+) -> bool {
+    if query.is_empty() || title_tokens.is_empty() {
+        return false;
+    }
+    if query.len() < 2 && title_tokens.len() > 1 {
+        return false;
+    }
+    if query.iter().any(|token| {
+        GENERATIONAL_SUFFIXES.contains(&token.as_str())
+            && !title_tokens.iter().any(|candidate| candidate == token)
+    }) {
+        return false;
+    }
+
+    let query_multi_count = query.iter().filter(|token| token.chars().count() > 1).count();
+    let title_multi_count = title_tokens
+        .iter()
+        .filter(|token| token.chars().count() > 1)
+        .count();
+
+    let mut used = vec![false; title_tokens.len()];
+    let mut forward_ok = query_multi_count > 0;
+    for token in query {
+        let is_initial = token.chars().count() == 1;
+        if is_initial && query_multi_count >= 2 {
+            continue;
+        }
+        let matched = title_tokens.iter().enumerate().find_map(|(index, candidate)| {
+            if used[index] {
+                return None;
+            }
+            let ok = if is_initial {
+                candidate.starts_with(token.as_str())
+            } else {
+                candidate == token
+            };
+            ok.then_some(index)
+        });
+        if let Some(index) = matched {
+            used[index] = true;
+        } else {
+            forward_ok = false;
+            break;
+        }
+    }
+    if forward_ok {
+        return true;
+    }
+
+    // Handle 3+ multi-letter query tokens (middle names, patronymics, compound
+    // surnames) when Wikipedia uses the shorter canonical 2+ token name.
+    if query_multi_count >= 3 && title_multi_count >= 2 {
+        let mut query_used = vec![false; query.len()];
+        for title_token in title_tokens {
+            let Some(q_idx) = query.iter().enumerate().find_map(|(index, q_token)| {
+                (!query_used[index] && q_token == title_token).then_some(index)
+            }) else {
+                return false;
+            };
+            query_used[q_idx] = true;
+        }
+        if let Some(given) = primary_given
+            && !title_tokens.iter().any(|t| t == given)
+        {
+            return false;
+        }
+        if let Some(surname) = primary_surname
+            && !title_tokens.iter().any(|t| t == surname)
+        {
+            return false;
+        }
+        return true;
+    }
+
+    false
 }
 
 /// True when an article title names the queried player.
 ///
-/// Search results for abbreviated PGN names such as `Bacrot, E` often contain
-/// a confident but unrelated chess player. Multi-letter query tokens (the
-/// surname and any spelled-out given names) must all appear in the title;
-/// single-letter initials may be absent so `Gawain C B Jones` still matches
-/// `Gawain Jones`. Prefix matching covers conventional abbreviations:
-/// `Svane, R` matches `Rasmus Svane` and `Buhmann,R` matches `Rainer Buhmann`.
+/// Multi-letter query tokens must match distinct tokens in the article title
+/// (or, for 3+ multi-letter tokens like middle names and compound surnames,
+/// all title tokens must match distinct query tokens including the primary
+/// given and surname tokens). Single-letter initials must match an unused
+/// title token when fewer than two multi-letter tokens are present.
 fn title_matches_name(name: &str, title: &str) -> bool {
-    let query = query_name_tokens(name);
+    let (primary_given, primary_surname, query) = split_primary_parts(name);
     let title = title.split('(').next().unwrap_or(title);
     let title_tokens = name_tokens(title);
-    if query.is_empty() || title_tokens.is_empty() {
-        return false;
-    }
-
-    let mut used = vec![false; title_tokens.len()];
-    let mut required = 0;
-    for token in &query {
-        if token.chars().count() == 1 {
-            continue;
-        }
-        required += 1;
-        let Some(index) = title_tokens
-            .iter()
-            .enumerate()
-            .find_map(|(index, candidate)| {
-                (!used[index] && candidate.starts_with(token.as_str())).then_some(index)
-            })
-        else {
-            return false;
-        };
-        used[index] = true;
-    }
-    required > 0
+    let check_given = primary_given.as_ref();
+    let check_surname = name.contains(',').then_some(primary_surname.as_ref()).flatten();
+    match_tokens(&query, &title_tokens, check_given, check_surname)
 }
 
 /// Normalized identity used for the cache's name index.
@@ -1806,22 +2479,37 @@ fn search_api_url(name: &str) -> String {
     )
 }
 
-/// PGN tags often use `Last, First`; Wikipedia search reads `First Last`
-/// more naturally. Leave every other spelling alone.
+fn clean_search_words(part: &str) -> Vec<String> {
+    part.split_whitespace()
+        .filter_map(|word| {
+            let trimmed = word.trim_end_matches(|ch: char| ch.is_ascii_digit());
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        })
+        .collect()
+}
+
+/// PGN tags often use `Last, First` (and ChessBase sometimes appends a numeric
+/// disambiguator like `Vladimir1`); Wikipedia search and direct summary URLs
+/// expect `First Last` without trailing digits.
 fn search_name(name: &str) -> String {
     let name = name.trim();
     if let Some((last, first)) = name.split_once(',') {
-        let last = last.trim();
-        let first = first.trim();
-        if !last.is_empty() && !first.is_empty() && !first.contains(',') {
-            return format!("{first} {last}");
+        let last_words = clean_search_words(last.trim());
+        let first_words = clean_search_words(first.trim());
+        if !last_words.is_empty() && !first_words.is_empty() && !first.contains(',') {
+            return format!("{} {}", first_words.join(" "), last_words.join(" "));
         }
     }
-    name.to_string()
+    let words = clean_search_words(name);
+    if words.is_empty() {
+        name.to_string()
+    } else {
+        words.join(" ")
+    }
 }
 
 fn summary_url(name: &str) -> String {
-    summary_url_for_title(name)
+    summary_url_for_title(&search_name(name))
 }
 
 fn summary_url_for_title(title: &str) -> String {
@@ -1948,15 +2636,26 @@ fn entity_char(entity: &str) -> Option<char> {
 }
 
 fn cache_path() -> Option<PathBuf> {
-    if let Some(dir) = std::env::var_os("XDG_CACHE_HOME") {
-        return Some(PathBuf::from(dir).join("brett").join("wikipedia.json"));
+    #[cfg(test)]
+    {
+        return Some(
+            std::env::temp_dir()
+                .join(format!("brett-test-wiki-{}", std::process::id()))
+                .join("wikipedia.json"),
+        );
     }
-    std::env::var_os("HOME").map(|home| {
-        PathBuf::from(home)
-            .join(".cache")
-            .join("brett")
-            .join("wikipedia.json")
-    })
+    #[cfg(not(test))]
+    {
+        if let Some(dir) = std::env::var_os("XDG_CACHE_HOME") {
+            return Some(PathBuf::from(dir).join("brett").join("wikipedia.json"));
+        }
+        std::env::var_os("HOME").map(|home| {
+            PathBuf::from(home)
+                .join(".cache")
+                .join("brett")
+                .join("wikipedia.json")
+        })
+    }
 }
 
 fn title_history_cache_path() -> Option<PathBuf> {
@@ -2072,10 +2771,14 @@ mod tests {
             country_periods: country_periods_from_texts(description, extract),
             fide_id: None,
             birth_year: None,
+            death_year: None,
             peak_elo: None,
-            title_history: title_from_extract(extract)
-                .map(|title| vec![TitleAward { title, year: None }])
-                .unwrap_or_default(),
+            latest_elo: None,
+            latest_elo_date: None,
+            fide_standard: None,
+            fide_rapid: None,
+            fide_blitz: None,
+            title_history: title_awards_from_texts(description, extract),
         }
     }
 
@@ -2591,6 +3294,10 @@ mod tests {
                             "rank": "normal",
                             "mainsnak": {"datavalue": {"value": {"time": "+1963-12-09T00:00:00Z", "type": "time"}, "type": "time"}, "datatype": "time", "snaktype": "value"}
                         }],
+                        "P570": [{
+                            "rank": "normal",
+                            "mainsnak": {"datavalue": {"value": {"time": "+2040-01-01T00:00:00Z", "type": "time"}, "type": "time"}, "datatype": "time", "snaktype": "value"}
+                        }],
                         "P1087": [{
                             "rank": "normal",
                             "mainsnak": {"datavalue": {"value": {"amount": "+2850"}, "type": "quantity"}, "datatype": "quantity", "snaktype": "value"}
@@ -2602,12 +3309,43 @@ mod tests {
         let fields = parse_wikidata_value(&payload);
         assert_eq!(fields.fide_id.as_deref(), Some("1503014"));
         assert_eq!(fields.birth_year, Some(1963));
+        assert_eq!(fields.death_year, Some(2040));
         assert_eq!(fields.peak_elo, Some(2850));
         assert_eq!(
             fields.countries,
             vec!["URS".to_string(), "RUS".to_string()],
             "terminated URS must sort before current RUS"
         );
+    }
+
+    #[test]
+    fn lifespan_text_fallback_parses_lead_dates_and_ignores_post_copula_years() {
+        let keres = Summary::from_value(&summary_json(
+            "Paul Keres",
+            "Estonian chess grandmaster (1916–1975)",
+            "Paul Keres was an Estonian chess grandmaster. He represented the Soviet Union and Germany (1941–1944).",
+        ))
+        .unwrap();
+        assert_eq!(keres.birth_year, Some(1916));
+        assert_eq!(keres.death_year, Some(1975));
+
+        let alekhine = Summary::from_value(&summary_json(
+            "Alexander Alekhine",
+            "Russian and French chess player",
+            "Alexander Alekhine (31 October 1892 – 24 March 1946) was a chess grandmaster.",
+        ))
+        .unwrap();
+        assert_eq!(alekhine.birth_year, Some(1892));
+        assert_eq!(alekhine.death_year, Some(1946));
+
+        let fischer = Summary::from_value(&summary_json(
+            "Bobby Fischer",
+            "American chess grandmaster",
+            "Robert James Fischer (March 9, 1943 – January 17, 2008) was an American chess grandmaster.",
+        ))
+        .unwrap();
+        assert_eq!(fischer.birth_year, Some(1943));
+        assert_eq!(fischer.death_year, Some(2008));
     }
 
     #[test]
@@ -2736,6 +3474,7 @@ mod tests {
         assert_eq!(summary.countries, vec!["NOR".to_string()]);
         assert!(summary.fide_id.is_none());
         assert!(summary.birth_year.is_none());
+        assert!(summary.death_year.is_none());
         assert!(summary.peak_elo.is_none());
 
         // New entries round-trip the enrichment fields.
@@ -2746,6 +3485,7 @@ mod tests {
         );
         enriched.fide_id = Some("1503014".to_string());
         enriched.birth_year = Some(1990);
+        enriched.death_year = Some(2077);
         enriched.peak_elo = Some(2863);
         let mut cache = Cache::default();
         cache.insert("Magnus Carlsen", &Lookup::Summary(enriched));
@@ -2755,6 +3495,7 @@ mod tests {
         };
         assert_eq!(round_tripped.fide_id.as_deref(), Some("1503014"));
         assert_eq!(round_tripped.birth_year, Some(1990));
+        assert_eq!(round_tripped.death_year, Some(2077));
         assert_eq!(round_tripped.peak_elo, Some(2863));
         assert_eq!(round_tripped.countries, vec!["NOR".to_string()]);
     }
@@ -2972,5 +3713,185 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn title_matching_handles_diacritics_compound_names_and_rejects_false_positives() {
+        assert!(title_matches_name("Bluebaum, Matthias", "Matthias Blübaum"));
+        assert!(title_matches_name("Indjic, Aleksandar", "Aleksandar Inđić"));
+        assert!(title_matches_name("Dreev, Alexey", "Aleksey Dreev"));
+        assert!(title_matches_name("Mekhitarian, Krikor Sevag", "Krikor Mekhitarian"));
+        assert!(title_matches_name(
+            "Martinez Alcantara, Jose Eduardo",
+            "José Martínez Alcántara"
+        ));
+        assert!(title_matches_name("Erigaisi, Arjun Kumar", "Arjun Erigaisi"));
+        assert!(title_matches_name(
+            "Iturrizaga Bonelli, Eduardo",
+            "Eduardo Iturrizaga"
+        ));
+        assert!(title_matches_name(
+            "Aravindh, Chithambaram VR",
+            "Aravindh Chithambaram"
+        ));
+        assert!(title_matches_name("Gawain C B Jones", "Gawain Jones"));
+        assert!(title_matches_name("Fedoseev, Vladimir1", "Vladimir Fedoseev"));
+
+        // False-positive guardrails: prefer no match over a wrong match.
+        assert!(!title_matches_name("Bacrot, M", "Étienne Bacrot"));
+        assert!(!title_matches_name("Carlsen, H", "Magnus Carlsen"));
+        assert!(!title_matches_name("Magnus Carlsen Jr", "Magnus Carlsen"));
+        assert!(!title_matches_name("Carlsen", "Magnus Carlsen"));
+        assert!(!title_matches_name("Smith, John Paul", "Paul Smith"));
+        assert!(!title_matches_name("Krause, Chris", "Christian Krause"));
+    }
+
+    #[test]
+    fn title_matching_handles_anglicised_slavic_and_german_transliterations() {
+        assert!(title_matches_name("Ivanchuk, Vassily", "Vasyl Ivanchuk"));
+        assert!(title_matches_name(
+            "Kortschnoj, Viktor Lvovich",
+            "Viktor Korchnoi"
+        ));
+        assert!(title_matches_name("Kortschnoj, Viktor", "Viktor Korchnoi"));
+        assert!(title_matches_name("Kasparow, Garri", "Garry Kasparov"));
+        assert!(title_matches_name("Tal, Michail", "Mikhail Tal"));
+        assert!(title_matches_name("Kramnik, Wladimir", "Vladimir Kramnik"));
+    }
+
+    #[test]
+    fn wikidata_p1087_extracts_peak_and_latest_dated_elo() {
+        let payload = json!({
+            "entities": {
+                "Q337223": {
+                    "claims": {
+                        "P1087": [
+                            {
+                                "rank": "normal",
+                                "mainsnak": {"datavalue": {"value": {"amount": "+2816"}, "type": "quantity"}},
+                                "qualifiers": {
+                                    "P585": [{"mainsnak": {"datavalue": {"value": {"time": "+2015-10-01T00:00:00Z"}, "type": "time"}}}]
+                                }
+                            },
+                            {
+                                "rank": "preferred",
+                                "mainsnak": {"datavalue": {"value": {"amount": "+2792"}, "type": "quantity"}},
+                                "qualifiers": {
+                                    "P585": [{"mainsnak": {"datavalue": {"value": {"time": "+2026-10-01T00:00:00Z"}, "type": "time"}}}]
+                                }
+                            }
+                        ]
+                    }
+                }
+            }
+        });
+        let fields = parse_wikidata_value(&payload);
+        assert_eq!(fields.peak_elo, Some(2816));
+        assert_eq!(fields.latest_elo, Some(2792));
+        assert_eq!(fields.latest_elo_date, Some(20261001));
+    }
+
+    #[test]
+    fn search_name_and_umlaut_variants_normalize_database_spellings() {
+        assert_eq!(search_name("Fedoseev, Vladimir1"), "Vladimir Fedoseev");
+        assert_eq!(search_name("Bluebaum, Matthias"), "Matthias Bluebaum");
+        assert_eq!(summary_url("Bluebaum, Matthias"), format!("{SUMMARY_ENDPOINT}Matthias_Bluebaum"));
+
+        let variants = umlaut_variants("Ueber, Goetze");
+        assert!(variants.contains(&"Über, Götze".to_string()));
+        assert!(variants.contains(&"Über, Goetze".to_string()));
+        assert!(variants.contains(&"Ueber, Götze".to_string()));
+        assert!(umlaut_variants("Grosse, Franz").contains(&"Große, Franz".to_string()));
+    }
+
+    #[test]
+    fn unversioned_ambiguous_cache_is_invalidated_and_remove_clears_entries() {
+        let old = json!({
+            "summaries": {
+                "Magnus Carlsen": summary_json(
+                    "Magnus Carlsen",
+                    "Norwegian chess grandmaster",
+                    "Sven Magnus Øen Carlsen is a Norwegian chess grandmaster.",
+                )
+            },
+            "queries": {
+                "bacrot e": "Magnus Carlsen",
+                "carlsen magnus": "Magnus Carlsen"
+            },
+            "ambiguous": {
+                "bluebaum matthias": "https://en.wikipedia.org/w/index.php?search=Matthias%20Bluebaum"
+            }
+        })
+        .to_string();
+        let mut cache = Cache::from_json(&old);
+        assert!(cache.get("Carlsen, Magnus").is_some());
+        assert_eq!(cache.get("Bacrot, E"), None);
+        assert_eq!(
+            cache.get("Bluebaum, Matthias"),
+            None,
+            "stale unversioned ambiguous entry should be discarded for retry"
+        );
+
+        let lookup = Lookup::Ambiguous {
+            search_url: search_url("Some Player"),
+        };
+        cache.insert("Some Player", &lookup);
+        let round_trip = Cache::from_json(&cache.to_json());
+        assert_eq!(round_trip.get("Some Player"), Some(lookup));
+
+        let mut mutable = round_trip;
+        mutable.remove("Some Player");
+        assert_eq!(mutable.get("Some Player"), None);
+    }
+
+    #[test]
+    fn lookup_does_not_retry_umlauts_after_network_error() {
+        let mut calls = 0usize;
+        let err = lookup_with("Bluebaum, Matthias", |_| {
+            calls += 1;
+            Err(FetchError::Other("HTTP 429".to_string()))
+        })
+        .unwrap_err();
+        assert!(err.contains("429"));
+        assert_eq!(calls, 2, "only direct summary and search for primary should run on error");
+    }
+
+    #[test]
+    fn bortnyk_and_paravyan_extracts_and_descriptions_resolve_gm_title_and_year() {
+        let paravyan = Summary::from_value(&summary_json(
+            "David Paravyan",
+            "Russian chess grandmaster (born 1998)",
+            "David Arturovich Paravyan is a Russian chess player of Armenian descent, who was awarded the title of grandmaster by FIDE in 2017.",
+        ))
+        .unwrap();
+        assert_eq!(paravyan.current_title(), Some(PlayerTitle::Gm));
+        assert!(paravyan
+            .title_history
+            .contains(&TitleAward {
+                title: PlayerTitle::Gm,
+                year: Some(2017),
+            }));
+
+        let bortnyk = Summary::from_value(&summary_json(
+            "Olexandr Bortnyk",
+            "Ukrainian chess grandmaster (born 1996)",
+            "Olexandr Mykolayovych Bortnyk is a Ukrainian chess player. He was awarded the Grandmaster title in 2015, at the age of 19.",
+        ))
+        .unwrap();
+        assert_eq!(bortnyk.current_title(), Some(PlayerTitle::Gm));
+        assert!(bortnyk
+            .title_history
+            .contains(&TitleAward {
+                title: PlayerTitle::Gm,
+                year: Some(2015),
+            }));
+
+        let woman_gm = Summary::from_value(&summary_json(
+            "Example Woman Player",
+            "Georgian chess player",
+            "Example Woman Player is a chess player who earned the Woman Grandmaster title in 2018.",
+        ))
+        .unwrap();
+        assert_eq!(woman_gm.current_title(), Some(PlayerTitle::Wgm));
     }
 }
