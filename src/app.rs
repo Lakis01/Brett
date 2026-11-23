@@ -32782,16 +32782,17 @@ fn game_tags_card(
 
     egui::Frame::new()
         .fill(SURFACE)
-        .corner_radius(12.0)
+        .corner_radius(6.0)
         .stroke(Stroke::new(1.0, BORDER))
-        .inner_margin(12.0)
+        .inner_margin(10.0)
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(
                     RichText::new(format!("PGN tags  ·  {}", game.headers.len()))
                         .size(14.0)
                         .strong(),
-                );
+                )
+                .on_hover_text("Click a value to edit it · click the date for a calendar");
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.menu_button("+ Add tag", |ui| {
                         let mut any = false;
@@ -32834,11 +32835,6 @@ fn game_tags_card(
                     }
                 });
             });
-            ui.label(
-                RichText::new("Click a value to edit it · click the date for a calendar")
-                    .small()
-                    .weak(),
-            );
             ui.add_space(5.0);
 
             if game.headers.is_empty() {
@@ -33053,8 +33049,9 @@ fn inline_player_elo_tag(game: &Game, name: &str) -> bool {
 
 fn missing_tag_row(ui: &mut Ui, name: &str, tag_add: &mut Option<&'static str>) {
     egui::Frame::new()
-        .fill(Color32::from_rgb(0x20, 0x23, 0x26))
-        .corner_radius(5.0)
+        .fill(Color32::from_rgb(0x12, 0x15, 0x1A))
+        .corner_radius(4.0)
+        .stroke(Stroke::new(1.0, BORDER))
         .inner_margin(egui::Margin::symmetric(7, 3))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -33363,8 +33360,9 @@ fn pgn_tag_row(
     date_clicked: &mut Option<egui::Pos2>,
 ) {
     egui::Frame::new()
-        .fill(Color32::from_rgb(0x20, 0x23, 0x26))
-        .corner_radius(5.0)
+        .fill(Color32::from_rgb(0x12, 0x15, 0x1A))
+        .corner_radius(4.0)
+        .stroke(Stroke::new(1.0, BORDER))
         .inner_margin(egui::Margin::symmetric(7, 3))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -33375,7 +33373,7 @@ fn pgn_tag_row(
                     19.0,
                     RichText::new(tag_display_name(name))
                         .small()
-                        .color(Color32::from_gray(165)),
+                        .color(Color32::from_rgb(0x8E, 0x97, 0xA8)),
                 )
                 .on_hover_text(name);
 
@@ -33614,7 +33612,7 @@ fn game_header_card(
 ) {
     egui::Frame::new()
         .fill(SURFACE)
-        .corner_radius(10.0)
+        .corner_radius(6.0)
         .stroke(Stroke::new(1.0, BORDER))
         .inner_margin(10.0)
         .show(ui, |ui| {
@@ -33809,8 +33807,9 @@ fn game_header_card(
 
 fn date_chip(ui: &mut Ui, text: &str) -> egui::Response {
     egui::Frame::new()
-        .fill(Color32::from_rgb(0x2A, 0x2E, 0x32))
+        .fill(Color32::from_rgb(0x1D, 0x22, 0x2B))
         .corner_radius(4.0)
+        .stroke(Stroke::new(1.0, BORDER))
         .inner_margin(egui::Margin::symmetric(6, 2))
         .show(ui, |ui| {
             ui.add(
@@ -33818,7 +33817,7 @@ fn date_chip(ui: &mut Ui, text: &str) -> egui::Response {
                     RichText::new(text)
                         .monospace()
                         .small()
-                        .color(Color32::from_gray(190)),
+                        .color(Color32::from_rgb(0xC2, 0xCA, 0xD8)),
                 )
                 .sense(Sense::click()),
             )
@@ -33869,8 +33868,8 @@ fn header_player_row(
                     " ",
                     0.0,
                     TextFormat {
-                        font_id: FontId::proportional(15.5),
-                        color: Color32::from_gray(230),
+                        font_id: FontId::proportional(15.0),
+                        color: Color32::from_rgb(0xEC, 0xEF, 0xF4),
                         ..Default::default()
                     },
                 );
@@ -33879,15 +33878,15 @@ fn header_player_row(
                 name,
                 0.0,
                 TextFormat {
-                    font_id: FontId::proportional(15.5),
-                    color: Color32::from_gray(230),
+                    font_id: FontId::proportional(15.0),
+                    color: Color32::from_rgb(0xEC, 0xEF, 0xF4),
                     ..Default::default()
                 },
             );
             if let Some(id) = fide_id {
                 let format = TextFormat {
                     font_id: FontId::proportional(10.5),
-                    color: Color32::from_gray(150),
+                    color: Color32::from_rgb(0x7C, 0x86, 0x98),
                     ..Default::default()
                 };
                 label.append(" · ", 0.0, format.clone());
@@ -34153,15 +34152,16 @@ fn meta_chip(ui: &mut Ui, text: &str) {
 
 fn meta_chip_hover(ui: &mut Ui, text: &str, hover: &str) {
     egui::Frame::new()
-        .fill(Color32::from_rgb(0x2A, 0x2E, 0x32))
+        .fill(Color32::from_rgb(0x1D, 0x22, 0x2B))
         .corner_radius(4.0)
+        .stroke(Stroke::new(1.0, BORDER))
         .inner_margin(egui::Margin::symmetric(6, 2))
         .show(ui, |ui| {
             ui.label(
                 RichText::new(text)
                     .monospace()
                     .small()
-                    .color(Color32::from_gray(190)),
+                    .color(Color32::from_rgb(0xC2, 0xCA, 0xD8)),
             )
             .on_hover_text(hover);
         });
