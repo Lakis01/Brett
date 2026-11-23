@@ -78,9 +78,9 @@ there.
 ## ICCF database notice
 
 Brett can use an optional ICCF correspondence database as a local, read-only
-reference. A compiled snapshot is redistributed in this repository under
-[`databases/iccf/`](databases/iccf/). Downloading or using it is optional, but
-encouraged for correspondence preparation. The snapshot is refreshed sporadically.
+reference. A compiled snapshot is redistributed under https://github.com/Lakis01/brett-correspondence_reference_base).
+Downloading or using it is optional, but encouraged as an additional resource
+beside Lichess Cloud Eval and chessdb.cn. The snapshot is refreshed sporadically.
 You may star that repository to be reminded of updates.
 
 > **The ICCF database is provided for personal use only and may not be sold or
