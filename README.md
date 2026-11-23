@@ -9,9 +9,8 @@ It is built for opening preparation, multi-source opponent scouting,
 database management, game review, and deep position analysis.
 
 It supports reading and writing common database formats (`.2cbh`, `.cbh`,
-`.si4`, `.pgn`) and opening books (`.bin`, `.ctg`, `.bkt`, `.abk`) through
-independently reverse-engineered codecs—no proprietary runtime or royalty code
-is used—and handles multi-million-game archives such as Mega Database 2026
+`.si4`, `.pgn`) and opening books (`.bin`, `.ctg`, `.bkt`, `.abk`)
+and handles multi-million-game archives such as Mega Database 2026
 (~12M games; the initial load/indexing pass runs in the background so the
 workspace stays responsive). Brett also integrates Lichess (opening explorer &
 cloud evaluation), `chessdb.cn` (deep cloud analysis), ChessABC, and
