@@ -84,11 +84,12 @@ pub fn has(code: &str) -> bool {
 }
 
 /// Returns `true` when `code` has a bespoke vector flag painting for a
-/// dissolved historical federation (`URS`, `YUG`, `GDR`, `TCH`, `SCG`).
+/// dissolved historical federation (`URS`, `YUG`, `GDR`, `TCH`, `SCG`,
+/// `AUE`, `AUH`, `BOH`, `DEI`, `PRU`, `RUE`).
 pub fn has_former_flag(code: &str) -> bool {
     matches!(
         code.trim().to_ascii_uppercase().as_str(),
-        "URS" | "YUG" | "GDR" | "TCH" | "SCG"
+        "URS" | "YUG" | "GDR" | "TCH" | "SCG" | "AUE" | "AUH" | "BOH" | "DEI" | "PRU" | "RUE"
     )
 }
 
@@ -422,6 +423,151 @@ fn paint_former_flag(painter: &Painter, code: &str, rect: Rect) -> bool {
             );
             true
         }
+        "AUE" => {
+            // Austrian Empire (1804–1867): Black over Habsburg Gold.
+            let half_h = rect.height() * 0.5;
+            painter.rect_filled(
+                Rect::from_min_size(rect.min, vec2(rect.width(), half_h)),
+                0.0,
+                Color32::from_rgb(0x14, 0x14, 0x14),
+            );
+            painter.rect_filled(
+                Rect::from_min_size(
+                    egui::pos2(rect.min.x, rect.min.y + half_h),
+                    vec2(rect.width(), rect.height() - half_h),
+                ),
+                0.0,
+                Color32::from_rgb(0xFF, 0xCC, 0x00),
+            );
+            true
+        }
+        "AUH" => {
+            // Austria-Hungary (1867–1918): Red / White / split Red-Green + dual shields.
+            let h = rect.height() / 3.0;
+            let red = Color32::from_rgb(0xD7, 0x14, 0x1A);
+            let white = Color32::from_rgb(0xF4, 0xF4, 0xF4);
+            let green = Color32::from_rgb(0x00, 0x87, 0x51);
+            let gold = Color32::from_rgb(0xE6, 0xB4, 0x50);
+            painter.rect_filled(
+                Rect::from_min_size(rect.min, vec2(rect.width(), h)),
+                0.0,
+                red,
+            );
+            painter.rect_filled(
+                Rect::from_min_size(egui::pos2(rect.min.x, rect.min.y + h), vec2(rect.width(), h)),
+                0.0,
+                white,
+            );
+            let half_w = rect.width() * 0.5;
+            let bot_y = rect.min.y + h * 2.0;
+            let bot_h = rect.height() - h * 2.0;
+            painter.rect_filled(
+                Rect::from_min_size(egui::pos2(rect.min.x, bot_y), vec2(half_w, bot_h)),
+                0.0,
+                red,
+            );
+            painter.rect_filled(
+                Rect::from_min_size(egui::pos2(rect.min.x + half_w, bot_y), vec2(rect.width() - half_w, bot_h)),
+                0.0,
+                green,
+            );
+            let sw = (rect.width() * 0.14).max(2.0);
+            let sh = (rect.height() * 0.30).max(3.0);
+            for cx_frac in [0.30, 0.70] {
+                let srect = Rect::from_center_size(
+                    egui::pos2(rect.left() + rect.width() * cx_frac, rect.center().y),
+                    vec2(sw, sh),
+                );
+                painter.rect_filled(srect, 1.0, red);
+                painter.rect_filled(
+                    Rect::from_min_size(srect.min, vec2(sw, (sh * 0.25).max(1.0))),
+                    0.0,
+                    gold,
+                );
+            }
+            true
+        }
+        "BOH" => {
+            // Kingdom of Bohemia: White over Red.
+            let half_h = rect.height() * 0.5;
+            painter.rect_filled(
+                Rect::from_min_size(rect.min, vec2(rect.width(), half_h)),
+                0.0,
+                Color32::from_rgb(0xF4, 0xF4, 0xF4),
+            );
+            painter.rect_filled(
+                Rect::from_min_size(
+                    egui::pos2(rect.min.x, rect.min.y + half_h),
+                    vec2(rect.width(), rect.height() - half_h),
+                ),
+                0.0,
+                Color32::from_rgb(0xD7, 0x14, 0x1A),
+            );
+            true
+        }
+        "DEI" => {
+            // German Empire (1871–1918): Black / White / Red.
+            paint_tricolor(
+                painter,
+                rect,
+                [
+                    Color32::from_rgb(0x10, 0x10, 0x10),
+                    Color32::from_rgb(0xF4, 0xF4, 0xF4),
+                    Color32::from_rgb(0xD0, 0x1C, 0x1F),
+                ],
+            );
+            true
+        }
+        "PRU" => {
+            // Kingdom of Prussia: White field with black top/bottom bars and black eagle crest.
+            let black = Color32::from_rgb(0x14, 0x14, 0x14);
+            let white = Color32::from_rgb(0xF4, 0xF4, 0xF4);
+            painter.rect_filled(rect, 0.0, white);
+            let band_h = (rect.height() * 0.14).max(1.5);
+            painter.rect_filled(
+                Rect::from_min_size(rect.min, vec2(rect.width(), band_h)),
+                0.0,
+                black,
+            );
+            painter.rect_filled(
+                Rect::from_min_size(
+                    egui::pos2(rect.min.x, rect.max.y - band_h),
+                    vec2(rect.width(), band_h),
+                ),
+                0.0,
+                black,
+            );
+            let center = egui::pos2(rect.left() + rect.width() * 0.42, rect.center().y);
+            let rx = (rect.width() * 0.15).max(2.0);
+            let ry = (rect.height() * 0.22).max(2.5);
+            painter.rect_filled(
+                Rect::from_center_size(center, vec2(rx * 1.6, ry * 0.55)),
+                1.0,
+                black,
+            );
+            painter.circle_filled(center, ry * 0.72, black);
+            true
+        }
+        "RUE" => {
+            // Russian Empire: White / Blue / Red with gold imperial canton.
+            paint_tricolor(
+                painter,
+                rect,
+                [
+                    Color32::from_rgb(0xF4, 0xF4, 0xF4),
+                    Color32::from_rgb(0x00, 0x39, 0xA6),
+                    Color32::from_rgb(0xD5, 0x2B, 0x1E),
+                ],
+            );
+            let canton = Rect::from_min_size(
+                rect.min,
+                vec2(rect.width() * 0.38, rect.height() * 0.52),
+            );
+            painter.rect_filled(canton, 0.0, Color32::from_rgb(0xFF, 0xCC, 0x00));
+            let mark_r = (canton.height() * 0.28).max(1.4);
+            painter.circle_filled(canton.center(), mark_r, Color32::from_rgb(0x18, 0x18, 0x18));
+            true
+        }
         _ => false,
     }
 }
@@ -538,7 +684,9 @@ mod tests {
 
     #[test]
     fn historical_federations_have_no_flag_image() {
-        for code in ["URS", "YUG", "GDR", "TCH", "SCG", "FID"] {
+        for code in [
+            "URS", "YUG", "GDR", "TCH", "SCG", "AUE", "AUH", "BOH", "DEI", "PRU", "RUE", "FID",
+        ] {
             assert_eq!(uv_for_code(code), None, "{code} must not be in atlas");
             assert!(!has(code));
         }
@@ -546,7 +694,9 @@ mod tests {
 
     #[test]
     fn dissolved_federations_render_as_visual_flags_at_4_3() {
-        for code in ["URS", "YUG", "GDR", "TCH", "SCG"] {
+        for code in [
+            "URS", "YUG", "GDR", "TCH", "SCG", "AUE", "AUH", "BOH", "DEI", "PRU", "RUE",
+        ] {
             assert!(
                 has_former_flag(code),
                 "{code} must have a vector former-flag painting"

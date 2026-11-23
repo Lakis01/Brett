@@ -1417,16 +1417,28 @@ mod tests {
             },
         );
         assert_eq!(trends.get(&1).and_then(|t| t.badge), Some(TrendBadge::New));
-        assert_eq!(trends.get(&2).and_then(|t| t.badge), Some(TrendBadge::Falling));
-        assert_eq!(trends.get(&3).and_then(|t| t.badge), Some(TrendBadge::Rising));
+        assert_eq!(
+            trends.get(&2).and_then(|t| t.badge),
+            Some(TrendBadge::Falling)
+        );
+        assert_eq!(
+            trends.get(&3).and_then(|t| t.badge),
+            Some(TrendBadge::Rising)
+        );
     }
 
     #[test]
     fn trend_source_round_trips_and_labels() {
         assert_eq!(TrendSource::default(), TrendSource::ActiveTree);
-        assert_eq!(TrendSource::from_config("active_tree"), TrendSource::ActiveTree);
+        assert_eq!(
+            TrendSource::from_config("active_tree"),
+            TrendSource::ActiveTree
+        );
         assert_eq!(TrendSource::from_config("chessabc"), TrendSource::ChessAbc);
-        assert_eq!(TrendSource::from_config("live:chessabc"), TrendSource::ChessAbc);
+        assert_eq!(
+            TrendSource::from_config("live:chessabc"),
+            TrendSource::ChessAbc
+        );
         assert_eq!(
             TrendSource::from_config("lichess_masters"),
             TrendSource::LichessMasters
@@ -1435,14 +1447,20 @@ mod tests {
             TrendSource::from_config("live:lichess-masters"),
             TrendSource::LichessMasters
         );
-        assert_eq!(TrendSource::from_config("lichess_all"), TrendSource::LichessAll);
+        assert_eq!(
+            TrendSource::from_config("lichess_all"),
+            TrendSource::LichessAll
+        );
         assert_eq!(
             TrendSource::from_config("live:lichess-all"),
             TrendSource::LichessAll
         );
         assert_eq!(TrendSource::ActiveTree.label(), "Database / Mega");
         assert_eq!(TrendSource::ChessAbc.label(), "ChessABC (live)");
-        assert_eq!(TrendSource::LichessMasters.label(), "Lichess Masters (live)");
+        assert_eq!(
+            TrendSource::LichessMasters.label(),
+            "Lichess Masters (live)"
+        );
         assert_eq!(TrendSource::LichessAll.label(), "Lichess All (live)");
         assert_eq!(TrendSource::ActiveTree.short_label(), "DB / Mega");
         assert_eq!(TrendSource::ActiveTree.config_value(), "active_tree");

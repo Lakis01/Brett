@@ -1958,13 +1958,7 @@ mod tests {
         let index_path = dir.join("games.brettpos");
         std::fs::write(&pgn_path, pgn).unwrap();
 
-        PositionIndex::build_to(
-            &pgn_path,
-            &index_path,
-            BuildOptions::default(),
-            |_| {},
-        )
-        .unwrap();
+        PositionIndex::build_to(&pgn_path, &index_path, BuildOptions::default(), |_| {}).unwrap();
         let index = PositionIndex::open(&index_path).unwrap();
         assert_eq!(index.latest_date(), 20260520);
 

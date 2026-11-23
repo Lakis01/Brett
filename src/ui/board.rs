@@ -34,6 +34,10 @@ pub enum BoardEvent {
         to: Square,
         color: ShapeColor,
     },
+    /// Horizontal touch swipe right (previous move).
+    SwipePrev,
+    /// Horizontal touch swipe left (next move).
+    SwipeNext,
 }
 
 pub struct BoardState<'a> {
@@ -48,6 +52,10 @@ pub struct BoardState<'a> {
     pub shape_drag_from: Option<Square>,
     /// Square currently being dragged, if any. Kept by the app across frames.
     pub drag_from: Option<Square>,
+    /// Active touch/stylus shape-drawing colour (primary drags/taps draw shapes instead of moving pieces).
+    pub draw_mode: Option<ShapeColor>,
+    /// Allow horizontal swipes on non-movable squares to step backward/forward.
+    pub touch_swipe: bool,
 }
 
 /// Draw an interactive board. Pieces can be moved by clicking or by dragging.
@@ -83,7 +91,10 @@ pub fn draw(ui: &mut Ui, tex: &PieceTextures, st: BoardState<'_>, side: f32) -> 
         )
     });
     let modifiers = ui.input(|i| i.modifiers);
-    let drawing_color = if key_g {
+    let has_touch = ui.input(|i| i.any_touches());
+    let drawing_color = if let Some(mode_color) = st.draw_mode {
+        mode_color
+    } else if key_g {
         ShapeColor::Green
     } else if key_r {
         ShapeColor::Red
@@ -94,8 +105,14 @@ pub fn draw(ui: &mut Ui, tex: &PieceTextures, st: BoardState<'_>, side: f32) -> 
     } else {
         shape_color(&modifiers)
     };
-    let shape_with_primary =
-        modifiers.shift || modifiers.ctrl || modifiers.alt || key_g || key_r || key_b || key_y;
+    let shape_with_primary = st.draw_mode.is_some()
+        || modifiers.shift
+        || modifiers.ctrl
+        || modifiers.alt
+        || key_g
+        || key_r
+        || key_b
+        || key_y;
     let secondary_drag = response.drag_started_by(PointerButton::Secondary)
         || response.dragged_by(PointerButton::Secondary)
         || response.drag_stopped_by(PointerButton::Secondary);
@@ -110,6 +127,20 @@ pub fn draw(ui: &mut Ui, tex: &PieceTextures, st: BoardState<'_>, side: f32) -> 
         && (response.dragged() || response.drag_started() || response.drag_stopped()))
     .then(|| st.drag_from.or(just_started))
     .flatten();
+
+    let swipe_origin_id = response.id.with("touch_swipe_origin");
+    if st.touch_swipe
+        && has_touch
+        && !shape_dragging
+        && active_drag.is_none()
+        && response.drag_started()
+    {
+        if let Some(p) = press_origin.or(pointer) {
+            ui.data_mut(|d| d.insert_temp(swipe_origin_id, p));
+        }
+    } else if !response.dragged() && !response.drag_stopped() {
+        ui.data_mut(|d| d.remove_temp::<Pos2>(swipe_origin_id));
+    }
 
     for row in 0..8 {
         for col in 0..8 {
@@ -302,15 +333,30 @@ pub fn draw(ui: &mut Ui, tex: &PieceTextures, st: BoardState<'_>, side: f32) -> 
         });
     }
 
-    if response.drag_stopped()
-        && let Some(from) = active_drag
-    {
-        if let Some(to) = hovered
-            && to != from
-        {
-            return Some(BoardEvent::Drop { from, to });
+    if response.drag_stopped() {
+        let swipe_start: Option<Pos2> = ui.data_mut(|d| d.remove_temp::<Pos2>(swipe_origin_id));
+        if let Some(from) = active_drag {
+            if let Some(to) = hovered
+                && to != from
+            {
+                return Some(BoardEvent::Drop { from, to });
+            }
+            return Some(BoardEvent::DragCancel);
         }
-        return Some(BoardEvent::DragCancel);
+        if st.touch_swipe
+            && has_touch
+            && !shape_dragging
+            && let (Some(start), Some(end)) = (swipe_start, pointer)
+        {
+            let delta = end - start;
+            if delta.x.abs() > cell * 1.4 && delta.x.abs() > delta.y.abs() * 2.0 {
+                return Some(if delta.x > 0.0 {
+                    BoardEvent::SwipePrev
+                } else {
+                    BoardEvent::SwipeNext
+                });
+            }
+        }
     }
 
     if let Some(from) = just_started {
@@ -536,5 +582,66 @@ mod tests {
             shape_color(&modifiers(false, true, true)),
             ShapeColor::Yellow
         );
+    }
+
+    #[test]
+    fn draw_mode_draws_square_on_primary_click() {
+        let ctx = egui::Context::default();
+        let tex = PieceTextures::load(&ctx);
+        let pos = Chess::default();
+        let center = pos2(120.0, 120.0);
+        let draw_once = |events: Vec<egui::Event>| -> Option<BoardEvent> {
+            let mut ev = None;
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), Vec2::splat(600.0))),
+                events,
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(input, |ui| {
+                ev = draw(
+                    ui,
+                    &tex,
+                    BoardState {
+                        pos: &pos,
+                        orientation: Color::White,
+                        last_move: None,
+                        selected: None,
+                        targets: &[],
+                        shapes: &[],
+                        shape_drag_from: None,
+                        drag_from: None,
+                        draw_mode: Some(ShapeColor::Blue),
+                        touch_swipe: true,
+                    },
+                    400.0,
+                );
+            });
+            out.textures_delta.clear();
+            ev
+        };
+        // Frame 1 registers the board rect; frame 2 delivers the click.
+        let _ = draw_once(vec![]);
+        let _ = draw_once(vec![
+            egui::Event::PointerMoved(center),
+            egui::Event::PointerButton {
+                pos: center,
+                button: PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]);
+        let emitted = draw_once(vec![egui::Event::PointerButton {
+            pos: center,
+            button: PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        }]);
+        assert!(matches!(
+            emitted,
+            Some(BoardEvent::ShapeSquare {
+                color: ShapeColor::Blue,
+                ..
+            })
+        ));
     }
 }

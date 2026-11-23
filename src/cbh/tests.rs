@@ -1195,8 +1195,7 @@ fn game_record_meta_medals_vcs_and_scan_mainline_positions_match_load() {
         .scan_mainline_positions(0, 200, &mut |ply, p| {
             streamed.push((
                 ply,
-                crate::chess::Fen::from_position(p, crate::chess::EnPassantMode::Legal)
-                    .to_string(),
+                crate::chess::Fen::from_position(p, crate::chess::EnPassantMode::Legal).to_string(),
             ));
             true
         })

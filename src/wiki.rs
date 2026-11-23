@@ -19,13 +19,12 @@ use serde_json::{Value, json};
 use crate::country::{self, Country};
 use crate::titles::{self, PlayerTitle, TitleAward};
 
-const USER_AGENT: &str =
-    "Brett/0.2 (https://github.com/Lakis01/Brett; contact@brett.chess)";
+const USER_AGENT: &str = "Brett/0.2 (https://github.com/Lakis01/Brett; contact@brett.chess)";
 const SUMMARY_ENDPOINT: &str = "https://en.wikipedia.org/api/rest_v1/page/summary/";
 const SEARCH_ENDPOINT: &str = "https://en.wikipedia.org/w/rest.php/v1/search/page";
 const SEARCH_PAGE: &str = "https://en.wikipedia.org/w/index.php";
 const WIKIDATA_ENDPOINT: &str = "https://www.wikidata.org/wiki/Special:EntityData/";
-const CACHE_VERSION: u32 = 3;
+const CACHE_VERSION: u32 = 4;
 const MAX_SUMMARIES: usize = 10_000;
 const MAX_AMBIGUOUS: usize = 10_000;
 static TITLE_HISTORY_SAVE_LOCK: Mutex<()> = Mutex::new(());
@@ -95,7 +94,9 @@ fn parse_json_year(value: &Value, key: &str) -> Option<i32> {
 /// Extract a 4-digit calendar year (`1400..=2100`) embedded as a standalone token
 /// at the end of a lifespan half-segment (e.g. `"31 October 1892"` -> `Some(1892)`).
 fn extract_trailing_year(segment: &str) -> Option<i32> {
-    let trimmed = segment.trim().trim_end_matches(|c: char| matches!(c, ',' | ';' | '.'));
+    let trimmed = segment
+        .trim()
+        .trim_end_matches(|c: char| matches!(c, ',' | ';' | '.'));
     let token = trimmed.split_whitespace().last()?;
     if token.len() == 4 && token.chars().all(|c| c.is_ascii_digit()) {
         let year = token.parse::<i32>().ok()?;
@@ -107,11 +108,7 @@ fn extract_trailing_year(segment: &str) -> Option<i32> {
 /// Extract the first 4-digit calendar year (`1400..=2100`) on the right side
 /// of a lifespan dash (e.g. `"24 March 1946"`, `"March 24, 1946"`, or `"1946, aged 53"`).
 fn extract_death_year_from_right(segment: &str) -> Option<i32> {
-    let candidate = segment
-        .split([';', '('])
-        .next()
-        .unwrap_or(segment)
-        .trim();
+    let candidate = segment.split([';', '(']).next().unwrap_or(segment).trim();
     for token in candidate.split_whitespace() {
         let clean = token.trim_matches(|c: char| !c.is_ascii_digit());
         if clean.len() == 4 && clean.chars().all(|c| c.is_ascii_digit()) {
@@ -151,7 +148,12 @@ fn parse_lifespan_paren(inner: &str) -> Option<(Option<i32>, Option<i32>)> {
     for prefix in ["born ", "b. "] {
         if let Some(pos) = lower.find(prefix) {
             let tail = &inner[pos + prefix.len()..];
-            for token in tail.split([',', ';', ')']).next().unwrap_or(tail).split_whitespace() {
+            for token in tail
+                .split([',', ';', ')'])
+                .next()
+                .unwrap_or(tail)
+                .split_whitespace()
+            {
                 let clean = token.trim_matches(|c: char| !c.is_ascii_digit());
                 if clean.len() == 4
                     && let Ok(year) = clean.parse::<i32>()
@@ -226,7 +228,11 @@ fn parse_title_history_entries(value: Option<&Value>) -> Vec<TitleAward> {
 /// `extract`, requiring explicit chess/FIDE context so non-chess phrases (e.g.
 /// "grandmaster of the local lodge") are never misread.
 fn title_awards_from_texts(description: &str, extract: &str) -> Vec<TitleAward> {
-    let desc_lead: String = description.chars().take(240).collect::<String>().to_lowercase();
+    let desc_lead: String = description
+        .chars()
+        .take(240)
+        .collect::<String>()
+        .to_lowercase();
     let extract_lead: String = extract.chars().take(600).collect::<String>().to_lowercase();
     let has_chess_context = desc_lead.contains("chess")
         || desc_lead.contains("fide")
@@ -237,16 +243,18 @@ fn title_awards_from_texts(description: &str, extract: &str) -> Vec<TitleAward> 
     }
 
     let is_word_boundary = |text: &str, idx: usize| -> bool {
-        idx == 0 || !text[..idx].chars().next_back().is_some_and(char::is_alphabetic)
+        idx == 0
+            || !text[..idx]
+                .chars()
+                .next_back()
+                .is_some_and(char::is_alphabetic)
     };
     let is_word_end = |text: &str, end: usize| -> bool {
         end >= text.len() || !text[end..].chars().next().is_some_and(char::is_alphabetic)
     };
     let is_preceded_by_woman = |text: &str, idx: usize| -> bool {
         let prefix = text[..idx].trim_end();
-        prefix.ends_with("woman")
-            || prefix.ends_with("women's")
-            || prefix.ends_with("womens")
+        prefix.ends_with("woman") || prefix.ends_with("women's") || prefix.ends_with("womens")
     };
     let extract_award_year = |text: &str, match_end: usize| -> Option<i32> {
         let rest = &text[match_end..];
@@ -260,7 +268,10 @@ fn title_awards_from_texts(description: &str, extract: &str) -> Vec<TitleAward> 
             let digits = &window[digits_start..];
             if digits.len() >= 4
                 && digits.as_bytes()[..4].iter().all(u8::is_ascii_digit)
-                && digits[4..].chars().next().is_none_or(|c| !c.is_ascii_digit())
+                && digits[4..]
+                    .chars()
+                    .next()
+                    .is_none_or(|c| !c.is_ascii_digit())
                 && !before.ends_with("born")
                 && let Ok(year) = digits[..4].parse::<i32>()
                 && (1940..=2100).contains(&year)
@@ -272,7 +283,11 @@ fn title_awards_from_texts(description: &str, extract: &str) -> Vec<TitleAward> 
         None
     };
 
-    let find_best_in = |text: &str, phrases: &[&str], reject_woman: bool, parse_year: bool| -> Option<Option<i32>> {
+    let find_best_in = |text: &str,
+                        phrases: &[&str],
+                        reject_woman: bool,
+                        parse_year: bool|
+     -> Option<Option<i32>> {
         let mut found: Option<Option<i32>> = None;
         for phrase in phrases {
             let mut start = 0;
@@ -307,7 +322,11 @@ fn title_awards_from_texts(description: &str, extract: &str) -> Vec<TitleAward> 
     let candidates: &[(PlayerTitle, &[&str], bool)] = &[
         (
             PlayerTitle::Wgm,
-            &["woman grandmaster", "women's grandmaster", "womens grandmaster"],
+            &[
+                "woman grandmaster",
+                "women's grandmaster",
+                "womens grandmaster",
+            ],
             false,
         ),
         (
@@ -321,7 +340,11 @@ fn title_awards_from_texts(description: &str, extract: &str) -> Vec<TitleAward> 
         ),
         (
             PlayerTitle::Wfm,
-            &["woman fide master", "women's fide master", "womens fide master"],
+            &[
+                "woman fide master",
+                "women's fide master",
+                "womens fide master",
+            ],
             false,
         ),
         (
@@ -559,6 +582,9 @@ impl Summary {
                     .collect()
             })
             .unwrap_or_default();
+        let (text_birth_year, text_death_year) = lifespan_years_from_texts(&description, &extract);
+        let birth_year = parse_json_year(value, "birth_year").or(text_birth_year);
+        let death_year = parse_json_year(value, "death_year").or(text_death_year);
         let text_periods = country_periods_from_texts(&description, &extract);
         let country_periods = if text_periods.is_empty() {
             if stored_periods.is_empty() {
@@ -580,7 +606,11 @@ impl Summary {
             let text_codes = country_codes_in_order(&text_periods);
             let mut periods: Vec<CountryPeriod> = stored_periods
                 .into_iter()
-                .filter(|period| text_codes.iter().any(|code| code == &period.code))
+                .filter(|period| {
+                    text_codes
+                        .iter()
+                        .any(|tc| code_matches_text_family(&period.code, tc))
+                })
                 .collect();
             for text_period in &text_periods {
                 if text_period.context.is_some() {
@@ -597,13 +627,18 @@ impl Summary {
                             || period.end_year.is_some()
                     });
                     periods.push(text_period.clone());
-                } else if !periods.iter().any(|period| period.code == text_period.code) {
+                } else if !periods
+                    .iter()
+                    .any(|period| text_period_covered_by(&text_period.code, period, death_year))
+                {
                     periods.push(text_period.clone());
                 }
             }
-            periods.sort_by_key(|period| period.start_year.or(period.end_year).unwrap_or(i32::MAX));
+            periods = upgrade_periods_for_lifespan(periods, birth_year, death_year);
+            sort_country_periods(&mut periods, &text_codes);
             periods
         };
+        let country_periods = upgrade_periods_for_lifespan(country_periods, birth_year, death_year);
         let countries = country_codes_in_order(&country_periods);
         let fide_id = value
             .get("fide_id")
@@ -611,9 +646,6 @@ impl Summary {
             .map(str::trim)
             .filter(|id| !id.is_empty())
             .map(str::to_string);
-        let (text_birth_year, text_death_year) = lifespan_years_from_texts(&description, &extract);
-        let birth_year = parse_json_year(value, "birth_year").or(text_birth_year);
-        let death_year = parse_json_year(value, "death_year").or(text_death_year);
         let peak_elo = value
             .get("peak_elo")
             .and_then(Value::as_u64)
@@ -882,6 +914,19 @@ static DEMONYMS: &[(&str, &str)] = &[
     ("czechoslovak", "TCH"),
     ("serbia and montenegro", "SCG"),
     ("nazi germany", "GER"),
+    ("austro-hungarian empire", "AUH"),
+    ("austro hungarian empire", "AUH"),
+    ("austro-hungarian", "AUH"),
+    ("austro hungarian", "AUH"),
+    ("austria-hungary", "AUH"),
+    ("austria hungary", "AUH"),
+    ("austrian empire", "AUE"),
+    ("kingdom of bohemia", "BOH"),
+    ("bohemian", "BOH"),
+    ("kingdom of prussia", "PRU"),
+    ("prussian", "PRU"),
+    ("german empire", "DEI"),
+    ("russian empire", "RUE"),
 ];
 
 /// Lowercase alphanumeric tokens in order of appearance.
@@ -942,12 +987,33 @@ pub(crate) fn demonym_countries(text: &str) -> Vec<String> {
 }
 
 /// Countries from a Wikipedia description plus the lead sentence of the
-/// extract, oldest → latest. The description order wins; lead-sentence
-/// codes not already seen are appended in order.
+/// extract, oldest → latest.
+///
+/// Wikipedia short descriptions almost always name only the player's current
+/// nationality (e.g. `"Canadian chess grandmaster"`), whereas the lead sentence
+/// often gives birth-to-current order (`"American-born Canadian chess
+/// grandmaster"`). Lead-only codes (like birth citizenship in `X-born Y` or
+/// `"former Soviet"`) therefore belong *before* the description codes, so
+/// `.last()` remains the player's current/dominant federation.
 fn countries_from_texts(description: &str, extract: &str) -> Vec<String> {
-    let mut out = demonym_countries(description);
+    let mut desc_codes = demonym_countries(description);
     let lead = extract.split('.').next().unwrap_or(extract);
-    for code in demonym_countries(lead) {
+    let lead_codes = demonym_countries(lead);
+    // Wikipedia short descriptions often simplify "Czechoslovak" to "Czech"
+    // (e.g. Vlastimil Hort: desc "Czech and German...", lead "Czechoslovak and German...").
+    // Do not invent a post-1993 CZE federation when the lead specifically says TCH.
+    if lead_codes.iter().any(|c| c == "TCH") && !lead_codes.iter().any(|c| c == "CZE") {
+        desc_codes.retain(|c| c != "CZE");
+    }
+    let mut out: Vec<String> = Vec::new();
+    for code in &lead_codes {
+        if !desc_codes.iter().any(|existing| existing == code)
+            && !out.iter().any(|existing| existing == code)
+        {
+            out.push(code.clone());
+        }
+    }
+    for code in desc_codes {
         if !out.iter().any(|existing| existing == &code) {
             out.push(code);
         }
@@ -1049,6 +1115,150 @@ fn year_after(text: &str, marker: &str) -> Option<i32> {
     (0..=2100).contains(&year).then_some(year)
 }
 
+fn code_matches_text_family(wikidata_code: &str, text_code: &str) -> bool {
+    if wikidata_code == text_code {
+        return true;
+    }
+    match wikidata_code {
+        "AUE" | "AUH" | "BOH" => matches!(text_code, "AUT" | "AUH" | "AUE" | "BOH" | "CZE" | "HUN"),
+        "DEI" | "PRU" | "GDR" | "FRG" => matches!(text_code, "GER" | "DEI" | "PRU" | "GDR" | "FRG" | "POL"),
+        "RUE" | "URS" => matches!(
+            text_code,
+            "RUS" | "RUE" | "URS" | "POL" | "UKR" | "LAT" | "LTU" | "EST" | "BLR" | "GEO" | "ARM"
+        ),
+        "TCH" => matches!(text_code, "TCH" | "CZE" | "SVK"),
+        "YUG" | "SCG" => matches!(
+            text_code,
+            "YUG" | "SCG" | "SRB" | "CRO" | "SLO" | "BIH" | "MNE" | "MKD"
+        ),
+        _ => false,
+    }
+}
+
+fn text_period_covered_by(text_code: &str, existing: &CountryPeriod, death_year: Option<i32>) -> bool {
+    if existing.code == text_code {
+        return true;
+    }
+    match text_code {
+        "AUT" => matches!(existing.code.as_str(), "AUE" | "AUH"),
+        "GER" if death_year.is_some_and(|d| d <= 1918) => {
+            matches!(existing.code.as_str(), "DEI" | "PRU")
+        }
+        "RUS" if death_year.is_some_and(|d| d <= 1917) => existing.code == "RUE",
+        _ => false,
+    }
+}
+
+fn default_historical_bounds(code: &str) -> (Option<i32>, Option<i32>) {
+    match code {
+        "AUE" => (Some(1804), Some(1867)),
+        "AUH" => (Some(1867), Some(1918)),
+        "DEI" => (Some(1871), Some(1918)),
+        "PRU" => (None, Some(1918)),
+        "RUE" => (None, Some(1917)),
+        "TCH" => (Some(1918), Some(1992)),
+        _ => (None, None),
+    }
+}
+
+fn upgrade_periods_for_lifespan(
+    mut periods: Vec<CountryPeriod>,
+    birth_year: Option<i32>,
+    death_year: Option<i32>,
+) -> Vec<CountryPeriod> {
+    if let Some(died) = death_year {
+        for p in &mut periods {
+            if died <= 1918 && p.code == "AUT" {
+                p.code = if died < 1867 { "AUE" } else { "AUH" }.to_string();
+            } else if died <= 1918 && p.code == "GER" {
+                p.code = if died < 1871 { "PRU" } else { "DEI" }.to_string();
+            } else if died <= 1917 && p.code == "RUS" {
+                p.code = "RUE".to_string();
+            }
+        }
+        if died <= 1918
+            && birth_year.is_some_and(|b| b < 1867)
+            && periods.iter().any(|p| p.code == "AUH")
+            && !periods.iter().any(|p| p.code == "AUE")
+            && !periods.iter().any(|p| p.code == "BOH")
+        {
+            periods.insert(
+                0,
+                CountryPeriod {
+                    code: "AUE".to_string(),
+                    start_year: None,
+                    end_year: Some(1867),
+                    context: None,
+                },
+            );
+        }
+    }
+    for p in &mut periods {
+        if p.start_year.is_none() && p.end_year.is_none() {
+            let (ds, de) = default_historical_bounds(&p.code);
+            if ds.is_some() || de.is_some() {
+                p.start_year = ds;
+                p.end_year = de;
+            }
+        }
+    }
+    let mut deduped: Vec<CountryPeriod> = Vec::with_capacity(periods.len());
+    for p in periods {
+        if let Some(existing) = deduped.iter_mut().find(|e| {
+            if e.code != p.code {
+                return false;
+            }
+            let compat_start =
+                e.start_year.is_none() || p.start_year.is_none() || e.start_year == p.start_year;
+            let compat_end =
+                e.end_year.is_none() || p.end_year.is_none() || e.end_year == p.end_year;
+            let merged_start = e.start_year.or(p.start_year);
+            let merged_end = e.end_year.or(p.end_year);
+            let valid_range = merged_start
+                .zip(merged_end)
+                .is_none_or(|(start, end)| start <= end);
+            compat_start && compat_end && valid_range
+        }) {
+            if existing.start_year.is_none() {
+                existing.start_year = p.start_year;
+            }
+            if existing.end_year.is_none() {
+                existing.end_year = p.end_year;
+            }
+            if existing.context.is_none() {
+                existing.context = p.context;
+            }
+        } else {
+            deduped.push(p);
+        }
+    }
+    deduped
+}
+
+fn sort_country_periods(periods: &mut Vec<CountryPeriod>, text_codes: &[String]) {
+    let text_pos = |code: &str| -> usize {
+        text_codes
+            .iter()
+            .position(|tc| code_matches_text_family(code, tc))
+            .unwrap_or(usize::MAX)
+    };
+    periods.sort_by_key(|period| {
+        let historical_rank = match period.code.as_str() {
+            "BOH" => 0,
+            "AUE" | "PRU" => 1,
+            "AUH" | "DEI" | "RUE" => 2,
+            "TCH" | "URS" | "YUG" => 3,
+            _ => 4,
+        };
+        (
+            period.end_year.is_none(),
+            period.start_year.or(period.end_year).unwrap_or(i32::MAX),
+            historical_rank,
+            text_pos(&period.code),
+        )
+    });
+}
+
 fn country_periods_from_texts(description: &str, extract: &str) -> Vec<CountryPeriod> {
     let countries = countries_from_texts(description, extract);
     let mut periods: Vec<CountryPeriod> = countries
@@ -1118,7 +1328,8 @@ fn country_periods_from_texts(description: &str, extract: &str) -> Vec<CountryPe
         ];
     }
 
-    periods
+    let (born, died) = lifespan_years_from_texts(description, extract);
+    upgrade_periods_for_lifespan(periods, born, died)
 }
 
 fn wikibase_item(value: &Value) -> Option<String> {
@@ -1371,7 +1582,9 @@ pub(crate) fn parse_wikidata_value(value: &Value) -> WikidataFields {
                     .unwrap_or(0);
                 let is_preferred = claim_rank(claim) == "preferred";
                 let candidate = (date, is_preferred, idx, elo);
-                if best_latest.is_none_or(|cur| (candidate.0, candidate.1, candidate.2) > (cur.0, cur.1, cur.2)) {
+                if best_latest.is_none_or(|cur| {
+                    (candidate.0, candidate.1, candidate.2) > (cur.0, cur.1, cur.2)
+                }) {
                     best_latest = Some(candidate);
                 }
             }
@@ -1400,10 +1613,13 @@ pub(crate) fn parse_wikidata_value(value: &Value) -> WikidataFields {
             fields.title_history.push(TitleAward { title, year });
         }
     }
-    // P1532 / P27 → countries and tenure qualifiers. P1532 is the federation
-    // history when available; P27 is a useful dated fallback (e.g. Karpov).
-    let mut sourced: Vec<(CountryPeriod, bool)> = Vec::new();
-    for prop in ["P1532", "P27"] {
+    // P1532 / P27 → countries and tenure qualifiers. P1532 is the sport
+    // federation history when available; P27 is citizenship context / dated
+    // fallback (e.g. Karpov). Undated or open-ended active sport federations
+    // (P1532) and preferred claims must sort last so `latest_country()` picks
+    // the active sport federation over birth/dual citizenship.
+    let mut sourced: Vec<(CountryPeriod, bool, bool)> = Vec::new();
+    for (prop, is_sport) in [("P1532", true), ("P27", false)] {
         if let Some(snatched) = claims.get(prop).and_then(Value::as_array) {
             for claim in snatched {
                 if claim_rank(claim) == "deprecated" {
@@ -1422,18 +1638,27 @@ pub(crate) fn parse_wikidata_value(value: &Value) -> WikidataFields {
                         end_year: parse_qualifier_year(claim, "P582"),
                         context: None,
                     },
+                    is_sport,
                     claim_rank(claim) == "preferred",
                 ));
             }
         }
     }
-    sourced.sort_by_key(|(period, is_preferred)| {
+    sourced.sort_by_key(|(period, is_sport, is_preferred)| {
         (
-            period.start_year.or(period.end_year).unwrap_or(i32::MAX),
-            !*is_preferred,
+            period.end_year.is_none(),
+            period.end_year.unwrap_or(i32::MAX),
+            if period.end_year.is_some() {
+                period.start_year.unwrap_or(i32::MIN)
+            } else {
+                0
+            },
+            *is_sport,
+            *is_preferred,
+            period.start_year.unwrap_or(i32::MIN),
         )
     });
-    for (period, _) in sourced {
+    for (period, _, _) in sourced {
         if let Some(existing) = fields.country_periods.iter_mut().find(|existing| {
             existing.code == period.code
                 && (existing.start_year.is_none()
@@ -1463,51 +1688,6 @@ pub(crate) fn parse_wikidata_value(value: &Value) -> WikidataFields {
 /// claim as a sporting federation (e.g. a temporary home country).
 pub(crate) fn apply_wikidata_value(summary: &mut Summary, value: &Value) {
     let fields = parse_wikidata_value(value);
-    if !fields.country_periods.is_empty() {
-        let text_codes = summary.countries.clone();
-        let mut periods: Vec<CountryPeriod> = if text_codes.is_empty() {
-            fields.country_periods
-        } else {
-            fields
-                .country_periods
-                .into_iter()
-                .filter(|period| text_codes.iter().any(|code| code == &period.code))
-                .collect()
-        };
-
-        // Text can provide a more specific historical interpretation than
-        // generic Wikidata claims (notably Keres's 1941–1944 wartime flag).
-        for text_period in summary.country_periods.iter().filter(|period| {
-            period.context.is_some() || period.start_year.is_some() || period.end_year.is_some()
-        }) {
-            if text_period.context.is_some() {
-                periods.retain(|period| period.code != text_period.code);
-                periods.push(text_period.clone());
-            } else if periods.iter().any(|period| {
-                period.code == text_period.code
-                    && period.start_year.is_none()
-                    && period.end_year.is_none()
-            }) {
-                periods.retain(|period| {
-                    period.code != text_period.code
-                        || period.start_year.is_some()
-                        || period.end_year.is_some()
-                });
-                periods.push(text_period.clone());
-            } else if periods.iter().any(|period| {
-                period.code == text_period.code
-                    && (period.start_year == text_period.start_year
-                        || period.end_year == text_period.end_year)
-            }) {
-                // The dated claim already supplies this interval.
-            } else if !periods.iter().any(|period| period.code == text_period.code) {
-                periods.push(text_period.clone());
-            }
-        }
-        periods.sort_by_key(|period| period.start_year.or(period.end_year).unwrap_or(i32::MAX));
-        summary.countries = country_codes_in_order(&periods);
-        summary.country_periods = periods;
-    }
     if let Some(fide_id) = fields.fide_id {
         summary.fide_id = Some(fide_id);
     }
@@ -1526,6 +1706,54 @@ pub(crate) fn apply_wikidata_value(summary: &mut Summary, value: &Value) {
         if summary.death_year.is_none() {
             summary.death_year = text_death;
         }
+    }
+    if !fields.country_periods.is_empty() {
+        let text_codes = summary.countries.clone();
+        let mut periods: Vec<CountryPeriod> = if text_codes.is_empty() {
+            fields.country_periods
+        } else {
+            fields
+                .country_periods
+                .into_iter()
+                .filter(|period| {
+                    text_codes
+                        .iter()
+                        .any(|tc| code_matches_text_family(&period.code, tc))
+                })
+                .collect()
+        };
+
+        // Keep any federation explicitly established by the Wikipedia text that
+        // Wikidata omitted or expressed under a different historical entity
+        // (e.g. Bohemia for Steinitz, Czechoslovakia for Hort, Nazi Germany for Keres).
+        for text_period in &summary.country_periods {
+            if text_period.context.is_some() {
+                periods.retain(|period| period.code != text_period.code);
+                periods.push(text_period.clone());
+            } else if (text_period.start_year.is_some() || text_period.end_year.is_some())
+                && periods.iter().any(|period| {
+                    period.code == text_period.code
+                        && period.start_year.is_none()
+                        && period.end_year.is_none()
+                })
+            {
+                periods.retain(|period| {
+                    period.code != text_period.code
+                        || period.start_year.is_some()
+                        || period.end_year.is_some()
+                });
+                periods.push(text_period.clone());
+            } else if !periods
+                .iter()
+                .any(|period| text_period_covered_by(&text_period.code, period, summary.death_year))
+            {
+                periods.push(text_period.clone());
+            }
+        }
+        periods = upgrade_periods_for_lifespan(periods, summary.birth_year, summary.death_year);
+        sort_country_periods(&mut periods, &text_codes);
+        summary.countries = country_codes_in_order(&periods);
+        summary.country_periods = periods;
     }
     if !fields.title_history.is_empty() {
         // Keep the undated lead-text title as a current-profile fallback even
@@ -1617,14 +1845,14 @@ impl Cache {
         if let Some(title) = self.queries.get(&key)
             && let Some(summary) = self.summaries.get(title)
             && is_confident(summary)
-            && title_matches_name(name, &summary.title)
+            && summary_matches_name(name, summary)
         {
             return Some(Lookup::Summary(summary.clone()));
         }
         if let Some(summary) = self.summaries.values().find(|summary| {
             query_key(&summary.title).as_deref() == Some(key.as_str())
                 && is_confident(summary)
-                && title_matches_name(name, &summary.title)
+                && summary_matches_name(name, summary)
         }) {
             return Some(Lookup::Summary(summary.clone()));
         }
@@ -1905,13 +2133,35 @@ fn lookup_with(
             let shortened = format!("{}, {}", surname.trim(), given_words[0]);
             if !shortened.eq_ignore_ascii_case(trimmed) {
                 match lookup_single(&shortened, &mut fetch) {
-                    Ok(Lookup::Summary(summary)) if title_matches_name(trimmed, &summary.title) => {
+                    Ok(Lookup::Summary(summary)) if summary_matches_name(trimmed, &summary) => {
                         return Ok(Lookup::Summary(summary));
                     }
                     Ok(_) => {}
                     Err(err) => return Err(err),
                 }
             }
+        }
+    }
+    // Fallback for generational suffixes (`Moroni, Luca Jr` -> `Luca Moroni`):
+    // retry without the suffix, requiring `summary_matches_name` to confirm
+    // either the database comma form or an explicit generational token in the extract.
+    if let Some(stripped) = strip_generational_suffix(trimmed) {
+        match lookup_single(&stripped, &mut fetch) {
+            Ok(Lookup::Summary(summary)) if summary_matches_name(trimmed, &summary) => {
+                return Ok(Lookup::Summary(summary));
+            }
+            Ok(_) => {}
+            Err(err) => return Err(err),
+        }
+    }
+    // Fallback for known World Champion name aliases (e.g. `Steinitz, William` -> `Wilhelm Steinitz`).
+    if let Some(champ) = crate::champions::champion(trimmed, crate::settings::ChampionLineage::Fide)
+        && !champ.name.eq_ignore_ascii_case(trimmed)
+    {
+        match lookup_single(champ.name, &mut fetch) {
+            Ok(Lookup::Summary(summary)) => return Ok(Lookup::Summary(summary)),
+            Ok(_) => {}
+            Err(err) => return Err(err),
         }
     }
     primary
@@ -1933,7 +2183,7 @@ fn lookup_single(
         Ok(value) => {
             if let Some(mut summary) = Summary::from_value(&value) {
                 direct_title = Some(summary.title.clone());
-                if is_confident(&summary) && title_matches_name(name, &summary.title) {
+                if is_confident(&summary) && summary_matches_name(name, &summary) {
                     if let Some(qid) = wikibase_item(&value) {
                         enrich_with_wikidata(&mut summary, &qid, &mut fetch);
                     }
@@ -1968,7 +2218,10 @@ fn lookup_single(
             else {
                 continue;
             };
-            if !title_matches_name(name, title) {
+            if !title_matches_name(name, title)
+                && !strip_generational_suffix(name)
+                    .is_some_and(|stripped| title_matches_name(&stripped, title))
+            {
                 continue;
             }
             let preferred = page
@@ -1994,7 +2247,7 @@ fn lookup_single(
             Ok(value) => {
                 if let Some(mut summary) = Summary::from_value(&value) {
                     parsed_any = true;
-                    if is_confident(&summary) && title_matches_name(name, &summary.title) {
+                    if is_confident(&summary) && summary_matches_name(name, &summary) {
                         if let Some(qid) = wikibase_item(&value) {
                             enrich_with_wikidata(&mut summary, &qid, &mut fetch);
                         }
@@ -2251,6 +2504,7 @@ fn fold_transliteration_digraphs(token: &str) -> String {
         "wladimir" => "vladimir".to_string(),
         "oleksandr" | "olexandr" => "aleksandr".to_string(),
         "ievgeni" | "jevgeni" => "evgeni".to_string(),
+        "william" | "wilhelm" => "wilhelm".to_string(),
         _ => folded,
     }
 }
@@ -2380,7 +2634,10 @@ fn match_tokens(
         return false;
     }
 
-    let query_multi_count = query.iter().filter(|token| token.chars().count() > 1).count();
+    let query_multi_count = query
+        .iter()
+        .filter(|token| token.chars().count() > 1)
+        .count();
     let title_multi_count = title_tokens
         .iter()
         .filter(|token| token.chars().count() > 1)
@@ -2393,17 +2650,20 @@ fn match_tokens(
         if is_initial && query_multi_count >= 2 {
             continue;
         }
-        let matched = title_tokens.iter().enumerate().find_map(|(index, candidate)| {
-            if used[index] {
-                return None;
-            }
-            let ok = if is_initial {
-                candidate.starts_with(token.as_str())
-            } else {
-                candidate == token
-            };
-            ok.then_some(index)
-        });
+        let matched = title_tokens
+            .iter()
+            .enumerate()
+            .find_map(|(index, candidate)| {
+                if used[index] {
+                    return None;
+                }
+                let ok = if is_initial {
+                    candidate.starts_with(token.as_str())
+                } else {
+                    candidate == token
+                };
+                ok.then_some(index)
+            });
         if let Some(index) = matched {
             used[index] = true;
         } else {
@@ -2455,8 +2715,66 @@ fn title_matches_name(name: &str, title: &str) -> bool {
     let title = title.split('(').next().unwrap_or(title);
     let title_tokens = name_tokens(title);
     let check_given = primary_given.as_ref();
-    let check_surname = name.contains(',').then_some(primary_surname.as_ref()).flatten();
+    let check_surname = name
+        .contains(',')
+        .then_some(primary_surname.as_ref())
+        .flatten();
     match_tokens(&query, &title_tokens, check_given, check_surname)
+}
+
+fn is_generational_suffix_word(word: &str) -> bool {
+    let clean = word.trim_matches(|ch: char| !ch.is_alphanumeric());
+    GENERATIONAL_SUFFIXES
+        .iter()
+        .any(|s| s.eq_ignore_ascii_case(clean))
+}
+
+fn strip_generational_suffix(name: &str) -> Option<String> {
+    let trimmed = name.trim();
+    if let Some((last, first)) = trimmed.split_once(',') {
+        let first_words: Vec<&str> = first
+            .split_whitespace()
+            .filter(|w| !is_generational_suffix_word(w))
+            .collect();
+        let last_words: Vec<&str> = last
+            .split_whitespace()
+            .filter(|w| !is_generational_suffix_word(w))
+            .collect();
+        let candidate = if first_words.is_empty() || last_words.is_empty() {
+            return None;
+        } else {
+            format!("{}, {}", last_words.join(" "), first_words.join(" "))
+        };
+        return (candidate != trimmed).then_some(candidate);
+    }
+    let words: Vec<&str> = trimmed.split_whitespace().collect();
+    if words.len() >= 3 && words.last().is_some_and(|w| is_generational_suffix_word(w)) {
+        return Some(words[..words.len() - 1].join(" "));
+    }
+    None
+}
+
+fn summary_matches_name(name: &str, summary: &Summary) -> bool {
+    if title_matches_name(name, &summary.title) {
+        return true;
+    }
+    let Some(stripped) = strip_generational_suffix(name) else {
+        return false;
+    };
+    if !title_matches_name(&stripped, &summary.title) {
+        return false;
+    }
+    let lead: String = summary
+        .extract
+        .chars()
+        .take(96)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    let extract_has_suffix = name
+        .split(|ch: char| !ch.is_alphanumeric())
+        .filter(|w| is_generational_suffix_word(w))
+        .any(|s| has_word(&lead, &s.to_ascii_lowercase()));
+    extract_has_suffix || name.contains(',')
 }
 
 /// Normalized identity used for the cache's name index.
@@ -2495,9 +2813,22 @@ fn search_name(name: &str) -> String {
     let name = name.trim();
     if let Some((last, first)) = name.split_once(',') {
         let last_words = clean_search_words(last.trim());
-        let first_words = clean_search_words(first.trim());
-        if !last_words.is_empty() && !first_words.is_empty() && !first.contains(',') {
-            return format!("{} {}", first_words.join(" "), last_words.join(" "));
+        let first_all = clean_search_words(first.trim());
+        let mut given_words = Vec::new();
+        let mut suffix_words = Vec::new();
+        for w in first_all {
+            if is_generational_suffix_word(&w) {
+                suffix_words.push(w);
+            } else {
+                given_words.push(w);
+            }
+        }
+        if !last_words.is_empty() && !given_words.is_empty() && !first.contains(',') {
+            let mut ordered = Vec::new();
+            ordered.extend(given_words);
+            ordered.extend(last_words);
+            ordered.extend(suffix_words);
+            return ordered.join(" ");
         }
     }
     let words = clean_search_words(name);
@@ -3220,6 +3551,33 @@ mod tests {
     }
 
     #[test]
+    fn american_born_canadian_and_wikidata_p1532_resolve_current_federation_last() {
+        let mut hansen_json = summary_json(
+            "Eric Hansen (chess player)",
+            "Canadian chess grandmaster (born 1992)",
+            "Eric Hansen is an American-born Canadian chess grandmaster and Twitch streamer. Hansen has represented Canada in the Chess Olympiad.",
+        );
+        // Heal stale cached `["CAN", "USA"]` ordering as well.
+        hansen_json["countries"] = json!(["CAN", "USA"]);
+        let hansen = Summary::from_value(&hansen_json).unwrap();
+        assert_eq!(hansen.countries, vec!["USA", "CAN"]);
+        assert_eq!(hansen.latest_country().map(|c| c.code), Some("CAN"));
+
+        let fields = parse_wikidata_value(&json!({
+            "claims": {
+                "P1532": [
+                    {"mainsnak": {"datavalue": {"value": {"id": "Q16"}}}}
+                ],
+                "P27": [
+                    {"mainsnak": {"datavalue": {"value": {"id": "Q30"}}}},
+                    {"mainsnak": {"datavalue": {"value": {"id": "Q16"}}}}
+                ]
+            }
+        }));
+        assert_eq!(fields.countries, vec!["USA", "CAN"]);
+    }
+
+    #[test]
     fn wikidata_federation_tenures_exclude_temporary_home_country() {
         let mut summary = Summary::from_value(&summary_json(
             "Levon Aronian",
@@ -3720,12 +4078,18 @@ mod tests {
         assert!(title_matches_name("Bluebaum, Matthias", "Matthias Blübaum"));
         assert!(title_matches_name("Indjic, Aleksandar", "Aleksandar Inđić"));
         assert!(title_matches_name("Dreev, Alexey", "Aleksey Dreev"));
-        assert!(title_matches_name("Mekhitarian, Krikor Sevag", "Krikor Mekhitarian"));
+        assert!(title_matches_name(
+            "Mekhitarian, Krikor Sevag",
+            "Krikor Mekhitarian"
+        ));
         assert!(title_matches_name(
             "Martinez Alcantara, Jose Eduardo",
             "José Martínez Alcántara"
         ));
-        assert!(title_matches_name("Erigaisi, Arjun Kumar", "Arjun Erigaisi"));
+        assert!(title_matches_name(
+            "Erigaisi, Arjun Kumar",
+            "Arjun Erigaisi"
+        ));
         assert!(title_matches_name(
             "Iturrizaga Bonelli, Eduardo",
             "Eduardo Iturrizaga"
@@ -3735,7 +4099,10 @@ mod tests {
             "Aravindh Chithambaram"
         ));
         assert!(title_matches_name("Gawain C B Jones", "Gawain Jones"));
-        assert!(title_matches_name("Fedoseev, Vladimir1", "Vladimir Fedoseev"));
+        assert!(title_matches_name(
+            "Fedoseev, Vladimir1",
+            "Vladimir Fedoseev"
+        ));
 
         // False-positive guardrails: prefer no match over a wrong match.
         assert!(!title_matches_name("Bacrot, M", "Étienne Bacrot"));
@@ -3795,7 +4162,10 @@ mod tests {
     fn search_name_and_umlaut_variants_normalize_database_spellings() {
         assert_eq!(search_name("Fedoseev, Vladimir1"), "Vladimir Fedoseev");
         assert_eq!(search_name("Bluebaum, Matthias"), "Matthias Bluebaum");
-        assert_eq!(summary_url("Bluebaum, Matthias"), format!("{SUMMARY_ENDPOINT}Matthias_Bluebaum"));
+        assert_eq!(
+            summary_url("Bluebaum, Matthias"),
+            format!("{SUMMARY_ENDPOINT}Matthias_Bluebaum")
+        );
 
         let variants = umlaut_variants("Ueber, Goetze");
         assert!(variants.contains(&"Über, Götze".to_string()));
@@ -3853,7 +4223,10 @@ mod tests {
         })
         .unwrap_err();
         assert!(err.contains("429"));
-        assert_eq!(calls, 2, "only direct summary and search for primary should run on error");
+        assert_eq!(
+            calls, 2,
+            "only direct summary and search for primary should run on error"
+        );
     }
 
     #[test]
@@ -3865,12 +4238,10 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(paravyan.current_title(), Some(PlayerTitle::Gm));
-        assert!(paravyan
-            .title_history
-            .contains(&TitleAward {
-                title: PlayerTitle::Gm,
-                year: Some(2017),
-            }));
+        assert!(paravyan.title_history.contains(&TitleAward {
+            title: PlayerTitle::Gm,
+            year: Some(2017),
+        }));
 
         let bortnyk = Summary::from_value(&summary_json(
             "Olexandr Bortnyk",
@@ -3879,12 +4250,10 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(bortnyk.current_title(), Some(PlayerTitle::Gm));
-        assert!(bortnyk
-            .title_history
-            .contains(&TitleAward {
-                title: PlayerTitle::Gm,
-                year: Some(2015),
-            }));
+        assert!(bortnyk.title_history.contains(&TitleAward {
+            title: PlayerTitle::Gm,
+            year: Some(2015),
+        }));
 
         let woman_gm = Summary::from_value(&summary_json(
             "Example Woman Player",
@@ -3893,5 +4262,122 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(woman_gm.current_title(), Some(PlayerTitle::Wgm));
+    }
+
+    #[test]
+    fn generational_suffix_moroni_jr_resolves_and_matches() {
+        assert_eq!(search_name("Moroni, Luca Jr"), "Luca Moroni Jr");
+        let summary = Summary::from_value(&summary_json(
+            "Luca Moroni",
+            "Italian chess grandmaster",
+            "Luca Moroni Jr. (born 1 July 2000) is an Italian chess grandmaster.",
+        ))
+        .unwrap();
+        assert!(summary_matches_name("Moroni, Luca Jr", &summary));
+
+        let lookup = lookup_with("Moroni, Luca Jr", |url| {
+            if url.ends_with("/Luca_Moroni") {
+                Ok(summary_json(
+                    "Luca Moroni",
+                    "Italian chess grandmaster",
+                    "Luca Moroni Jr. (born 1 July 2000) is an Italian chess grandmaster.",
+                ))
+            } else {
+                Err(FetchError::NotFound)
+            }
+        })
+        .unwrap();
+        match lookup {
+            Lookup::Summary(found) => {
+                assert_eq!(found.title, "Luca Moroni");
+                assert_eq!(found.countries, vec!["ITA".to_string()]);
+            }
+            other => panic!("expected Summary for Moroni, Luca Jr, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn steinitz_william_resolves_as_wilhelm_steinitz_with_historical_flags() {
+        let lookup = lookup_with("Steinitz, William", |url| {
+            if url.ends_with("/Wilhelm_Steinitz") {
+                Ok(summary_json(
+                    "Wilhelm Steinitz",
+                    "Austrian and American chess player (1836–1900)",
+                    "Wilhelm Steinitz (born in Prague, Kingdom of Bohemia, Austrian Empire; later William Steinitz; 1836–1900) was an Austrian and later American chess player and the first World Chess Champion.",
+                ))
+            } else {
+                Err(FetchError::NotFound)
+            }
+        })
+        .unwrap();
+        match lookup {
+            Lookup::Summary(found) => {
+                assert_eq!(found.title, "Wilhelm Steinitz");
+                assert!(found.countries.contains(&"BOH".to_string()));
+                assert!(found.countries.contains(&"USA".to_string()));
+            }
+            other => panic!("expected Summary for Steinitz, William, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hort_keeps_czechoslovakia_and_germany_and_repairs_stale_cache() {
+        let hort = Summary::from_value(&summary_json(
+            "Vlastimil Hort",
+            "Czech and German chess grandmaster",
+            "Vlastimil Hort (12 January 1944 – 12 May 2025) was a Czechoslovak and German chess grandmaster.",
+        ))
+        .unwrap();
+        assert_eq!(
+            hort.countries,
+            vec!["TCH".to_string(), "GER".to_string()]
+        );
+
+        let stale = json!({
+            "title": "Vlastimil Hort",
+            "description": "Czech and German chess grandmaster",
+            "extract": "Vlastimil Hort was a Czechoslovak and German chess grandmaster.",
+            "url": "https://en.wikipedia.org/wiki/Vlastimil_Hort",
+            "countries": ["GER"],
+            "country_periods": [
+                {"code": "GER", "start_year": null, "end_year": null, "context": null}
+            ],
+            "fide_id": null,
+            "birth_year": 1944,
+            "death_year": 2025,
+            "latest_elo": null,
+            "latest_elo_date": null,
+            "peak_elo": null,
+            "fide_standard": null,
+            "fide_rapid": null,
+            "fide_blitz": null,
+            "title_history": []
+        });
+        let repaired = Summary::from_value(&stale).unwrap();
+        assert_eq!(
+            repaired.countries,
+            vec!["TCH".to_string(), "GER".to_string()]
+        );
+    }
+
+    #[test]
+    fn historical_1800_to_present_states_resolve_without_modern_leaks() {
+        let anderssen = Summary::from_value(&summary_json(
+            "Adolf Anderssen",
+            "German chess master (1818–1879)",
+            "Karl Ernst Adolf Anderssen (born in Breslau, Kingdom of Prussia; 1818–1879) was a German chess master.",
+        ))
+        .unwrap();
+        assert!(anderssen.countries.contains(&"PRU".to_string()));
+        assert!(!anderssen.countries.contains(&"GER".to_string()));
+
+        let chigorin = Summary::from_value(&summary_json(
+            "Mikhail Chigorin",
+            "Russian chess player (1850–1908)",
+            "Mikhail Ivanovich Chigorin (1850–1908) was a leading Russian chess player in the Russian Empire.",
+        ))
+        .unwrap();
+        assert!(chigorin.countries.contains(&"RUE".to_string()));
+        assert!(!chigorin.countries.contains(&"RUS".to_string()));
     }
 }

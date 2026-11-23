@@ -479,7 +479,9 @@ pub fn find_biggest_gap(
                     let child_pos = &game.nodes[child_id].pos;
                     let child_key = position_key(child_pos);
                     !game.nodes[child_id].children.is_empty()
-                        || transpositions.get(&child_key).is_some_and(|v| !v.is_empty())
+                        || transpositions
+                            .get(&child_key)
+                            .is_some_and(|v| !v.is_empty())
                 } else {
                     false
                 };
@@ -711,12 +713,7 @@ impl TrainSession {
 /// shared opening prefixes without duplicating identical moves.
 #[must_use]
 pub fn merge_pgn_games(games: Vec<Game>) -> Game {
-    fn merge_subtree(
-        dst: &mut Game,
-        dst_parent: usize,
-        src: &Game,
-        src_node: usize,
-    ) {
+    fn merge_subtree(dst: &mut Game, dst_parent: usize, src: &Game, src_node: usize) {
         let src_children = src.nodes[src_node].children.clone();
         for src_child in src_children {
             let child = &src.nodes[src_child];
@@ -822,13 +819,11 @@ mod tests {
 
     #[test]
     fn zobrist_transposition_map_groups_moves_from_different_move_orders() {
-        let g2 = parse_pgn(
-            b"1. d4 Nf6 (1... e6 2. c4 Nf6 3. Nf3 d5) 2. c4 e6 3. Nc3 Bb4 *",
-        )
-        .unwrap()
-        .into_iter()
-        .next()
-        .unwrap();
+        let g2 = parse_pgn(b"1. d4 Nf6 (1... e6 2. c4 Nf6 3. Nf3 d5) 2. c4 e6 3. Nc3 Bb4 *")
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
         let map2 = position_moves_map(&g2);
         let node_before_nc3 = g2
             .nodes
@@ -853,7 +848,8 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let tmp_dir = std::env::temp_dir().join(format!("brett-rep-gap-{}-{nanos}", std::process::id()));
+        let tmp_dir =
+            std::env::temp_dir().join(format!("brett-rep-gap-{}-{nanos}", std::process::id()));
         fs::create_dir_all(&tmp_dir).unwrap();
         let pgn_path = tmp_dir.join("ref.pgn");
         let idx_path = tmp_dir.join("ref.brettpos");
@@ -868,7 +864,11 @@ mod tests {
         let index = PositionIndex::open(&idx_path).unwrap();
 
         // White repertoire covers 1. e4 e5 2. Nf3, leaving 1... c5 unanswered (3 ref games).
-        let rep_game = parse_pgn(b"1. e4 e5 2. Nf3 *").unwrap().into_iter().next().unwrap();
+        let rep_game = parse_pgn(b"1. e4 e5 2. Nf3 *")
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
         let gap = find_biggest_gap(&rep_game, Color::White, &index, 1).unwrap();
         assert_eq!(gap.opponent_uci, "c7c5");
         assert_eq!(gap.reference_games, 3);
@@ -883,13 +883,18 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!("brett-rep-store-{}-{nanos}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("brett-rep-store-{}-{nanos}", std::process::id()));
         let mut rep = Repertoire::new(
             "italian".to_string(),
             "Italian Game".to_string(),
             Color::White,
         );
-        let g = parse_pgn(b"1. e4 e5 2. Nf3 Nc6 *").unwrap().into_iter().next().unwrap();
+        let g = parse_pgn(b"1. e4 e5 2. Nf3 Nc6 *")
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
         rep.set_game(&g);
 
         let today = 20_000;
@@ -917,13 +922,12 @@ mod tests {
 
     #[test]
     fn merge_pgn_games_combines_multiple_chapters_into_one_tree() {
-        let ch1 = parse_pgn(
-            b"[Event \"Italian Study\"]\n\n1. e4 e5 2. Nf3 Nc6 3. Bc4 Bc5 {Main line} *",
-        )
-        .unwrap()
-        .into_iter()
-        .next()
-        .unwrap();
+        let ch1 =
+            parse_pgn(b"[Event \"Italian Study\"]\n\n1. e4 e5 2. Nf3 Nc6 3. Bc4 Bc5 {Main line} *")
+                .unwrap()
+                .into_iter()
+                .next()
+                .unwrap();
         let ch2 = parse_pgn(
             b"[Event \"Italian Study Ch 2\"]\n\n1. e4 e5 2. Nf3 Nc6 3. Bb5 {Ruy Lopez} a6 *",
         )

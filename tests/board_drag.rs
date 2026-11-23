@@ -70,6 +70,8 @@ fn run_frame(
                 shapes: &[],
                 drag_from: *drag.borrow(),
                 shape_drag_from: None,
+                draw_mode: None,
+                touch_swipe: false,
             },
             SIDE,
         );
@@ -82,7 +84,9 @@ fn run_frame(
                 | BoardEvent::Click(_)
                 | BoardEvent::ShapeSquare { .. }
                 | BoardEvent::ShapeArrow { .. }
-                | BoardEvent::ShapeDragStart(_) => {
+                | BoardEvent::ShapeDragStart(_)
+                | BoardEvent::SwipePrev
+                | BoardEvent::SwipeNext => {
                     *drag.borrow_mut() = None;
                 }
             }

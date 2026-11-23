@@ -112,6 +112,7 @@ fn main() -> anyhow::Result<()> {
         &output,
         TwoCbhWriteOptions {
             allow_annotation_loss: true,
+            ..Default::default()
         },
         games.into_iter().map(Ok),
     )?;

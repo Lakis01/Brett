@@ -73,6 +73,231 @@ struct Entry {
     deleted: bool,
 }
 
+/// Per-node annotations stored in an optional `<stem>.brettann` gzip-JSON
+/// sidecar when writing Brett personal `.2cbh` databases.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct BrettNodeAnnotation {
+    pub path: Vec<u16>,
+    pub comment: String,
+    pub nags: Vec<u8>,
+    pub clock_centis: Option<u64>,
+    pub eval_cp: Option<i32>,
+    pub eval_mate: Option<i32>,
+    pub shapes: Vec<String>,
+}
+
+impl BrettNodeAnnotation {
+    fn to_json(&self) -> serde_json::Value {
+        let mut obj = serde_json::Map::new();
+        if !self.path.is_empty() {
+            obj.insert(
+                "p".to_string(),
+                serde_json::Value::Array(self.path.iter().map(|&v| serde_json::json!(v)).collect()),
+            );
+        }
+        if !self.comment.is_empty() {
+            obj.insert("c".to_string(), serde_json::json!(self.comment));
+        }
+        if !self.nags.is_empty() {
+            obj.insert(
+                "n".to_string(),
+                serde_json::Value::Array(self.nags.iter().map(|&v| serde_json::json!(v)).collect()),
+            );
+        }
+        if let Some(clk) = self.clock_centis {
+            obj.insert("k".to_string(), serde_json::json!(clk));
+        }
+        if let Some(cp) = self.eval_cp {
+            obj.insert("ec".to_string(), serde_json::json!(cp));
+        }
+        if let Some(mate) = self.eval_mate {
+            obj.insert("em".to_string(), serde_json::json!(mate));
+        }
+        if !self.shapes.is_empty() {
+            obj.insert("s".to_string(), serde_json::json!(self.shapes));
+        }
+        serde_json::Value::Object(obj)
+    }
+
+    fn from_json(v: &serde_json::Value) -> Option<Self> {
+        let obj = v.as_object()?;
+        let path = obj
+            .get("p")
+            .and_then(serde_json::Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|x| x.as_u64().and_then(|u| u16::try_from(u).ok()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let comment = obj
+            .get("c")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let nags = obj
+            .get("n")
+            .and_then(serde_json::Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|x| x.as_u64().and_then(|u| u8::try_from(u).ok()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let clock_centis = obj.get("k").and_then(serde_json::Value::as_u64);
+        let eval_cp = obj
+            .get("ec")
+            .and_then(serde_json::Value::as_i64)
+            .and_then(|x| i32::try_from(x).ok());
+        let eval_mate = obj
+            .get("em")
+            .and_then(serde_json::Value::as_i64)
+            .and_then(|x| i32::try_from(x).ok());
+        let shapes = obj
+            .get("s")
+            .and_then(serde_json::Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        Some(Self {
+            path,
+            comment,
+            nags,
+            clock_centis,
+            eval_cp,
+            eval_mate,
+            shapes,
+        })
+    }
+}
+
+pub(crate) type BrettAnnotationMap = std::collections::HashMap<u32, Vec<BrettNodeAnnotation>>;
+
+pub(crate) fn serialize_brett_annotations(map: &BrettAnnotationMap) -> Vec<u8> {
+    let mut root = serde_json::Map::new();
+    for (&id, anns) in map {
+        let items: Vec<serde_json::Value> = anns.iter().map(BrettNodeAnnotation::to_json).collect();
+        root.insert(id.to_string(), serde_json::Value::Array(items));
+    }
+    serde_json::to_vec(&serde_json::Value::Object(root)).unwrap_or_default()
+}
+
+pub(crate) fn collect_brett_annotations(game: &Game) -> Vec<BrettNodeAnnotation> {
+    fn visit(
+        nodes: &[crate::domain::Node],
+        node_idx: usize,
+        path: &mut Vec<u16>,
+        out: &mut Vec<BrettNodeAnnotation>,
+    ) {
+        let Some(node) = nodes.get(node_idx) else {
+            return;
+        };
+        if !node.comment.is_empty()
+            || !node.nags.is_empty()
+            || node.clock.is_some()
+            || node.eval.is_some()
+            || !node.shapes.is_empty()
+        {
+            out.push(BrettNodeAnnotation {
+                path: path.clone(),
+                comment: node.comment.clone(),
+                nags: node.nags.clone(),
+                clock_centis: node.clock.map(|c| c.centis),
+                eval_cp: node.eval.and_then(|e| e.cp),
+                eval_mate: node.eval.and_then(|e| e.mate),
+                shapes: node.shapes.iter().map(|s| s.token()).collect(),
+            });
+        }
+        for (child_pos, &child_idx) in node.children.iter().enumerate() {
+            if let Ok(step) = u16::try_from(child_pos) {
+                path.push(step);
+                visit(nodes, child_idx, path, out);
+                path.pop();
+            }
+        }
+    }
+    let mut out = Vec::new();
+    let mut path = Vec::new();
+    visit(&game.nodes, 0, &mut path, &mut out);
+    out
+}
+
+fn load_brettann_sidecar(path: &Path) -> Option<Arc<BrettAnnotationMap>> {
+    if !path.is_file() {
+        return None;
+    }
+    let bytes = fs::read(path).ok()?;
+    let decoder = flate2::read::GzDecoder::new(&bytes[..]);
+    let val: serde_json::Value = serde_json::from_reader(decoder).ok()?;
+    let obj = val.as_object()?;
+    let mut map = BrettAnnotationMap::new();
+    for (k, v) in obj {
+        let Ok(id) = k.parse::<u32>() else {
+            continue;
+        };
+        let Some(arr) = v.as_array() else {
+            continue;
+        };
+        let items: Vec<BrettNodeAnnotation> = arr
+            .iter()
+            .filter_map(BrettNodeAnnotation::from_json)
+            .collect();
+        if !items.is_empty() {
+            map.insert(id, items);
+        }
+    }
+    Some(Arc::new(map))
+}
+
+fn apply_brett_annotations(game: &mut Game, anns: &[BrettNodeAnnotation]) {
+    for ann in anns {
+        let mut cur = 0usize;
+        let mut valid = true;
+        for &step in &ann.path {
+            if let Some(&next) = game
+                .nodes
+                .get(cur)
+                .and_then(|n| n.children.get(usize::from(step)))
+            {
+                cur = next;
+            } else {
+                valid = false;
+                break;
+            }
+        }
+        if !valid {
+            continue;
+        }
+        let node = &mut game.nodes[cur];
+        if !ann.comment.is_empty() {
+            node.comment = ann.comment.clone();
+        }
+        if !ann.nags.is_empty() {
+            node.nags = ann.nags.clone();
+        }
+        if let Some(centis) = ann.clock_centis {
+            node.clock = Some(crate::domain::Clock { centis });
+        }
+        if ann.eval_cp.is_some() || ann.eval_mate.is_some() {
+            node.eval = Some(crate::domain::PgnEval {
+                cp: ann.eval_cp,
+                mate: ann.eval_mate,
+            });
+        }
+        for token in &ann.shapes {
+            if let Some(shape) = crate::domain::Shape::parse_token(token)
+                && !node.shapes.contains(&shape)
+            {
+                node.shapes.push(shape);
+            }
+        }
+    }
+}
+
 /// A validated 2CBH container with targeted record access.
 pub struct TwoCbhFile {
     cbh_path: PathBuf,
@@ -82,6 +307,7 @@ pub struct TwoCbhFile {
     cbh: Mmap,
     cbg: Mmap,
     count: u32,
+    brett_annotations: Option<Arc<BrettAnnotationMap>>,
 }
 
 impl TwoCbhFile {
@@ -156,6 +382,7 @@ impl TwoCbhFile {
             let cba = map_file(path, "2CBH annotations")?;
             validate_companion(path, &cba, "annotations")?;
         }
+        let brett_annotations = load_brettann_sidecar(&sibling(&stem, ".brettann"));
 
         Ok(Self {
             cbh_path,
@@ -165,6 +392,7 @@ impl TwoCbhFile {
             cbh,
             cbg,
             count,
+            brett_annotations,
         })
     }
 
@@ -1287,12 +1515,7 @@ impl GameLibrary for TwoCbhLibrary {
                     return Ok(false);
                 }
                 let start_pos = moves::start_position_960(start_id)?;
-                fast_index::scan_2cbh_mainline_positions(
-                    &start_pos,
-                    &raw[6..],
-                    max_ply,
-                    visitor,
-                )?;
+                fast_index::scan_2cbh_mainline_positions(&start_pos, &raw[6..], max_ply, visitor)?;
                 Ok(true)
             }
             kind => bail!("2CBH game {} uses unknown encoding kind {kind}", entry.id),
@@ -1498,6 +1721,12 @@ fn load_game(
     }
     if decoded && game.nodes.len() == 1 {
         game.set_header("PlyCount", "0".to_string());
+    }
+    if decoded
+        && let Some(map) = &file.brett_annotations
+        && let Some(anns) = map.get(&id)
+    {
+        apply_brett_annotations(&mut game, anns);
     }
     Ok(game)
 }

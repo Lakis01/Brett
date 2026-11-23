@@ -66,7 +66,12 @@ pub fn draw_with_hold(
         Stroke::new(1.0, CENTER_TICK),
     );
 
-    painter.rect_stroke(rect, radius, Stroke::new(1.0, BORDER_COLOR), StrokeKind::Inside);
+    painter.rect_stroke(
+        rect,
+        radius,
+        Stroke::new(1.0, BORDER_COLOR),
+        StrokeKind::Inside,
+    );
 
     let tip = match (eval, is_held) {
         (Some(eval), true) => {

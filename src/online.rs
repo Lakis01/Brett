@@ -1982,9 +1982,7 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 fn ym_from_epoch_ms(ms: u64) -> Option<String> {
     let days = (ms / 86_400_000) as i64;
     let (y, m, _) = civil_from_days(days);
-    (1970..=2100)
-        .contains(&y)
-        .then(|| format!("{y:04}-{m:02}"))
+    (1970..=2100).contains(&y).then(|| format!("{y:04}-{m:02}"))
 }
 
 fn parse_ymd(text: &str) -> Option<(i64, u32, u32)> {
@@ -2270,13 +2268,16 @@ pub fn fetch_account_summary(
             }
             let response = request.call().ok()?;
             let mut body = String::new();
-            response.into_reader().take(256 * 1024).read_to_string(&mut body).ok()?;
+            response
+                .into_reader()
+                .take(256 * 1024)
+                .read_to_string(&mut body)
+                .ok()?;
             parse_lichess_user_summary_json(&body)
         }
         OnlineSource::ChessCom => {
             let lower = username.to_ascii_lowercase();
-            let archives_url =
-                format!("https://api.chess.com/pub/player/{lower}/games/archives");
+            let archives_url = format!("https://api.chess.com/pub/player/{lower}/games/archives");
             let mut earliest_ym = None;
             let mut latest_ym = None;
             if let Ok(archives_body) = get_text(&agent, &archives_url, Some("application/json"))
@@ -2474,17 +2475,15 @@ pub fn parse_lichess_team_members_ndjson(ndjson: &str) -> Vec<TeamMemberInfo> {
             continue;
         };
         let rating_for = |perf: &str| -> Option<u32> {
-            val.get("perfs")
-                .and_then(|p| p.get(perf))
-                .and_then(|p| {
-                    let games = p.get("games").and_then(Value::as_u64).unwrap_or(0);
-                    if games == 0 {
-                        return None;
-                    }
-                    p.get("rating")
-                        .and_then(Value::as_u64)
-                        .and_then(|r| u32::try_from(r).ok())
-                })
+            val.get("perfs").and_then(|p| p.get(perf)).and_then(|p| {
+                let games = p.get("games").and_then(Value::as_u64).unwrap_or(0);
+                if games == 0 {
+                    return None;
+                }
+                p.get("rating")
+                    .and_then(Value::as_u64)
+                    .and_then(|r| u32::try_from(r).ok())
+            })
         };
         let seen_recently = val
             .get("seenAt")
@@ -2540,11 +2539,7 @@ pub fn parse_chesscom_club_members_json(json_str: &str) -> Vec<TeamMemberInfo> {
     };
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
-    for (bucket, recent) in [
-        ("weekly", true),
-        ("monthly", true),
-        ("all_time", false),
-    ] {
+    for (bucket, recent) in [("weekly", true), ("monthly", true), ("all_time", false)] {
         let Some(arr) = val.get(bucket).and_then(Value::as_array) else {
             continue;
         };

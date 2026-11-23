@@ -24,6 +24,7 @@ pub mod flags;
 pub mod guiding;
 pub mod league_import;
 pub mod library;
+pub mod live;
 pub mod my_games;
 pub mod online;
 pub mod pgn;
@@ -40,6 +41,7 @@ pub mod search;
 pub mod session;
 pub mod settings;
 pub mod setup;
+pub mod structure_plans;
 #[doc(hidden)]
 pub mod test_data;
 pub mod titles;

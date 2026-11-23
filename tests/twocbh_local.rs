@@ -100,6 +100,7 @@ fn writer_round_trips_update01_sample() {
         &target,
         brett::twocbh::TwoCbhWriteOptions {
             allow_annotation_loss: true,
+            ..Default::default()
         },
         games.iter().cloned().map(Ok),
     )

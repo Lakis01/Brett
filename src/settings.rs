@@ -56,7 +56,8 @@ pub fn write_atomic_with_backup(path: &Path, content: &str) -> Result<()> {
 /// Read a JSON config file, automatically falling back to `<path>.bak` if the
 /// primary file is missing, empty, or corrupted.
 pub fn read_with_backup_json(path: &Path) -> Option<String> {
-    let is_valid = |text: &str| !text.trim().is_empty() && serde_json::from_str::<Value>(text).is_ok();
+    let is_valid =
+        |text: &str| !text.trim().is_empty() && serde_json::from_str::<Value>(text).is_ok();
     if let Ok(text) = fs::read_to_string(path)
         && is_valid(&text)
     {
@@ -397,7 +398,13 @@ impl EnginePreset {
                     EnginePreset::Light => (1, 64),
                     EnginePreset::Balanced => (if hw.logical_cpus <= 2 { 1 } else { 2 }, 256),
                     EnginePreset::Performance => {
-                        let t = if hw.physical_cores >= 16 { 3 } else if hw.logical_cpus <= 2 { 1 } else { 2 };
+                        let t = if hw.physical_cores >= 16 {
+                            3
+                        } else if hw.logical_cpus <= 2 {
+                            1
+                        } else {
+                            2
+                        };
                         let h = if hw.gpu_kind.has_discrete_vram() && hw.total_ram_mb >= 30_000 {
                             1024
                         } else if hw.total_ram_mb >= 16_000 {
@@ -448,7 +455,8 @@ impl EnginePreset {
         // Pass 1: Give GPU neural engines lean CPU feeder threads + right-sized NNCache/tree hash.
         for &(idx, profile) in slots {
             if profile == EngineComputeProfile::GpuNeural {
-                let (mut gt, mut gh) = self.compute_for_profile(hw, EngineComputeProfile::GpuNeural);
+                let (mut gt, mut gh) =
+                    self.compute_for_profile(hw, EngineComputeProfile::GpuNeural);
                 if gpu_count > 1 {
                     gt = 1;
                     gh = floor_power_of_two_mb((gh / gpu_count).max(64));
@@ -809,8 +817,13 @@ pub struct PreparationPrefs {
     pub prep_mode: PrepMode,
     /// Temporary disk cache for compiled preparation playerbases (enabled by default).
     pub prep_cache_enabled: bool,
-    /// Expiry TTL in hours for cached preparation playerbases (default 48h).
+    /// Expiry TTL in hours for cached preparation playerbases (default 72h = 3 days).
     pub prep_cache_ttl_hours: u32,
+    /// Cache reverse-color repertoire exposure on disk (off by default; reverse
+    /// color exposure warnings are disabled while off).
+    pub prep_cache_reverse_color: bool,
+    /// Expiry TTL in hours for cached reverse-color exposure (default 72h = 3 days).
+    pub prep_reverse_cache_ttl_hours: u32,
     /// Online accounts per prepared player, keyed by canonical player key.
     pub prep_online_accounts:
         std::collections::HashMap<String, Vec<crate::players::PrepOnlineAccount>>,
@@ -832,7 +845,9 @@ impl Default for PreparationPrefs {
             prep_include_online: true,
             prep_mode: PrepMode::default(),
             prep_cache_enabled: true,
-            prep_cache_ttl_hours: 48,
+            prep_cache_ttl_hours: 72,
+            prep_cache_reverse_color: false,
+            prep_reverse_cache_ttl_hours: 72,
             prep_online_accounts: std::collections::HashMap::new(),
         }
     }
@@ -913,7 +928,16 @@ impl PreparationPrefs {
         let prep_cache_ttl_hours = value
             .get("prep_cache_ttl_hours")
             .and_then(Value::as_u64)
-            .unwrap_or(48)
+            .unwrap_or(72)
+            .clamp(1, 168) as u32;
+        let prep_cache_reverse_color = value
+            .get("prep_cache_reverse_color")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let prep_reverse_cache_ttl_hours = value
+            .get("prep_reverse_cache_ttl_hours")
+            .and_then(Value::as_u64)
+            .unwrap_or(72)
             .clamp(1, 168) as u32;
         let prep_online_accounts = value
             .get("prep_online_accounts")
@@ -951,6 +975,8 @@ impl PreparationPrefs {
             prep_mode,
             prep_cache_enabled,
             prep_cache_ttl_hours,
+            prep_cache_reverse_color,
+            prep_reverse_cache_ttl_hours,
             prep_online_accounts,
         }
     }
@@ -982,6 +1008,8 @@ impl PreparationPrefs {
             "prep_mode": self.prep_mode.config_value(),
             "prep_cache_enabled": self.prep_cache_enabled,
             "prep_cache_ttl_hours": self.prep_cache_ttl_hours,
+            "prep_cache_reverse_color": self.prep_cache_reverse_color,
+            "prep_reverse_cache_ttl_hours": self.prep_reverse_cache_ttl_hours,
             "prep_online_accounts": accounts,
         }))
         .unwrap_or_default()
@@ -1126,6 +1154,43 @@ impl PhotoSize {
             "medium" => Self::Medium,
             "large" => Self::Large,
             _ => Self::Small,
+        }
+    }
+}
+
+/// Whether touch / 2-in-1 UI enhancements are shown.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TouchMode {
+    #[default]
+    Auto,
+    On,
+    Off,
+}
+
+impl TouchMode {
+    pub const ALL: [Self; 3] = [Self::Auto, Self::On, Self::Off];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Auto (2-in-1)",
+            Self::On => "Always on",
+            Self::Off => "Off",
+        }
+    }
+
+    pub fn config_value(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::On => "on",
+            Self::Off => "off",
+        }
+    }
+
+    pub fn from_config(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "on" | "true" => Self::On,
+            "off" | "false" => Self::Off,
+            _ => Self::Auto,
         }
     }
 }
@@ -1295,6 +1360,8 @@ pub struct DisplayPrefs {
     /// Show the start/previous/next/end buttons. Keyboard navigation always
     /// remains available.
     pub show_nav_buttons: bool,
+    /// Touch / 2-in-1 UI enhancements mode (`auto`, `on`, or `off`).
+    pub touch_mode: TouchMode,
     /// Show the editable PGN-tags card above the move list.
     pub show_pgn_tags: bool,
     /// Show the move annotations and comment editor card below the move list.
@@ -1358,8 +1425,9 @@ impl Default for DisplayPrefs {
             photo_size: PhotoSize::default(),
             champion_lineage: ChampionLineage::default(),
             show_nav_buttons: false,
+            touch_mode: TouchMode::default(),
             show_pgn_tags: true,
-            show_annotations: true,
+            show_annotations: false,
             show_clocks: true,
             engine_bar: true,
             prep_filter_facing_color: true,
@@ -1536,6 +1604,11 @@ impl DisplayPrefs {
             .get("show_nav_buttons")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        let touch_mode = value
+            .get("touch_mode")
+            .and_then(Value::as_str)
+            .map(TouchMode::from_config)
+            .unwrap_or_default();
         let show_pgn_tags = value
             .get("show_pgn_tags")
             .and_then(Value::as_bool)
@@ -1543,7 +1616,7 @@ impl DisplayPrefs {
         let show_annotations = value
             .get("show_annotations")
             .and_then(Value::as_bool)
-            .unwrap_or(true);
+            .unwrap_or(false);
         let show_clocks = value
             .get("show_clocks")
             .and_then(Value::as_bool)
@@ -1675,6 +1748,7 @@ impl DisplayPrefs {
             photo_size,
             champion_lineage,
             show_nav_buttons,
+            touch_mode,
             show_pgn_tags,
             show_annotations,
             show_clocks,
@@ -1703,15 +1777,29 @@ impl DisplayPrefs {
         map.insert("show_all_ratings".to_string(), json!(self.show_all_ratings));
         map.insert("engine_view".to_string(), json!(self.engine_view));
         map.insert("engine_auto".to_string(), json!(self.engine_auto));
-        map.insert("opening_tree_path".to_string(), json!(self.opening_tree_path));
-        map.insert("opening_book_path".to_string(), json!(self.opening_book_path));
+        map.insert(
+            "opening_tree_path".to_string(),
+            json!(self.opening_tree_path),
+        );
+        map.insert(
+            "opening_book_path".to_string(),
+            json!(self.opening_book_path),
+        );
         map.insert(
             "last_database_dir".to_string(),
-            json!(self.last_database_dir.as_ref().map(|path| path.display().to_string())),
+            json!(
+                self.last_database_dir
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+            ),
         );
         map.insert(
             "last_print_dir".to_string(),
-            json!(self.last_print_dir.as_ref().map(|path| path.display().to_string())),
+            json!(
+                self.last_print_dir
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+            ),
         );
         map.insert(
             "default_database_format".to_string(),
@@ -1722,7 +1810,10 @@ impl DisplayPrefs {
             json!(self.prep_recent_games_height.clamp(120, 900)),
         );
         map.insert("multi_view".to_string(), json!(self.multi_view));
-        map.insert("visible_tab_names".to_string(), json!(self.visible_tab_names));
+        map.insert(
+            "visible_tab_names".to_string(),
+            json!(self.visible_tab_names),
+        );
         map.insert(
             "open_shelf_paths".to_string(),
             json!(
@@ -1742,31 +1833,62 @@ impl DisplayPrefs {
                     .collect::<Vec<_>>()
             ),
         );
-        map.insert("prep_recent_limit".to_string(), json!(self.prep_recent_limit));
-        map.insert("show_empty_pgn_tags".to_string(), json!(self.show_empty_pgn_tags));
+        map.insert(
+            "prep_recent_limit".to_string(),
+            json!(self.prep_recent_limit),
+        );
+        map.insert(
+            "show_empty_pgn_tags".to_string(),
+            json!(self.show_empty_pgn_tags),
+        );
         map.insert("hover_moves".to_string(), json!(self.hover_moves));
-        map.insert("show_player_photos".to_string(), json!(self.show_player_photos));
-        map.insert("photo_size".to_string(), json!(self.photo_size.config_value()));
+        map.insert(
+            "show_player_photos".to_string(),
+            json!(self.show_player_photos),
+        );
+        map.insert(
+            "photo_size".to_string(),
+            json!(self.photo_size.config_value()),
+        );
         map.insert(
             "champion_lineage".to_string(),
             json!(self.champion_lineage.config_value()),
         );
         map.insert("show_nav_buttons".to_string(), json!(self.show_nav_buttons));
+        map.insert(
+            "touch_mode".to_string(),
+            json!(self.touch_mode.config_value()),
+        );
         map.insert("show_pgn_tags".to_string(), json!(self.show_pgn_tags));
         map.insert("show_annotations".to_string(), json!(self.show_annotations));
         map.insert("show_clocks".to_string(), json!(self.show_clocks));
         map.insert("engine_bar".to_string(), json!(self.engine_bar));
         map.insert("review_skip_book".to_string(), json!(self.review_skip_book));
-        map.insert("review_book_min_games".to_string(), json!(self.review_book_min_games));
-        map.insert("review_book_max_plies".to_string(), json!(self.review_book_max_plies));
-        map.insert("trend_window".to_string(), json!(self.trend_window.config_value()));
+        map.insert(
+            "review_book_min_games".to_string(),
+            json!(self.review_book_min_games),
+        );
+        map.insert(
+            "review_book_max_plies".to_string(),
+            json!(self.review_book_max_plies),
+        );
+        map.insert(
+            "trend_window".to_string(),
+            json!(self.trend_window.config_value()),
+        );
         map.insert(
             "trend_baseline".to_string(),
             json!(self.trend_baseline.config_value()),
         );
         map.insert("trend_min_games".to_string(), json!(self.trend_min_games));
-        map.insert("trend_source".to_string(), json!(self.trend_source.config_value()));
-        map.insert("engine_limit_mode".to_string(), json!(self.engine_limit_mode));
+        map.insert(
+            "trend_source".to_string(),
+            json!(self.trend_source.config_value()),
+        );
+        map.insert(
+            "engine_limit_mode".to_string(),
+            json!(self.engine_limit_mode),
+        );
         map.insert("engine_depth".to_string(), json!(self.engine_depth));
         map.insert("engine_time_ms".to_string(), json!(self.engine_time_ms));
         map.insert(
@@ -2165,7 +2287,10 @@ processor\t: 1\nphysical id\t: 0\ncore id\t\t: 0\n\n\
 processor\t: 2\nphysical id\t: 0\ncore id\t\t: 4\n\n\
 processor\t: 3\nphysical id\t: 0\ncore id\t\t: 4\n\n\
 processor\t: 4\nphysical id\t: 0\ncore id\t\t: 8\n";
-        assert_eq!(SystemHardware::parse_cpuinfo_physical_cores(cpuinfo), Some(3));
+        assert_eq!(
+            SystemHardware::parse_cpuinfo_physical_cores(cpuinfo),
+            Some(3)
+        );
 
         assert_eq!(
             EngineComputeProfile::detect("/usr/bin/lc0", None),
@@ -2232,19 +2357,24 @@ processor\t: 4\nphysical id\t: 0\ncore id\t\t: 8\n";
             prep_mode: PrepMode::Smart,
             prep_cache_enabled: false,
             prep_cache_ttl_hours: 24,
+            prep_cache_reverse_color: true,
+            prep_reverse_cache_ttl_hours: 96,
             prep_online_accounts: std::collections::HashMap::new(),
         };
         assert_eq!(PreparationPrefs::from_json(&prefs.to_json()), prefs);
         assert!(PreparationPrefs::default().prep_cache_enabled);
-        assert_eq!(PreparationPrefs::default().prep_cache_ttl_hours, 48);
+        assert_eq!(PreparationPrefs::default().prep_cache_ttl_hours, 72);
+        assert!(!PreparationPrefs::default().prep_cache_reverse_color);
+        assert_eq!(PreparationPrefs::default().prep_reverse_cache_ttl_hours, 72);
 
         let parsed = PreparationPrefs::from_json(
-            r#"{"reference_path":" /tmp/ref.pgn ","reference_enabled":true,"rating_band":9999,"rating_offset":-9999,"prep_cache_ttl_hours":999}"#,
+            r#"{"reference_path":" /tmp/ref.pgn ","reference_enabled":true,"rating_band":9999,"rating_offset":-9999,"prep_cache_ttl_hours":999,"prep_reverse_cache_ttl_hours":0}"#,
         );
         assert_eq!(parsed.reference_path, Some(PathBuf::from("/tmp/ref.pgn")));
         assert_eq!(parsed.rating_band, 1_000);
         assert_eq!(parsed.rating_offset, -1_000);
         assert_eq!(parsed.prep_cache_ttl_hours, 168);
+        assert_eq!(parsed.prep_reverse_cache_ttl_hours, 1);
     }
 
     #[test]
@@ -2308,6 +2438,7 @@ processor\t: 4\nphysical id\t: 0\ncore id\t\t: 8\n";
             photo_size: PhotoSize::Medium,
             champion_lineage: ChampionLineage::Classical,
             show_nav_buttons: true,
+            touch_mode: TouchMode::On,
             show_pgn_tags: false,
             show_annotations: false,
             show_clocks: false,
@@ -2347,8 +2478,17 @@ processor\t: 4\nphysical id\t: 0\ncore id\t\t: 8\n";
         assert!(!DisplayPrefs::default().hover_moves);
         assert!(DisplayPrefs::default().show_player_photos);
         assert!(!DisplayPrefs::default().show_nav_buttons);
+        assert_eq!(DisplayPrefs::default().touch_mode, TouchMode::Auto);
+        assert_eq!(
+            DisplayPrefs::from_json(r#"{"touch_mode":"on"}"#).touch_mode,
+            TouchMode::On
+        );
+        assert_eq!(
+            DisplayPrefs::from_json(r#"{"touch_mode":"off"}"#).touch_mode,
+            TouchMode::Off
+        );
         assert!(DisplayPrefs::default().show_pgn_tags);
-        assert!(DisplayPrefs::default().show_annotations);
+        assert!(!DisplayPrefs::default().show_annotations);
         assert!(DisplayPrefs::default().engine_bar);
         assert!(DisplayPrefs::default().review_skip_book);
         assert_eq!(DisplayPrefs::default().review_book_min_games, 3);

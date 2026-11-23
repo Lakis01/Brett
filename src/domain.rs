@@ -255,6 +255,25 @@ impl Shape {
             }
         }
     }
+
+    /// Parse one `%csl`/`%cal` token such as `Ge4` or `Re2e4`.
+    pub fn parse_token(token: &str) -> Option<Self> {
+        let mut chars = token.trim().chars();
+        let color = ShapeColor::from_code(chars.next()?)?;
+        let rest: String = chars.collect();
+        match rest.len() {
+            2 => Some(Self::Square {
+                color,
+                square: rest.parse().ok()?,
+            }),
+            4 => Some(Self::Arrow {
+                color,
+                from: rest[..2].parse().ok()?,
+                to: rest[2..].parse().ok()?,
+            }),
+            _ => None,
+        }
+    }
 }
 
 /// Render shapes as ChessBase- and Lichess-compatible PGN drawing tokens.

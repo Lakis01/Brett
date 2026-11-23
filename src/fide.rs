@@ -274,7 +274,8 @@ mod tests {
 
     #[test]
     fn parses_chessabc_player_json_ratings() {
-        let json = r#"{"id":2016192,"title":"GM","rating":2792,"rapidRating":2718,"blitzRating":2800}"#;
+        let json =
+            r#"{"id":2016192,"title":"GM","rating":2792,"rapidRating":2718,"blitzRating":2800}"#;
         assert_eq!(
             parse_chessabc_player_json(json),
             Some(FideRatings {

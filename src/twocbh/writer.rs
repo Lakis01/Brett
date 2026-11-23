@@ -37,8 +37,8 @@ pub const CORE_EXTENSIONS: [&str; 4] = ["2cbh", "2cbg", "2cba", "2lid"];
 /// ChessBase index files derived from a 2CBH database.
 pub const DERIVED_EXTENSIONS: [&str; 2] = ["2lcd", "2lgd"];
 
-/// Every file that belongs to a 2CBH stem (core files plus derived indexes).
-pub const ALL_EXTENSIONS: [&str; 6] = ["2cbh", "2cbg", "2cba", "2lid", "2lcd", "2lgd"];
+/// Every file that belongs to a 2CBH stem (core files, derived indexes, plus Brett annotations sidecar).
+pub const ALL_EXTENSIONS: [&str; 7] = ["2cbh", "2cbg", "2cba", "2lid", "2lcd", "2lgd", "brettann"];
 
 const CBG_HEADER: u64 = 12;
 const CBG_VERSION: u16 = 0x0500;
@@ -58,6 +58,9 @@ pub struct TwoCbhWriteOptions {
     /// Allow writing games whose comments, NAGs, clocks, or evaluations are
     /// not representable in this container-first pass.
     pub allow_annotation_loss: bool,
+    /// Write a lossless gzip-JSON `<stem>.brettann` sidecar alongside `.2cbh`
+    /// so comments, NAGs, clocks, evaluations, and board shapes round-trip.
+    pub write_brett_annotations_sidecar: bool,
 }
 
 /// Whether `game` carries comments, NAGs, clocks, or evaluations that the
@@ -246,10 +249,8 @@ fn detect_start(game: &Game) -> Result<Start> {
         .to_ascii_lowercase();
     let variant_960 = variant.contains("960") || variant.contains("fischer");
     let variant_from_pos = variant == "from position" || variant == "fromposition";
-    let variant_standard = variant.is_empty()
-        || variant == "standard"
-        || variant == "chess"
-        || variant_from_pos;
+    let variant_standard =
+        variant.is_empty() || variant == "standard" || variant == "chess" || variant_from_pos;
     if !variant_960 && !variant_standard {
         bail!("2CBH export does not support variant {variant:?}");
     }
@@ -775,6 +776,7 @@ struct TwoCbhWriter {
     cba_offset: u64,
     games: u32,
     options: TwoCbhWriteOptions,
+    brett_annotations: super::BrettAnnotationMap,
     guard: TempGuard,
 }
 
@@ -846,6 +848,7 @@ impl TwoCbhWriter {
             cba_offset: CBG_HEADER,
             games: 0,
             options,
+            brett_annotations: HashMap::new(),
             guard,
         })
     }
@@ -885,6 +888,7 @@ impl TwoCbhWriter {
     fn add_game(&mut self, game: &Game) -> Result<()> {
         let index = self.games;
         if !self.options.allow_annotation_loss
+            && !self.options.write_brett_annotations_sidecar
             && let Some((feature, node)) = first_unsupported_annotation(game)
         {
             bail!(
@@ -963,6 +967,12 @@ impl TwoCbhWriter {
             .as_mut()
             .context("2CBH temporary file is already closed")?
             .write_all(&record)?;
+        if self.options.write_brett_annotations_sidecar {
+            let anns = super::collect_brett_annotations(game);
+            if !anns.is_empty() {
+                self.brett_annotations.insert(index + 1, anns);
+            }
+        }
         self.games = self
             .games
             .checked_add(1)
@@ -1082,12 +1092,29 @@ impl TwoCbhWriter {
 
         // Install `.2cbh` last so readers never observe a new header before
         // its companion files are in place.
-        let staged = [
-            (&self.cbg_tmp, core_path(&self.stem, ".2cbg")),
-            (&self.cba_tmp, core_path(&self.stem, ".2cba")),
-            (&self.lid_tmp, core_path(&self.stem, ".2lid")),
-            (&self.cbh_tmp, core_path(&self.stem, ".2cbh")),
+        let mut staged_owned = vec![
+            (self.cbg_tmp.clone(), core_path(&self.stem, ".2cbg")),
+            (self.cba_tmp.clone(), core_path(&self.stem, ".2cba")),
+            (self.lid_tmp.clone(), core_path(&self.stem, ".2lid")),
+            (self.cbh_tmp.clone(), core_path(&self.stem, ".2cbh")),
         ];
+        if self.options.write_brett_annotations_sidecar && !self.brett_annotations.is_empty() {
+            let ann_tmp = temp_path(&core_path(&self.stem, ".brettann"), &self.unique);
+            self.guard.paths.push(ann_tmp.clone());
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+            let raw = super::serialize_brett_annotations(&self.brett_annotations);
+            encoder.write_all(&raw)?;
+            let compressed = encoder.finish()?;
+            fs::write(&ann_tmp, &compressed).with_context(|| {
+                format!("writing temporary annotation sidecar {}", ann_tmp.display())
+            })?;
+            staged_owned.insert(3, (ann_tmp, core_path(&self.stem, ".brettann")));
+        }
+        let staged: Vec<(&PathBuf, PathBuf)> = staged_owned
+            .iter()
+            .map(|(tmp, dst)| (tmp, dst.clone()))
+            .collect();
 
         let mut total_bytes = 0u64;
         for (tmp, _) in &staged {
@@ -1241,7 +1268,12 @@ pub fn merge_updates_into_2cbh(
     let target_cbg_path = core_path(&stem, ".2cbg");
     let target_cba_path = core_path(&stem, ".2cba");
     let target_lid_path = core_path(&stem, ".2lid");
-    for path in [&target_cbh_path, &target_cbg_path, &target_cba_path, &target_lid_path] {
+    for path in [
+        &target_cbh_path,
+        &target_cbg_path,
+        &target_cba_path,
+        &target_lid_path,
+    ] {
         if !path.is_file() {
             bail!("missing target 2CBH companion file {}", path.display());
         }
@@ -1257,13 +1289,22 @@ pub fn merge_updates_into_2cbh(
         let cbg_map = map_readonly(&target_cbg_path, "target 2CBG")?;
         let cba_map = map_readonly(&target_cba_path, "target 2CBA")?;
         if cbh_map.len() < RECORD_SIZE {
-            bail!("{} is shorter than one 2CBH header record", target_cbh_path.display());
+            bail!(
+                "{} is shorter than one 2CBH header record",
+                target_cbh_path.display()
+            );
         }
         if cbg_map.len() < CBG_HEADER as usize {
-            bail!("{} is shorter than a 2CBG header", target_cbg_path.display());
+            bail!(
+                "{} is shorter than a 2CBG header",
+                target_cbg_path.display()
+            );
         }
         if cba_map.len() < CBG_HEADER as usize {
-            bail!("{} is shorter than a 2CBA header", target_cba_path.display());
+            bail!(
+                "{} is shorter than a 2CBA header",
+                target_cba_path.display()
+            );
         }
 
         let file_slots = cbh_map.len() / RECORD_SIZE;
@@ -1273,8 +1314,12 @@ pub fn merge_updates_into_2cbh(
         } else {
             file_slots
         };
-        let cbg_end = le_u64(&cbg_map[0..8]).max(CBG_HEADER).min(cbg_map.len() as u64);
-        let cba_end = le_u64(&cba_map[0..8]).max(CBG_HEADER).min(cba_map.len() as u64);
+        let cbg_end = le_u64(&cbg_map[0..8])
+            .max(CBG_HEADER)
+            .min(cbg_map.len() as u64);
+        let cba_end = le_u64(&cba_map[0..8])
+            .max(CBG_HEADER)
+            .min(cba_map.len() as u64);
 
         let mut seen = HashSet::with_capacity(cbh_slots);
         for slot in 1..cbh_slots {
@@ -1396,9 +1441,8 @@ pub fn merge_updates_into_2cbh(
         let lgd = sibling(&stem, ".2lgd");
         let reopened = super::TwoCbhFile::open(&target_cbh_path)
             .with_context(|| format!("reopening {} to build .2lgd", target_cbh_path.display()))?;
-        super::accelerator::TwoCbhAccelerator::build_to(&reopened, &lgd).with_context(|| {
-            format!("rebuilding .2lgd accelerator at {}", lgd.display())
-        })?;
+        super::accelerator::TwoCbhAccelerator::build_to(&reopened, &lgd)
+            .with_context(|| format!("rebuilding .2lgd accelerator at {}", lgd.display()))?;
     }
 
     let bytes = (cbh_slots.saturating_sub(initial_slots) as u64) * RECORD_SIZE as u64
@@ -1594,7 +1638,8 @@ impl TargetLidState {
         if !self.needs_initial_pad {
             return Ok(());
         }
-        let target_len = (self.layout.first_offset + self.allocated_blocks * self.layout.stride) as u64;
+        let target_len =
+            (self.layout.first_offset + self.allocated_blocks * self.layout.stride) as u64;
         file.set_len(target_len)?;
         self.needs_initial_pad = false;
         Ok(())
@@ -1654,7 +1699,9 @@ impl TargetLidState {
         fide: Option<u32>,
         raw_block: &[u8],
     ) -> Result<u32> {
-        if last.is_empty() && first.is_empty() && fide.is_none()
+        if last.is_empty()
+            && first.is_empty()
+            && fide.is_none()
             && let Some(empty_id) = self.empty_player_id
         {
             return Ok(empty_id);
@@ -1694,7 +1741,9 @@ impl TargetLidState {
         }
 
         let new_id = self.next_id[0];
-        self.next_id[0] = new_id.checked_add(1).context("2LID player table overflow")?;
+        self.next_id[0] = new_id
+            .checked_add(1)
+            .context("2LID player table overflow")?;
         if key.0.is_empty() && key.1.is_empty() && self.empty_player_id.is_none() {
             self.empty_player_id = Some(new_id);
         }
@@ -1746,7 +1795,9 @@ impl TargetLidState {
             return Ok(id);
         }
         let new_id = self.next_id[2];
-        self.next_id[2] = new_id.checked_add(1).context("2LID source table overflow")?;
+        self.next_id[2] = new_id
+            .checked_add(1)
+            .context("2LID source table overflow")?;
         let owned;
         let bytes = if let Some(raw) = raw_block {
             raw
@@ -1772,9 +1823,7 @@ impl TargetLidState {
             return Ok(id);
         }
         let new_id = self.next_id[LID_TEAM_SEC];
-        self.next_id[LID_TEAM_SEC] = new_id
-            .checked_add(1)
-            .context("2LID team table overflow")?;
+        self.next_id[LID_TEAM_SEC] = new_id.checked_add(1).context("2LID team table overflow")?;
         self.write_section_block(file, new_id, LID_TEAM_SEC, raw_block)?;
         self.team_by_key.insert(name_key, new_id);
         Ok(new_id)
@@ -1957,13 +2006,9 @@ fn merge_2cbh_source(src_cbh: &Path, sink: &mut MergeSink<'_>) -> Result<()> {
         if let Some(raw) = src_layout.raw_slice(&lid, id_u32, 0)
             && let Some((last, first, fide, _fide_off)) = parse_player_raw(raw)
         {
-            let target_id = sink.lid_state.map_or_insert_player(
-                sink.lid_file,
-                last,
-                first,
-                fide,
-                raw,
-            )?;
+            let target_id =
+                sink.lid_state
+                    .map_or_insert_player(sink.lid_file, last, first, fide, raw)?;
             *slot = target_id;
         }
     }
@@ -1982,12 +2027,9 @@ fn merge_2cbh_source(src_cbh: &Path, sink: &mut MergeSink<'_>) -> Result<()> {
         if let Some(raw) = src_layout.raw_slice(&lid, id_u32, 2)
             && let Some((title, pub_name)) = parse_two_string_key(raw)
         {
-            *slot = sink.lid_state.map_or_insert_source(
-                sink.lid_file,
-                title,
-                pub_name,
-                Some(raw),
-            )?;
+            *slot =
+                sink.lid_state
+                    .map_or_insert_source(sink.lid_file, title, pub_name, Some(raw))?;
         }
     }
     if src_layout.sizes[LID_TEAM_SEC] >= 8 {
@@ -1996,9 +2038,7 @@ fn merge_2cbh_source(src_cbh: &Path, sink: &mut MergeSink<'_>) -> Result<()> {
             if let Some(raw) = src_layout.raw_slice(&lid, id_u32, LID_TEAM_SEC)
                 && let Some(key) = parse_one_string_key(raw)
             {
-                *slot = sink
-                    .lid_state
-                    .map_or_insert_team(sink.lid_file, key, raw)?;
+                *slot = sink.lid_state.map_or_insert_team(sink.lid_file, key, raw)?;
             }
         }
     }
@@ -2141,7 +2181,8 @@ fn merge_cbv_source(archive: &Path, sink: &mut MergeSink<'_>) -> Result<()> {
         };
         let content = TwoCbhWriter::build_cbg_content(start_id, custom_start.as_deref(), &tokens);
 
-        let (w_last, w_first, w_fide) = player_key(game.header("White"), game.header("WhiteFideId"));
+        let (w_last, w_first, w_fide) =
+            player_key(game.header("White"), game.header("WhiteFideId"));
         let w_raw = player_record(&(w_last.clone(), w_first.clone(), w_fide))?;
         let white_id = sink.lid_state.map_or_insert_player(
             sink.lid_file,
@@ -2151,7 +2192,8 @@ fn merge_cbv_source(archive: &Path, sink: &mut MergeSink<'_>) -> Result<()> {
             &w_raw,
         )?;
 
-        let (b_last, b_first, b_fide) = player_key(game.header("Black"), game.header("BlackFideId"));
+        let (b_last, b_first, b_fide) =
+            player_key(game.header("Black"), game.header("BlackFideId"));
         let b_raw = player_record(&(b_last.clone(), b_first.clone(), b_fide))?;
         let black_id = sink.lid_state.map_or_insert_player(
             sink.lid_file,

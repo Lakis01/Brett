@@ -134,7 +134,10 @@ impl TwoCbhAccelerator {
                         .is_some_and(|io_err| io_err.kind() == std::io::ErrorKind::NotFound)
                 });
                 if not_found {
-                    tracing::debug!("2LGD sidecar not present at {}; falling back to read", path.display());
+                    tracing::debug!(
+                        "2LGD sidecar not present at {}; falling back to read",
+                        path.display()
+                    );
                 } else {
                     tracing::warn!(
                         "2LGD mmap failed for {} ({err:#}); falling back to read",
@@ -380,7 +383,10 @@ impl TwoCbhAccelerator {
             let event_id = valid_entity(record, OFF_EVENT);
             let annot_id = valid_entity(record, OFF_ANNOTATOR);
             let source_id = valid_entity(record, OFF_SOURCE);
-            for entity in [white, black, event_id, annot_id, source_id].into_iter().flatten() {
+            for entity in [white, black, event_id, annot_id, source_id]
+                .into_iter()
+                .flatten()
+            {
                 max_entity = max_entity.max(entity);
             }
             if let Some(w) = white {
@@ -647,6 +653,7 @@ mod tests {
             &path,
             crate::twocbh::writer::TwoCbhWriteOptions {
                 allow_annotation_loss: true,
+                ..Default::default()
             },
             games,
         )
@@ -742,6 +749,7 @@ mod tests {
             &path,
             crate::twocbh::writer::TwoCbhWriteOptions {
                 allow_annotation_loss: true,
+                ..Default::default()
             },
             games,
         )
@@ -768,6 +776,7 @@ mod tests {
             &path,
             crate::twocbh::writer::TwoCbhWriteOptions {
                 allow_annotation_loss: true,
+                ..Default::default()
             },
             games,
         )
@@ -781,7 +790,8 @@ mod tests {
                 .write(true)
                 .open(&path)
                 .unwrap();
-            file.seek(SeekFrom::Start(192 + OFF_ANNOTATOR as u64)).unwrap();
+            file.seek(SeekFrom::Start(192 + OFF_ANNOTATOR as u64))
+                .unwrap();
             file.write_all(&0x8a27_2176u32.to_le_bytes()).unwrap();
             file.write_all(&0x0007_f181u32.to_le_bytes()).unwrap();
         }

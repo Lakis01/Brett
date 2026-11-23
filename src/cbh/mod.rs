@@ -34,9 +34,7 @@ use anyhow::{Context, Result, bail};
 use memmap2::Mmap;
 
 use crate::domain::Game;
-use crate::library::{
-    GameLibrary, GameRecordMeta, IndexedGame, SharedStr, SourceMeta, StringPool,
-};
+use crate::library::{GameLibrary, GameRecordMeta, IndexedGame, SharedStr, SourceMeta, StringPool};
 
 /// Above this size the per-game lowercase search cache costs more memory than
 /// it saves. Searches then inspect the interned headers on demand.
@@ -324,8 +322,9 @@ impl CbhLibrary {
             let off = usize::try_from(moves_offset).context("CBG offset overflow")?;
             if off >= MIN_CBG_HEADER as usize && off + 4 <= mmap.len() {
                 let head = &mmap[off..off + 4];
-                let size =
-                    (usize::from(head[1]) << 16) | (usize::from(head[2]) << 8) | usize::from(head[3]);
+                let size = (usize::from(head[1]) << 16)
+                    | (usize::from(head[2]) << 8)
+                    | usize::from(head[3]);
                 if size >= 4 && size <= MAX_MOVE_RECORD && off + size <= mmap.len() {
                     return f(head[0], &mmap[off + 4..off + size]);
                 }

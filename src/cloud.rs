@@ -1147,10 +1147,19 @@ mod tests {
     #[test]
     fn retry_after_parser_handles_missing_and_clamped_seconds() {
         assert_eq!(parse_retry_after_seconds(None), Duration::from_secs(60));
-        assert_eq!(parse_retry_after_seconds(Some("abc")), Duration::from_secs(60));
+        assert_eq!(
+            parse_retry_after_seconds(Some("abc")),
+            Duration::from_secs(60)
+        );
         assert_eq!(parse_retry_after_seconds(Some("2")), Duration::from_secs(5));
-        assert_eq!(parse_retry_after_seconds(Some("45")), Duration::from_secs(45));
-        assert_eq!(parse_retry_after_seconds(Some("999")), Duration::from_secs(300));
+        assert_eq!(
+            parse_retry_after_seconds(Some("45")),
+            Duration::from_secs(45)
+        );
+        assert_eq!(
+            parse_retry_after_seconds(Some("999")),
+            Duration::from_secs(300)
+        );
     }
 
     #[test]
@@ -1166,7 +1175,11 @@ mod tests {
         );
 
         // Shorter note does not shrink an active longer cooldown.
-        note_cooldown_until(&mut slot, base + Duration::from_secs(10), Duration::from_secs(5));
+        note_cooldown_until(
+            &mut slot,
+            base + Duration::from_secs(10),
+            Duration::from_secs(5),
+        );
         assert_eq!(
             cooldown_remaining_from(&mut slot, base + Duration::from_secs(10)),
             Some(Duration::from_secs(20))

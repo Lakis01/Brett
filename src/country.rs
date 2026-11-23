@@ -372,6 +372,33 @@ static WIKIDATA_QIDS: &[(&str, &str)] = &[
     ("Q79", "EGY"),
     ("Q49", "KEN"),
     ("Q103", "NGR"),
+    ("Q33946", "TCH"),
+    ("Q36704", "YUG"),
+    ("Q1290149", "YUG"),
+    ("Q191077", "YUG"),
+    ("Q15102440", "YUG"),
+    ("Q83286", "YUG"),
+    ("Q16957", "GDR"),
+    ("Q713750", "FRG"),
+    ("Q37024", "SCG"),
+    ("Q2184", "URS"),
+    ("Q2305208", "URS"),
+    ("Q131964", "AUE"),
+    ("Q28513", "AUH"),
+    ("Q533534", "AUH"),
+    ("Q45341", "BOH"),
+    ("Q39599", "BOH"),
+    ("Q43287", "DEI"),
+    ("Q1206012", "DEI"),
+    ("Q41304", "GER"),
+    ("Q27306", "PRU"),
+    ("Q38872", "PRU"),
+    ("Q34266", "RUE"),
+    ("Q21", "ENG"),
+    ("Q22", "SCO"),
+    ("Q25", "WLS"),
+    ("Q174193", "GBR"),
+    ("Q756617", "DEN"),
 ];
 
 static COUNTRIES: &[Country] = &[
@@ -575,6 +602,12 @@ static COUNTRIES: &[Country] = &[
     Country::new("FRG", "DE", "West Germany", "🇩🇪", "🇩🇪 FRG"),
     Country::new("TCH", "CS", "Czechoslovakia", "🇨🇸", "🇨🇸 TCH"),
     Country::new("SCG", "CS", "Serbia and Montenegro", "🇷🇸", "🇷🇸 SCG"),
+    Country::new("AUE", "AT", "Austrian Empire", "🇦🇹", "🇦🇹 AUE"),
+    Country::new("AUH", "AT", "Austria-Hungary", "🇦🇹", "🇦🇹 AUH"),
+    Country::new("BOH", "CZ", "Bohemia", "🇨🇿", "🇨🇿 BOH"),
+    Country::new("DEI", "DE", "German Empire", "🇩🇪", "🇩🇪 DEI"),
+    Country::new("PRU", "DE", "Prussia", "🇩🇪", "🇩🇪 PRU"),
+    Country::new("RUE", "RU", "Russian Empire", "🇷🇺", "🇷🇺 RUE"),
     Country::new("FID", "UN", "FIDE", "🌐", "🌐 FID"),
 ];
 
@@ -637,6 +670,22 @@ static ALIASES: &[(&str, &str)] = &[
     ("Norge", "NOR"),
     ("Sverige", "SWE"),
     ("Polska", "POL"),
+    ("Austrian Empire", "AUE"),
+    ("Austria-Hungary", "AUH"),
+    ("Austria–Hungary", "AUH"),
+    ("Austro-Hungarian Empire", "AUH"),
+    ("Cisleithania", "AUH"),
+    ("Kingdom of Bohemia", "BOH"),
+    ("Bohemia", "BOH"),
+    ("German Empire", "DEI"),
+    ("Kingdom of Prussia", "PRU"),
+    ("Prussia", "PRU"),
+    ("Russian Empire", "RUE"),
+    ("Czechoslovakia", "TCH"),
+    ("East Germany", "GDR"),
+    ("West Germany", "FRG"),
+    ("Serbia and Montenegro", "SCG"),
+    ("Yugoslavia", "YUG"),
 ];
 
 #[cfg(test)]
@@ -921,10 +970,7 @@ mod tests {
             from_event_tag(Some("FRA-chU20")).map(|c| c.code),
             Some("FRA")
         );
-        assert_eq!(
-            from_event_tag(Some("ESP-Cup")).map(|c| c.code),
-            Some("ESP")
-        );
+        assert_eq!(from_event_tag(Some("ESP-Cup")).map(|c| c.code), Some("ESP"));
     }
 
     #[test]

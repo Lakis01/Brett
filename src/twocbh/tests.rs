@@ -968,10 +968,7 @@ fn game_record_meta_medals_vcs_and_scan_mainline_positions_match_load() {
     let mut streamed = Vec::new();
     let ok = library
         .scan_mainline_positions(0, 200, &mut |ply, p| {
-            streamed.push((
-                ply,
-                Fen::from_position(p, EnPassantMode::Legal).to_string(),
-            ));
+            streamed.push((ply, Fen::from_position(p, EnPassantMode::Legal).to_string()));
             true
         })
         .unwrap();

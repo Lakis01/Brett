@@ -160,8 +160,8 @@ pub fn score_candidate(
     member: &TeamMemberInfo,
     games: &[Game],
 ) -> CandidateMatch {
-    let cand_key = player_key(&member.username)
-        .unwrap_or_else(|| member.username.trim().to_ascii_lowercase());
+    let cand_key =
+        player_key(&member.username).unwrap_or_else(|| member.username.trim().to_ascii_lowercase());
 
     let mut white_weight = 0.0f64;
     let mut white_total = 0.0f64;
@@ -283,7 +283,12 @@ pub fn score_candidate(
     }
 }
 
-fn format_line_snippet(game: &Game, target_node: usize, before: &Chess, mv: crate::chess::Move) -> String {
+fn format_line_snippet(
+    game: &Game,
+    target_node: usize,
+    before: &Chess,
+    mv: crate::chess::Move,
+) -> String {
     let mut seq = Vec::new();
     let mut cur = target_node;
     while seq.len() < 4 {

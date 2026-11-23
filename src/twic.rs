@@ -159,7 +159,8 @@ pub fn extract_pgn_from_zip(bytes: &[u8]) -> Result<Vec<u8>> {
             }
         }
     }
-    let eocd = eocd_pos.ok_or_else(|| anyhow!("Not a valid ZIP archive (EOCD record not found)"))?;
+    let eocd =
+        eocd_pos.ok_or_else(|| anyhow!("Not a valid ZIP archive (EOCD record not found)"))?;
     let total_entries = u16_le(bytes, eocd + 10) as usize;
     let cd_size = u32_le(bytes, eocd + 12) as usize;
     let cd_offset = u32_le(bytes, eocd + 16) as usize;
@@ -372,7 +373,8 @@ fn month_number(token: &str) -> Option<u32> {
 pub fn parse_date_hint(text: &str) -> Option<(String, u32)> {
     let cleaned = strip_html_tags(text);
     for token in cleaned.split_whitespace() {
-        let tok = token.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '/' && c != '.');
+        let tok = token
+            .trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '/' && c != '.');
         // YYYY-MM-DD or YYYY.MM.DD
         let parts_dash: Vec<&str> = tok.split('-').collect();
         if parts_dash.len() == 3
@@ -465,7 +467,9 @@ pub fn parse_twic_index_html(html: &str) -> Vec<TwicIssue> {
             continue;
         }
         // Look inside surrounding <tr>...</tr> if present for release date.
-        let tr_start = lower[..pos].rfind("<tr").unwrap_or_else(|| pos.saturating_sub(240));
+        let tr_start = lower[..pos]
+            .rfind("<tr")
+            .unwrap_or_else(|| pos.saturating_sub(240));
         let tr_end = lower[pos..]
             .find("</tr>")
             .map(|r| pos + r + 5)
@@ -627,7 +631,8 @@ where
         } else {
             raw
         };
-        let mut parsed = parse_pgn(&pgn_bytes).with_context(|| format!("parsing PGN from {url}"))?;
+        let mut parsed =
+            parse_pgn(&pgn_bytes).with_context(|| format!("parsing PGN from {url}"))?;
         all_games.append(&mut parsed);
     }
     on_progress(total, total, "Done");
@@ -794,7 +799,10 @@ mod tests {
         assert_eq!(items.len(), 3);
         assert_eq!(items[0].year, 2024);
         assert_eq!(items[0].title, "Tata Steel Masters & Challengers");
-        assert_eq!(filter_tournaments(&items, Some(2024), "candidates").len(), 1);
+        assert_eq!(
+            filter_tournaments(&items, Some(2024), "candidates").len(),
+            1
+        );
         assert_eq!(filter_tournaments(&items, None, "wijk").len(), 1);
     }
 }

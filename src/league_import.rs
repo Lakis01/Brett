@@ -437,10 +437,7 @@ pub fn resolve_generic_url(base_url: &str, href: &str) -> Option<String> {
     if href.starts_with('/') {
         return Some(format!("{scheme}://{authority}{href}"));
     }
-    let base_path = base_tail
-        .split(['?', '#'])
-        .next()
-        .unwrap_or("");
+    let base_path = base_tail.split(['?', '#']).next().unwrap_or("");
     let base_dir = match base_path.rfind('/') {
         Some(idx) => &base_path[..=idx],
         None => "/",
@@ -449,10 +446,7 @@ pub fn resolve_generic_url(base_url: &str, href: &str) -> Option<String> {
         Some(idx) => (&href[..idx], &href[idx..]),
         None => (href, ""),
     };
-    let mut stack: Vec<&str> = base_dir
-        .split('/')
-        .filter(|s| !s.is_empty())
-        .collect();
+    let mut stack: Vec<&str> = base_dir.split('/').filter(|s| !s.is_empty()).collect();
     for seg in href_path.split('/') {
         match seg {
             "" | "." => {}
@@ -1044,7 +1038,9 @@ pub fn parse_ligamanager_downloads(html: &str) -> LigaManagerDownloads {
             continue;
         }
         // Extract label and game count hint from surrounding `<li>...</li>`.
-        let li_start = lower[..pos].rfind("<li").unwrap_or_else(|| pos.saturating_sub(300));
+        let li_start = lower[..pos]
+            .rfind("<li")
+            .unwrap_or_else(|| pos.saturating_sub(300));
         let li_text = strip_tags(&html[li_start..pos]);
         let mut label = clean
             .rsplit('/')
@@ -1083,9 +1079,10 @@ pub fn parse_ligamanager_downloads(html: &str) -> LigaManagerDownloads {
 fn extract_select_options(html: &str, select_id: &str) -> Vec<(String, String)> {
     let lower = html.to_ascii_lowercase();
     let marker = format!("id=\"{select_id}\"");
-    let Some(id_at) = lower.find(&marker).or_else(|| {
-        lower.find(&format!("name=\"{select_id}\""))
-    }) else {
+    let Some(id_at) = lower
+        .find(&marker)
+        .or_else(|| lower.find(&format!("name=\"{select_id}\"")))
+    else {
         return Vec::new();
     };
     let select_start = lower[..id_at].rfind("<select").unwrap_or(id_at);
@@ -1282,7 +1279,9 @@ pub fn resolve_league_url(input: &str) -> Result<ResolvedLeagueUrl> {
         None => (after_scheme, "/"),
     };
     let host = host_raw.to_ascii_lowercase();
-    let (path_only, query) = path_and_query.split_once('?').unwrap_or((path_and_query, ""));
+    let (path_only, query) = path_and_query
+        .split_once('?')
+        .unwrap_or((path_and_query, ""));
 
     let portal = if host.ends_with("ligamanager.schachbund-bayern.de") {
         Some(LeaguePortal::LigaManagerBayern)
@@ -1445,7 +1444,10 @@ pub fn parse_league_pgn_bytes(raw: &[u8], filter_expr: &str) -> Result<Vec<Game>
     Ok(filter_league_games(games, filter_expr))
 }
 
-pub fn download_and_parse_league_pgn(pgn_url: &str, filter_expr: &str) -> Result<(usize, Vec<Game>)> {
+pub fn download_and_parse_league_pgn(
+    pgn_url: &str,
+    filter_expr: &str,
+) -> Result<(usize, Vec<Game>)> {
     let raw = fetch_bytes(pgn_url)?;
     let utf8 = decode_pgn_bytes_utf8(&raw);
     let all_games = parse_pgn(&utf8)?;
@@ -1533,7 +1535,9 @@ mod tests {
         assert_eq!(dl.season, "2025-2026");
         assert_eq!(
             dl.all_pgn_url.as_deref(),
-            Some("https://ligamanager.schachbund-bayern.de/bsb/2025-2026/oberliga-2486/partien/download/alle.pgn")
+            Some(
+                "https://ligamanager.schachbund-bayern.de/bsb/2025-2026/oberliga-2486/partien/download/alle.pgn"
+            )
         );
         assert_eq!(dl.rounds.len(), 2);
         assert_eq!(dl.rounds[0].label, "Runde 1");
@@ -1576,7 +1580,10 @@ mod tests {
             }
         );
         assert_eq!(
-            resolve_league_url("https://ergebnisdienst.schachbund.de/saison2025-26/bedh.php?liga=olby").unwrap(),
+            resolve_league_url(
+                "https://ergebnisdienst.schachbund.de/saison2025-26/bedh.php?liga=olby"
+            )
+            .unwrap(),
             ResolvedLeagueUrl::DsbLeague {
                 season_prefix: "saison2025-26/".to_string(),
                 league_code: "olby".to_string()
@@ -1684,13 +1691,19 @@ mod provider_portal_tests {
     #[test]
     fn resolves_urls_and_discovers_html_pgn_links() {
         assert_eq!(
-            resolve_generic_url("https://www.schachbund-nrw.de/liga/index.html", "pgn/r1.pgn")
-                .as_deref(),
+            resolve_generic_url(
+                "https://www.schachbund-nrw.de/liga/index.html",
+                "pgn/r1.pgn"
+            )
+            .as_deref(),
             Some("https://www.schachbund-nrw.de/liga/pgn/r1.pgn")
         );
         assert_eq!(
-            resolve_generic_url("https://www.chess.at/turniere/open/", "../files/open.pgn?v=2")
-                .as_deref(),
+            resolve_generic_url(
+                "https://www.chess.at/turniere/open/",
+                "../files/open.pgn?v=2"
+            )
+            .as_deref(),
             Some("https://www.chess.at/turniere/files/open.pgn?v=2")
         );
         assert_eq!(resolve_generic_url("https://example.org/", "#top"), None);

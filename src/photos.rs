@@ -360,9 +360,80 @@ pub fn custom_path(name: &str) -> Option<PathBuf> {
     Some(custom_dir()?.join(format!("{key}.webp")))
 }
 
+fn find_custom_in_dir(dir: &Path, name: &str, aliases: &[String]) -> Option<PathBuf> {
+    if let Some(key) = player_key(name) {
+        let exact = dir.join(format!("{key}.webp"));
+        if exact.exists() {
+            return Some(exact);
+        }
+    }
+    for alias in aliases {
+        if let Some(key) = player_key(alias) {
+            let candidate = dir.join(format!("{key}.webp"));
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+    }
+    let entries = std::fs::read_dir(dir).ok()?;
+    let mut matched_path: Option<PathBuf> = None;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("webp") {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let matches = entry_matches_name(stem, name)
+            || aliases.iter().any(|alias| entry_matches_name(stem, alias));
+        if matches {
+            if matched_path.is_some() {
+                return None;
+            }
+            matched_path = Some(path);
+        }
+    }
+    matched_path
+}
+
+/// Whether a custom portrait file exists for `name` or any of its aliases.
+pub fn has_custom_with_aliases(name: &str, aliases: &[String]) -> bool {
+    let Some(dir) = custom_dir() else {
+        return false;
+    };
+    find_custom_in_dir(&dir, name, aliases).is_some()
+}
+
+/// Read a player's custom portrait bytes when one has been chosen, checking
+/// `aliases` and abbreviated stems when no exact key file exists.
+pub fn custom_bytes_with_aliases(name: &str, aliases: &[String]) -> Option<Vec<u8>> {
+    let dir = custom_dir()?;
+    std::fs::read(find_custom_in_dir(&dir, name, aliases)?).ok()
+}
+
 /// Read a player's custom portrait bytes when one has been chosen.
 pub fn custom_bytes(name: &str) -> Option<Vec<u8>> {
-    std::fs::read(custom_path(name)?).ok()
+    custom_bytes_with_aliases(name, &[])
+}
+
+/// Remove a player's user portrait (plus any alias files when provided). Returns
+/// whether a file was removed.
+pub fn remove_custom_with_aliases(name: &str, aliases: &[String]) -> Result<bool> {
+    let mut removed = false;
+    if let Some(path) = custom_path(name)
+        && remove_custom_path(&path)?
+    {
+        removed = true;
+    }
+    for alias in aliases {
+        if let Some(path) = custom_path(alias)
+            && remove_custom_path(&path)?
+        {
+            removed = true;
+        }
+    }
+    Ok(removed)
 }
 
 /// Remove a player's user portrait. Returns whether a file was removed.
@@ -531,10 +602,16 @@ mod tests {
         assert_eq!(library.full_name("Hinterreiter, Markus"), None);
         // Unique initial match works, while ambiguous initial match returns None.
         assert_eq!(library.bytes("Svane, F"), Some(&b"frederik"[..]));
-        assert_eq!(library.full_name("Svane, F").as_deref(), Some("Frederik Svane"));
+        assert_eq!(
+            library.full_name("Svane, F").as_deref(),
+            Some("Frederik Svane")
+        );
         assert_eq!(library.bytes("Svane, R"), None);
         assert_eq!(library.full_name("Svane, R"), None);
-        assert_eq!(library.full_name("Hinterreiter, M").as_deref(), Some("Martin Hinterreiter"));
+        assert_eq!(
+            library.full_name("Hinterreiter, M").as_deref(),
+            Some("Martin Hinterreiter")
+        );
         let _ = std::fs::remove_file(path);
     }
 
@@ -665,5 +742,34 @@ mod tests {
         std::fs::write(&path, bytes).unwrap();
         assert!(PhotoLibrary::open(&path).is_err());
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn custom_portrait_lookup_matches_aliases_and_initial_stems() {
+        let dir = std::env::temp_dir().join(format!(
+            "brett-custom-aliases-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("hinterreiter markus.webp");
+        std::fs::write(&file, b"webp-data").unwrap();
+
+        let aliases = vec![
+            "Markus Hinterreiter".to_string(),
+            "GermanoMosconi32".to_string(),
+        ];
+        assert_eq!(
+            find_custom_in_dir(&dir, "GermanoMosconi32", &aliases),
+            Some(file.clone())
+        );
+        assert_eq!(
+            find_custom_in_dir(&dir, "Hinterreiter, M", &[]),
+            Some(file)
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

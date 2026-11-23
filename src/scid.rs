@@ -375,11 +375,7 @@ impl GameLibrary for ScidLibrary {
             0
         } else {
             let basic = (u32::from(entry.eco) - 1) / 131;
-            if basic <= 499 {
-                (basic + 1) as u16
-            } else {
-                0
-            }
+            if basic <= 499 { (basic + 1) as u16 } else { 0 }
         };
         let mut medals = 0u16;
         if entry.flags & (1 << 7) != 0 {
@@ -580,10 +576,7 @@ impl GameLibrary for ScidLibrary {
                     let decoded = decode_move(&cur_pos, &cur_lists, val, bytes, &mut cursor)?;
                     let (next_pos, next_lists) = match decoded.special {
                         Special::Null => {
-                            let next = cur_pos
-                                .clone()
-                                .swap_turn()
-                                .context("illegal null move")?;
+                            let next = cur_pos.clone().swap_turn().context("illegal null move")?;
                             (next, cur_lists.clone())
                         }
                         Special::Castle(kingside) => {
@@ -1830,10 +1823,7 @@ mod tests {
         let mut streamed = Vec::new();
         let ok = library
             .scan_mainline_positions(0, 200, &mut |ply, p| {
-                streamed.push((
-                    ply,
-                    Fen::from_position(p, EnPassantMode::Legal).to_string(),
-                ));
+                streamed.push((ply, Fen::from_position(p, EnPassantMode::Legal).to_string()));
                 true
             })
             .unwrap();

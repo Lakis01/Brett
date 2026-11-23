@@ -460,6 +460,7 @@ fn annotation_loss_is_blocked_by_default() {
         &path,
         TwoCbhWriteOptions {
             allow_annotation_loss: true,
+            ..Default::default()
         },
         vec![Ok(game)],
     )
@@ -482,6 +483,34 @@ fn every_annotation_kind_is_guarded() {
         let err = write_database(&path, vec![Ok(game)]).unwrap_err();
         assert!(format!("{err:#}").contains(feature), "{pgn}");
     }
+}
+
+#[test]
+fn brettann_sidecar_round_trips_annotations_and_variations() {
+    let dir = TempDir::new();
+    let path = dir.path().join("lossless.2cbh");
+    let game = parse_one(
+        "[White \"Analyst\"]\n[Black \"Opponent\"]\n\n1. e4! {[%clk 0:03:00][%eval 0.25][%cal Ge2e4][%csl Gd4] Best by test} e5 (1... c5! {Sicilian alt [%eval 0.35]} 2. Nf3) 2. Nf3 *",
+    );
+    let report = write_database_with_options(
+        &path,
+        TwoCbhWriteOptions {
+            allow_annotation_loss: false,
+            write_brett_annotations_sidecar: true,
+        },
+        vec![Ok(game.clone())],
+    )
+    .unwrap();
+    assert_eq!(report.games, 1);
+    assert!(path.with_extension("brettann").exists());
+
+    let got = TwoCbhLibrary::open(&path).unwrap().load(0).unwrap();
+    assert_eq!(got.nodes[1].comment, "Best by test");
+    assert_eq!(got.nodes[1].nags, game.nodes[1].nags);
+    assert_eq!(got.nodes[1].clock, game.nodes[1].clock);
+    assert_eq!(got.nodes[1].eval, game.nodes[1].eval);
+    assert_eq!(got.nodes[1].shapes, game.nodes[1].shapes);
+    assert!(got.nodes.iter().any(|n| n.comment == "Sicilian alt"));
 }
 
 #[test]
@@ -583,7 +612,8 @@ fn from_position_games_encode_decode_and_round_trip_through_2cbh() {
     );
     assert_eq!(scanned_plies, vec![0, 1, 2, 3, 4, 5]);
 
-    let crazyhouse = parse_one("[Variant \"Crazyhouse\"]\n[White \"A\"]\n[Black \"B\"]\n\n1. e4 e5 *\n");
+    let crazyhouse =
+        parse_one("[Variant \"Crazyhouse\"]\n[White \"A\"]\n[Black \"B\"]\n\n1. e4 e5 *\n");
     let err = encode_game_moves(&crazyhouse).unwrap_err();
     assert!(err.to_string().contains("crazyhouse"), "{err:#}");
 }

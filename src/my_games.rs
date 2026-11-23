@@ -13,7 +13,9 @@ use crate::domain::Game;
 use crate::library::{SharedStr, open_library};
 use crate::online::{OnlineSource, fetch_player_games_filtered_with_token};
 use crate::pgn::game_to_pgn;
-use crate::players::{GameCategory, SourceTag, classify_headers_category, deduplicate_and_merge_games};
+use crate::players::{
+    GameCategory, SourceTag, classify_headers_category, deduplicate_and_merge_games,
+};
 use crate::settings::{config_dir, read_with_backup_json, write_atomic_with_backup};
 
 const BRETT_SOURCE_PREFIX: &str = "Brett:";
@@ -310,11 +312,114 @@ pub fn filter_and_tag_synced_games(account: &MyGamesOnlineAccount, games: Vec<Ga
     out
 }
 
+/// Default behavior when an imported/synced game matches an existing game in My Games.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DuplicatePolicy {
+    /// Prompt interactively on every conflict (with "apply to all" option).
+    #[default]
+    Ask,
+    /// Keep Source A (the copy already in My Games).
+    PreferExisting,
+    /// Replace with Source B (the incoming imported copy).
+    PreferIncoming,
+    /// Keep whichever copy has more variations, comments, NAGs, or annotations.
+    PreferRicher,
+}
+
+impl DuplicatePolicy {
+    pub const ALL: [Self; 4] = [
+        Self::Ask,
+        Self::PreferExisting,
+        Self::PreferIncoming,
+        Self::PreferRicher,
+    ];
+
+    #[must_use]
+    pub fn config_value(self) -> &'static str {
+        match self {
+            Self::Ask => "ask",
+            Self::PreferExisting => "existing",
+            Self::PreferIncoming => "incoming",
+            Self::PreferRicher => "richer",
+        }
+    }
+
+    #[must_use]
+    pub fn from_config(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "existing" | "prefer_existing" | "source_a" | "a" => Self::PreferExisting,
+            "incoming" | "prefer_incoming" | "source_b" | "b" => Self::PreferIncoming,
+            "richer" | "prefer_richer" => Self::PreferRicher,
+            _ => Self::Ask,
+        }
+    }
+
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Ask => "Ask every time",
+            Self::PreferExisting => "Always keep Existing (Source A)",
+            Self::PreferIncoming => "Always use Incoming (Source B)",
+            Self::PreferRicher => "Always keep Richer game & variations",
+        }
+    }
+}
+
+/// Sidebar privacy/visibility policy for the `MY GAMES` shelf section.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MyGamesSidebarMode {
+    /// Collapsed on launch so online account handles are not immediately exposed.
+    #[default]
+    Collapsed,
+    /// Expanded on launch.
+    Expanded,
+    /// Locked behind a click-to-unlock toggle that hides account handles.
+    Locked,
+    /// Completely hidden from the left sidebar.
+    Hidden,
+}
+
+impl MyGamesSidebarMode {
+    pub const ALL: [Self; 4] = [Self::Collapsed, Self::Expanded, Self::Locked, Self::Hidden];
+
+    #[must_use]
+    pub fn config_value(self) -> &'static str {
+        match self {
+            Self::Collapsed => "collapsed",
+            Self::Expanded => "expanded",
+            Self::Locked => "locked",
+            Self::Hidden => "hidden",
+        }
+    }
+
+    #[must_use]
+    pub fn from_config(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "expanded" | "show" | "shown" => Self::Expanded,
+            "locked" | "lock" => Self::Locked,
+            "hidden" | "hide" => Self::Hidden,
+            _ => Self::Collapsed,
+        }
+    }
+
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Collapsed => "Collapsed by default (recommended)",
+            Self::Expanded => "Expanded on launch",
+            Self::Locked => "Locked (require click to reveal)",
+            Self::Hidden => "Hidden from sidebar",
+        }
+    }
+}
+
 /// Persistent configuration for the unified My Games database and online sync.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MyGamesConfig {
     pub path: Option<PathBuf>,
     pub auto_sync_on_startup: bool,
+    pub duplicate_policy: DuplicatePolicy,
+    pub sidebar_mode: MyGamesSidebarMode,
     pub accounts: Vec<MyGamesOnlineAccount>,
 }
 
@@ -323,6 +428,8 @@ impl Default for MyGamesConfig {
         Self {
             path: None,
             auto_sync_on_startup: true,
+            duplicate_policy: DuplicatePolicy::default(),
+            sidebar_mode: MyGamesSidebarMode::default(),
             accounts: Vec::new(),
         }
     }
@@ -359,6 +466,8 @@ impl MyGamesConfig {
         serde_json::to_string_pretty(&serde_json::json!({
             "path": self.path.as_ref().map(|p| p.display().to_string()),
             "auto_sync_on_startup": self.auto_sync_on_startup,
+            "duplicate_policy": self.duplicate_policy.config_value(),
+            "sidebar_mode": self.sidebar_mode.config_value(),
             "accounts": accounts,
         }))
         .unwrap_or_default()
@@ -366,7 +475,8 @@ impl MyGamesConfig {
 
     #[must_use]
     pub fn from_json(text: &str) -> Self {
-        let value: serde_json::Value = serde_json::from_str(text).unwrap_or(serde_json::Value::Null);
+        let value: serde_json::Value =
+            serde_json::from_str(text).unwrap_or(serde_json::Value::Null);
         let path = value
             .get("path")
             .and_then(serde_json::Value::as_str)
@@ -377,6 +487,16 @@ impl MyGamesConfig {
             .get("auto_sync_on_startup")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(true);
+        let duplicate_policy = value
+            .get("duplicate_policy")
+            .and_then(serde_json::Value::as_str)
+            .map(DuplicatePolicy::from_config)
+            .unwrap_or_default();
+        let sidebar_mode = value
+            .get("sidebar_mode")
+            .and_then(serde_json::Value::as_str)
+            .map(MyGamesSidebarMode::from_config)
+            .unwrap_or_default();
         let mut accounts = Vec::new();
         if let Some(arr) = value.get("accounts").and_then(serde_json::Value::as_array) {
             for item in arr {
@@ -433,6 +553,8 @@ impl MyGamesConfig {
         Self {
             path,
             auto_sync_on_startup,
+            duplicate_policy,
+            sidebar_mode,
             accounts,
         }
     }
@@ -518,7 +640,8 @@ pub fn write_games_to_path(path: &Path, games: Vec<Game>) -> Result<usize> {
             crate::twocbh::write_database_with_options(
                 path,
                 crate::twocbh::TwoCbhWriteOptions {
-                    allow_annotation_loss: true,
+                    allow_annotation_loss: false,
+                    write_brett_annotations_sidecar: true,
                 },
                 games.into_iter().map(Ok),
             )
@@ -574,7 +697,7 @@ pub struct MyGamesMergeReport {
     pub skipped: usize,
 }
 
-fn load_all_games_if_exists(path: &Path) -> Result<Vec<Game>> {
+pub fn load_all_games_if_exists(path: &Path) -> Result<Vec<Game>> {
     if !path.exists() {
         return Ok(Vec::new());
     }
@@ -758,6 +881,282 @@ pub struct MyGamesCounts {
     pub online: BTreeMap<MyGamesSection, usize>,
 }
 
+/// Per-conflict decision chosen manually or derived from [`DuplicatePolicy`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConflictChoice {
+    KeepExisting,
+    UseIncoming,
+    KeepRicher,
+}
+
+/// One duplicate conflict between an existing My Games entry (Source A) and
+/// an incoming game (Source B).
+#[derive(Clone, Debug)]
+pub struct DuplicateConflict {
+    pub existing_index: usize,
+    pub incoming_index: usize,
+    pub existing: Game,
+    pub incoming: Game,
+    pub existing_richness: (usize, usize, usize, usize, usize),
+    pub incoming_richness: (usize, usize, usize, usize, usize),
+    pub recommended: ConflictChoice,
+}
+
+/// Pre-scanned import plan separating unique incoming games from duplicate conflicts.
+#[derive(Clone, Debug)]
+pub struct ImportScan {
+    pub existing: Vec<Game>,
+    pub incoming: Vec<Game>,
+    pub unique_incoming_indices: Vec<usize>,
+    pub conflicts: Vec<DuplicateConflict>,
+    pub identical_skipped: usize,
+}
+
+/// Summary of an applied deduplicated import into My Games.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DeduplicatedImportReport {
+    pub total_games: usize,
+    pub added: usize,
+    pub replaced_with_incoming: usize,
+    pub kept_existing: usize,
+    pub identical_skipped: usize,
+}
+
+fn game_spine_ucis(game: &Game) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = game.nodes.first().and_then(|n| n.children.first().copied());
+    while let Some(idx) = cur {
+        let Some(node) = game.nodes.get(idx) else {
+            break;
+        };
+        if let Some(mv) = &node.mv {
+            out.push(mv.uci.clone());
+        }
+        cur = node.children.first().copied();
+    }
+    out
+}
+
+fn merge_non_brett_headers(dst: &mut Game, src: &Game) {
+    for (k, v) in &src.headers {
+        let val = v.trim();
+        if val.is_empty() || val == "?" || val == "????.??.??" || val == "*" {
+            continue;
+        }
+        if k.eq_ignore_ascii_case("Source") && val.starts_with("Brett:") {
+            continue;
+        }
+        let existing_val = dst.header(k).unwrap_or("").trim();
+        let should_take = existing_val.is_empty()
+            || existing_val == "?"
+            || existing_val == "????.??.??"
+            || existing_val == "*"
+            || (!k.eq_ignore_ascii_case("Source") && val.len() > existing_val.len() + 3);
+        if should_take {
+            dst.set_header(k, val.to_string());
+        }
+    }
+}
+
+/// Scan `incoming` against `existing` (after collapsing duplicates inside
+/// `incoming` itself to their richest copy). Identical copies with equal
+/// richness are silently skipped; copies differing in variations, comments,
+/// NAGs, clocks, evals, or boards raise a [`DuplicateConflict`].
+#[must_use]
+pub fn scan_import_conflicts(existing: Vec<Game>, raw_incoming: Vec<Game>) -> ImportScan {
+    // 1. Deduplicate incoming batch internally, always keeping the richer copy.
+    let deduped_incoming: Vec<Game> =
+        crate::players::deduplicate_and_merge_games(vec![(SourceTag::Owoju, raw_incoming)])
+            .into_iter()
+            .map(|(_, g)| g)
+            .collect();
+
+    // 2. Index existing games for fast O(1) online-ID or spine lookup, plus a
+    // fallback pairwise check on date/online buckets.
+    let mut existing_online: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    let mut existing_prefix: std::collections::HashMap<Vec<String>, Vec<usize>> =
+        std::collections::HashMap::new();
+    let mut existing_richness: Vec<(usize, usize, usize, usize, usize)> =
+        Vec::with_capacity(existing.len());
+
+    for (idx, g) in existing.iter().enumerate() {
+        if let Some(oid) = crate::players::online_game_id(g) {
+            existing_online.entry(oid).or_insert(idx);
+        }
+        let ucis = game_spine_ucis(g);
+        let key: Vec<String> = ucis.iter().take(12).cloned().collect();
+        existing_prefix.entry(key).or_default().push(idx);
+        existing_richness.push(crate::players::game_richness_score(g));
+    }
+
+    let mut unique_incoming_indices = Vec::new();
+    let mut conflicts = Vec::new();
+    let mut identical_skipped = 0usize;
+    let mut matched_existing: std::collections::HashSet<usize> = std::collections::HashSet::new();
+
+    for (inc_idx, inc) in deduped_incoming.iter().enumerate() {
+        let mut match_idx =
+            crate::players::online_game_id(inc).and_then(|oid| existing_online.get(&oid).copied());
+
+        if match_idx.is_none() {
+            let ucis = game_spine_ucis(inc);
+            let pkey: Vec<String> = ucis.iter().take(12).cloned().collect();
+            if let Some(cands) = existing_prefix.get(&pkey) {
+                for &ex_idx in cands {
+                    if crate::players::games_are_duplicates(&existing[ex_idx], inc) {
+                        match_idx = Some(ex_idx);
+                        break;
+                    }
+                }
+            }
+            if match_idx.is_none() && ucis.len() < 12 {
+                // Short games (< 12 plies): check exact spine bucket too.
+                if let Some(cands) = existing_prefix.get(&ucis) {
+                    for &ex_idx in cands {
+                        if crate::players::games_are_duplicates(&existing[ex_idx], inc) {
+                            match_idx = Some(ex_idx);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(ex_idx) = match_idx {
+            if !matched_existing.insert(ex_idx) {
+                // Already matched by an earlier incoming copy; keep richer skip.
+                identical_skipped += 1;
+                continue;
+            }
+            let r_ex = existing_richness[ex_idx];
+            let r_in = crate::players::game_richness_score(inc);
+            if r_ex == r_in && existing[ex_idx].nodes.len() == inc.nodes.len() {
+                identical_skipped += 1;
+                continue;
+            }
+            let recommended = if r_in > r_ex {
+                ConflictChoice::UseIncoming
+            } else {
+                ConflictChoice::KeepExisting
+            };
+            conflicts.push(DuplicateConflict {
+                existing_index: ex_idx,
+                incoming_index: inc_idx,
+                existing: existing[ex_idx].clone(),
+                incoming: inc.clone(),
+                existing_richness: r_ex,
+                incoming_richness: r_in,
+                recommended,
+            });
+        } else {
+            unique_incoming_indices.push(inc_idx);
+        }
+    }
+
+    ImportScan {
+        existing,
+        incoming: deduped_incoming,
+        unique_incoming_indices,
+        conflicts,
+        identical_skipped,
+    }
+}
+
+/// Apply conflict resolutions to `scan` and write the deduplicated result atomically
+/// to `db_path`. Preserves existing `Brett:*` section tags unless overridden.
+pub fn apply_deduplicated_import(
+    db_path: &Path,
+    mut scan: ImportScan,
+    choices: &[ConflictChoice],
+    default_section: Option<&MyGamesSection>,
+) -> Result<DeduplicatedImportReport> {
+    let mut replaced_with_incoming = 0usize;
+    let mut kept_existing = 0usize;
+
+    for (idx, conflict) in scan.conflicts.iter().enumerate() {
+        let choice = choices
+            .get(idx)
+            .copied()
+            .unwrap_or(ConflictChoice::KeepRicher);
+        let use_incoming = match choice {
+            ConflictChoice::KeepExisting => false,
+            ConflictChoice::UseIncoming => true,
+            ConflictChoice::KeepRicher => conflict.incoming_richness > conflict.existing_richness,
+        };
+        if use_incoming {
+            let ex_source = scan.existing[conflict.existing_index]
+                .header("Source")
+                .map(str::to_string);
+            let mut replacement = conflict.incoming.clone();
+            merge_non_brett_headers(&mut replacement, &scan.existing[conflict.existing_index]);
+            if let Some(src) = ex_source.filter(|s| s.starts_with("Brett:")) {
+                replacement.set_header("Source", src);
+            } else if replacement
+                .header("Source")
+                .is_none_or(|s| !s.starts_with("Brett:"))
+            {
+                let sec = default_section
+                    .cloned()
+                    .unwrap_or_else(|| classify_game_section(&replacement));
+                tag_game_section(&mut replacement, &sec);
+            }
+            scan.existing[conflict.existing_index] = replacement;
+            replaced_with_incoming += 1;
+        } else {
+            let incoming_ref = &scan.incoming[conflict.incoming_index];
+            merge_non_brett_headers(&mut scan.existing[conflict.existing_index], incoming_ref);
+            kept_existing += 1;
+        }
+    }
+
+    let mut added = 0usize;
+    for inc_idx in scan.unique_incoming_indices {
+        let mut game = scan.incoming[inc_idx].clone();
+        if game
+            .header("Source")
+            .is_none_or(|s| !s.starts_with("Brett:"))
+        {
+            let sec = default_section
+                .cloned()
+                .unwrap_or_else(|| classify_game_section(&game));
+            tag_game_section(&mut game, &sec);
+        }
+        if db_supports_game_variant(db_path, &game) {
+            scan.existing.push(game);
+            added += 1;
+        }
+    }
+
+    let total_games = scan.existing.len();
+    write_games_to_path(db_path, scan.existing)?;
+    Ok(DeduplicatedImportReport {
+        total_games,
+        added,
+        replaced_with_incoming,
+        kept_existing,
+        identical_skipped: scan.identical_skipped,
+    })
+}
+
+/// Merge `incoming` into `db_path` using a hard [`DuplicatePolicy`] (must not be `Ask`).
+pub fn import_games_with_policy(
+    db_path: &Path,
+    incoming: Vec<Game>,
+    policy: DuplicatePolicy,
+    default_section: Option<&MyGamesSection>,
+) -> Result<DeduplicatedImportReport> {
+    let existing = load_all_games_if_exists(db_path)?;
+    let scan = scan_import_conflicts(existing, incoming);
+    let choice = match policy {
+        DuplicatePolicy::PreferExisting => ConflictChoice::KeepExisting,
+        DuplicatePolicy::PreferIncoming => ConflictChoice::UseIncoming,
+        DuplicatePolicy::PreferRicher | DuplicatePolicy::Ask => ConflictChoice::KeepRicher,
+    };
+    let choices = vec![choice; scan.conflicts.len()];
+    apply_deduplicated_import(db_path, scan, &choices, default_section)
+}
+
 /// Tally games across `Classical`, `Rapid`, `Blitz`, and `Online` subsections.
 #[must_use]
 pub fn tally_sections<'a, I>(games: I, accounts: &[MyGamesOnlineAccount]) -> MyGamesCounts
@@ -790,7 +1189,10 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        p.push(format!("brett-my-games-{name}-{}-{nanos}", std::process::id()));
+        p.push(format!(
+            "brett-my-games-{name}-{}-{nanos}",
+            std::process::id()
+        ));
         p
     }
 
@@ -798,7 +1200,7 @@ mod tests {
         let stem = path.with_extension("");
         for ext in [
             "pgn", "si4", "sn4", "sg4", "cbh", "cbg", "cba", "cbp", "cbt", "cbc", "cbs", "cbj",
-            "2cbh", "2cbg", "2cba", "2lid", "2lgd", "json", "json.bak",
+            "2cbh", "2cbg", "2cba", "2lid", "2lgd", "brettann", "json", "json.bak",
         ] {
             let p = stem.with_extension(ext);
             let _ = fs::remove_file(p);
@@ -821,7 +1223,10 @@ mod tests {
         }
 
         let minimal = parse_pgn(b"[White \"A\"]\n[Black \"B\"]\n\n1. e4 e5 *").unwrap();
-        assert_eq!(classify_game_section(&minimal[0]), MyGamesSection::Classical);
+        assert_eq!(
+            classify_game_section(&minimal[0]),
+            MyGamesSection::Classical
+        );
 
         let mut blitz_game = minimal[0].clone();
         blitz_game.set_header("TimeControl", "180+2".to_string());
@@ -879,8 +1284,9 @@ mod tests {
         let pgn = b"[Event \"Club Championship\"]\n[White \"Alice\"]\n[Black \"Bob\"]\n[Date \"2025.03.01\"]\n[Result \"1-0\"]\n\n1. e4 e5 2. Nf3 Nc6 3. Bb5 a6 1-0\n\n[Event \"Weekend Rapid\"]\n[White \"Carol\"]\n[Black \"Dave\"]\n[Date \"2025.03.02\"]\n[Result \"0-1\"]\n\n1. d4 d5 2. c4 e6 0-1\n";
         let games = parse_pgn(pgn).unwrap();
 
-        let r1 = merge_games_into_my_games(&path, vec![games[0].clone()], &MyGamesSection::Classical)
-            .unwrap();
+        let r1 =
+            merge_games_into_my_games(&path, vec![games[0].clone()], &MyGamesSection::Classical)
+                .unwrap();
         assert_eq!(r1.added, 1);
         assert_eq!(r1.total_games, 1);
 
@@ -909,6 +1315,8 @@ mod tests {
         let cfg = MyGamesConfig {
             path: Some(PathBuf::from("/tmp/MyGames.2cbh")),
             auto_sync_on_startup: true,
+            duplicate_policy: DuplicatePolicy::PreferRicher,
+            sidebar_mode: MyGamesSidebarMode::Locked,
             accounts: vec![
                 MyGamesOnlineAccount {
                     source: OnlineSource::Lichess,
@@ -977,7 +1385,8 @@ mod tests {
             exclude_online: true,
             last_sync_unix: None,
         };
-        let tagged = filter_and_tag_synced_games(&acct, vec![classical, rapid, blitz, online_chesscom]);
+        let tagged =
+            filter_and_tag_synced_games(&acct, vec![classical, rapid, blitz, online_chesscom]);
         assert_eq!(tagged.len(), 3);
         assert_eq!(classify_game_section(&tagged[0]), MyGamesSection::Classical);
         assert_eq!(classify_game_section(&tagged[1]), MyGamesSection::Rapid);
@@ -997,10 +1406,89 @@ mod tests {
         assert!(!classify_game_section(&tagged_all[0]).is_online());
         assert!(!acct.section().is_online());
 
-        let std_game = crate::domain::parse_pgn(b"[Variant \"From Position\"]\n\n*").unwrap().remove(0);
-        let crazy_game = crate::domain::parse_pgn(b"[Variant \"Crazyhouse\"]\n\n*").unwrap().remove(0);
-        assert!(db_supports_game_variant(Path::new("/tmp/a.2cbh"), &std_game));
-        assert!(!db_supports_game_variant(Path::new("/tmp/a.2cbh"), &crazy_game));
-        assert!(db_supports_game_variant(Path::new("/tmp/a.pgn"), &crazy_game));
+        let std_game = crate::domain::parse_pgn(b"[Variant \"From Position\"]\n\n*")
+            .unwrap()
+            .remove(0);
+        let crazy_game = crate::domain::parse_pgn(b"[Variant \"Crazyhouse\"]\n\n*")
+            .unwrap()
+            .remove(0);
+        assert!(db_supports_game_variant(
+            Path::new("/tmp/a.2cbh"),
+            &std_game
+        ));
+        assert!(!db_supports_game_variant(
+            Path::new("/tmp/a.2cbh"),
+            &crazy_game
+        ));
+        assert!(db_supports_game_variant(
+            Path::new("/tmp/a.pgn"),
+            &crazy_game
+        ));
+    }
+
+    #[test]
+    fn deduplicated_import_prefers_richer_variations_and_preserves_brett_tags() {
+        let path = temp_path("dedupe-import").with_extension("2cbh");
+        create_empty_database(&path).unwrap();
+
+        let lichess_bare = crate::domain::parse_pgn(
+            b"[Event \"Rated Blitz game\"]\n[Site \"https://lichess.org/AbCdEfGh\"]\n[White \"user123\"]\n[Black \"Opponent\"]\n[Date \"2025.06.01\"]\n[Result \"1-0\"]\n\n1. e4 e5 2. Nf3 Nc6 3. Bb5 a6 4. Ba4 Nf6 5. O-O Be7 6. Re1 b5 1-0\n",
+        )
+        .unwrap();
+        let analyzed_copy = crate::domain::parse_pgn(
+            b"[Event \"Annotated Study\"]\n[Site \"https://lichess.org/AbCdEfGh\"]\n[White \"Real Name\"]\n[Black \"Opponent\"]\n[Date \"2025.06.01\"]\n[Result \"1-0\"]\n\n1. e4 e5 2. Nf3 Nc6 3. Bb5 a6 (3... Nf6 {Berlin option} 4. O-O) 4. Ba4 Nf6 5. O-O Be7 6. Re1 b5 {Mainline Ruy Lopez} 1-0\n",
+        )
+        .unwrap();
+
+        merge_games_into_my_games(
+            &path,
+            lichess_bare,
+            &MyGamesSection::OnlineLichess("user123".to_string()),
+        )
+        .unwrap();
+
+        let existing = load_all_games_if_exists(&path).unwrap();
+        let scan = scan_import_conflicts(existing, analyzed_copy);
+        assert_eq!(scan.conflicts.len(), 1);
+        assert_eq!(scan.conflicts[0].recommended, ConflictChoice::UseIncoming);
+
+        let report = apply_deduplicated_import(
+            &path,
+            scan,
+            &[ConflictChoice::KeepRicher],
+            Some(&MyGamesSection::Classical),
+        )
+        .unwrap();
+        assert_eq!(report.total_games, 1);
+        assert_eq!(report.replaced_with_incoming, 1);
+
+        let lib = open_library(&path).unwrap();
+        let got = lib.load(0).unwrap();
+        assert!(got.nodes.iter().any(|n| n.comment == "Berlin option"));
+        assert!(got.nodes.iter().any(|n| n.comment == "Mainline Ruy Lopez"));
+        assert_eq!(got.header("Source"), Some("Brett:Online:Lichess:user123"));
+
+        // Subsequent bare sync must NOT overwrite the analyzed copy or duplicate it.
+        let bare_again = crate::domain::parse_pgn(
+            b"[Event \"Rated Blitz game\"]\n[Site \"https://lichess.org/AbCdEfGh\"]\n[White \"user123\"]\n[Black \"Opponent\"]\n[Date \"2025.06.01\"]\n[Result \"1-0\"]\n\n1. e4 e5 2. Nf3 Nc6 3. Bb5 a6 4. Ba4 Nf6 5. O-O Be7 6. Re1 b5 1-0\n",
+        )
+        .unwrap();
+        let merged = merge_games_into_my_games(
+            &path,
+            bare_again,
+            &MyGamesSection::OnlineLichess("user123".to_string()),
+        )
+        .unwrap();
+        assert_eq!(merged.total_games, 1);
+        assert_eq!(merged.added, 0);
+        let reloaded = open_library(&path).unwrap().load(0).unwrap();
+        assert!(
+            reloaded
+                .nodes
+                .iter()
+                .any(|n| n.comment == "Mainline Ruy Lopez")
+        );
+
+        cleanup_db(&path);
     }
 }
