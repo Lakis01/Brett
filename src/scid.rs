@@ -365,6 +365,13 @@ impl GameLibrary for ScidLibrary {
             return GameRecordMeta::default();
         };
         let year = ((entry.date >> 9) & 0x7FFF) as u16;
+        let date_num = if year == 0 {
+            0
+        } else {
+            let month = ((entry.date >> 5) & 0xF).min(12);
+            let day = (entry.date & 0x1F).min(31);
+            u32::from(year) * 10_000 + month * 100 + day
+        };
         let result = match entry.result {
             1 => 2,
             2 => 0,
@@ -416,6 +423,7 @@ impl GameLibrary for ScidLibrary {
             white_elo: entry.white_elo,
             black_elo: entry.black_elo,
             year,
+            date_num,
             result,
             eco_code,
             medals,

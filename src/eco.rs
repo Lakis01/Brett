@@ -13,11 +13,12 @@
 //! position that has a named entry (`O(plies)` per game, independent of the
 //! position index).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::OnceLock;
 
 use crate::chess::{CastlingMode, Chess, Position, SanPlus, UciMove};
 use crate::domain::Game;
+use crate::library::{eco_code_to_str, eco_str_to_code};
 use crate::position;
 
 const TSV_FILES: [&str; 5] = [
@@ -79,6 +80,314 @@ impl ClassifySummary {
 }
 
 static GLOBAL_TABLE: OnceLock<EcoTable> = OnceLock::new();
+static GLOBAL_CATALOG: OnceLock<Vec<EcoCodeInfo>> = OnceLock::new();
+
+/// Catalog entry aggregating all named opening lines for a single ECO code (`A00`..`E99`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EcoCodeInfo {
+    pub code: u16,
+    pub eco: String,
+    pub volume: char,
+    pub summary: String,
+    pub variations: Vec<String>,
+    pub search_haystack: String,
+}
+
+impl EcoCodeInfo {
+    /// Return the first variation matching `query_lower`, or `summary` when empty/unmatched.
+    #[must_use]
+    pub fn display_for_query(&self, query_lower: &str) -> &str {
+        let q = query_lower.trim();
+        if !q.is_empty()
+            && let Some(found) = self
+                .variations
+                .iter()
+                .find(|v| v.to_ascii_lowercase().contains(q))
+        {
+            return found.as_str();
+        }
+        &self.summary
+    }
+}
+
+/// Curated clickable opening ECO family preset for quick filtering.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EcoPreset {
+    pub label: &'static str,
+    pub spec: &'static str,
+    pub volume: char,
+}
+
+pub const ECO_PRESETS: &[EcoPreset] = &[
+    EcoPreset {
+        label: "English",
+        spec: "A10-A39",
+        volume: 'A',
+    },
+    EcoPreset {
+        label: "Réti",
+        spec: "A04-A09",
+        volume: 'A',
+    },
+    EcoPreset {
+        label: "Benoni / Benko",
+        spec: "A56-A79",
+        volume: 'A',
+    },
+    EcoPreset {
+        label: "Dutch",
+        spec: "A80-A99",
+        volume: 'A',
+    },
+    EcoPreset {
+        label: "Sicilian (all)",
+        spec: "B20-B99",
+        volume: 'B',
+    },
+    EcoPreset {
+        label: "Najdorf",
+        spec: "B90-B99",
+        volume: 'B',
+    },
+    EcoPreset {
+        label: "Dragon",
+        spec: "B70-B79",
+        volume: 'B',
+    },
+    EcoPreset {
+        label: "Scheveningen",
+        spec: "B80-B89",
+        volume: 'B',
+    },
+    EcoPreset {
+        label: "Sveshnikov",
+        spec: "B32-B33",
+        volume: 'B',
+    },
+    EcoPreset {
+        label: "Kan / Taimanov",
+        spec: "B41-B49",
+        volume: 'B',
+    },
+    EcoPreset {
+        label: "Rossolimo / Moscow",
+        spec: "B30-B31, B51-B52",
+        volume: 'B',
+    },
+    EcoPreset {
+        label: "Caro-Kann",
+        spec: "B10-B19",
+        volume: 'B',
+    },
+    EcoPreset {
+        label: "Pirc / Modern",
+        spec: "B06-B09",
+        volume: 'B',
+    },
+    EcoPreset {
+        label: "Scandinavian / Alekhine",
+        spec: "B01-B05",
+        volume: 'B',
+    },
+    EcoPreset {
+        label: "French",
+        spec: "C00-C19",
+        volume: 'C',
+    },
+    EcoPreset {
+        label: "Ruy Lopez",
+        spec: "C60-C99",
+        volume: 'C',
+    },
+    EcoPreset {
+        label: "Berlin",
+        spec: "C65-C67",
+        volume: 'C',
+    },
+    EcoPreset {
+        label: "Italian / Two Knights",
+        spec: "C50-C59",
+        volume: 'C',
+    },
+    EcoPreset {
+        label: "Scotch / Four Knights",
+        spec: "C44-C49",
+        volume: 'C',
+    },
+    EcoPreset {
+        label: "Petroff",
+        spec: "C42-C43",
+        volume: 'C',
+    },
+    EcoPreset {
+        label: "QGD",
+        spec: "D30-D69",
+        volume: 'D',
+    },
+    EcoPreset {
+        label: "Slav / Semi-Slav",
+        spec: "D10-D19, D43-D49",
+        volume: 'D',
+    },
+    EcoPreset {
+        label: "QGA",
+        spec: "D20-D29",
+        volume: 'D',
+    },
+    EcoPreset {
+        label: "London / Colle",
+        spec: "D00, D02, D04-D05",
+        volume: 'D',
+    },
+    EcoPreset {
+        label: "Grünfeld",
+        spec: "D70-D99",
+        volume: 'D',
+    },
+    EcoPreset {
+        label: "Catalan",
+        spec: "E01-E09",
+        volume: 'E',
+    },
+    EcoPreset {
+        label: "Nimzo-Indian",
+        spec: "E20-E59",
+        volume: 'E',
+    },
+    EcoPreset {
+        label: "Queen's Indian / Bogo",
+        spec: "E11-E19",
+        volume: 'E',
+    },
+    EcoPreset {
+        label: "King's Indian",
+        spec: "E60-E99",
+        volume: 'E',
+    },
+];
+
+/// Return the full sorted 500-entry ECO catalog (`A00`..`E99`) built from the
+/// embedded CC0 `lichess-org/chess-openings` TSV files.
+pub fn global_catalog() -> &'static [EcoCodeInfo] {
+    GLOBAL_CATALOG.get_or_init(|| build_catalog_from_tsv_sources(&TSV_FILES))
+}
+
+fn build_catalog_from_tsv_sources(sources: &[&str]) -> Vec<EcoCodeInfo> {
+    let mut by_code: BTreeMap<u16, Vec<String>> = BTreeMap::new();
+    for code in 1u16..=500 {
+        by_code.insert(code, Vec::new());
+    }
+    for source in sources {
+        for (line_idx, raw_line) in source.lines().enumerate() {
+            let line = raw_line.trim();
+            if line.is_empty() || (line_idx == 0 && line.starts_with("eco\t")) {
+                continue;
+            }
+            let mut fields = line.splitn(3, '\t');
+            let (Some(eco_raw), Some(name_raw), _) = (fields.next(), fields.next(), fields.next())
+            else {
+                continue;
+            };
+            let code = eco_str_to_code(eco_raw);
+            if !(1..=500).contains(&code) {
+                continue;
+            }
+            let name = name_raw.trim();
+            if name.is_empty() {
+                continue;
+            }
+            let list = by_code.entry(code).or_default();
+            if !list.iter().any(|existing| existing == name) {
+                list.push(name.to_string());
+            }
+        }
+    }
+    by_code
+        .into_iter()
+        .filter_map(|(code, mut variations)| {
+            let eco = eco_code_to_str(code)?;
+            let volume = eco.chars().next().unwrap_or('A');
+            variations.sort_by_key(|v| (v.len(), v.clone()));
+            let summary = variations
+                .first()
+                .cloned()
+                .unwrap_or_else(|| format!("ECO {eco}"));
+            let search_haystack = if variations.is_empty() {
+                eco.to_ascii_lowercase()
+            } else {
+                format!("{} {}", eco, variations.join(" | ")).to_ascii_lowercase()
+            };
+            Some(EcoCodeInfo {
+                code,
+                eco,
+                volume,
+                summary,
+                variations,
+                search_haystack,
+            })
+        })
+        .collect()
+}
+
+/// Expand an ECO filter specification (e.g. `"B10-B15, B90, D3"`) into discrete `1..=500` ECO codes.
+#[must_use]
+pub fn expand_eco_spec(spec: &str) -> BTreeSet<u16> {
+    let mut set = BTreeSet::new();
+    for (lo, hi) in crate::search::parse_eco_ranges(spec) {
+        let start = lo.max(1);
+        let end = hi.min(500);
+        if start <= end {
+            for code in start..=end {
+                set.insert(code);
+            }
+        }
+    }
+    set
+}
+
+/// Format a set of discrete `1..=500` ECO codes into compact range notation (`"B10-B15, B90"`),
+/// keeping volume letter boundaries separate (`"B99, C00"`).
+#[must_use]
+pub fn format_eco_codes(codes: &BTreeSet<u16>) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let mut run_start: Option<u16> = None;
+    let mut run_end: Option<u16> = None;
+
+    let flush = |start: u16, end: u16, out: &mut Vec<String>| {
+        if let (Some(a), Some(b)) = (eco_code_to_str(start), eco_code_to_str(end)) {
+            if start == end {
+                out.push(a);
+            } else {
+                out.push(format!("{a}-{b}"));
+            }
+        }
+    };
+
+    for &code in codes {
+        if !(1..=500).contains(&code) {
+            continue;
+        }
+        match (run_start, run_end) {
+            (Some(s), Some(e)) if code == e + 1 && (e - 1) / 100 == (code - 1) / 100 => {
+                run_end = Some(code);
+                let _ = s;
+            }
+            (Some(s), Some(e)) => {
+                flush(s, e, &mut parts);
+                run_start = Some(code);
+                run_end = Some(code);
+            }
+            _ => {
+                run_start = Some(code);
+                run_end = Some(code);
+            }
+        }
+    }
+    if let (Some(s), Some(e)) = (run_start, run_end) {
+        flush(s, e, &mut parts);
+    }
+    parts.join(", ")
+}
 
 /// Return the shared, lazily initialized ECO table built from the embedded CC0
 /// `lichess-org/chess-openings` TSV files.
@@ -474,5 +783,40 @@ C51\tAlternate Name\t1. e4 e5 2. Bc4 Nc6 3. Nf3
         );
         assert_eq!(placeholder_game.header("ECO"), Some("D06"));
         assert_eq!(placeholder_game.header("Opening"), Some("Queen's Gambit"));
+    }
+
+    #[test]
+    fn catalog_presets_and_range_roundtrip_work() {
+        let cat = global_catalog();
+        assert_eq!(cat.len(), 500);
+        assert_eq!(cat.first().unwrap().eco, "A00");
+        assert_eq!(cat.last().unwrap().eco, "E99");
+
+        let parsed = expand_eco_spec("B10-B15, B90, B92, B99-C00");
+        assert!(parsed.contains(&eco_str_to_code("B10")));
+        assert!(parsed.contains(&eco_str_to_code("B15")));
+        assert!(!parsed.contains(&eco_str_to_code("B16")));
+        assert!(parsed.contains(&eco_str_to_code("B90")));
+        assert!(parsed.contains(&eco_str_to_code("B99")));
+        assert!(parsed.contains(&eco_str_to_code("C00")));
+
+        // Volume boundary B99/C00 is formatted cleanly as "B99, C00"
+        assert_eq!(format_eco_codes(&parsed), "B10-B15, B90, B92, B99, C00");
+
+        for preset in ECO_PRESETS {
+            let codes = expand_eco_spec(preset.spec);
+            assert!(
+                !codes.is_empty(),
+                "ECO preset '{}' failed to expand",
+                preset.label
+            );
+        }
+
+        let b90 = cat.iter().find(|e| e.eco == "B90").expect("B90 present");
+        assert!(b90.search_haystack.contains("english attack"));
+        assert!(
+            b90.display_for_query("english attack")
+                .contains("English Attack")
+        );
     }
 }

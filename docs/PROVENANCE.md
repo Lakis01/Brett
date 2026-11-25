@@ -36,6 +36,7 @@ is. This audit separates the two deliberately.
 | `.cbv` / `.cbz` container path | `src/cbv.rs` | Uses the `cbvault-format` 0.1.4 crate to materialise members, then opens the extracted classic database through `src/cbh/` | Links `cbvault-format` (MIT) | MIT. `cbvault-format`'s classic reader is a port of `cbformat` in `oschess-cb-bridge` at commit `ca9e8f8e`, which is MIT. |
 | Photo-pack converter | `scripts/convert_spf.py` | Brett-authored BPF1/WebP converter; input is Scid's `Player_photos.zip` | None | Converter is Brett MIT. The photo data has no explicit redistribution licence and remains local-only. |
 | Champion data and crowns | `src/champions.rs`, `docs/CHAMPIONS.md` | Hand-authored from public championship records | None | Brett MIT. |
+| Position search & structure plans | `src/search.rs`, `src/structure_plans.rs`, `docs/STRUCTURES_COPYRIGHT_AUDIT.md` | Clean-room Brett bitboard predicates, standard chess classifications, and freshly authored illustrative positions/prose | None | Brett MIT. Audited against *Chess Structures* copyright boundaries (`docs/STRUCTURES_COPYRIGHT_AUDIT.md`). |
 | Clock parsing and trend engine | `src/domain.rs`, `src/recent.rs` | Brett-authored | None | Brett MIT. |
 
 ## The `cbvault-format` chain

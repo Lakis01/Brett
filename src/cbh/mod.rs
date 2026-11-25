@@ -591,6 +591,7 @@ impl GameLibrary for CbhLibrary {
             white_elo: entry.white_elo,
             black_elo: entry.black_elo,
             year: entry.year,
+            date_num: u32::from(entry.year) * 10_000,
             result: entry.result,
             eco_code: entry.eco_code,
             medals: entry.medals,

@@ -493,6 +493,54 @@ impl GameList {
         ids
     }
 
+    /// Append a specific subset of game indices from another database lazily.
+    /// Returns `(input_pos, slot_id)` pairs for every appended row.
+    pub fn append_library_indices(
+        &mut self,
+        library: Arc<dyn GameLibrary>,
+        indices: &[usize],
+        edited: &HashMap<usize, Game>,
+        deduplicate: bool,
+    ) -> Result<Vec<(usize, usize)>> {
+        let mut added = Vec::new();
+        for (input_pos, &index) in indices.iter().enumerate() {
+            if index >= library.len() {
+                continue;
+            }
+            if deduplicate {
+                let headers_vec;
+                let headers = if let Some(indexed) = library.games().get(index) {
+                    indexed.headers()
+                } else {
+                    headers_vec = library.game_headers(index);
+                    &headers_vec
+                };
+                let candidates = self.duplicate_candidate_ids(headers);
+                if !candidates.is_empty() {
+                    let incoming = library
+                        .load(index)
+                        .with_context(|| format!("loading game {}", index + 1))?;
+                    let mut duplicate = false;
+                    for id in candidates {
+                        let existing = self.load(id, edited)?;
+                        if same_game(&existing, &incoming) {
+                            duplicate = true;
+                            break;
+                        }
+                    }
+                    if duplicate {
+                        continue;
+                    }
+                }
+            }
+            let id = self.next_id;
+            self.next_id += 1;
+            self.push_slot(GameSlot::external(id, Arc::clone(&library), index));
+            added.push((input_pos, id));
+        }
+        Ok(added)
+    }
+
     pub fn move_slot(&mut self, id: usize, insertion_index: usize) -> bool {
         let Some(from) = self.position_of(id) else {
             return false;
@@ -657,6 +705,20 @@ impl GameList {
     pub fn update_headers(&mut self, id: usize, game: &Game) {
         if let Some(slot) = self.slot_mut(id) {
             slot.refresh_headers(game);
+        }
+    }
+
+    /// Sort slots in place using a comparator over slot IDs and rebuild the O(1) position lookup.
+    pub fn sort_slots_by<F>(&mut self, mut cmp: F)
+    where
+        F: FnMut(usize, usize) -> std::cmp::Ordering,
+    {
+        self.slots.sort_by(|a, b| cmp(a.id, b.id));
+        for (position, slot) in self.slots.iter().enumerate() {
+            if slot.id >= self.positions.len() {
+                self.positions.resize(slot.id + 1, usize::MAX);
+            }
+            self.positions[slot.id] = position;
         }
     }
 
@@ -1109,5 +1171,69 @@ mod tests {
             }
         );
         assert_eq!(dst.len(), 4);
+    }
+
+    #[test]
+    fn append_library_indices_appends_subset_with_optional_dedup() {
+        let path = std::env::temp_dir().join(format!(
+            "brett-session-indices-{}-{}.pgn",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let source_pgn = concat!(
+            "[Event \"T\"]\n[White \"Alpha\"]\n[Black \"Beta\"]\n[Date \"2024.01.01\"]\n[Result \"1-0\"]\n\n1. e4 e5 2. Nf3 Nc6 1-0\n\n",
+            "[Event \"T\"]\n[White \"Gamma\"]\n[Black \"Delta\"]\n[Date \"2024.01.02\"]\n[Result \"0-1\"]\n\n1. d4 d5 2. c4 e6 0-1\n\n",
+            "[Event \"T\"]\n[White \"Epsilon\"]\n[Black \"Zeta\"]\n[Date \"2024.01.03\"]\n[Result \"1/2-1/2\"]\n\n1. c4 c5 2. Nc3 Nc6 1/2-1/2\n"
+        );
+        std::fs::write(&path, source_pgn).unwrap();
+        let lib: Arc<dyn GameLibrary> = Arc::new(PgnLibrary::build(&path).unwrap());
+
+        let mut list = GameList::empty();
+        let added = list
+            .append_library_indices(Arc::clone(&lib), &[2, 0], &HashMap::new(), false)
+            .unwrap();
+        assert_eq!(added.len(), 2);
+        assert_eq!(list.len(), 2);
+        assert_eq!(list.slot_white(added[0].1), "Epsilon");
+        assert_eq!(list.slot_white(added[1].1), "Alpha");
+
+        // Deduplicated append skips index 0 (already present) and adds index 1
+        let dedup_added = list
+            .append_library_indices(Arc::clone(&lib), &[0, 1], &HashMap::new(), true)
+            .unwrap();
+        assert_eq!(dedup_added.len(), 1);
+        assert_eq!(dedup_added[0].0, 1);
+        assert_eq!(list.slot_white(dedup_added[0].1), "Gamma");
+        assert_eq!(list.len(), 3);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sort_slots_by_reorders_and_updates_positions_consistently() {
+        let mut list = GameList::empty();
+        let make = |white: &str| {
+            crate::domain::parse_pgn(
+                format!("[White \"{white}\"]\n[Black \"Opp\"]\n[Result \"*\"]\n\n1. e4 e5 *\n")
+                    .as_bytes(),
+            )
+            .unwrap()
+            .remove(0)
+        };
+        let id_c = list.insert_game(make("Charlie"), None);
+        let id_a = list.insert_game(make("Alpha"), None);
+        let id_b = list.insert_game(make("Bravo"), None);
+
+        let names: HashMap<usize, String> = [id_c, id_a, id_b]
+            .into_iter()
+            .map(|id| (id, list.slot_white(id)))
+            .collect();
+        list.sort_slots_by(|lhs, rhs| names[&lhs].cmp(&names[&rhs]));
+        assert_eq!(list.id_at(0), Some(id_a));
+        assert_eq!(list.id_at(1), Some(id_b));
+        assert_eq!(list.id_at(2), Some(id_c));
+        assert_eq!(list.position_of(id_a), Some(0));
+        assert_eq!(list.position_of(id_b), Some(1));
+        assert_eq!(list.position_of(id_c), Some(2));
     }
 }

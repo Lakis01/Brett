@@ -1429,7 +1429,7 @@ impl GameLibrary for TwoCbhLibrary {
         };
         let white_elo = le_u16(&record[0x60..0x62]);
         let black_elo = le_u16(&record[0x70..0x72]);
-        let year = decode_packed_date(le_u32(&record[0xbc..0xc0])).0;
+        let (year, date_num) = decode_packed_date(le_u32(&record[0xbc..0xc0]));
         let raw_res = le_u32(&record[0x58..0x5c]) & 0xffff;
         let result = match raw_res {
             0 => 0,
@@ -1451,6 +1451,7 @@ impl GameLibrary for TwoCbhLibrary {
             white_elo,
             black_elo,
             year,
+            date_num,
             result,
             eco_code,
             medals,

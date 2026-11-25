@@ -1119,7 +1119,9 @@ fn code_matches_text_family(wikidata_code: &str, text_code: &str) -> bool {
     }
     match wikidata_code {
         "AUE" | "AUH" | "BOH" => matches!(text_code, "AUT" | "AUH" | "AUE" | "BOH" | "CZE" | "HUN"),
-        "DEI" | "PRU" | "GDR" | "FRG" => matches!(text_code, "GER" | "DEI" | "PRU" | "GDR" | "FRG" | "POL"),
+        "DEI" | "PRU" | "GDR" | "FRG" => {
+            matches!(text_code, "GER" | "DEI" | "PRU" | "GDR" | "FRG" | "POL")
+        }
         "RUE" | "URS" => matches!(
             text_code,
             "RUS" | "RUE" | "URS" | "POL" | "UKR" | "LAT" | "LTU" | "EST" | "BLR" | "GEO" | "ARM"
@@ -1133,7 +1135,11 @@ fn code_matches_text_family(wikidata_code: &str, text_code: &str) -> bool {
     }
 }
 
-fn text_period_covered_by(text_code: &str, existing: &CountryPeriod, death_year: Option<i32>) -> bool {
+fn text_period_covered_by(
+    text_code: &str,
+    existing: &CountryPeriod,
+    death_year: Option<i32>,
+) -> bool {
     if existing.code == text_code {
         return true;
     }
@@ -4324,10 +4330,7 @@ mod tests {
             "Vlastimil Hort (12 January 1944 – 12 May 2025) was a Czechoslovak and German chess grandmaster.",
         ))
         .unwrap();
-        assert_eq!(
-            hort.countries,
-            vec!["TCH".to_string(), "GER".to_string()]
-        );
+        assert_eq!(hort.countries, vec!["TCH".to_string(), "GER".to_string()]);
 
         let stale = json!({
             "title": "Vlastimil Hort",

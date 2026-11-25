@@ -124,6 +124,16 @@ The database is for personal use and may not be sold or re-sold to a third
 party. Keep the three SCID files together when refreshing or copying the
 snapshot.
 
+## Contributing position search filters & structure presets
+
+Brett's built-in **position search filters** and **strategic plan illustrations** (`src/search.rs` and `src/structure_plans.rs`) are preliminary and actively evolving. If you hand-craft sharper pawn/piece filters using the **Board Pattern** editor (`OR` / `AND` / `NONE` conjunctions, file-absence guards, and piece brushes), Brett saves them to:
+
+```text
+$XDG_CONFIG_HOME/brett/custom_structures.json
+```
+
+Community contributions of handcrafted filter definitions and original plan illustrations are very welcome! Feel free to open a GitHub Issue or Pull Request with your exported JSON preset entries (and brief notes on edge cases they catch or exclude). Please ensure any contributed prose or sample FENs are original and do not copy text or diagrams from copyrighted chess books.
+
 ## Pull-request checklist
 
 - `cargo fmt --all` has been run.

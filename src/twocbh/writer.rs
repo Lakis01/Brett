@@ -1580,7 +1580,10 @@ impl TargetLidState {
             if let Some(block) = layout.raw_slice(bytes, id_u32, 0) {
                 next_id[0] = id_u32 + 1;
                 if let Some((last, first, fide, fide_off)) = parse_player_raw(block) {
-                    if last.is_empty() && first.is_empty() && (id_u32 == 2 || empty_player_id.is_none()) {
+                    if last.is_empty()
+                        && first.is_empty()
+                        && (id_u32 == 2 || empty_player_id.is_none())
+                    {
                         empty_player_id = Some(id_u32);
                     }
                     if let Some(f) = fide {

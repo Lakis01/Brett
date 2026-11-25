@@ -117,6 +117,8 @@ pub struct GameRecordMeta {
     pub white_elo: u16,
     pub black_elo: u16,
     pub year: u16,
+    /// Packed `YYYYMMDD` (`0` if unknown).
+    pub date_num: u32,
     /// `0 = 0-1`, `1 = 1/2-1/2`, `2 = 1-0`, `3 = *`.
     pub result: u8,
     /// `0` if unknown, else `1..=500` where `A00 = 1 .. E99 = 500`.
@@ -162,6 +164,28 @@ pub(crate) fn parse_year_header(date: &str) -> u16 {
         return 0;
     }
     trimmed[..4].parse::<u16>().unwrap_or(0)
+}
+
+pub(crate) fn parse_date_num(date: &str) -> u32 {
+    let mut parts = date.trim().split(['.', '-', '/']);
+    let year = parts
+        .next()
+        .and_then(|y| y.parse::<u32>().ok())
+        .unwrap_or(0);
+    if year == 0 {
+        return 0;
+    }
+    let month = parts
+        .next()
+        .and_then(|m| m.parse::<u32>().ok())
+        .filter(|&m| (1..=12).contains(&m))
+        .unwrap_or(0);
+    let day = parts
+        .next()
+        .and_then(|d| d.parse::<u32>().ok())
+        .filter(|&d| (1..=31).contains(&d))
+        .unwrap_or(0);
+    year * 10_000 + month * 100 + day
 }
 
 pub(crate) fn parse_result_code(result: &str) -> u8 {
@@ -527,13 +551,16 @@ pub trait GameLibrary: Send + Sync {
         let black_elo = header("BlackElo")
             .and_then(|v| v.trim().parse::<u16>().ok())
             .unwrap_or(0);
-        let year = header("Date").map_or(0, parse_year_header);
+        let date_str = header("Date");
+        let year = date_str.map_or(0, parse_year_header);
+        let date_num = date_str.map_or(0, parse_date_num);
         let result = header("Result").map_or(3, parse_result_code);
         let eco_code = header("ECO").map_or(0, eco_str_to_code);
         GameRecordMeta {
             white_elo,
             black_elo,
             year,
+            date_num,
             result,
             eco_code,
             medals: 0,

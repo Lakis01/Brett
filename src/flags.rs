@@ -454,7 +454,10 @@ fn paint_former_flag(painter: &Painter, code: &str, rect: Rect) -> bool {
                 red,
             );
             painter.rect_filled(
-                Rect::from_min_size(egui::pos2(rect.min.x, rect.min.y + h), vec2(rect.width(), h)),
+                Rect::from_min_size(
+                    egui::pos2(rect.min.x, rect.min.y + h),
+                    vec2(rect.width(), h),
+                ),
                 0.0,
                 white,
             );
@@ -467,7 +470,10 @@ fn paint_former_flag(painter: &Painter, code: &str, rect: Rect) -> bool {
                 red,
             );
             painter.rect_filled(
-                Rect::from_min_size(egui::pos2(rect.min.x + half_w, bot_y), vec2(rect.width() - half_w, bot_h)),
+                Rect::from_min_size(
+                    egui::pos2(rect.min.x + half_w, bot_y),
+                    vec2(rect.width() - half_w, bot_h),
+                ),
                 0.0,
                 green,
             );
@@ -559,10 +565,8 @@ fn paint_former_flag(painter: &Painter, code: &str, rect: Rect) -> bool {
                     Color32::from_rgb(0xD5, 0x2B, 0x1E),
                 ],
             );
-            let canton = Rect::from_min_size(
-                rect.min,
-                vec2(rect.width() * 0.38, rect.height() * 0.52),
-            );
+            let canton =
+                Rect::from_min_size(rect.min, vec2(rect.width() * 0.38, rect.height() * 0.52));
             painter.rect_filled(canton, 0.0, Color32::from_rgb(0xFF, 0xCC, 0x00));
             let mark_r = (canton.height() * 0.28).max(1.4);
             painter.circle_filled(canton.center(), mark_r, Color32::from_rgb(0x18, 0x18, 0x18));

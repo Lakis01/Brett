@@ -199,7 +199,7 @@ impl RightTab {
     fn label(self) -> &'static str {
         match self {
             Self::Moves => "Moves",
-            Self::Tree => "Tree",
+            Self::Tree => "Tree & Ref",
             Self::Engine => "Engine",
             Self::Preparation => "Prep",
             Self::Repertoire => "Repertoire",
@@ -219,7 +219,7 @@ impl RightTab {
     fn from_config_name(name: &str) -> Option<Self> {
         match name.trim().to_ascii_lowercase().as_str() {
             "moves" => Some(Self::Moves),
-            "tree" => Some(Self::Tree),
+            "tree" | "tree & ref" | "tree & reference" | "reference" => Some(Self::Tree),
             "engine" => Some(Self::Engine),
             "prep" | "preparation" => Some(Self::Preparation),
             "repertoire" | "train" => Some(Self::Repertoire),
@@ -381,10 +381,15 @@ enum PatternPaintTarget {
 
 enum PositionSearchMsg {
     Progress(usize, usize, usize),
-    Done(Result<(Arc<dyn GameLibrary>, Vec<PositionHit>), String>),
+    Done {
+        append: bool,
+        result: Result<(Arc<dyn GameLibrary>, search::SearchBatchResult), String>,
+    },
     StructIndexProgress(usize, usize),
     StructIndexDone(Result<(PathBuf, u64, usize, usize), String>),
 }
+
+const POS_SEARCH_BATCH_SIZE: usize = 1_000;
 
 struct FileDialogResult {
     target: FileDialogTarget,
@@ -503,7 +508,6 @@ impl ReferenceMode {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum RefGamesSort {
     #[default]
@@ -511,7 +515,6 @@ enum RefGamesSort {
     Recent,
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Debug)]
 struct RefGameEntry {
     lib_index: usize,
@@ -529,7 +532,6 @@ struct RefGameEntry {
     cat: players::GameCategory,
 }
 
-#[allow(dead_code)]
 impl RefGameEntry {
     fn avg_elo(&self) -> u32 {
         match (self.white_elo, self.black_elo) {
@@ -541,7 +543,6 @@ impl RefGameEntry {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Debug, Default)]
 struct RefPositionGames {
     source_path: PathBuf,
@@ -1356,6 +1357,7 @@ struct HoveredGameBrowse {
     anchor_node: usize,
     cursor_node: usize,
     hovered_pv_step: Option<usize>,
+    hover_orientation: Option<Color>,
 }
 
 #[derive(Clone, Debug)]
@@ -1563,6 +1565,39 @@ struct PendingOpenChoice {
     path: PathBuf,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SlotSearchMeta {
+    matched_ply: usize,
+    structure_side: Color,
+    white_elo: u16,
+    black_elo: u16,
+    date_num: u32,
+    original_order: usize,
+}
+
+#[derive(Clone, Debug)]
+struct PlayerSortedGamesCache {
+    session_revision: usize,
+    player_key: String,
+    prep_color: Option<Color>,
+    indices: Vec<usize>,
+}
+
+#[derive(Clone, Debug)]
+enum PendingDeleteTarget {
+    SessionSlots(Vec<usize>),
+    PrepMergedIndex(usize),
+}
+
+#[derive(Clone, Debug)]
+struct PendingDeleteGames {
+    target: PendingDeleteTarget,
+    previews: Vec<String>,
+    games: Vec<Game>,
+    remember_deleted: bool,
+    is_read_only_db: bool,
+}
+
 struct ParkedDatabase {
     library: Option<Arc<dyn GameLibrary>>,
     session: crate::session::GameList,
@@ -1571,6 +1606,10 @@ struct ParkedDatabase {
     dirty: bool,
     session_dirty: bool,
     database_save_path: Option<PathBuf>,
+    scratch_title: Option<String>,
+    slot_search_meta: HashMap<usize, SlotSearchMeta>,
+    search_list_perspective: Option<search::SearchBoardPerspective>,
+    search_list_sort: search::PositionHitSort,
     current_slot: Option<usize>,
     selected_slots: BTreeSet<usize>,
     selection_anchor: Option<usize>,
@@ -1691,6 +1730,13 @@ pub struct App {
     /// Last writable database path chosen in this session. Save database
     /// writes here without asking again.
     database_save_path: Option<PathBuf>,
+    scratch_title: Option<String>,
+    slot_search_meta: HashMap<usize, SlotSearchMeta>,
+    search_list_perspective: Option<search::SearchBoardPerspective>,
+    search_list_sort: search::PositionHitSort,
+    deleted_games: my_games::DeletedGamesRegistry,
+    pending_delete_games: Option<PendingDeleteGames>,
+    player_profile_sorted_games: Option<PlayerSortedGamesCache>,
     /// The game list changed independently of the current game's edits.
     session_dirty: bool,
     /// The window close request is waiting for Save / Discard / Cancel.
@@ -1715,12 +1761,10 @@ pub struct App {
     /// independent so browsing a live source never overwrites local defaults).
     #[allow(dead_code)]
     reference_mode: ReferenceMode,
-    #[allow(dead_code)]
     ref_games_sort: RefGamesSort,
-    #[allow(dead_code)]
     ref_position_games: Option<RefPositionGames>,
-    #[allow(dead_code)]
     ref_position_games_rx: Option<mpsc::Receiver<RefPositionGames>>,
+    ref_position_games_pending: Option<(PathBuf, u64)>,
     tree_index: Option<PositionIndex>,
     tree_index_rx: Option<mpsc::Receiver<TreeIndexMessage>>,
     tree_index_job: Option<PathBuf>,
@@ -2079,6 +2123,20 @@ pub struct App {
     pos_search_rx: Option<mpsc::Receiver<PositionSearchMsg>>,
     pos_search_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
     pos_search_struct_cache: Option<(PathBuf, u64, usize, bool)>,
+    pos_search_perspective: search::SearchBoardPerspective,
+    pos_search_last_label: String,
+    pos_search_sort: search::PositionHitSort,
+    pos_search_next_start: usize,
+    pos_search_total_candidates: usize,
+    pos_search_has_more: bool,
+    pos_search_last_query: Option<PositionQuery>,
+    pos_search_eco_browser_open: bool,
+    pos_search_eco_query: String,
+    pos_search_eco_volume: Option<char>,
+    pos_search_eco_selected_only: bool,
+    pos_search_eco_keep_selection: bool,
+    pos_search_eco_last_anchor: Option<usize>,
+    pos_search_eco_drag: Option<(usize, bool, std::collections::BTreeSet<u16>)>,
     online_game_rx: Option<mpsc::Receiver<Result<Game, String>>>,
     online_game_job: Option<String>,
     online_reference_open: bool,
@@ -2450,6 +2508,13 @@ impl App {
             last_database_dir: display_prefs.last_database_dir.clone(),
             last_print_dir: display_prefs.last_print_dir.clone(),
             database_save_path: None,
+            scratch_title: None,
+            slot_search_meta: HashMap::new(),
+            search_list_perspective: None,
+            search_list_sort: search::PositionHitSort::default(),
+            deleted_games: my_games::DeletedGamesRegistry::load(),
+            pending_delete_games: None,
+            player_profile_sorted_games: None,
             session_dirty: false,
             close_confirm_open: false,
             pending_window_close: false,
@@ -2465,6 +2530,7 @@ impl App {
             ref_games_sort: RefGamesSort::default(),
             ref_position_games: None,
             ref_position_games_rx: None,
+            ref_position_games_pending: None,
             tree_index: None,
             tree_index_rx: None,
             tree_index_job: None,
@@ -2782,6 +2848,20 @@ impl App {
             pos_search_rx: None,
             pos_search_cancel: None,
             pos_search_struct_cache: None,
+            pos_search_perspective: search::SearchBoardPerspective::default(),
+            pos_search_last_label: String::new(),
+            pos_search_sort: search::PositionHitSort::default(),
+            pos_search_next_start: 0,
+            pos_search_total_candidates: 0,
+            pos_search_has_more: false,
+            pos_search_last_query: None,
+            pos_search_eco_browser_open: false,
+            pos_search_eco_query: String::new(),
+            pos_search_eco_volume: None,
+            pos_search_eco_selected_only: false,
+            pos_search_eco_keep_selection: true,
+            pos_search_eco_last_anchor: None,
+            pos_search_eco_drag: None,
             online_game_rx: None,
             online_game_job: None,
             online_reference_open: false,
@@ -2984,7 +3064,6 @@ impl App {
         }
         app.prep_recent_games_height =
             (display_prefs.prep_recent_games_height as f32).clamp(120.0, 900.0);
-        app.sync_my_games_accounts_into_player_names();
         if !cfg!(test) {
             let prep_ttl = app.prep_cache_ttl_hours;
             let rev_enabled = app.prep_cache_reverse_color;
@@ -3565,6 +3644,11 @@ impl App {
         self.dirty = false;
         self.session_dirty = false;
         self.database_save_path = None;
+        self.scratch_title = None;
+        self.slot_search_meta.clear();
+        self.search_list_perspective = None;
+        self.search_list_sort = search::PositionHitSort::default();
+        self.player_profile_sorted_games = None;
         self.current_slot = None;
         self.current = None;
         self.print_diagrams.clear();
@@ -3782,7 +3866,8 @@ impl App {
             Ok(PlayerDirectoryMessage::Done(directory)) => {
                 self.players = directory;
                 self.apply_player_aliases_to_directory();
-                self.players_status = format!("{} players indexed.", games_label(self.players.len()));
+                self.players_status =
+                    format!("{} players indexed.", games_label(self.players.len()));
                 self.players_job = None;
                 self.preload_cached_wiki_titles();
                 self.wiki_batch_plan_cache = None;
@@ -4257,25 +4342,33 @@ impl App {
         names
     }
 
-    fn sync_my_games_accounts_into_player_names(&mut self) -> bool {
-        let mut added = false;
-        for acc in &self.my_games_config.accounts {
-            let user = acc.username.trim();
-            if user.is_empty() {
-                continue;
-            }
-            let user_key = players::player_key(user);
-            let already = self.prep_player_names.iter().any(|existing| {
-                let (_, clean) = players::parse_player_alias(existing);
-                clean.trim().eq_ignore_ascii_case(user)
-                    || (user_key.is_some() && players::player_key(clean) == user_key)
-            });
-            if !already {
-                self.prep_player_names.push(user.to_string());
-                added = true;
-            }
+    fn primary_my_player_display_name(&self) -> Option<&str> {
+        self.prep_player_names
+            .iter()
+            .map(|raw| players::parse_player_alias(raw).1.trim())
+            .find(|s| !s.is_empty())
+    }
+
+    /// Map any configured online account username back to the primary player name
+    /// for list and board display, leaving underlying PGN tags untouched.
+    fn display_player_name<'a>(&'a self, raw_name: &'a str) -> &'a str {
+        let Some(primary) = self.primary_my_player_display_name() else {
+            return raw_name;
+        };
+        let trimmed = raw_name.trim();
+        if trimmed.is_empty() {
+            return raw_name;
         }
-        added
+        let raw_key = players::player_key(trimmed);
+        let matches_account = self.my_games_config.accounts.iter().any(|acc| {
+            let u = acc.username.trim();
+            !u.is_empty()
+                && (u.eq_ignore_ascii_case(trimmed)
+                    || (acc.source == OnlineSource::ChessAbc
+                        && raw_key.is_some()
+                        && players::player_key(u) == raw_key))
+        });
+        if matches_account { primary } else { raw_name }
     }
 
     fn is_my_player_name(&self, name: &str) -> bool {
@@ -4311,8 +4404,7 @@ impl App {
             if let Some(key) = prev_key {
                 self.selected_player = self.players.find_key(&key).or_else(|| {
                     if self.is_my_player_name(&key) {
-                        top_priority_player_key(&aliases)
-                            .and_then(|yk| self.players.find_key(&yk))
+                        top_priority_player_key(&aliases).and_then(|yk| self.players.find_key(&yk))
                     } else {
                         None
                     }
@@ -4350,6 +4442,13 @@ impl App {
     fn effective_display_orientation(&self, game: &Game, is_hover_overlay: bool) -> Color {
         if !is_hover_overlay {
             return self.orientation;
+        }
+        if let Some(orient) = self
+            .hovered_game_browse
+            .as_ref()
+            .and_then(|browse| browse.hover_orientation)
+        {
+            return orient;
         }
         if self.prep.is_none() {
             self.my_games_player_color(game.white(), game.black())
@@ -4430,13 +4529,18 @@ impl App {
         }
         self.my_games_sync_status = "Syncing Lichess / Chess.com accounts…".to_string();
         let config = self.my_games_config.clone();
+        let deleted = self.deleted_games.clone();
         let token = self.effective_lichess_token();
         let (tx, rx) = mpsc::channel();
         let ctx = self.ctx.clone();
         std::thread::spawn(move || {
-            let res = my_games::sync_online_accounts_into_db(&config, token.as_deref())
-                .map(|report| (config, report))
-                .map_err(|err| format!("{err:#}"));
+            let res = my_games::sync_online_accounts_into_db_with_deleted(
+                &config,
+                token.as_deref(),
+                &deleted,
+            )
+            .map(|report| (config, report))
+            .map_err(|err| format!("{err:#}"));
             let _ = tx.send(res);
             ctx.request_repaint();
         });
@@ -4468,8 +4572,13 @@ impl App {
                 } else {
                     String::new()
                 };
+                let deleted_note = if report.skipped_deleted > 0 {
+                    format!(", {} deleted ignored", report.skipped_deleted)
+                } else {
+                    String::new()
+                };
                 let base_msg = format!(
-                    "My Games sync: {} fetched, {} added ({} skipped{variant_note}, {} total).",
+                    "My Games sync: {} fetched, {} added ({} skipped{variant_note}{deleted_note}, {} total).",
                     games_label(report.fetched),
                     report.added,
                     report.skipped,
@@ -4895,6 +5004,15 @@ impl App {
             path.file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_else(|| path.display().to_string())
+        } else if idx == self.active_db_index
+            && let Some(title) = self.scratch_title.as_deref()
+        {
+            title.to_string()
+        } else if idx != self.active_db_index
+            && let Some(Some(p)) = self.shelf_entries.get(idx)
+            && let Some(title) = p.scratch_title.as_deref()
+        {
+            title.to_string()
         } else if self.shelf_entry_count(idx) == 0 {
             "Empty database".to_string()
         } else {
@@ -4922,6 +5040,10 @@ impl App {
                 .and_then(|e| e.as_ref())
                 .is_some_and(|p| p.dirty || p.session_dirty)
         }
+    }
+
+    fn active_db_is_read_only(&self) -> bool {
+        self.shelf_entry_read_only(self.active_db_index)
     }
 
     fn shelf_entry_read_only(&self, idx: usize) -> bool {
@@ -4959,6 +5081,10 @@ impl App {
             dirty: std::mem::replace(&mut self.dirty, false),
             session_dirty: std::mem::replace(&mut self.session_dirty, false),
             database_save_path: self.database_save_path.take(),
+            scratch_title: self.scratch_title.take(),
+            slot_search_meta: std::mem::take(&mut self.slot_search_meta),
+            search_list_perspective: self.search_list_perspective.take(),
+            search_list_sort: std::mem::take(&mut self.search_list_sort),
             current_slot: self.current_slot.take(),
             selected_slots: std::mem::take(&mut self.selected_slots),
             selection_anchor: self.selection_anchor.take(),
@@ -4978,6 +5104,11 @@ impl App {
         self.dirty = parked.dirty;
         self.session_dirty = parked.session_dirty;
         self.database_save_path = parked.database_save_path;
+        self.scratch_title = parked.scratch_title;
+        self.slot_search_meta = parked.slot_search_meta;
+        self.search_list_perspective = parked.search_list_perspective;
+        self.search_list_sort = parked.search_list_sort;
+        self.player_profile_sorted_games = None;
         self.current_slot = parked.current_slot;
         self.selected_slots = parked.selected_slots;
         self.selection_anchor = parked.selection_anchor;
@@ -5035,6 +5166,11 @@ impl App {
             self.shelf_entries.push(None);
             self.active_db_index = self.shelf_entries.len() - 1;
         }
+        self.scratch_title = None;
+        self.slot_search_meta.clear();
+        self.search_list_perspective = None;
+        self.search_list_sort = search::PositionHitSort::default();
+        self.player_profile_sorted_games = None;
         self.players_status = "No players indexed.".to_string();
         self.index_status = "Empty scratch database.".to_string();
         self.status = "Created a new scratch database on the Open Databases shelf.".to_string();
@@ -5488,7 +5624,8 @@ impl App {
     /// chooser; an existing writable target overwrites cleanly in place.
     fn save_database_now(&mut self, close_after: bool) {
         self.ensure_current_game_in_session();
-        if self.session.is_empty() {
+        if self.session.is_empty() && !(self.session_dirty && self.writable_save_target().is_some())
+        {
             self.status = "There are no games to save.".to_string();
             return;
         }
@@ -7649,10 +7786,6 @@ impl App {
                     });
                     let _ = self.my_games_config.save();
                     self.my_games_new_account_user.clear();
-                    if self.sync_my_games_accounts_into_player_names() {
-                        self.settings_my_player_names = self.prep_player_names.join("\n");
-                        self.save_reference_prefs();
-                    }
                     self.apply_player_aliases_to_directory();
                 }
             }
@@ -7709,10 +7842,6 @@ impl App {
         }
         if changed {
             let _ = self.my_games_config.save();
-            if self.sync_my_games_accounts_into_player_names() {
-                self.settings_my_player_names = self.prep_player_names.join("\n");
-                self.save_reference_prefs();
-            }
             self.apply_player_aliases_to_directory();
         }
         ui.horizontal_wrapped(|ui| {
@@ -7741,6 +7870,55 @@ impl App {
                 self.open_league_import_dialog();
             }
         });
+        if !self.deleted_games.is_empty() {
+            ui.add_space(4.0);
+            let mut restore_idx = None;
+            let mut clear_all = false;
+            egui::CollapsingHeader::new(format!(
+                "Deleted / ignored games ({})",
+                self.deleted_games.len()
+            ))
+            .id_salt("my-games-deleted-list")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(
+                            "Games removed manually will be skipped during Lichess / Chess.com / ChessABC sync.",
+                        )
+                        .small()
+                        .weak(),
+                    );
+                    if ui.small_button("Clear all").clicked() {
+                        clear_all = true;
+                    }
+                });
+                egui::ScrollArea::vertical()
+                    .id_salt("my-games-deleted-scroll")
+                    .max_height(140.0)
+                    .show(ui, |ui| {
+                        for (idx, entry) in self.deleted_games.entries().iter().enumerate() {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(entry.summary_label()).small());
+                                if ui.small_button("Restore").clicked() {
+                                    restore_idx = Some(idx);
+                                }
+                            });
+                        }
+                    });
+            });
+            if clear_all {
+                self.deleted_games.clear();
+                if !cfg!(test) {
+                    let _ = self.deleted_games.save();
+                }
+            } else if let Some(idx) = restore_idx {
+                self.deleted_games.remove(idx);
+                if !cfg!(test) {
+                    let _ = self.deleted_games.save();
+                }
+            }
+        }
         sync_clicked
     }
 
@@ -8261,7 +8439,6 @@ impl App {
             self.settings_status = format!("Could not save My Games settings: {err:#}");
             saved = false;
         }
-        self.sync_my_games_accounts_into_player_names();
         self.apply_player_aliases_to_directory();
 
         if reference_path_changed || reference_enabled_changed || reference_window_changed {
@@ -10997,7 +11174,8 @@ impl App {
             Color::White => game.white(),
             Color::Black => game.black(),
         };
-        self.title_for_player_date(name, game.date(), fallback)
+        let display_name = self.display_player_name(name);
+        self.title_for_player_date(display_name, game.date(), fallback)
     }
 
     /// Number of players selected by the batch scope, how many still need a
@@ -11838,6 +12016,7 @@ impl App {
             exclude_chesscom: self.prep_exclude_chesscom,
             ..Default::default()
         };
+        let deleted_games = self.deleted_games.clone();
         let max_games = Self::PREP_ONLINE_MAX;
         let total = {
             let mut total = 0usize;
@@ -11956,10 +12135,12 @@ impl App {
                 && !force_refresh
                 && let Some(cached) = players::load_prep_cache(&cache_key, cache_ttl_hours, None)
             {
+                let mut cached_games = cached.games;
+                cached_games.retain(|g| !deleted_games.contains(g));
                 let book = PlayerBook::from_merged_games(
                     player.key.clone(),
                     player.name.clone(),
-                    &cached.games,
+                    &cached_games,
                     config,
                     as_of,
                 );
@@ -11967,7 +12148,7 @@ impl App {
                 let _ = tx.send(PrepLoadMessage::Done(Ok(PrepLoadResult {
                     sources_label: cached.sources_label,
                     book,
-                    games: cached.games,
+                    games: cached_games,
                     self_exposure,
                     loaded_from_cache_at: Some(cached.cached_unix),
                     cache_saved_at: None,
@@ -11998,8 +12179,10 @@ impl App {
                     .collect();
                 let mut merged = players::deduplicate_and_merge_games(cloned);
                 merged.retain(|(_, game)| {
-                    players::player_key(game.white()).as_deref() == Some(player.key.as_str())
-                        || players::player_key(game.black()).as_deref() == Some(player.key.as_str())
+                    (players::player_key(game.white()).as_deref() == Some(player.key.as_str())
+                        || players::player_key(game.black()).as_deref()
+                            == Some(player.key.as_str()))
+                        && !deleted_games.contains(game)
                 });
                 let games: Vec<Game> = merged.into_iter().map(|(_, game)| game).collect();
                 let sources_label = format!("{} · {} games", notes.join(" + "), games.len());
@@ -12284,8 +12467,9 @@ impl App {
             let source_count = sources.len();
             let mut merged = players::deduplicate_and_merge_games(sources);
             merged.retain(|(_, game)| {
-                players::player_key(game.white()).as_deref() == Some(player.key.as_str())
-                    || players::player_key(game.black()).as_deref() == Some(player.key.as_str())
+                (players::player_key(game.white()).as_deref() == Some(player.key.as_str())
+                    || players::player_key(game.black()).as_deref() == Some(player.key.as_str()))
+                    && !deleted_games.contains(game)
             });
             let games: Vec<Game> = merged.into_iter().map(|(_, game)| game).collect();
             let book = PlayerBook::from_merged_games(
@@ -14024,10 +14208,18 @@ impl App {
                     .take()
                     .or_else(|| self.prep.as_ref().map(|prep| prep.player_name.clone()))
                     .unwrap_or_default();
-                self.prep_online_status = format!(
-                    "Loaded {} from ChessABC for {name}.",
-                    games_label(games.len())
-                );
+                let (games, skipped_deleted) = self.deleted_games.filter_games(games);
+                self.prep_online_status = if skipped_deleted > 0 {
+                    format!(
+                        "Loaded {} from ChessABC for {name} ({skipped_deleted} deleted ignored).",
+                        games_label(games.len())
+                    )
+                } else {
+                    format!(
+                        "Loaded {} from ChessABC for {name}.",
+                        games_label(games.len())
+                    )
+                };
                 self.prep_online_games = games;
             }
             Ok(Err(err)) => {
@@ -14832,12 +15024,30 @@ impl App {
                     )
                 };
                 self.current = Some(game);
+                let search_meta = self.slot_search_meta.get(&id).copied();
                 let orientation = self
                     .current
                     .as_ref()
                     .and_then(|game| my_player_color(&self.effective_my_player_names(), game));
                 if self.prep.is_none() {
-                    if let Some(color) = orientation {
+                    if let Some(meta) = search_meta {
+                        if let Some(orient) = self
+                            .search_list_perspective
+                            .and_then(|persp| persp.orientation_for(meta.structure_side))
+                        {
+                            self.orientation = orient;
+                        } else if let Some(color) = orientation {
+                            self.orientation = color;
+                        }
+                        let target = meta.matched_ply.min(
+                            self.current
+                                .as_ref()
+                                .map_or(0, |g| g.nodes.len().saturating_sub(1)),
+                        );
+                        if target > 0 {
+                            self.goto(target);
+                        }
+                    } else if let Some(color) = orientation {
                         self.orientation = color;
                     }
                 } else if let Some(locked) = self.prep_locked_orientation() {
@@ -16082,6 +16292,7 @@ impl App {
             players,
             prep_tab,
             date,
+            delete_key,
         ) = ctx.input(|i| {
             (
                 i.key_pressed(Key::ArrowRight),
@@ -16103,6 +16314,7 @@ impl App {
                 i.key_pressed(Key::P) && !i.modifiers.shift,
                 i.key_pressed(Key::P) && i.modifiers.shift,
                 i.key_pressed(Key::D),
+                i.key_pressed(Key::Delete),
             )
         });
 
@@ -16195,6 +16407,22 @@ impl App {
         if date && self.current.is_some() {
             self.date_picker_anchor = None;
             self.open_date_picker();
+        }
+        if delete_key
+            && self.left_tab == LeftTab::Games
+            && self.prep.is_none()
+            && self.pending_delete_games.is_none()
+        {
+            let ids: Vec<usize> = if !self.selected_slots.is_empty() {
+                self.selected_slots.iter().copied().collect()
+            } else if let Some(slot_id) = self.current_slot {
+                vec![slot_id]
+            } else {
+                Vec::new()
+            };
+            if !ids.is_empty() {
+                self.request_delete_session_slots(ids);
+            }
         }
     }
 
@@ -17677,6 +17905,7 @@ impl App {
                 return;
             }
             let mut merged_preview = None;
+            let mut ctx_delete_prep: Option<usize> = None;
             egui::ScrollArea::vertical()
                 .id_salt("game-list")
                 .auto_shrink([false, false])
@@ -17694,13 +17923,15 @@ impl App {
                             format!("{} · {} · {}", game.event(), game.date(), game.result());
                         let site_owned = game.header("Site").map(str::to_string);
                         let width = ui.available_width();
+                        let white_disp = self.display_player_name(game.white());
+                        let black_disp = self.display_player_name(game.black());
                         let mut response = game_row(
                             ui,
                             false,
                             "",
-                            RowName::new(game.white(), self.title_for_game(game, Color::White)),
+                            RowName::new(white_disp, self.title_for_game(game, Color::White)),
                             Some(RowName::new(
-                                game.black(),
+                                black_disp,
                                 self.title_for_game(game, Color::Black),
                             )),
                             "",
@@ -17729,8 +17960,17 @@ impl App {
                         if response.clicked() {
                             merged_preview = Some(position);
                         }
+                        response.context_menu(|ui| {
+                            if ui.button("Delete / hide game…").clicked() {
+                                ctx_delete_prep = Some(position);
+                                ui.close();
+                            }
+                        });
                     }
                 });
+            if let Some(position) = ctx_delete_prep {
+                self.request_delete_prep_game(position);
+            }
             if let Some(position) = merged_preview
                 && let Some(game) = self.prep_merged_games.get(position).cloned()
             {
@@ -17886,12 +18126,85 @@ impl App {
             return;
         }
 
+        if self.prep.is_none() && !self.slot_search_meta.is_empty() {
+            let mut clear_meta = false;
+            let mut changed_persp = None;
+            let mut changed_sort = None;
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("View from:").small().strong());
+                let cur_persp = self
+                    .search_list_perspective
+                    .unwrap_or(search::SearchBoardPerspective::StructureSide);
+                for (persp, label) in [
+                    (search::SearchBoardPerspective::StructureSide, "Structure"),
+                    (search::SearchBoardPerspective::OpponentSide, "Opponent"),
+                    (search::SearchBoardPerspective::FixedWhite, "White"),
+                ] {
+                    if ui.selectable_label(cur_persp == persp, label).clicked() {
+                        changed_persp = Some(persp);
+                    }
+                }
+                if ui
+                    .small_button("×")
+                    .on_hover_text("Clear search perspective lock")
+                    .clicked()
+                {
+                    clear_meta = true;
+                }
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("Sort:").small().strong());
+                for sort in search::PositionHitSort::ALL {
+                    let tip = match sort {
+                        search::PositionHitSort::DbOrder => "Original search hit order",
+                        search::PositionHitSort::StructureEloDesc => {
+                            "Sort by the Elo of the player holding the searched structure (White or Black per game)"
+                        }
+                        search::PositionHitSort::OpponentEloDesc => {
+                            "Sort by the Elo of the player facing the searched structure"
+                        }
+                        search::PositionHitSort::AverageEloDesc => {
+                            "Sort by average Elo of both players"
+                        }
+                        search::PositionHitSort::DateDesc => "Sort newest games first",
+                    };
+                    if ui
+                        .selectable_label(self.search_list_sort == sort, sort.short_label())
+                        .on_hover_text(tip)
+                        .clicked()
+                    {
+                        changed_sort = Some(sort);
+                    }
+                }
+            });
+            if clear_meta {
+                self.slot_search_meta.clear();
+                self.search_list_perspective = None;
+                self.search_list_sort = search::PositionHitSort::DbOrder;
+            } else {
+                if let Some(persp) = changed_persp {
+                    self.search_list_perspective = Some(persp);
+                    if let Some(slot_id) = self.current_slot
+                        && let Some(meta) = self.slot_search_meta.get(&slot_id)
+                        && let Some(orient) = persp.orientation_for(meta.structure_side)
+                    {
+                        self.orientation = orient;
+                    }
+                }
+                if let Some(sort) = changed_sort {
+                    self.apply_search_list_sort(sort);
+                }
+            }
+            ui.add_space(2.0);
+        }
+
         let mut select = None;
         let mut reorder: Option<(GameRowDrag, usize)> = None;
         let mut ctx_copy = false;
         let mut ctx_paste_at: Option<usize> = None;
         let mut ctx_copy_to_shelf: Option<(usize, Vec<usize>)> = None;
         let mut ctx_copy_to_my_games: Option<(MyGamesSection, Vec<usize>)> = None;
+        let mut ctx_delete_slots: Option<Vec<usize>> = None;
         let my_games_configured = self.my_games_config.path.is_some();
         let shelf_targets: Vec<(usize, String)> = (0..self.shelf_entries.len())
             .filter(|&idx| idx != self.active_db_index && !self.shelf_entry_read_only(idx))
@@ -17963,12 +18276,14 @@ impl App {
                         || self.selected_slots.contains(&id))
                         && self.prep.is_none();
                     let width = ui.available_width();
+                    let white_disp = self.display_player_name(&white_name);
+                    let black_disp = self.display_player_name(&black_name);
                     let mut response = game_row(
                         ui,
                         selected,
                         "",
-                        RowName::new(&white_name, white_title),
-                        Some(RowName::new(&black_name, black_title)),
+                        RowName::new(white_disp, white_title),
+                        Some(RowName::new(black_disp, black_title)),
                         "",
                         &subtitle,
                         site_owned.as_deref(),
@@ -17990,6 +18305,23 @@ impl App {
                             if let Some(game) = game {
                                 self.activate_hovered_game_browse(browse_id, game);
                             }
+                        }
+                        if let Some(meta) = self.slot_search_meta.get(&id).copied()
+                            && let Some(browse) = self.hovered_game_browse.as_mut()
+                        {
+                            browse.hover_orientation = self
+                                .search_list_perspective
+                                .and_then(|p| p.orientation_for(meta.structure_side));
+                            let target = meta
+                                .matched_ply
+                                .min(browse.game.nodes.len().saturating_sub(1));
+                            browse.anchor_node = target;
+                            browse.cursor_node = target;
+                            self.hover_preview =
+                                browse.game.nodes.get(target).map(|node| HoverPreview {
+                                    pos: node.pos.clone(),
+                                    last_move: domain::last_move_squares(node),
+                                });
                         }
                     }
                     let drag_ids: Vec<usize> =
@@ -18132,9 +18464,22 @@ impl App {
                                 },
                             );
                         }
+                        if self.prep.is_none() {
+                            ui.separator();
+                            if ui
+                                .button(format!("Delete {}…", games_label(copy_count)))
+                                .clicked()
+                            {
+                                ctx_delete_slots = Some(drag_ids.clone());
+                                ui.close();
+                            }
+                        }
                     });
                 }
             });
+        if let Some(slot_ids) = ctx_delete_slots {
+            self.request_delete_session_slots(slot_ids);
+        }
         if ctx_copy {
             let ctx = ui.ctx().clone();
             self.copy_selected_games_to_clipboard(&ctx);
@@ -18244,25 +18589,54 @@ impl App {
             .as_ref()
             .filter(|prep| prep.player_key == player.key)
             .map(|prep| prep.opponent_color());
-        let game_indices: Vec<usize> = player
-            .game_indices
-            .iter()
-            .copied()
-            .filter(|index| {
-                let Some(color) = prep_color else {
-                    return true;
-                };
-                self.library
-                    .as_ref()
-                    .map(|library| {
-                        let (white_name, black_name) = library.game_players(*index);
-                        let white = self.name_belongs_to_player(&white_name, &player);
-                        let black = self.name_belongs_to_player(&black_name, &player);
-                        if color == Color::White { white } else { black }
-                    })
-                    .unwrap_or(false)
-            })
-            .collect();
+        let cache_valid = self.player_profile_sorted_games.as_ref().is_some_and(|c| {
+            c.session_revision == self.session_revision
+                && c.player_key == player.key
+                && c.prep_color == prep_color
+        });
+        let game_indices: Vec<usize> = if cache_valid {
+            self.player_profile_sorted_games
+                .as_ref()
+                .map(|c| c.indices.clone())
+                .unwrap_or_default()
+        } else {
+            let mut list: Vec<(usize, u32)> = player
+                .game_indices
+                .iter()
+                .copied()
+                .filter(|index| {
+                    let Some(color) = prep_color else {
+                        return true;
+                    };
+                    self.library
+                        .as_ref()
+                        .map(|library| {
+                            let (white_name, black_name) = library.game_players(*index);
+                            let white = self.name_belongs_to_player(&white_name, &player);
+                            let black = self.name_belongs_to_player(&black_name, &player);
+                            if color == Color::White { white } else { black }
+                        })
+                        .unwrap_or(false)
+                })
+                .map(|idx| {
+                    let date_num = self
+                        .library
+                        .as_ref()
+                        .map(|lib| lib.game_record_meta(idx).date_num)
+                        .unwrap_or(0);
+                    (idx, date_num)
+                })
+                .collect();
+            list.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| b.0.cmp(&a.0)));
+            let sorted: Vec<usize> = list.into_iter().map(|(idx, _)| idx).collect();
+            self.player_profile_sorted_games = Some(PlayerSortedGamesCache {
+                session_revision: self.session_revision,
+                player_key: player.key.clone(),
+                prep_color,
+                indices: sorted.clone(),
+            });
+            sorted
+        };
         let mut back = false;
         let mut exit = false;
         let mut select_game = None;
@@ -18284,6 +18658,15 @@ impl App {
                 None
             };
 
+        let is_you = top_priority_player_key(&self.effective_my_player_names()).as_deref()
+            == Some(player.key.as_str());
+        let has_exit = self
+            .prep
+            .as_ref()
+            .is_some_and(|prep| prep.player_key == player.key);
+        let has_fide = player.fide_id.is_some();
+        let has_wiki = matches!(&wiki_header_state, Some(Ok(_)));
+
         egui::Frame::new()
             .fill(SURFACE)
             .corner_radius(8.0)
@@ -18292,30 +18675,44 @@ impl App {
             .show(ui, |ui| {
                 // Header row: navigation left; FIDE / Wikipedia links and Exit prep right.
                 ui.horizontal(|ui| {
-                    if ui.small_button("← All players").clicked() {
+                    let header_layout = profile_header_layout(
+                        ui.available_width(),
+                        is_you,
+                        has_exit,
+                        has_fide,
+                        has_wiki,
+                    );
+                    let back_resp = ui.small_button(header_layout.back);
+                    let back_resp = if header_layout.back == "←" {
+                        back_resp.on_hover_text("All players")
+                    } else {
+                        back_resp
+                    };
+                    if back_resp.clicked() {
                         back = true;
                     }
-                    if top_priority_player_key(&self.effective_my_player_names()).as_deref()
-                        == Some(player.key.as_str())
-                    {
+                    if is_you {
                         ui.label(RichText::new("You").small().strong().color(GOLD))
                             .on_hover_text("First name in the player-priority list");
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if self
-                            .prep
-                            .as_ref()
-                            .is_some_and(|prep| prep.player_key == player.key)
-                            && ui.small_button("Exit prep").clicked()
-                        {
-                            exit = true;
+                        if has_exit {
+                            let exit_resp = ui.small_button(header_layout.exit);
+                            let exit_resp = if header_layout.exit == "Exit" {
+                                exit_resp.on_hover_text("Exit preparation")
+                            } else {
+                                exit_resp
+                            };
+                            if exit_resp.clicked() {
+                                exit = true;
+                            }
                         }
                         if let Some(id) = player.fide_id.clone() {
-                            paint_fide_pill(ui, &id);
+                            paint_fide_pill(ui, &id, header_layout.fide_icon_only);
                         }
                         match &wiki_header_state {
                             Some(Ok((url, title))) => {
-                                paint_wiki_pill(ui, url, title);
+                                paint_wiki_pill(ui, url, title, header_layout.wiki);
                             }
                             Some(Err(is_ambiguous))
                                 if ui
@@ -18329,7 +18726,7 @@ impl App {
                             Some(Err(_)) | None => {}
                         }
                         if ui
-                            .small_button("🔍 Find")
+                            .small_button(header_layout.find)
                             .on_hover_text(
                                 "Scan a Lichess team or Chess.com club to find this player's online account by repertoire match",
                             )
@@ -18475,7 +18872,8 @@ impl App {
                             let elo_display = primary_elo
                                 .map(|elo| elo.to_string())
                                 .unwrap_or_else(|| "—".to_string());
-                            ui.label(RichText::new(elo_display).monospace().strong());
+                            ui.label(RichText::new(elo_display).monospace().strong())
+                                .on_hover_text("Current Elo");
                             if let Some(rapid) = player.fide_rapid {
                                 ui.horizontal(|ui| {
                                     ui.spacing_mut().item_spacing.x = 3.0;
@@ -18649,7 +19047,7 @@ impl App {
             .is_some_and(|prep| prep.player_key == player.key)
             && !self.prep_merged_games.is_empty();
         let merged_positions: Vec<usize> = if merged_active {
-            let mut out = Vec::new();
+            let mut out: Vec<(usize, u32)> = Vec::new();
             for (position, game) in self.prep_merged_games.iter().enumerate() {
                 let player_white = self.name_belongs_to_player(game.white(), &player);
                 let player_black = self.name_belongs_to_player(game.black(), &player);
@@ -18662,9 +19060,10 @@ impl App {
                         continue;
                     }
                 }
-                out.push(position);
+                out.push((position, parse_ref_game_date(game.date())));
             }
-            out
+            out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| b.0.cmp(&a.0)));
+            out.into_iter().map(|(pos, _)| pos).collect()
         } else {
             Vec::new()
         };
@@ -18685,6 +19084,8 @@ impl App {
                 .weak(),
             );
         }
+        let mut delete_prep_pos: Option<usize> = None;
+        let mut delete_lib_slot: Option<usize> = None;
         if total == 0 {
             ui.label(RichText::new("No games for this player.").weak());
         } else if merged_active {
@@ -18706,6 +19107,7 @@ impl App {
                         } else {
                             (game.white().to_string(), Color::White, Color::Black)
                         };
+                        let opponent_disp = self.display_player_name(&opponent);
                         let cat = players::classify_game_category(game);
                         let type_color = self.game_category_color(cat);
                         let subtitle = format!("{} · {}", game.event(), game.date());
@@ -18716,7 +19118,7 @@ impl App {
                             ui,
                             false,
                             &format!("{} vs ", color_name(player_color)),
-                            RowName::new(&opponent, self.title_for_game(game, opponent_color)),
+                            RowName::new(opponent_disp, self.title_for_game(game, opponent_color)),
                             None,
                             "",
                             &subtitle,
@@ -18747,6 +19149,12 @@ impl App {
                         if response.clicked() {
                             merged_preview = Some(position);
                         }
+                        response.context_menu(|ui| {
+                            if ui.button("Delete / hide game…").clicked() {
+                                delete_prep_pos = Some(position);
+                                ui.close();
+                            }
+                        });
                     }
                 });
             if let Some(position) = merged_preview
@@ -18854,6 +19262,7 @@ impl App {
                                 type_label,
                             )
                         };
+                        let opponent_disp = self.display_player_name(&opponent);
                         let subtitle = format!("{event} · {date}");
                         let player_color = if color == "White" {
                             Color::White
@@ -18862,9 +19271,8 @@ impl App {
                         };
                         let result_badge = standardize_result_badge(&result);
                         let outcome = calc_player_outcome(&result, player_color);
-                        let selected = self
-                            .session
-                            .source_slot(idx)
+                        let slot_id_for_row = self.session.source_slot(idx);
+                        let selected = slot_id_for_row
                             .is_some_and(|id| self.current_slot == Some(id))
                             && self.prep.is_none();
                         let width = ui.available_width();
@@ -18872,7 +19280,7 @@ impl App {
                             ui,
                             selected,
                             &format!("{color} vs "),
-                            RowName::new(&opponent, opponent_title),
+                            RowName::new(opponent_disp, opponent_title),
                             None,
                             "",
                             &subtitle,
@@ -18902,8 +19310,23 @@ impl App {
                         if response.clicked() {
                             select_game = Some(idx);
                         }
+                        if let Some(slot_id) = slot_id_for_row
+                            && self.prep.is_none()
+                        {
+                            response.context_menu(|ui| {
+                                if ui.button("Delete game…").clicked() {
+                                    delete_lib_slot = Some(slot_id);
+                                    ui.close();
+                                }
+                            });
+                        }
                     }
                 });
+        }
+        if let Some(pos) = delete_prep_pos {
+            self.request_delete_prep_game(pos);
+        } else if let Some(slot_id) = delete_lib_slot {
+            self.request_delete_session_slots(vec![slot_id]);
         }
 
         if open_photo {
@@ -19059,8 +19482,7 @@ impl App {
                     let key = player.key.clone();
                     let (player_title, player_elo, player_country) =
                         player_list_row_meta(player, self.display_title(player));
-                    let player_countries =
-                        player_list_row_countries(player, player_country);
+                    let player_countries = player_list_row_countries(player, player_country);
                     let is_you = you_key.as_deref() == Some(key.as_str());
                     let title = if is_you {
                         "You".to_string()
@@ -20955,6 +21377,10 @@ impl App {
             ui,
             &game,
             (
+                self.display_player_name(game.white()),
+                self.display_player_name(game.black()),
+            ),
+            (
                 self.title_for_game(&game, Color::White),
                 self.title_for_game(&game, Color::Black),
             ),
@@ -21026,25 +21452,20 @@ impl App {
                         {
                             crosstable_clicked = true;
                         }
-                        let ann_btn = egui::Button::new(
-                            RichText::new("Annotate")
-                                .small()
-                                .color(if ann_visible {
-                                    GOLD
-                                } else {
-                                    ui.visuals().text_color()
-                                }),
-                        )
+                        let ann_btn = egui::Button::new(RichText::new("Annotate").small().color(
+                            if ann_visible {
+                                GOLD
+                            } else {
+                                ui.visuals().text_color()
+                            },
+                        ))
                         .selected(ann_visible)
                         .fill(if ann_visible {
                             GOLD_SOFT
                         } else {
                             Color32::from_rgb(0x22, 0x26, 0x2F)
                         })
-                        .stroke(Stroke::new(
-                            1.0,
-                            if ann_visible { GOLD } else { BORDER },
-                        ))
+                        .stroke(Stroke::new(1.0, if ann_visible { GOLD } else { BORDER }))
                         .corner_radius(4.0);
                         if ui
                             .add(ann_btn)
@@ -21182,10 +21603,12 @@ impl App {
                         }
                     } else {
                         ui.label(
-                            RichText::new("Symbols attach to moves; comments below apply to the game intro.")
-                                .small()
-                                .weak()
-                                .italics(),
+                            RichText::new(
+                                "Symbols attach to moves; comments below apply to the game intro.",
+                            )
+                            .small()
+                            .weak()
+                            .italics(),
                         );
                     }
 
@@ -21351,6 +21774,16 @@ impl App {
         {
             self.maybe_request_chessabc_position(&pos);
         }
+        let active_ref_lib = self
+            .tree_library
+            .as_ref()
+            .or(self.library.as_ref())
+            .cloned();
+        if active_ref_lib.is_some() {
+            self.maybe_request_ref_position_games(key);
+        }
+
+        let pos_facts = search::analyze_position_facts(&pos);
         let mut explorer_source = self.explorer_source;
         let mut source_changed = None;
         let mut choose_tree = false;
@@ -21363,6 +21796,10 @@ impl App {
         let mut clicked_uci = None;
         let mut hover_preview = None;
         let mut load_game_id = None;
+        let mut load_ref_game: Option<(usize, String)> = None;
+        let mut hovered_ref_lib_idx: Option<usize> = None;
+        let mut search_preset_pos: Option<search::StructurePreset> = None;
+        let mut search_similar_pos = false;
         let mut choose_book = false;
         let mut clear_book = false;
         let mut build_index = false;
@@ -21376,8 +21813,11 @@ impl App {
             .show(ui, |ui| {
                 ui.set_max_width(ui.available_width());
                 ui.horizontal(|ui| {
-                    ui.heading("Tree");
-                    if self.cloud_rx.is_some() || self.explorer_rx.is_some() {
+                    ui.heading("Tree & Reference");
+                    if self.cloud_rx.is_some()
+                        || self.explorer_rx.is_some()
+                        || self.ref_position_games_rx.is_some()
+                    {
                         ui.spinner();
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -21464,6 +21904,71 @@ impl App {
                 });
                 ui.add_space(4.0);
 
+                // Compact Position Facts / Structure strip
+                egui::Frame::new()
+                    .fill(SURFACE)
+                    .corner_radius(6.0)
+                    .stroke(Stroke::new(1.0, BORDER))
+                    .inner_margin(8.0)
+                    .show(ui, |ui| {
+                        let join_files = |files: &[crate::chess::File]| -> String {
+                            if files.is_empty() {
+                                "—".to_string()
+                            } else {
+                                files
+                                    .iter()
+                                    .map(|f| f.to_string())
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            }
+                        };
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(RichText::new("Position facts:").small().strong());
+                            ui.label(
+                                RichText::new(format!(
+                                    "Open [{}] · ½-Open W[{}] B[{}]",
+                                    join_files(&pos_facts.open_files),
+                                    join_files(&pos_facts.half_open_white),
+                                    join_files(&pos_facts.half_open_black),
+                                ))
+                                .small()
+                                .monospace()
+                                .weak(),
+                            );
+                        });
+                        ui.horizontal_wrapped(|ui| {
+                            if !pos_facts.matched_structures.is_empty() {
+                                ui.label(RichText::new("Structure:").small().strong());
+                                for &(preset, side) in pos_facts.matched_structures.iter().take(4) {
+                                    let badge = format!(
+                                        "{} ({})",
+                                        preset.label(),
+                                        if side == Color::White { "W" } else { "B" }
+                                    );
+                                    if ui
+                                        .small_button(RichText::new(badge).small().color(GOLD))
+                                        .on_hover_text(
+                                            "Launch Position Search pre-filled with this pawn structure",
+                                        )
+                                        .clicked()
+                                    {
+                                        search_preset_pos = Some(preset);
+                                    }
+                                }
+                            }
+                            if ui
+                                .small_button("Find similar structures…")
+                                .on_hover_text(
+                                    "Launch Position Search pre-filled for the current structure / pawn skeleton",
+                                )
+                                .clicked()
+                            {
+                                search_similar_pos = true;
+                            }
+                        });
+                    });
+                ui.add_space(4.0);
+
                 if let Some(source) = &self.prompt_persist_index {
                     ui.add_space(4.0);
                     egui::Frame::new()
@@ -21513,7 +22018,7 @@ impl App {
                     "current database".to_string()
                 };
                 ui.label(
-                    RichText::new(format!("Local opening tree · {tree_label}"))
+                    RichText::new(format!("Reference / Local moves · {tree_label}"))
                         .strong()
                         .small(),
                 );
@@ -21563,25 +22068,143 @@ impl App {
                     }
                 }
 
-                if let Some(book) = &book {
-                    let moves = book.moves(&pos).unwrap_or_default();
-                    ui.add_space(8.0);
-                    egui::Frame::new()
-                        .fill(SURFACE)
-                        .corner_radius(10.0)
-                        .stroke(Stroke::new(1.0, BORDER))
-                        .inner_margin(10.0)
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                ui.heading("Opening book");
-                                ui.label(RichText::new(book.summary()).small().weak());
-                            });
+                // Primary Matching Reference Games section (promoted alongside Local/Reference Moves)
+                ui.add_space(6.0);
+                ui.separator();
+                ui.scope(|ui| {
+                    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Matching reference games").strong().small());
+                        if let Some(ref_games) = self.ref_position_games.as_ref().filter(|g| g.key == key) {
                             ui.label(
-                                RichText::new(
-                                    "Native book moves · hover to preview · click to play",
+                                RichText::new(format!("({})", games_label(ref_games.total_matched)))
+                                    .small()
+                                    .weak(),
+                            );
+                        }
+                        if self.ref_position_games_rx.is_some() {
+                            ui.spinner();
+                        }
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            ui.selectable_value(
+                                &mut self.ref_games_sort,
+                                RefGamesSort::Recent,
+                                "Recent",
+                            );
+                            ui.selectable_value(
+                                &mut self.ref_games_sort,
+                                RefGamesSort::TopRated,
+                                "Top rated",
+                            );
+                        });
+                    });
+                    if let Some(ref_games) = self.ref_position_games.as_ref().filter(|g| g.key == key) {
+                        if !ref_games.top_players.is_empty() {
+                            let top_str = ref_games
+                                .top_players
+                                .iter()
+                                .map(|(name, cnt)| format!("{} ({cnt})", self.display_player_name(name)))
+                                .collect::<Vec<_>>()
+                                .join(" · ");
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(format!("Top players: {top_str}")).small().weak(),
                                 )
+                                .truncate(),
+                            );
+                        }
+                        let list = match self.ref_games_sort {
+                            RefGamesSort::TopRated => &ref_games.by_rating,
+                            RefGamesSort::Recent => &ref_games.by_recent,
+                        };
+                        if list.is_empty() {
+                            ui.label(
+                                RichText::new("No matching reference games in scan window.")
+                                    .small()
+                                    .weak()
+                                    .italics(),
+                            );
+                        } else {
+                            for entry in list.iter().take(12) {
+                                let w_disp = self.display_player_name(&entry.white);
+                                let b_disp = self.display_player_name(&entry.black);
+                                let wt = entry
+                                    .white_title
+                                    .map(|t| format!("{t} "))
+                                    .unwrap_or_default();
+                                let bt = entry
+                                    .black_title
+                                    .map(|t| format!("{t} "))
+                                    .unwrap_or_default();
+                                let welo = entry
+                                    .white_elo
+                                    .map(|r| format!(" ({r})"))
+                                    .unwrap_or_default();
+                                let belo = entry
+                                    .black_elo
+                                    .map(|r| format!(" ({r})"))
+                                    .unwrap_or_default();
+                                let cat_color = self.game_category_color(entry.cat);
+                                let line = format!(
+                                    "{wt}{w_disp}{welo} – {bt}{b_disp}{belo} · {} · {}",
+                                    standardize_result_badge(&entry.result),
+                                    entry.date
+                                );
+                                let site_part = entry
+                                    .site
+                                    .as_deref()
+                                    .filter(|s| !s.is_empty() && *s != "?")
+                                    .map(|s| format!(" · {s}"))
+                                    .unwrap_or_default();
+                                let resp = ui
+                                    .selectable_label(
+                                        false,
+                                        RichText::new(&line).small().monospace().color(cat_color),
+                                    )
+                                    .on_hover_text(format!(
+                                        "{}{site_part} ({}) · hover to preview · click to open at position",
+                                        entry.event, entry.date
+                                    ));
+                                if resp.hovered() {
+                                    hovered_ref_lib_idx = Some(entry.lib_index);
+                                }
+                                if resp.clicked() {
+                                    load_ref_game = Some((
+                                        entry.lib_index,
+                                        format!("{w_disp} - {b_disp} · {}", entry.date),
+                                    ));
+                                }
+                            }
+                        }
+                    } else if active_ref_lib.is_none() {
+                        ui.label(
+                            RichText::new("Open a database or configure a Reference DB to see matching games.")
                                 .small()
                                 .weak(),
+                        );
+                    } else if self.ref_position_games_rx.is_some() {
+                        ui.label(RichText::new("Scanning recent reference games…").small().weak());
+                    }
+                });
+
+                ui.add_space(6.0);
+                let book_heading = if let Some(b) = &book {
+                    format!("Opening book · {}", b.summary())
+                } else if let Some(live_src) = LiveReferenceSource::from_config_str(&self.book_path) {
+                    format!("Opening book · {}", live_src.label())
+                } else {
+                    "Opening book".to_string()
+                };
+                egui::CollapsingHeader::new(RichText::new(book_heading).strong())
+                    .id_salt("tree-opening-book-collapse")
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        if let Some(book) = &book {
+                            let moves = book.moves(&pos).unwrap_or_default();
+                            ui.label(
+                                RichText::new("Native book moves · hover to preview · click to play")
+                                    .small()
+                                    .weak(),
                             );
                             ui.add_space(3.0);
                             if moves.is_empty() {
@@ -21654,36 +22277,17 @@ impl App {
                                         }
                                     });
                             }
-                        });
-                } else if LiveReferenceSource::from_config_str(&self.book_path).is_none() {
-                    ui.add_space(8.0);
-                    egui::Frame::new()
-                        .fill(SURFACE)
-                        .corner_radius(10.0)
-                        .stroke(Stroke::new(1.0, BORDER))
-                        .inner_margin(10.0)
-                        .show(ui, |ui| {
-                            ui.heading("Opening book");
+                        } else if LiveReferenceSource::from_config_str(&self.book_path).is_none() {
                             ui.label(
                                 RichText::new(
-                                    "No opening book configured. Choose a .bin/.ctg/.abk file or a live Lichess/ChessABC source above.",
+                                    "No opening book configured. Choose a .bin/.ctg/.abk/.bkt file or a live Lichess/ChessABC source above.",
                                 )
                                 .weak()
                                 .small(),
                             );
-                        });
-                } else if let Some(live_src) = LiveReferenceSource::from_config_str(&self.book_path) {
-                    ui.add_space(8.0);
-                    egui::Frame::new()
-                        .fill(SURFACE)
-                        .corner_radius(10.0)
-                        .stroke(Stroke::new(1.0, BORDER))
-                        .inner_margin(10.0)
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                ui.heading("Opening book");
-                                ui.label(RichText::new(live_src.label()).small().weak());
-                            });
+                        } else if let Some(live_src) =
+                            LiveReferenceSource::from_config_str(&self.book_path)
+                        {
                             ui.label(
                                 RichText::new(
                                     "Live reference moves · hover to preview · click to play",
@@ -21827,18 +22431,24 @@ impl App {
                                     );
                                 }
                             }
-                        });
-                }
+                        }
+                    });
 
-                ui.add_space(8.0);
-                egui::Frame::new()
-                    .fill(SURFACE)
-                    .corner_radius(10.0)
-                    .stroke(Stroke::new(1.0, BORDER))
-                    .inner_margin(10.0)
+                ui.add_space(4.0);
+                let lichess_heading = match &self.cloud {
+                    Some(snapshot) => match &snapshot.explorer {
+                        Ok(explorer) => {
+                            format!("Lichess reference · {} moves", explorer.moves.len())
+                        }
+                        Err(_) => "Lichess reference".to_string(),
+                    },
+                    None => "Lichess reference".to_string(),
+                };
+                egui::CollapsingHeader::new(RichText::new(lichess_heading).strong())
+                    .id_salt("tree-lichess-collapse")
+                    .default_open(false)
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
-                            ui.heading("Lichess reference");
                             for source in [
                                 cloud::ExplorerSource::Masters,
                                 cloud::ExplorerSource::Lichess,
@@ -21944,7 +22554,7 @@ impl App {
                             if let Ok(explorer) = &snapshot.explorer
                                 && !explorer.top_games.is_empty()
                             {
-                                ui.add_space(8.0);
+                                ui.add_space(6.0);
                                 ui.separator();
                                 ui.horizontal(|ui| {
                                     ui.label(
@@ -21994,6 +22604,54 @@ impl App {
                     });
             });
 
+        if let Some(preset) = search_preset_pos {
+            self.pos_search_query = PositionQuery::default();
+            self.pos_search_query.set_structure(Some(preset));
+            self.pos_search_query.min_ply = 8;
+            self.pos_search_tab = PositionSearchTab::PlansStructures;
+            self.pos_search_open = true;
+            self.start_position_search();
+        } else if search_similar_pos {
+            if let Some((preset, _)) = pos_facts.matched_structures.first().copied() {
+                self.pos_search_query = PositionQuery::default();
+                self.pos_search_query.set_structure(Some(preset));
+                self.pos_search_query.min_ply = 8;
+                self.pos_search_tab = PositionSearchTab::PlansStructures;
+            } else {
+                self.pos_search_query = PositionQuery::from_pawn_skeleton(&pos);
+                self.pos_search_tab = PositionSearchTab::BoardPattern;
+            }
+            self.pos_search_open = true;
+            self.start_position_search();
+        }
+        if let Some(lib_idx) = hovered_ref_lib_idx
+            && let Some(lib) = active_ref_lib.clone()
+        {
+            self.activate_hovered_game_browse_lazy(
+                format!("tree-ref:{lib_idx}:{key}"),
+                move || lib.load(lib_idx).ok(),
+            );
+        }
+        if let Some((lib_idx, label)) = load_ref_game
+            && let Some(lib) = active_ref_lib.as_ref()
+        {
+            let is_active_lib = self
+                .library
+                .as_ref()
+                .is_some_and(|active| same_file_path(active.path(), lib.path()));
+            if is_active_lib && let Some(slot_id) = self.session.source_slot(lib_idx) {
+                self.select_slot(slot_id);
+                if let Some(game) = self.current.as_ref()
+                    && let Some(node_id) = find_node_for_position_key(game, key)
+                {
+                    self.goto(node_id);
+                }
+                self.focus_right_tab(RightTab::Moves);
+            } else if let Ok(game) = lib.load(lib_idx) {
+                let target_node = find_node_for_position_key(&game, key).unwrap_or(0);
+                self.open_game_preview_at(game, label, target_node);
+            }
+        }
         if build_index {
             self.request_index_build();
         }
@@ -22097,23 +22755,24 @@ impl App {
         }
     }
 
-    #[allow(dead_code)]
     fn poll_ref_position_games(&mut self) {
         let Some(rx) = self.ref_position_games_rx.take() else {
             return;
         };
         match rx.try_recv() {
             Ok(result) => {
+                self.ref_position_games_pending = None;
                 self.ref_position_games = Some(result);
             }
             Err(TryRecvError::Empty) => {
                 self.ref_position_games_rx = Some(rx);
             }
-            Err(TryRecvError::Disconnected) => {}
+            Err(TryRecvError::Disconnected) => {
+                self.ref_position_games_pending = None;
+            }
         }
     }
 
-    #[allow(dead_code)]
     fn maybe_request_ref_position_games(&mut self, key: u64) {
         let Some(active_lib) = self
             .tree_library
@@ -22122,6 +22781,7 @@ impl App {
             .cloned()
         else {
             self.ref_position_games = None;
+            self.ref_position_games_pending = None;
             return;
         };
         if self
@@ -22131,10 +22791,18 @@ impl App {
         {
             return;
         }
+        if self
+            .ref_position_games_pending
+            .as_ref()
+            .is_some_and(|(path, k)| *k == key && path == active_lib.path())
+        {
+            return;
+        }
         if self.ref_position_games_rx.is_some() {
             return;
         }
         let is_start = key == position::position_key(&Chess::default());
+        self.ref_position_games_pending = Some((active_lib.path().to_path_buf(), key));
         let (tx, rx) = mpsc::channel();
         self.ref_position_games_rx = Some(rx);
         let ctx = self.ctx.clone();
@@ -24216,6 +24884,7 @@ impl App {
             anchor_node,
             cursor_node: anchor_node,
             hovered_pv_step: None,
+            hover_orientation: None,
         });
         self.hovered_game_active_this_frame = true;
         if let Some(preview) = preview {
@@ -24261,6 +24930,7 @@ impl App {
             anchor_node: 0,
             cursor_node,
             hovered_pv_step: Some(target.step_index),
+            hover_orientation: None,
         });
         self.hovered_game_active_this_frame = true;
         if let Some(preview) = preview {
@@ -24452,6 +25122,10 @@ impl App {
         game_header_card(
             ui,
             &game,
+            (
+                self.display_player_name(game.white()),
+                self.display_player_name(game.black()),
+            ),
             (
                 self.title_for_game(&game, Color::White),
                 self.title_for_game(&game, Color::Black),
@@ -27706,43 +28380,81 @@ impl App {
     }
 
     fn start_position_search(&mut self) {
+        self.start_position_search_batch(POS_SEARCH_BATCH_SIZE, false);
+    }
+
+    fn start_position_search_batch(&mut self, max_hits: usize, continue_existing: bool) {
         if self.pos_search_rx.is_some() {
             return;
         }
-        if self.pos_search_query.compile().is_empty_partial()
-            && self.pos_search_query.metadata.is_empty()
-        {
-            self.pos_search_status =
-                "Choose a Structure, Endgame, Board Pattern, or Metadata/Medal filter first."
-                    .to_string();
-            return;
-        }
-        let (existing_lib, fallback_ref_path) = match self.resolve_position_search_target() {
-            Ok(target) => target,
-            Err(msg) => {
-                self.pos_search_status = msg.to_string();
+        let (existing_lib, fallback_ref_path, query, start_index) = if continue_existing {
+            let Some(lib) = self.pos_search_target_lib.clone() else {
+                self.pos_search_status = "Run an initial search first.".to_string();
+                return;
+            };
+            let Some(query) = self.pos_search_last_query.clone() else {
+                self.pos_search_status = "Run an initial search first.".to_string();
+                return;
+            };
+            (Some(lib), None, query, self.pos_search_next_start)
+        } else {
+            if self.pos_search_query.compile().is_empty_partial()
+                && self.pos_search_query.metadata.is_empty()
+            {
+                self.pos_search_status =
+                    "Choose a Structure, Endgame, Board Pattern, or Metadata/Medal filter first."
+                        .to_string();
                 return;
             }
+            let (existing_lib, fallback_ref_path) = match self.resolve_position_search_target() {
+                Ok(target) => target,
+                Err(msg) => {
+                    self.pos_search_status = msg.to_string();
+                    return;
+                }
+            };
+
+            self.pos_search_last_label = if let Some(preset) = self.pos_search_query.structure {
+                preset.label().to_string()
+            } else if let Some(endgame) = self.pos_search_query.endgame {
+                endgame.preset.short_label().to_string()
+            } else {
+                "Position search".to_string()
+            };
+
+            let mut query = self.pos_search_query.clone();
+            if let Some(preset) = query.structure
+                && let Some(ov) =
+                    search::find_custom_override(&self.pos_search_custom_presets, preset)
+            {
+                query.primary_side_override = Some(query.primary_side());
+                query.structure = None;
+                query.squares = ov.squares;
+                query.extra_clauses = ov.extra_clauses.clone();
+                query.side_to_move = ov.side_to_move;
+                query.ignore_color_flip = ov.ignore_color_flip;
+            }
+            self.pos_search_last_query = Some(query.clone());
+            self.pos_search_hits.clear();
+            self.pos_search_next_start = 0;
+            self.pos_search_total_candidates = 0;
+            self.pos_search_has_more = false;
+            (existing_lib, fallback_ref_path, query, 0)
         };
 
-        let mut query = self.pos_search_query.clone();
-        if let Some(preset) = query.structure
-            && let Some(ov) = search::find_custom_override(&self.pos_search_custom_presets, preset)
-        {
-            query.structure = None;
-            query.squares = ov.squares;
-            query.extra_clauses = ov.extra_clauses.clone();
-            query.side_to_move = ov.side_to_move;
-            query.ignore_color_flip = ov.ignore_color_flip;
-        }
         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let cancel_worker = cancel.clone();
         self.pos_search_cancel = Some(cancel);
-        self.pos_search_hits.clear();
-        self.pos_search_progress = Some((0, 1, 0));
-        self.pos_search_status = "Searching games…".to_string();
+        self.pos_search_progress =
+            Some((start_index, start_index.max(1), self.pos_search_hits.len()));
+        self.pos_search_status = if continue_existing {
+            "Searching next games…".to_string()
+        } else {
+            "Searching games…".to_string()
+        };
         let (tx, rx) = mpsc::channel();
         let ctx = self.ctx.clone();
+        let base_found = self.pos_search_hits.len();
         std::thread::spawn(move || {
             let lib = if let Some(l) = existing_lib {
                 Ok(l)
@@ -27755,22 +28467,29 @@ impl App {
                 Ok(lib) => {
                     let progress_tx = tx.clone();
                     let progress_ctx = ctx.clone();
-                    let hits = search::search_library(
+                    let batch = search::search_library_from(
                         lib.as_ref(),
                         &query,
-                        500,
+                        start_index,
+                        max_hits,
                         |scanned, total, found| {
-                            let _ = progress_tx
-                                .send(PositionSearchMsg::Progress(scanned, total, found));
+                            let _ = progress_tx.send(PositionSearchMsg::Progress(
+                                scanned,
+                                total,
+                                base_found + found,
+                            ));
                             progress_ctx.request_repaint();
                         },
                         &cancel_worker,
                     );
-                    Ok((lib, hits))
+                    Ok((lib, batch))
                 }
                 Err(err) => Err(err),
             };
-            let _ = tx.send(PositionSearchMsg::Done(result));
+            let _ = tx.send(PositionSearchMsg::Done {
+                append: continue_existing,
+                result,
+            });
             ctx.request_repaint();
         });
         self.pos_search_rx = Some(rx);
@@ -27847,23 +28566,48 @@ impl App {
                 Ok(PositionSearchMsg::Progress(scanned, total, found)) => {
                     self.pos_search_progress = Some((scanned, total, found));
                 }
-                Ok(PositionSearchMsg::Done(Ok((lib, hits)))) => {
+                Ok(PositionSearchMsg::Done {
+                    append,
+                    result: Ok((lib, batch)),
+                }) => {
                     self.pos_search_cancel = None;
                     self.pos_search_progress = None;
-                    let count = hits.len();
                     self.pos_search_target_lib = Some(lib);
-                    self.pos_search_hits = hits;
-                    self.pos_search_status = if count >= 500 {
-                        "Showing first 500 matching games (limit reached).".to_string()
+                    if append {
+                        self.pos_search_hits.extend(batch.hits);
+                    } else {
+                        self.pos_search_hits = batch.hits;
+                    }
+                    search::sort_position_hits(&mut self.pos_search_hits, self.pos_search_sort);
+                    let count = self.pos_search_hits.len();
+                    self.pos_search_next_start = batch.next_start_index;
+                    self.pos_search_total_candidates = batch.total_candidates;
+                    self.pos_search_has_more = batch.truncated
+                        || (batch.cancelled && batch.next_start_index < batch.total_candidates);
+                    self.pos_search_status = if batch.cancelled {
+                        format!(
+                            "Search stopped ({count} matching games · scanned {}/{}).",
+                            batch.next_start_index, batch.total_candidates
+                        )
+                    } else if self.pos_search_has_more {
+                        format!(
+                            "Showing {count} matching games (scanned {}/{}).",
+                            batch.next_start_index, batch.total_candidates
+                        )
                     } else if count == 0 {
                         "No matching games found.".to_string()
                     } else {
-                        format!("Found {} matching games.", count)
+                        format!(
+                            "Found {count} matching games (scanned all {} candidates).",
+                            batch.total_candidates
+                        )
                     };
                     keep = false;
                     break;
                 }
-                Ok(PositionSearchMsg::Done(Err(err))) => {
+                Ok(PositionSearchMsg::Done {
+                    result: Err(err), ..
+                }) => {
                     self.pos_search_cancel = None;
                     self.pos_search_progress = None;
                     self.pos_search_status = format!("Search failed: {err}");
@@ -27905,13 +28649,191 @@ impl App {
         }
     }
 
+    fn load_pos_search_hits_into_new_db(&mut self) {
+        if self.pos_search_hits.is_empty() {
+            return;
+        }
+        let Some(lib) = self.pos_search_target_lib.clone() else {
+            return;
+        };
+        let hits = self.pos_search_hits.clone();
+        let label = if self.pos_search_last_label.trim().is_empty() {
+            "Position search".to_string()
+        } else {
+            self.pos_search_last_label.clone()
+        };
+        let persp = self.pos_search_perspective;
+        self.new_shelf_database();
+        self.scratch_title = Some(format!("Search: {label}"));
+        let indices: Vec<usize> = hits.iter().map(|h| h.game_index).collect();
+        match self
+            .session
+            .append_library_indices(lib, &indices, &HashMap::new(), false)
+        {
+            Ok(added) => {
+                self.slot_search_meta.clear();
+                for &(input_pos, slot_id) in &added {
+                    if let Some(hit) = hits.get(input_pos) {
+                        self.slot_search_meta.insert(
+                            slot_id,
+                            SlotSearchMeta {
+                                matched_ply: hit.matched_ply,
+                                structure_side: hit.structure_side,
+                                white_elo: hit.white_elo,
+                                black_elo: hit.black_elo,
+                                date_num: hit.date_num,
+                                original_order: input_pos,
+                            },
+                        );
+                    }
+                }
+                self.search_list_perspective = Some(persp);
+                self.search_list_sort = self.pos_search_sort;
+                self.session_dirty = false;
+                self.session_revision = self.session_revision.wrapping_add(1);
+                self.games_filter_cache = None;
+                self.player_profile_sorted_games = None;
+                self.left_tab = LeftTab::Games;
+                if let Some(first_id) = self.session.id_at(0) {
+                    self.select_slot(first_id);
+                }
+                self.status = format!(
+                    "Loaded {} into \"Search: {label}\" ({}).",
+                    games_label(added.len()),
+                    persp.label()
+                );
+            }
+            Err(err) => {
+                self.status = format!("Could not load search results: {err:#}");
+            }
+        }
+    }
+
+    fn append_pos_search_hits_to_current_db(&mut self) {
+        if self.pos_search_hits.is_empty() {
+            return;
+        }
+        if self.active_db_is_read_only() {
+            self.status =
+                "Active database is read-only; load results into a new Games list instead."
+                    .to_string();
+            return;
+        }
+        let Some(lib) = self.pos_search_target_lib.clone() else {
+            return;
+        };
+        let hits = self.pos_search_hits.clone();
+        let indices: Vec<usize> = hits.iter().map(|h| h.game_index).collect();
+        let persp = self.pos_search_perspective;
+        match self
+            .session
+            .append_library_indices(lib, &indices, &self.edited, true)
+        {
+            Ok(added) => {
+                let base_order = self.slot_search_meta.len();
+                for &(input_pos, slot_id) in &added {
+                    if let Some(hit) = hits.get(input_pos) {
+                        self.slot_search_meta.insert(
+                            slot_id,
+                            SlotSearchMeta {
+                                matched_ply: hit.matched_ply,
+                                structure_side: hit.structure_side,
+                                white_elo: hit.white_elo,
+                                black_elo: hit.black_elo,
+                                date_num: hit.date_num,
+                                original_order: base_order + input_pos,
+                            },
+                        );
+                    }
+                }
+                self.search_list_perspective = Some(persp);
+                if self.search_list_sort != search::PositionHitSort::DbOrder {
+                    self.apply_search_list_sort(self.search_list_sort);
+                }
+                if !added.is_empty() {
+                    self.session_dirty = true;
+                }
+                self.session_revision = self.session_revision.wrapping_add(1);
+                self.games_filter_cache = None;
+                self.player_profile_sorted_games = None;
+                self.left_tab = LeftTab::Games;
+                let skipped = hits.len().saturating_sub(added.len());
+                self.status = if skipped > 0 {
+                    format!(
+                        "Appended {} to current database ({skipped} duplicates skipped).",
+                        games_label(added.len())
+                    )
+                } else {
+                    format!("Appended {} to current database.", games_label(added.len()))
+                };
+            }
+            Err(err) => {
+                self.status = format!("Could not append search results: {err:#}");
+            }
+        }
+    }
+
+    fn apply_search_list_sort(&mut self, sort: search::PositionHitSort) {
+        self.search_list_sort = sort;
+        let meta_map = &self.slot_search_meta;
+        let struct_elo = |m: &SlotSearchMeta| -> u16 {
+            match m.structure_side {
+                Color::White => m.white_elo,
+                Color::Black => m.black_elo,
+            }
+        };
+        let opp_elo = |m: &SlotSearchMeta| -> u16 {
+            match m.structure_side {
+                Color::White => m.black_elo,
+                Color::Black => m.white_elo,
+            }
+        };
+        let avg_elo = |m: &SlotSearchMeta| -> u16 {
+            match (m.white_elo, m.black_elo) {
+                (w, b) if w > 0 && b > 0 => ((u32::from(w) + u32::from(b)) / 2) as u16,
+                (w, b) => w.max(b),
+            }
+        };
+        self.session
+            .sort_slots_by(|lhs, rhs| match (meta_map.get(&lhs), meta_map.get(&rhs)) {
+                (Some(a), Some(b)) => match sort {
+                    search::PositionHitSort::DbOrder => a.original_order.cmp(&b.original_order),
+                    search::PositionHitSort::StructureEloDesc => struct_elo(b)
+                        .cmp(&struct_elo(a))
+                        .then_with(|| opp_elo(b).cmp(&opp_elo(a)))
+                        .then_with(|| b.date_num.cmp(&a.date_num))
+                        .then_with(|| a.original_order.cmp(&b.original_order)),
+                    search::PositionHitSort::OpponentEloDesc => opp_elo(b)
+                        .cmp(&opp_elo(a))
+                        .then_with(|| struct_elo(b).cmp(&struct_elo(a)))
+                        .then_with(|| b.date_num.cmp(&a.date_num))
+                        .then_with(|| a.original_order.cmp(&b.original_order)),
+                    search::PositionHitSort::AverageEloDesc => avg_elo(b)
+                        .cmp(&avg_elo(a))
+                        .then_with(|| struct_elo(b).cmp(&struct_elo(a)))
+                        .then_with(|| b.date_num.cmp(&a.date_num))
+                        .then_with(|| a.original_order.cmp(&b.original_order)),
+                    search::PositionHitSort::DateDesc => b
+                        .date_num
+                        .cmp(&a.date_num)
+                        .then_with(|| avg_elo(b).cmp(&avg_elo(a)))
+                        .then_with(|| a.original_order.cmp(&b.original_order)),
+                },
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => lhs.cmp(&rhs),
+            });
+        self.games_filter_cache = None;
+        self.session_revision = self.session_revision.wrapping_add(1);
+    }
+
     fn draw_structure_plan_mini_board(
         &self,
         ui: &mut Ui,
         ctx: &egui::Context,
         plan: &crate::structure_plans::StructurePlan,
     ) {
-        use crate::chess::{Fen, Position as _};
+        use crate::chess::{Fen, Position as _, San};
         let Ok(fen) = plan.setup_fen.parse::<Fen>() else {
             return;
         };
@@ -27933,9 +28855,62 @@ impl App {
             )
         };
 
+        let mut display_pos = pos.clone();
         let mut anim_skip_sq: Option<Square> = None;
         let mut anim_piece_draw: Option<(crate::chess::Piece, egui::Pos2)> = None;
-        if let Some(maneuver) = plan.animated_maneuver
+        if !plan.animated_moves.is_empty() {
+            let mut frames: Vec<(Chess, crate::chess::Piece, Square, Square, Chess)> = Vec::new();
+            let mut cur = pos.clone();
+            for san_str in plan.animated_moves {
+                if let Ok(mv) = San::Raw((*san_str).to_string()).to_move(&cur)
+                    && let Some(from_sq) = mv.from()
+                {
+                    let to_sq = mv.to();
+                    if let Some(piece) = cur.board().piece_at(from_sq) {
+                        let next = cur.clone().play_unchecked(mv);
+                        frames.push((cur, piece, from_sq, to_sq, next.clone()));
+                        cur = next;
+                    }
+                }
+            }
+            if !frames.is_empty() {
+                let elapsed = self
+                    .pos_search_plan_anim_start
+                    .map_or(0.0, |t| t.elapsed().as_secs_f32());
+                let initial_hold = 0.70_f32;
+                let slide_secs = 0.65_f32;
+                let post_pause = 0.55_f32;
+                let step_secs = slide_secs + post_pause;
+                let end_hold = 1.00_f32;
+                let cycle = initial_hold + frames.len() as f32 * step_secs + end_hold;
+                let t = elapsed % cycle;
+                if t < initial_hold {
+                    display_pos = pos.clone();
+                } else if t >= initial_hold + frames.len() as f32 * step_secs {
+                    display_pos = frames.last().unwrap().4.clone();
+                } else {
+                    let local = t - initial_hold;
+                    let idx = ((local / step_secs).floor() as usize).min(frames.len() - 1);
+                    let in_step = local - idx as f32 * step_secs;
+                    let (ref before_pos, piece, from_sq, to_sq, ref after_pos) = frames[idx];
+                    if in_step < slide_secs {
+                        display_pos = before_pos.clone();
+                        anim_skip_sq = Some(from_sq);
+                        let frac = (in_step / slide_secs).clamp(0.0, 1.0);
+                        let eased = frac * frac * (3.0 - 2.0 * frac);
+                        let a = sq_center(from_sq);
+                        let b = sq_center(to_sq);
+                        anim_piece_draw = Some((
+                            piece,
+                            pos2(a.x + (b.x - a.x) * eased, a.y + (b.y - a.y) * eased),
+                        ));
+                    } else {
+                        display_pos = after_pos.clone();
+                    }
+                }
+                ctx.request_repaint_after(Duration::from_millis(33));
+            }
+        } else if let Some(maneuver) = plan.animated_maneuver
             && maneuver.waypoints.len() >= 2
         {
             let elapsed = self
@@ -27961,7 +28936,7 @@ impl App {
             ctx.request_repaint_after(Duration::from_millis(33));
         }
 
-        let board = pos.board();
+        let board = display_pos.board();
         for rank_row in 0..8usize {
             for file_col in 0..8usize {
                 let rank = 7 - rank_row;
@@ -28064,17 +29039,326 @@ impl App {
         );
     }
 
+    fn draw_eco_browser(&mut self, ui: &mut Ui) {
+        let mut selected = crate::eco::expand_eco_spec(&self.pos_search_query.metadata.eco_filter);
+        let mut changed = false;
+
+        // 1. Clickable opening ECO family presets
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("Opening Presets:").small().strong());
+            for preset in crate::eco::ECO_PRESETS {
+                let preset_codes = crate::eco::expand_eco_spec(preset.spec);
+                let all_selected =
+                    !preset_codes.is_empty() && preset_codes.iter().all(|c| selected.contains(c));
+                let partial = !all_selected && preset_codes.iter().any(|c| selected.contains(c));
+                let label_text = if partial {
+                    RichText::new(format!("{}·", preset.label))
+                        .small()
+                        .color(GOLD)
+                } else {
+                    RichText::new(preset.label).small()
+                };
+                if ui
+                    .selectable_label(all_selected, label_text)
+                    .on_hover_text(format!(
+                        "{} ({}) — click to toggle",
+                        preset.label, preset.spec
+                    ))
+                    .clicked()
+                {
+                    let keep = self.pos_search_eco_keep_selection
+                        || ui.input(|i| {
+                            i.modifiers.shift || i.modifiers.ctrl || i.modifiers.command
+                        });
+                    if all_selected {
+                        for c in &preset_codes {
+                            selected.remove(c);
+                        }
+                    } else if keep {
+                        selected.extend(preset_codes);
+                    } else {
+                        selected = preset_codes;
+                    }
+                    changed = true;
+                }
+            }
+        });
+
+        if !self.pos_search_eco_browser_open {
+            if changed {
+                self.pos_search_query.metadata.eco_filter = crate::eco::format_eco_codes(&selected);
+            }
+            return;
+        }
+
+        ui.add_space(4.0);
+        let catalog = crate::eco::global_catalog();
+        let query_lower = self.pos_search_eco_query.trim().to_ascii_lowercase();
+        let visible: Vec<&crate::eco::EcoCodeInfo> = catalog
+            .iter()
+            .filter(|info| {
+                if let Some(vol) = self.pos_search_eco_volume
+                    && info.volume != vol
+                {
+                    return false;
+                }
+                if self.pos_search_eco_selected_only && !selected.contains(&info.code) {
+                    return false;
+                }
+                if !query_lower.is_empty() && !info.search_haystack.contains(&query_lower) {
+                    return false;
+                }
+                true
+            })
+            .collect();
+
+        // 2. Flat 1px-bordered inline ECO code & description browser (Operate mode: zero card-in-card clutter)
+        egui::Frame::new()
+            .fill(SURFACE_ALT)
+            .stroke(Stroke::new(1.0, BORDER))
+            .corner_radius(3.0)
+            .inner_margin(egui::Margin::symmetric(8, 6))
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .add(
+                            egui::TextEdit::singleline(&mut self.pos_search_eco_query)
+                                .desired_width(220.0)
+                                .hint_text("Search ECO or opening description…"),
+                        )
+                        .changed()
+                    {
+                        self.pos_search_eco_last_anchor = None;
+                        self.pos_search_eco_drag = None;
+                    }
+                    for (vol, label) in [
+                        (None, "All"),
+                        (Some('A'), "A"),
+                        (Some('B'), "B"),
+                        (Some('C'), "C"),
+                        (Some('D'), "D"),
+                        (Some('E'), "E"),
+                    ] {
+                        if ui
+                            .selectable_label(self.pos_search_eco_volume == vol, label)
+                            .clicked()
+                        {
+                            self.pos_search_eco_volume = vol;
+                            self.pos_search_eco_last_anchor = None;
+                        }
+                    }
+                    let sel_label = format!("Selected ({})", selected.len());
+                    if ui
+                        .selectable_label(self.pos_search_eco_selected_only, sel_label)
+                        .clicked()
+                    {
+                        self.pos_search_eco_selected_only = !self.pos_search_eco_selected_only;
+                        self.pos_search_eco_last_anchor = None;
+                    }
+                    ui.separator();
+                    let keep_btn = ui
+                        .selectable_label(self.pos_search_eco_keep_selection, "+ Keep selection")
+                        .on_hover_text(
+                            "Keep existing selections when clicking or dragging new ECO codes (turn off to replace on plain click; Shift/Ctrl always keeps)",
+                        );
+                    if keep_btn.clicked() {
+                        self.pos_search_eco_keep_selection = !self.pos_search_eco_keep_selection;
+                    }
+                    if !visible.is_empty()
+                        && ui
+                            .small_button("Select visible")
+                            .on_hover_text("Add all currently filtered ECO codes to selection")
+                            .clicked()
+                    {
+                        for info in &visible {
+                            selected.insert(info.code);
+                        }
+                        changed = true;
+                    }
+                    if !selected.is_empty()
+                        && ui.small_button("Clear").clicked()
+                    {
+                        selected.clear();
+                        self.pos_search_eco_last_anchor = None;
+                        self.pos_search_eco_drag = None;
+                        changed = true;
+                    }
+                });
+
+                ui.label(
+                    RichText::new(format!(
+                        "{} codes shown · Click to toggle · Drag across rows for range · Shift+Click for range",
+                        visible.len()
+                    ))
+                    .small()
+                    .weak(),
+                );
+                ui.add_space(2.0);
+
+                if !ui.input(|i| i.pointer.primary_down()) {
+                    self.pos_search_eco_drag = None;
+                }
+                let pointer_pos = ui.input(|i| i.pointer.interact_pos());
+                let primary_pressed = ui.input(|i| i.pointer.primary_pressed());
+                let primary_down = ui.input(|i| i.pointer.primary_down());
+                let mod_shift = ui.input(|i| i.modifiers.shift);
+                let mod_ctrl = ui.input(|i| i.modifiers.ctrl || i.modifiers.command);
+
+                let row_h = 20.0;
+                let avail_w = ui.available_width();
+                egui::ScrollArea::vertical()
+                    .id_salt("eco-browser-list")
+                    .max_height(185.0)
+                    .auto_shrink([false, false])
+                    .show_rows(ui, row_h, visible.len(), |ui, range| {
+                        for row_idx in range {
+                            let info = visible[row_idx];
+                            let is_sel = selected.contains(&info.code);
+                            let (rect, resp) = ui.allocate_exact_size(
+                                vec2(avail_w, row_h),
+                                Sense::click_and_drag(),
+                            );
+                            let hovered = resp.hovered();
+                            if is_sel {
+                                ui.painter().rect_filled(rect, 2.0, SELECT_BG);
+                            } else if hovered {
+                                ui.painter().rect_filled(rect, 2.0, SURFACE);
+                            }
+
+                            let mark = if is_sel { "✓" } else { "·" };
+                            let mark_col = if is_sel { SELECT_ACCENT } else { MUTED };
+                            ui.painter().text(
+                                pos2(rect.left() + 8.0, rect.center().y),
+                                Align2::CENTER_CENTER,
+                                mark,
+                                FontId::monospace(12.0),
+                                mark_col,
+                            );
+                            ui.painter().text(
+                                pos2(rect.left() + 20.0, rect.center().y),
+                                Align2::LEFT_CENTER,
+                                &info.eco,
+                                FontId::monospace(12.0),
+                                if is_sel { SELECT_ACCENT } else { GOLD },
+                            );
+
+                            let desc = info.display_for_query(&query_lower);
+                            let max_chars = ((rect.width() - 68.0) / 6.7).max(16.0) as usize;
+                            let desc_trunc = if desc.chars().count() > max_chars {
+                                let prefix: String = desc.chars().take(max_chars.saturating_sub(1)).collect();
+                                format!("{prefix}…")
+                            } else {
+                                desc.to_string()
+                            };
+                            ui.painter().text(
+                                pos2(rect.left() + 56.0, rect.center().y),
+                                Align2::LEFT_CENTER,
+                                desc_trunc,
+                                FontId::proportional(12.0),
+                                if is_sel { TEXT } else { MUTED },
+                            );
+
+                            if !info.variations.is_empty() {
+                                let preview = info
+                                    .variations
+                                    .iter()
+                                    .take(8)
+                                    .cloned()
+                                    .collect::<Vec<_>>()
+                                    .join("\n");
+                                let extra = info.variations.len().saturating_sub(8);
+                                let tip = if extra > 0 {
+                                    format!("{}:\n{preview}\n(+{extra} more)", info.eco)
+                                } else {
+                                    format!("{}:\n{preview}", info.eco)
+                                };
+                                let _ = resp.on_hover_text(tip);
+                            }
+
+                            if let Some(pos) = pointer_pos
+                                && ui.clip_rect().contains(pos)
+                                && rect.contains(pos)
+                            {
+                                if primary_pressed {
+                                    if mod_shift
+                                        && let Some(anchor) = self.pos_search_eco_last_anchor
+                                    {
+                                        let lo = anchor.min(row_idx);
+                                        let hi = anchor.max(row_idx).min(visible.len().saturating_sub(1));
+                                        let keep = self.pos_search_eco_keep_selection || mod_ctrl;
+                                        if !keep {
+                                            selected.clear();
+                                        }
+                                        for item in &visible[lo..=hi] {
+                                            selected.insert(item.code);
+                                        }
+                                        self.pos_search_eco_last_anchor = Some(row_idx);
+                                        self.pos_search_eco_drag = None;
+                                        changed = true;
+                                    } else {
+                                        let keep = self.pos_search_eco_keep_selection || mod_ctrl;
+                                        let paint_on = if keep { !is_sel } else { true };
+                                        let base = if keep {
+                                            selected.clone()
+                                        } else {
+                                            std::collections::BTreeSet::new()
+                                        };
+                                        selected = base.clone();
+                                        if paint_on {
+                                            selected.insert(info.code);
+                                        } else {
+                                            selected.remove(&info.code);
+                                        }
+                                        self.pos_search_eco_drag = Some((row_idx, paint_on, base));
+                                        self.pos_search_eco_last_anchor = Some(row_idx);
+                                        changed = true;
+                                    }
+                                } else if primary_down
+                                    && let Some((start_row, paint_on, base)) =
+                                        self.pos_search_eco_drag.as_ref()
+                                {
+                                    let lo = (*start_row).min(row_idx);
+                                    let hi = (*start_row).max(row_idx).min(visible.len().saturating_sub(1));
+                                    let mut next = base.clone();
+                                    for item in &visible[lo..=hi] {
+                                        if *paint_on {
+                                            next.insert(item.code);
+                                        } else {
+                                            next.remove(&item.code);
+                                        }
+                                    }
+                                    if next != selected {
+                                        selected = next;
+                                        changed = true;
+                                    }
+                                    self.pos_search_eco_last_anchor = Some(row_idx);
+                                }
+                            }
+                        }
+                    });
+            });
+
+        if changed {
+            self.pos_search_query.metadata.eco_filter = crate::eco::format_eco_codes(&selected);
+        }
+    }
+
     fn position_search_dialog(&mut self, ctx: &egui::Context) {
         if !self.pos_search_open {
             return;
         }
         let mut open = self.pos_search_open;
         let running = self.pos_search_rx.is_some();
-        let mut start_search = false;
+        let mut start_search_batch = false;
+        let mut start_search_all = false;
+        let mut start_search_more = false;
+        let mut start_search_all_remaining = false;
         let mut start_struct_build = false;
         let mut cancel_search = false;
         let mut clicked_hit: Option<usize> = None;
         let mut hovered_hit: Option<usize> = None;
+        let mut load_hits_into_list = false;
+        let mut append_hits_to_db = false;
         let current_board_pos = self.current.as_ref().map(|g| {
             let n = self.node.min(g.nodes.len().saturating_sub(1));
             g.nodes[n].pos.clone()
@@ -28160,6 +29444,12 @@ impl App {
                         self.pos_search_query = PositionQuery::default();
                         self.pos_search_hits.clear();
                         self.pos_search_status.clear();
+                        self.pos_search_next_start = 0;
+                        self.pos_search_total_candidates = 0;
+                        self.pos_search_has_more = false;
+                        self.pos_search_last_query = None;
+                        self.pos_search_eco_drag = None;
+                        self.pos_search_eco_last_anchor = None;
                     }
                     match struct_index_state {
                         Some(true) => {
@@ -28526,6 +29816,17 @@ impl App {
                                         ctx,
                                         active_plan,
                                     );
+                                    if !active_plan.animated_moves.is_empty() {
+                                        cols[1].label(
+                                            RichText::new(format!(
+                                                "Moves: {}",
+                                                active_plan.animated_moves.join(" ")
+                                            ))
+                                            .small()
+                                            .monospace()
+                                            .color(GOLD),
+                                        );
+                                    }
                                     cols[1].label(
                                         RichText::new(active_plan.summary).small().weak(),
                                     );
@@ -29503,14 +30804,53 @@ impl App {
                                     );
                                     ui.end_row();
 
-                                    ui.label(RichText::new("ECO:").small());
-                                    ui.add(
-                                        egui::TextEdit::singleline(
-                                            &mut self.pos_search_query.metadata.eco_filter,
+                                    ui.label(RichText::new("ECO / Ranges:").small());
+                                    ui.horizontal(|ui| {
+                                        let eco_count = crate::eco::expand_eco_spec(
+                                            &self.pos_search_query.metadata.eco_filter,
                                         )
-                                        .desired_width(180.0)
-                                        .hint_text("B90, C60-C99, D3…"),
-                                    );
+                                        .len();
+                                        ui.add(
+                                            egui::TextEdit::singleline(
+                                                &mut self.pos_search_query.metadata.eco_filter,
+                                            )
+                                            .desired_width(145.0)
+                                            .hint_text("B10-B15, B90, D3…"),
+                                        )
+                                        .on_hover_text(
+                                            "Enter ECO codes, prefixes (D3), or ranges (B10-B15, B90-B99)",
+                                        );
+                                        let browse_label = match (
+                                            self.pos_search_eco_browser_open,
+                                            eco_count,
+                                        ) {
+                                            (true, 0) => "Hide ECO ▴".to_string(),
+                                            (true, n) => format!("Hide ({n}) ▴"),
+                                            (false, 0) => "Browse ECO ▾".to_string(),
+                                            (false, n) => format!("ECO ({n}) ▾"),
+                                        };
+                                        if ui
+                                            .selectable_label(
+                                                self.pos_search_eco_browser_open,
+                                                browse_label,
+                                            )
+                                            .on_hover_text(
+                                                "Search all 500 ECO codes & descriptions, click or drag to select ranges",
+                                            )
+                                            .clicked()
+                                        {
+                                            self.pos_search_eco_browser_open =
+                                                !self.pos_search_eco_browser_open;
+                                        }
+                                        if !self.pos_search_query.metadata.eco_filter.is_empty()
+                                            && ui
+                                                .small_button("×")
+                                                .on_hover_text("Clear ECO filter")
+                                                .clicked()
+                                        {
+                                            self.pos_search_query.metadata.eco_filter.clear();
+                                        }
+                                    });
                                     ui.label(RichText::new("Years:").small());
                                     ui.horizontal(|ui| {
                                         let mut yf = self
@@ -29561,6 +30901,8 @@ impl App {
                                     ui.end_row();
                                 });
 
+                            ui.add_space(4.0);
+                            self.draw_eco_browser(ui);
                             ui.add_space(4.0);
                             ui.horizontal_wrapped(|ui| {
                                 ui.label(RichText::new("Elo:").small().strong());
@@ -29717,13 +31059,38 @@ impl App {
 
                 ui.add_space(6.0);
                 ui.separator();
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     if running {
                         if ui.button("Cancel").clicked() {
                             cancel_search = true;
                         }
-                    } else if ui.button(RichText::new("Search").strong()).clicked() {
-                        start_search = true;
+                    } else {
+                        if ui.button(RichText::new("Search (1,000)").strong()).clicked() {
+                            start_search_batch = true;
+                        }
+                        if ui
+                            .button("Search all")
+                            .on_hover_text("Scan the entire target database without stopping at 1,000 hits")
+                            .clicked()
+                        {
+                            start_search_all = true;
+                        }
+                        if self.pos_search_has_more {
+                            if ui
+                                .button(RichText::new("+1,000 more").strong().color(GOLD))
+                                .on_hover_text("Continue scanning from the last match for up to 1,000 more games")
+                                .clicked()
+                            {
+                                start_search_more = true;
+                            }
+                            if ui
+                                .button("Search all remaining")
+                                .on_hover_text("Continue scanning through the rest of the database")
+                                .clicked()
+                            {
+                                start_search_all_remaining = true;
+                            }
+                        }
                     }
                     if let Some((scanned, total, found)) = self.pos_search_progress {
                         let frac = if total > 0 {
@@ -29741,6 +31108,67 @@ impl App {
                         ui.label(RichText::new(&self.pos_search_status).small().weak());
                     }
                 });
+                if !self.pos_search_hits.is_empty() {
+                    let is_endgame = self.pos_search_query.endgame.is_some();
+                    let structure_side_label = match self
+                        .pos_search_query
+                        .structure
+                        .map(|preset| preset.primary_side())
+                    {
+                        Some(Color::White) => "Structure side (White)",
+                        Some(Color::Black) => "Structure side (Black)",
+                        None => "Structure side",
+                    };
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new("View games from:").small().strong());
+                        for (persp, label) in [
+                            (search::SearchBoardPerspective::StructureSide, structure_side_label),
+                            (search::SearchBoardPerspective::OpponentSide, "Opponent side"),
+                            (search::SearchBoardPerspective::FixedWhite, "Fixed White"),
+                        ] {
+                            ui.selectable_value(&mut self.pos_search_perspective, persp, label);
+                        }
+                        ui.separator();
+                        if ui
+                            .button("Load into Games list")
+                            .on_hover_text("Open these search hits in a new shelf database tab")
+                            .clicked()
+                        {
+                            load_hits_into_list = true;
+                        }
+                        if ui
+                            .add_enabled(
+                                !self.active_db_is_read_only(),
+                                egui::Button::new("Append to current DB"),
+                            )
+                            .on_hover_text("Append non-duplicate search hits to the active database")
+                            .clicked()
+                        {
+                            append_hits_to_db = true;
+                        }
+                    });
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new("Sort results:").small().strong());
+                        for sort in search::PositionHitSort::ALL {
+                            let label = match (sort, is_endgame) {
+                                (search::PositionHitSort::StructureEloDesc, true) => {
+                                    "Featured side Elo ↓"
+                                }
+                                (search::PositionHitSort::StructureEloDesc, false) => {
+                                    "Structure holder Elo ↓"
+                                }
+                                _ => sort.label(),
+                            };
+                            if ui
+                                .selectable_label(self.pos_search_sort == sort, label)
+                                .clicked()
+                            {
+                                self.pos_search_sort = sort;
+                                search::sort_position_hits(&mut self.pos_search_hits, sort);
+                            }
+                        }
+                    });
+                }
 
                 ui.separator();
                 let hit_count = self.pos_search_hits.len();
@@ -29798,8 +31226,23 @@ impl App {
         if start_struct_build {
             self.start_struct_index_build();
         }
-        if start_search {
-            self.start_position_search();
+        if start_search_batch {
+            self.start_position_search_batch(POS_SEARCH_BATCH_SIZE, false);
+        }
+        if start_search_all {
+            self.start_position_search_batch(usize::MAX, false);
+        }
+        if start_search_more {
+            self.start_position_search_batch(POS_SEARCH_BATCH_SIZE, true);
+        }
+        if start_search_all_remaining {
+            self.start_position_search_batch(usize::MAX, true);
+        }
+        if load_hits_into_list {
+            self.load_pos_search_hits_into_new_db();
+        }
+        if append_hits_to_db {
+            self.append_pos_search_hits_to_current_db();
         }
         if let Some(hit_idx) = hovered_hit
             && let Some(hit) = self.pos_search_hits.get(hit_idx).cloned()
@@ -29810,17 +31253,20 @@ impl App {
                 && let Ok(game) = lib.load(hit.game_index)
             {
                 self.activate_hovered_game_browse(browse_id, game);
-                if let Some(browse) = self.hovered_game_browse.as_mut() {
-                    let target = hit
-                        .matched_ply
-                        .min(browse.game.nodes.len().saturating_sub(1));
-                    browse.anchor_node = target;
-                    browse.cursor_node = target;
-                    self.hover_preview = browse.game.nodes.get(target).map(|node| HoverPreview {
-                        pos: node.pos.clone(),
-                        last_move: domain::last_move_squares(node),
-                    });
-                }
+            }
+            if let Some(browse) = self.hovered_game_browse.as_mut() {
+                browse.hover_orientation = self
+                    .pos_search_perspective
+                    .orientation_for(hit.structure_side);
+                let target = hit
+                    .matched_ply
+                    .min(browse.game.nodes.len().saturating_sub(1));
+                browse.anchor_node = target;
+                browse.cursor_node = target;
+                self.hover_preview = browse.game.nodes.get(target).map(|node| HoverPreview {
+                    pos: node.pos.clone(),
+                    last_move: domain::last_move_squares(node),
+                });
             }
         }
         if let Some(hit_idx) = clicked_hit
@@ -29840,6 +31286,221 @@ impl App {
                 let label = format!("{} - {} · ply {}", hit.white, hit.black, hit.matched_ply);
                 self.open_game_preview_at(game, label, hit.matched_ply);
             }
+            if let Some(orient) = self
+                .pos_search_perspective
+                .orientation_for(hit.structure_side)
+            {
+                self.orientation = orient;
+            }
+        }
+    }
+
+    fn request_delete_session_slots(&mut self, slot_ids: Vec<usize>) {
+        let mut unique = BTreeSet::new();
+        let mut previews = Vec::new();
+        let mut games = Vec::new();
+        let mut valid_ids = Vec::new();
+        for id in slot_ids {
+            if !unique.insert(id) || self.session.slot(id).is_none() {
+                continue;
+            }
+            let loaded = if self.current_slot == Some(id) {
+                self.current
+                    .clone()
+                    .or_else(|| self.session.load(id, &self.edited).ok())
+            } else {
+                self.session.load(id, &self.edited).ok()
+            };
+            if let Some(game) = loaded {
+                let preview = format!(
+                    "{} - {} ({} · {})",
+                    self.display_player_name(game.white()),
+                    self.display_player_name(game.black()),
+                    game.date(),
+                    game.event()
+                );
+                previews.push(preview);
+                games.push(game);
+                valid_ids.push(id);
+            }
+        }
+        if valid_ids.is_empty() {
+            return;
+        }
+        self.pending_delete_games = Some(PendingDeleteGames {
+            target: PendingDeleteTarget::SessionSlots(valid_ids),
+            previews,
+            games,
+            remember_deleted: true,
+            is_read_only_db: self.active_db_is_read_only(),
+        });
+    }
+
+    fn request_delete_prep_game(&mut self, position: usize) {
+        let Some(game) = self.prep_merged_games.get(position).cloned() else {
+            return;
+        };
+        let preview = format!(
+            "{} - {} ({} · {})",
+            self.display_player_name(game.white()),
+            self.display_player_name(game.black()),
+            game.date(),
+            game.event()
+        );
+        self.pending_delete_games = Some(PendingDeleteGames {
+            target: PendingDeleteTarget::PrepMergedIndex(position),
+            previews: vec![preview],
+            games: vec![game],
+            remember_deleted: true,
+            is_read_only_db: false,
+        });
+    }
+
+    fn execute_pending_delete_games(&mut self, pending: PendingDeleteGames) {
+        let mut remembered_count = 0usize;
+        if pending.remember_deleted {
+            for game in &pending.games {
+                if self.deleted_games.add_game(game) {
+                    remembered_count += 1;
+                }
+            }
+            if !cfg!(test) {
+                let _ = self.deleted_games.save();
+            }
+        }
+        match pending.target {
+            PendingDeleteTarget::SessionSlots(slot_ids) => {
+                let deleted_set: HashSet<usize> = slot_ids.iter().copied().collect();
+                let mut removed_count = 0usize;
+                for id in slot_ids {
+                    if self.session.remove(id).is_some() {
+                        removed_count += 1;
+                    }
+                    self.edited.remove(&id);
+                    self.slot_search_meta.remove(&id);
+                    self.selected_slots.remove(&id);
+                }
+                if self
+                    .current_slot
+                    .is_some_and(|cur| deleted_set.contains(&cur))
+                {
+                    self.current_slot = None;
+                    self.current = None;
+                    self.dirty = false;
+                    self.node = 0;
+                    if let Some(next_id) = self.session.id_at(0) {
+                        self.select_slot(next_id);
+                    }
+                }
+                if removed_count > 0 {
+                    self.session_dirty = true;
+                    self.session_revision = self.session_revision.wrapping_add(1);
+                    self.games_filter_cache = None;
+                    self.player_profile_sorted_games = None;
+                    if self.active_db_is_my_games()
+                        && !self.active_db_is_read_only()
+                        && self.session.len() <= 10_000
+                    {
+                        self.save_database_now(false);
+                    }
+                }
+                self.status = if remembered_count > 0 {
+                    format!(
+                        "Deleted {} ({remembered_count} remembered so sync will skip it).",
+                        games_label(removed_count)
+                    )
+                } else {
+                    format!("Deleted {}.", games_label(removed_count))
+                };
+            }
+            PendingDeleteTarget::PrepMergedIndex(position) => {
+                if position < self.prep_merged_games.len() {
+                    self.prep_merged_games.remove(position);
+                    self.player_profile_sorted_games = None;
+                    if let Some(prep) = &self.prep {
+                        self.player_book = Some(PlayerBook::from_merged_games(
+                            prep.player_key.clone(),
+                            prep.player_name.clone(),
+                            &self.prep_merged_games,
+                            players::PredictionConfig {
+                                exclude_chesscom: self.prep_exclude_chesscom,
+                                ..Default::default()
+                            },
+                            players::today(),
+                        ));
+                    }
+                    self.status = if remembered_count > 0 {
+                        "Removed game from preparation list and added to deleted-games ignore list."
+                            .to_string()
+                    } else {
+                        "Removed game from preparation list.".to_string()
+                    };
+                }
+            }
+        }
+    }
+
+    fn delete_games_confirm_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut pending) = self.pending_delete_games.take() else {
+            return;
+        };
+        let mut open = true;
+        let mut confirm = false;
+        let mut cancel = false;
+        let count = pending.previews.len();
+        egui::Window::new("Delete games")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.set_min_width(340.0);
+                ui.label(
+                    RichText::new(format!("Delete {}?", games_label(count)))
+                        .strong(),
+                );
+                ui.add_space(4.0);
+                for preview in pending.previews.iter().take(5) {
+                    ui.label(RichText::new(format!("• {preview}")).small());
+                }
+                if pending.previews.len() > 5 {
+                    ui.label(
+                        RichText::new(format!("… and {} more", pending.previews.len() - 5))
+                            .small()
+                            .weak(),
+                    );
+                }
+                ui.add_space(6.0);
+                ui.checkbox(
+                    &mut pending.remember_deleted,
+                    "Remember deleted so Lichess / Chess.com / ChessABC sync won't re-import",
+                );
+                if pending.is_read_only_db {
+                    ui.label(
+                        RichText::new(
+                            "Note: active source file is read-only; this removes the game(s) from the current session list and adds them to the ignore list.",
+                        )
+                        .small()
+                        .color(GOLD),
+                    );
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                    if ui
+                        .button(RichText::new("Delete").strong().color(Color32::from_rgb(0xE0, 0x5C, 0x5C)))
+                        .clicked()
+                    {
+                        confirm = true;
+                    }
+                });
+            });
+        if confirm {
+            self.execute_pending_delete_games(pending);
+        } else if open && !cancel {
+            self.pending_delete_games = Some(pending);
         }
     }
 
@@ -31456,6 +33117,7 @@ impl eframe::App for App {
         self.poll_prep_load();
         self.poll_wiki();
         self.poll_reference();
+        self.poll_ref_position_games();
         self.poll_correspondence();
         self.poll_correspondence_download();
         self.poll_online();
@@ -31488,6 +33150,7 @@ impl eframe::App for App {
             || self.player_book_rx.is_some()
             || self.prep_load_rx.is_some()
             || self.reference_rx.is_some()
+            || self.ref_position_games_rx.is_some()
             || self.online_rx.is_some()
             || self.online_game_rx.is_some()
             || self.online_ref_rx.is_some()
@@ -31585,28 +33248,45 @@ impl eframe::App for App {
                         let top_color = effective_orientation.other();
                         let bottom_color = effective_orientation;
                         let show_clocks = self.show_clocks && game.has_clocks();
-                        let badge = |color: Color| PlayerBadge {
-                            name: if color == Color::White {
-                                game.white().to_string()
+                        let badge = |color: Color| {
+                            let raw_name = if color == Color::White {
+                                game.white()
                             } else {
-                                game.black().to_string()
-                            },
-                            title: self.title_for_game(game, color).map(str::to_string),
-                            country: player_country_with_directory(game, color, &self.players),
-                            fide_id: player_fide_id(game, color).map(str::to_string),
-                            rating: player_rating(
-                                game,
+                                game.black()
+                            };
+                            let display_name = self.display_player_name(raw_name);
+                            let country =
+                                player_country_with_directory(game, color, &self.players).or_else(
+                                    || {
+                                        (display_name != raw_name)
+                                            .then(|| players::player_key(display_name))
+                                            .flatten()
+                                            .and_then(|key| {
+                                                self.players
+                                                    .get(self.players.find_key(&key)?)?
+                                                    .country
+                                            })
+                                    },
+                                );
+                            PlayerBadge {
+                                name: display_name.to_string(),
+                                title: self.title_for_game(game, color).map(str::to_string),
+                                country,
+                                fide_id: player_fide_id(game, color).map(str::to_string),
+                                rating: player_rating(
+                                    game,
+                                    color,
+                                    self.rating_priority,
+                                    self.show_all_ratings,
+                                ),
+                                team: team_for(game, color).map(str::to_string),
+                                clock: if show_clocks {
+                                    game.clock_for(disp_node, color)
+                                } else {
+                                    None
+                                },
                                 color,
-                                self.rating_priority,
-                                self.show_all_ratings,
-                            ),
-                            team: team_for(game, color).map(str::to_string),
-                            clock: if show_clocks {
-                                game.clock_for(disp_node, color)
-                            } else {
-                                None
-                            },
-                            color,
+                            }
                         };
                         let meta = BoardMeta {
                             pos: hover
@@ -31883,6 +33563,7 @@ impl eframe::App for App {
         self.date_picker_dialog(&ctx);
         self.pending_game_drop_dialog(&ctx);
         self.pending_merge_dialog(&ctx);
+        self.delete_games_confirm_dialog(&ctx);
         self.pending_open_dialog(&ctx);
         self.save_database_dialog(&ctx);
         self.close_confirmation_dialog(&ctx);
@@ -32030,11 +33711,9 @@ fn player_strip(
     });
     name_painter.galley(pos2(text_left, name_y), name_galley.clone(), TEXT);
     if let Some(country) = player.country {
+        let flag_x = (text_left + name_galley.size().x + 6.0).min(right_limit + 4.0);
         let flag_rect = Rect::from_min_size(
-            pos2(
-                right_limit + 4.0,
-                rect.center().y - flags::LIST_SIZE.y * 0.5,
-            ),
+            pos2(flag_x, rect.center().y - flags::LIST_SIZE.y * 0.5),
             flags::LIST_SIZE,
         );
         flags::paint_flag(&painter, country, flag_rect);
@@ -33603,9 +35282,11 @@ fn elo_of(header: Option<&str>) -> Option<u32> {
     header.and_then(parse_elo)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn game_header_card(
     ui: &mut Ui,
     game: &Game,
+    display_names: (&str, &str),
     titles: (Option<&'static str>, Option<&'static str>),
     prep: Option<&PrepSession>,
     priority: RatingPriority,
@@ -33768,7 +35449,7 @@ fn game_header_card(
             ui.add_space(6.0);
             header_player_row(
                 ui,
-                game.white(),
+                display_names.0,
                 titles.0,
                 player_country(game, Color::White),
                 player_fide_id(game, Color::White),
@@ -33779,7 +35460,7 @@ fn game_header_card(
             ui.add_space(3.0);
             header_player_row(
                 ui,
-                game.black(),
+                display_names.1,
                 titles.1,
                 player_country(game, Color::Black),
                 player_fide_id(game, Color::Black),
@@ -34345,7 +36026,8 @@ fn render_move_tokens_flat(
                     let (rect, _) =
                         ui.allocate_exact_size(vec2(galley.size().x + 2.0, row_h), Sense::hover());
                     let text_pos = pos2(rect.left() + 1.0, rect.center().y - galley.size().y * 0.5);
-                    ui.painter().galley(text_pos, galley, Color32::from_rgb(0x6E, 0x77, 0x87));
+                    ui.painter()
+                        .galley(text_pos, galley, Color32::from_rgb(0x6E, 0x77, 0x87));
                 }
                 Token::CloseParen => {
                     depth = depth.saturating_sub(1);
@@ -34358,7 +36040,8 @@ fn render_move_tokens_flat(
                     let (rect, _) =
                         ui.allocate_exact_size(vec2(galley.size().x + 2.0, row_h), Sense::hover());
                     let text_pos = pos2(rect.left() + 1.0, rect.center().y - galley.size().y * 0.5);
-                    ui.painter().galley(text_pos, galley, Color32::from_rgb(0x6E, 0x77, 0x87));
+                    ui.painter()
+                        .galley(text_pos, galley, Color32::from_rgb(0x6E, 0x77, 0x87));
                 }
                 Token::Move {
                     node,
@@ -34544,7 +36227,8 @@ fn move_token_pill(
         x += pg.size().x + prefix_gap;
     }
     let sy = rect.center().y - san_galley.size().y * 0.5;
-    ui.painter().galley(pos2(x, sy), san_galley.clone(), san_color);
+    ui.painter()
+        .galley(pos2(x, sy), san_galley.clone(), san_color);
     x += san_galley.size().x;
     if let Some(ng) = nag_galley {
         x += nag_gap;
@@ -34561,8 +36245,13 @@ fn move_comment_chip(ui: &mut Ui, preview: &str, full: &str) -> egui::Response {
         .painter()
         .layout_no_wrap(text, FontId::proportional(11.0), color);
     let pad_x = 5.0;
-    let row_h = if ui.input(|i| i.any_touches()) { 26.0 } else { 21.0 };
-    let (rect, response) = ui.allocate_exact_size(vec2(galley.size().x + pad_x * 2.0, row_h), Sense::click());
+    let row_h = if ui.input(|i| i.any_touches()) {
+        26.0
+    } else {
+        21.0
+    };
+    let (rect, response) =
+        ui.allocate_exact_size(vec2(galley.size().x + pad_x * 2.0, row_h), Sense::click());
     let fill = if response.hovered() {
         Color32::from_rgb(0x24, 0x29, 0x33)
     } else {
@@ -34588,7 +36277,11 @@ fn move_chip(ui: &mut Ui, selected: bool, san: &str, muted: bool) -> egui::Respo
         "",
         None,
         muted,
-        if ui.input(|i| i.any_touches()) { 26.0 } else { 21.0 },
+        if ui.input(|i| i.any_touches()) {
+            26.0
+        } else {
+            21.0
+        },
     )
 }
 
@@ -35389,6 +37082,89 @@ fn paint_globe_glyph(painter: &egui::Painter, center: egui::Pos2, radius: f32, c
     }
 }
 
+/// Progressive header pill layout for narrow Player Profile sidebars.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ProfileHeaderLayout {
+    back: &'static str,
+    exit: &'static str,
+    find: &'static str,
+    wiki: &'static str,
+    fide_icon_only: bool,
+}
+
+fn profile_header_layout(
+    avail_width: f32,
+    has_you: bool,
+    has_exit: bool,
+    has_fide: bool,
+    has_wiki: bool,
+) -> ProfileHeaderLayout {
+    let tiers = [
+        ProfileHeaderLayout {
+            back: "← All players",
+            exit: "Exit prep",
+            find: "🔍 Find",
+            wiki: "Wikipedia",
+            fide_icon_only: false,
+        },
+        ProfileHeaderLayout {
+            back: "← All players",
+            exit: "Exit prep",
+            find: "🔍",
+            wiki: "Wikipedia",
+            fide_icon_only: false,
+        },
+        ProfileHeaderLayout {
+            back: "← All players",
+            exit: "Exit prep",
+            find: "🔍",
+            wiki: "Wiki",
+            fide_icon_only: false,
+        },
+        ProfileHeaderLayout {
+            back: "←",
+            exit: "Exit",
+            find: "🔍",
+            wiki: "Wiki",
+            fide_icon_only: false,
+        },
+        ProfileHeaderLayout {
+            back: "←",
+            exit: "Exit",
+            find: "🔍",
+            wiki: "",
+            fide_icon_only: true,
+        },
+    ];
+    let est_width = |t: ProfileHeaderLayout| -> f32 {
+        let mut w = t.back.chars().count() as f32 * 5.6 + 16.0;
+        if has_you {
+            w += 26.0;
+        }
+        w += t.find.chars().count() as f32 * 5.6 + 16.0;
+        if has_wiki {
+            w += if t.wiki.is_empty() {
+                26.0
+            } else {
+                t.wiki.chars().count() as f32 * 5.6 + 26.0
+            };
+        }
+        if has_fide {
+            w += if t.fide_icon_only { 26.0 } else { 56.0 };
+        }
+        if has_exit {
+            w += t.exit.chars().count() as f32 * 5.6 + 16.0;
+        }
+        w
+    };
+    for tier in tiers {
+        if est_width(tier) <= avail_width {
+            return tier;
+        }
+    }
+    *tiers.last().unwrap()
+}
+
 /// Hairline pill button opening an external profile/article link. Returns
 /// `true` when clicked.
 fn paint_header_link_pill(
@@ -35399,12 +37175,17 @@ fn paint_header_link_pill(
     accent: Color32,
 ) -> bool {
     let font = FontId::proportional(11.0);
-    let painter_probe = ui.painter();
-    let text_w = painter_probe
-        .layout_no_wrap(label.to_string(), font.clone(), accent)
-        .size()
-        .x;
-    let w = text_w + 32.0;
+    let icon_only = label.is_empty();
+    let w = if icon_only {
+        24.0
+    } else {
+        let painter_probe = ui.painter();
+        let text_w = painter_probe
+            .layout_no_wrap(label.to_string(), font.clone(), accent)
+            .size()
+            .x;
+        text_w + 32.0
+    };
     let (rect, response) = ui.allocate_exact_size(vec2(w, 22.0), Sense::click());
     let stroke_color = if response.hovered() {
         accent
@@ -35427,15 +37208,21 @@ fn paint_header_link_pill(
         Stroke::new(1.0, stroke_color),
         StrokeKind::Inside,
     );
-    let globe_center = pos2(rect.left() + 13.0, rect.center().y);
+    let globe_center = if icon_only {
+        pos2(rect.center().x, rect.center().y)
+    } else {
+        pos2(rect.left() + 13.0, rect.center().y)
+    };
     paint_globe_glyph(&painter, globe_center, 6.0, label_color);
-    painter.text(
-        pos2(globe_center.x + 10.0, rect.center().y),
-        Align2::LEFT_CENTER,
-        label,
-        font,
-        label_color,
-    );
+    if !icon_only {
+        painter.text(
+            pos2(globe_center.x + 10.0, rect.center().y),
+            Align2::LEFT_CENTER,
+            label,
+            font,
+            label_color,
+        );
+    }
     if response.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
@@ -35448,26 +37235,21 @@ fn paint_header_link_pill(
     }
 }
 
-/// Gold-hairline FIDE pill button opening the FIDE profile. Returns true
-/// when clicked.
-fn paint_fide_pill(ui: &mut Ui, id: &str) -> bool {
+/// Gold-hairline FIDE pill button opening the FIDE profile. Returns `true`
+/// when clicked. Omits the numeric FIDE ID from the button label.
+fn paint_fide_pill(ui: &mut Ui, id: &str, icon_only: bool) -> bool {
     let Some(url) = fide::profile_url(id) else {
         return false;
     };
-    let label = format!("FIDE · {id}");
-    paint_header_link_pill(
-        ui,
-        &url,
-        &label,
-        "Open this player's FIDE rating profile in your browser",
-        GOLD,
-    )
+    let label = if icon_only { "" } else { "FIDE" };
+    let tooltip = format!("Open FIDE profile #{id} in your browser");
+    paint_header_link_pill(ui, &url, label, &tooltip, GOLD)
 }
 
 /// Subtle Operate-mode pill button opening the Wikipedia biography.
-fn paint_wiki_pill(ui: &mut Ui, url: &str, title: &str) -> bool {
+fn paint_wiki_pill(ui: &mut Ui, url: &str, title: &str, label: &str) -> bool {
     let tooltip = format!("Open {title} on English Wikipedia (text: CC BY-SA 4.0)\n{url}");
-    paint_header_link_pill(ui, url, "Wikipedia", &tooltip, MUTED)
+    paint_header_link_pill(ui, url, label, &tooltip, MUTED)
 }
 
 /// Two-line, full-width selectable row for the game list.
@@ -35533,7 +37315,13 @@ fn player_row(
     } else {
         display_flags
             .iter()
-            .map(|&country| if flags::has_visual_flag(country) { 16.0 } else { 30.0 })
+            .map(|&country| {
+                if flags::has_visual_flag(country) {
+                    16.0
+                } else {
+                    30.0
+                }
+            })
             .sum::<f32>()
             + 3.0 * (display_flags.len().saturating_sub(1) as f32)
     };
@@ -36000,8 +37788,7 @@ fn parse_ref_game_date(date: &str) -> u32 {
 }
 
 /// Bounded scan of a database for games and top players reaching `key`.
-/// Capped at 2,500 games and 80 ms so it completes rapidly without holding memory.
-#[allow(dead_code)]
+/// Scans tail-first (most recent additions) and caps at 2,500 games / 80 ms.
 fn collect_ref_position_games(
     lib: Arc<dyn GameLibrary>,
     key: u64,
@@ -36014,8 +37801,9 @@ fn collect_ref_position_games(
     let mut matched = Vec::new();
     let mut player_counts: HashMap<String, u32> = HashMap::new();
 
-    for idx in 0..max_scan {
-        if idx > 0 && idx % 64 == 0 && started.elapsed() >= budget {
+    let start_idx = total_games.saturating_sub(max_scan);
+    for (scanned, idx) in (start_idx..total_games).rev().enumerate() {
+        if scanned > 0 && scanned % 64 == 0 && started.elapsed() >= budget {
             break;
         }
         let mut reaches = is_start;
@@ -39239,6 +41027,13 @@ mod tests {
             last_database_dir: None,
             last_print_dir: None,
             database_save_path: None,
+            scratch_title: None,
+            slot_search_meta: HashMap::new(),
+            search_list_perspective: None,
+            search_list_sort: search::PositionHitSort::default(),
+            deleted_games: my_games::DeletedGamesRegistry::default(),
+            pending_delete_games: None,
+            player_profile_sorted_games: None,
             session_dirty: false,
             close_confirm_open: false,
             pending_window_close: false,
@@ -39254,6 +41049,7 @@ mod tests {
             ref_games_sort: RefGamesSort::default(),
             ref_position_games: None,
             ref_position_games_rx: None,
+            ref_position_games_pending: None,
             tree_index: None,
             tree_index_rx: None,
             tree_index_job: None,
@@ -39539,6 +41335,20 @@ mod tests {
             pos_search_rx: None,
             pos_search_cancel: None,
             pos_search_struct_cache: None,
+            pos_search_perspective: search::SearchBoardPerspective::default(),
+            pos_search_last_label: String::new(),
+            pos_search_sort: search::PositionHitSort::default(),
+            pos_search_next_start: 0,
+            pos_search_total_candidates: 0,
+            pos_search_has_more: false,
+            pos_search_last_query: None,
+            pos_search_eco_browser_open: false,
+            pos_search_eco_query: String::new(),
+            pos_search_eco_volume: None,
+            pos_search_eco_selected_only: false,
+            pos_search_eco_keep_selection: true,
+            pos_search_eco_last_anchor: None,
+            pos_search_eco_drag: None,
             online_game_rx: None,
             online_game_job: None,
             online_reference_open: false,
@@ -40627,21 +42437,24 @@ mod tests {
     fn online_accounts_group_as_you_and_hover_autoflips_board() {
         let mut app = test_app();
         app.prep_player_names = vec!["Markus Hinterreiter".to_string()];
-        app.my_games_config.accounts.push(my_games::MyGamesOnlineAccount {
-            source: online::OnlineSource::Lichess,
-            username: "GermanoMosconi32".to_string(),
-            enabled: true,
-            max_games: None,
-            exclude_online: false,
-            last_sync_unix: None,
-        });
-        assert!(app.sync_my_games_accounts_into_player_names());
+        app.my_games_config
+            .accounts
+            .push(my_games::MyGamesOnlineAccount {
+                source: online::OnlineSource::Lichess,
+                username: "GermanoMosconi32".to_string(),
+                enabled: true,
+                max_games: None,
+                exclude_online: false,
+                last_sync_unix: None,
+            });
         assert_eq!(
             app.prep_player_names,
-            vec![
-                "Markus Hinterreiter".to_string(),
-                "GermanoMosconi32".to_string()
-            ]
+            vec!["Markus Hinterreiter".to_string()]
+        );
+        assert!(app.is_my_player_name("GermanoMosconi32"));
+        assert_eq!(
+            app.display_player_name("GermanoMosconi32"),
+            "Markus Hinterreiter"
         );
         let hover_game = Game {
             headers: vec![
@@ -40650,6 +42463,7 @@ mod tests {
             ],
             ..Game::default()
         };
+        assert_eq!(hover_game.black(), "GermanoMosconi32");
         app.orientation = Color::White;
         assert_eq!(
             app.effective_display_orientation(&hover_game, true),
@@ -43410,6 +45224,7 @@ mod tests {
             anchor_node: 0,
             cursor_node: 2,
             hovered_pv_step: None,
+            hover_orientation: None,
         });
 
         let (disp_game, disp_node, disp_overlay) =
@@ -44022,5 +45837,190 @@ mod tests {
             central_before.width(),
             central_after.width()
         );
+    }
+
+    #[test]
+    fn profile_header_layout_drops_fide_id_by_default_and_collapses_progressively() {
+        let wide = profile_header_layout(420.0, true, true, true, true);
+        assert_eq!(wide.back, "← All players");
+        assert_eq!(wide.exit, "Exit prep");
+        assert_eq!(wide.find, "🔍 Find");
+        assert_eq!(wide.wiki, "Wikipedia");
+        assert!(!wide.fide_icon_only);
+
+        let mid = profile_header_layout(340.0, true, true, true, true);
+        assert_eq!(mid.find, "🔍");
+        assert!(!mid.fide_icon_only);
+
+        let narrow_wiki = profile_header_layout(312.0, true, true, true, true);
+        assert_eq!(narrow_wiki.find, "🔍");
+        assert_eq!(narrow_wiki.wiki, "Wiki");
+
+        let compact_nav = profile_header_layout(220.0, true, true, true, true);
+        assert_eq!(compact_nav.back, "←");
+        assert_eq!(compact_nav.exit, "Exit");
+
+        let icons_only = profile_header_layout(140.0, true, true, true, true);
+        assert_eq!(icons_only.wiki, "");
+        assert!(icons_only.fide_icon_only);
+    }
+
+    #[test]
+    fn search_results_load_and_append_with_perspective_flip() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("brett-search-load-{stamp}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("games.pgn");
+        std::fs::write(
+            &db_path,
+            b"[Event \"Open\"]\n[White \"Alice\"]\n[Black \"Bob\"]\n[Date \"2024.01.01\"]\n[Result \"1-0\"]\n\n1. e4 c5 2. Nf3 Nc6 3. d4 cxd4 4. Nxd4 g6 5. c4 1-0\n\n[Event \"Closed\"]\n[White \"Carol\"]\n[Black \"Dave\"]\n[Date \"2024.02.01\"]\n[Result \"0-1\"]\n\n1. d4 Nf6 2. c4 e6 3. Nc3 d5 0-1\n",
+        )
+        .unwrap();
+
+        let lib: Arc<dyn GameLibrary> = Arc::new(PgnLibrary::build(&db_path).unwrap());
+        let mut app = test_app();
+        app.pos_search_target_lib = Some(lib.clone());
+        app.pos_search_last_label = "Maroczy".to_string();
+        app.pos_search_perspective = search::SearchBoardPerspective::OpponentSide;
+        app.pos_search_hits = vec![search::PositionHit {
+            game_index: 0,
+            white: "Alice".to_string(),
+            black: "Bob".to_string(),
+            white_elo: 2400,
+            black_elo: 2350,
+            event: "Open".to_string(),
+            date: "2024.01.01".to_string(),
+            date_num: 20240101,
+            result: "1-0".to_string(),
+            eco: "B36".to_string(),
+            medals: 0,
+            vcs_flags: 0,
+            matched_ply: 9,
+            matched_flipped: false,
+            structure_side: Color::White,
+        }];
+
+        app.load_pos_search_hits_into_new_db();
+        assert_eq!(app.session.len(), 1);
+        assert_eq!(
+            app.shelf_entry_title(app.active_db_index),
+            "Search: Maroczy"
+        );
+        // OpponentSide for a White structure -> Black orientation, jumped to matched ply 9
+        assert_eq!(app.orientation, Color::Black);
+        assert_eq!(app.node, 9);
+
+        // Append again (dedup skips the already present game, while adding game 1)
+        app.pos_search_perspective = search::SearchBoardPerspective::StructureSide;
+        app.pos_search_hits.push(search::PositionHit {
+            game_index: 1,
+            white: "Carol".to_string(),
+            black: "Dave".to_string(),
+            white_elo: 2500,
+            black_elo: 2450,
+            event: "Closed".to_string(),
+            date: "2024.02.01".to_string(),
+            date_num: 20240201,
+            result: "0-1".to_string(),
+            eco: "D37".to_string(),
+            medals: 0,
+            vcs_flags: 0,
+            matched_ply: 4,
+            matched_flipped: false,
+            structure_side: Color::Black,
+        });
+        app.append_pos_search_hits_to_current_db();
+        assert_eq!(app.session.len(), 2);
+        let second_id = app.session.id_at(1).unwrap();
+        app.select_slot(second_id);
+        assert_eq!(app.orientation, Color::Black);
+        assert_eq!(app.node, 4);
+
+        // Verify structure-holder vs opponent Elo sorting in the Games list
+        app.apply_search_list_sort(search::PositionHitSort::StructureEloDesc);
+        let first_id = app.session.id_at(0).unwrap();
+        assert_eq!(app.session.slot_white(first_id), "Carol"); // Carol/Dave: Black structure, Black Elo = 2450 > Alice 2400
+
+        app.apply_search_list_sort(search::PositionHitSort::OpponentEloDesc);
+        let first_opp_id = app.session.id_at(0).unwrap();
+        assert_eq!(app.session.slot_white(first_opp_id), "Carol"); // Carol/Dave: Opp (White) Elo = 2500 > Bob 2350
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn player_profile_sorts_most_recent_games_first() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("brett-profile-sort-{stamp}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("chron.pgn");
+        std::fs::write(
+            &db_path,
+            b"[Event \"Old\"]\n[White \"Hero\"]\n[Black \"A\"]\n[Date \"2019.03.10\"]\n[Result \"1-0\"]\n\n1. e4 e5 1-0\n\n[Event \"Newest\"]\n[White \"B\"]\n[Black \"Hero\"]\n[Date \"2025.11.02\"]\n[Result \"0-1\"]\n\n1. d4 d5 0-1\n\n[Event \"Mid\"]\n[White \"Hero\"]\n[Black \"C\"]\n[Date \"2022.07.15\"]\n[Result \"1/2-1/2\"]\n\n1. c4 e5 1/2-1/2\n",
+        )
+        .unwrap();
+
+        let lib: Arc<dyn GameLibrary> = Arc::new(PgnLibrary::build(&db_path).unwrap());
+        assert_eq!(lib.game_record_meta(0).date_num, 20190310);
+        assert_eq!(lib.game_record_meta(1).date_num, 20251102);
+        assert_eq!(lib.game_record_meta(2).date_num, 20220715);
+
+        let mut app = test_app();
+        app.install_library_with_session(lib.clone(), &db_path, None);
+        app.players = PlayerDirectory::build(lib.as_ref());
+        let p_idx = app.players.find_key("hero").unwrap();
+        app.selected_player = Some(p_idx);
+
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(400.0, 600.0))),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(input, |ui| {
+            app.players_content(ui);
+        });
+        out.textures_delta.clear();
+
+        let cached = app
+            .player_profile_sorted_games
+            .as_ref()
+            .expect("player profile sorted games cache populated");
+        assert_eq!(cached.indices, vec![1, 2, 0]);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn delete_games_removes_slot_and_remembers_in_deleted_registry() {
+        let mut app = test_app();
+        let games = domain::parse_pgn(
+            b"[Event \"Online Rapid\"]\n[Site \"Lichess\"]\n[White \"me\"]\n[Black \"opp\"]\n[Date \"2025.01.05\"]\n[Result \"1-0\"]\n[LichessId \"del001\"]\n\n1. e4 e5 1-0\n",
+        )
+        .unwrap();
+        let slot_id = app.session.insert_game(games[0].clone(), None);
+        app.select_slot(slot_id);
+        assert_eq!(app.session.len(), 1);
+
+        app.request_delete_session_slots(vec![slot_id]);
+        let pending = app.pending_delete_games.take().expect("pending delete");
+        // Keep registry empty before execution
+        assert!(!app.deleted_games.contains(&games[0]));
+        app.execute_pending_delete_games(PendingDeleteGames {
+            remember_deleted: true,
+            ..pending
+        });
+
+        assert_eq!(app.session.len(), 0);
+        assert!(app.current_slot.is_none());
+        assert!(app.deleted_games.contains(&games[0]));
+        let (kept, skipped) = app.deleted_games.filter_games(games);
+        assert!(kept.is_empty());
+        assert_eq!(skipped, 1);
     }
 }

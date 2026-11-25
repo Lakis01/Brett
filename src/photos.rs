@@ -766,10 +766,7 @@ mod tests {
             find_custom_in_dir(&dir, "GermanoMosconi32", &aliases),
             Some(file.clone())
         );
-        assert_eq!(
-            find_custom_in_dir(&dir, "Hinterreiter, M", &[]),
-            Some(file)
-        );
+        assert_eq!(find_custom_in_dir(&dir, "Hinterreiter, M", &[]), Some(file));
         let _ = std::fs::remove_dir_all(dir);
     }
 }

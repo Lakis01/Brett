@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{BufWriter, Write as _};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use memmap2::Mmap;
@@ -769,6 +769,14 @@ impl StructureFamily {
             ],
             Self::Iqp => &[
                 StructurePreset::IqpDFile,
+                StructurePreset::IqpVsEPawnNoFianchetto,
+                StructurePreset::IqpVsEPawnFianchetto,
+                StructurePreset::IqpVsCPawnNoFianchetto,
+                StructurePreset::IqpVsCPawnFianchetto,
+                StructurePreset::IqpVsEPawn,
+                StructurePreset::IqpVsCPawn,
+                StructurePreset::IqpVsNoFianchetto,
+                StructurePreset::IqpVsFianchetto,
                 StructurePreset::IqpDynamic,
                 StructurePreset::IqpBlockaded,
                 StructurePreset::IqpAnyCentralFile,
@@ -776,6 +784,8 @@ impl StructureFamily {
             ],
             Self::HangingPawns => &[
                 StructurePreset::HangingPawnsClassic,
+                StructurePreset::HangingPawnsVsNoFianchetto,
+                StructurePreset::HangingPawnsVsFianchetto,
                 StructurePreset::HangingPawnsDynamic,
             ],
             Self::MaroczyAndHedgehog => &[
@@ -796,6 +806,7 @@ impl StructureFamily {
                 StructurePreset::SlavCaroKann,
                 StructurePreset::SlavFormation,
                 StructurePreset::GrunfeldCenter,
+                StructurePreset::Botvinnik,
                 StructurePreset::BotvinnikTriangle,
             ],
             Self::ClosedChains => &[
@@ -833,12 +844,22 @@ pub enum StructurePreset {
     CarlsbadF3E4,
     // IQP & Panov family
     IqpDFile,
+    IqpVsEPawnNoFianchetto,
+    IqpVsEPawnFianchetto,
+    IqpVsCPawnNoFianchetto,
+    IqpVsCPawnFianchetto,
+    IqpVsEPawn,
+    IqpVsCPawn,
+    IqpVsNoFianchetto,
+    IqpVsFianchetto,
     IqpDynamic,
     IqpBlockaded,
     IqpAnyCentralFile,
     PanovFormation,
     // Hanging Pawns family
     HangingPawnsClassic,
+    HangingPawnsVsNoFianchetto,
+    HangingPawnsVsFianchetto,
     HangingPawnsDynamic,
     // Maróczy & Hedgehog
     MaroczyBindAny,
@@ -856,6 +877,7 @@ pub enum StructurePreset {
     SlavCaroKann,
     SlavFormation,
     GrunfeldCenter,
+    Botvinnik,
     BotvinnikTriangle,
     // Closed chains & semi-closed formations
     FrenchChain,
@@ -869,7 +891,7 @@ pub enum StructurePreset {
 pub type StructuralPreset = StructurePreset;
 
 impl StructurePreset {
-    pub const ALL: [Self; 40] = [
+    pub const ALL: [Self; 51] = [
         Self::StonewallAny,
         Self::StonewallClassic,
         Self::StonewallNc6,
@@ -884,11 +906,21 @@ impl StructurePreset {
         Self::CarlsbadCentralE4,
         Self::CarlsbadF3E4,
         Self::IqpDFile,
+        Self::IqpVsEPawnNoFianchetto,
+        Self::IqpVsEPawnFianchetto,
+        Self::IqpVsCPawnNoFianchetto,
+        Self::IqpVsCPawnFianchetto,
+        Self::IqpVsEPawn,
+        Self::IqpVsCPawn,
+        Self::IqpVsNoFianchetto,
+        Self::IqpVsFianchetto,
         Self::IqpDynamic,
         Self::IqpBlockaded,
         Self::IqpAnyCentralFile,
         Self::PanovFormation,
         Self::HangingPawnsClassic,
+        Self::HangingPawnsVsNoFianchetto,
+        Self::HangingPawnsVsFianchetto,
         Self::HangingPawnsDynamic,
         Self::MaroczyBindAny,
         Self::MaroczyBindNoFianchetto,
@@ -903,6 +935,7 @@ impl StructurePreset {
         Self::SlavCaroKann,
         Self::SlavFormation,
         Self::GrunfeldCenter,
+        Self::Botvinnik,
         Self::BotvinnikTriangle,
         Self::FrenchChain,
         Self::FrenchTarraschDxE,
@@ -929,11 +962,22 @@ impl StructurePreset {
             | Self::CarlsbadCentralE4
             | Self::CarlsbadF3E4 => StructureFamily::Carlsbad,
             Self::IqpDFile
+            | Self::IqpVsEPawnNoFianchetto
+            | Self::IqpVsEPawnFianchetto
+            | Self::IqpVsCPawnNoFianchetto
+            | Self::IqpVsCPawnFianchetto
+            | Self::IqpVsEPawn
+            | Self::IqpVsCPawn
+            | Self::IqpVsNoFianchetto
+            | Self::IqpVsFianchetto
             | Self::IqpDynamic
             | Self::IqpBlockaded
             | Self::IqpAnyCentralFile
             | Self::PanovFormation => StructureFamily::Iqp,
-            Self::HangingPawnsClassic | Self::HangingPawnsDynamic => StructureFamily::HangingPawns,
+            Self::HangingPawnsClassic
+            | Self::HangingPawnsVsNoFianchetto
+            | Self::HangingPawnsVsFianchetto
+            | Self::HangingPawnsDynamic => StructureFamily::HangingPawns,
             Self::MaroczyBindAny
             | Self::MaroczyBindNoFianchetto
             | Self::MaroczyBindFianchetto
@@ -947,6 +991,7 @@ impl StructurePreset {
             Self::SlavCaroKann
             | Self::SlavFormation
             | Self::GrunfeldCenter
+            | Self::Botvinnik
             | Self::BotvinnikTriangle => StructureFamily::SlavAndGrunfeld,
             Self::FrenchChain
             | Self::FrenchTarraschDxE
@@ -974,11 +1019,21 @@ impl StructurePreset {
             Self::CarlsbadCentralE4 => "Carlsbad + e4 Plan",
             Self::CarlsbadF3E4 => "Carlsbad + f3 Setup",
             Self::IqpDFile => "IQP (d4/d5)",
+            Self::IqpVsEPawnNoFianchetto => "IQP vs e-pawn (no K-side fianchetto)",
+            Self::IqpVsEPawnFianchetto => "IQP vs e-pawn + K-side fianchetto",
+            Self::IqpVsCPawnNoFianchetto => "IQP vs c-pawn (no K-side fianchetto)",
+            Self::IqpVsCPawnFianchetto => "IQP vs c-pawn + K-side fianchetto",
+            Self::IqpVsEPawn => "IQP vs e-pawn (any)",
+            Self::IqpVsCPawn => "IQP vs c-pawn (any)",
+            Self::IqpVsNoFianchetto => "IQP vs No K-side fianchetto (any)",
+            Self::IqpVsFianchetto => "IQP vs K-side fianchetto (any)",
             Self::IqpDynamic => "Dynamic IQP (2+ minor pieces)",
             Self::IqpBlockaded => "Blockaded IQP (opp on d5 + e6)",
             Self::IqpAnyCentralFile => "Any Central IQP (c/d/e file)",
             Self::PanovFormation => "Panov Attack (c4+d4 vs d5+e6)",
             Self::HangingPawnsClassic => "Hanging Pawns (c4+d4)",
+            Self::HangingPawnsVsNoFianchetto => "Hanging Pawns vs No K-side fianchetto",
+            Self::HangingPawnsVsFianchetto => "Hanging Pawns vs K-side fianchetto (g6+Bg7)",
             Self::HangingPawnsDynamic => "Hanging Pawns (c4/c5 + d4/d5)",
             Self::MaroczyBindAny => "Maróczy Bind (any: c4+e4 vs d6)",
             Self::MaroczyBindNoFianchetto => "Maróczy — No K-side fianchetto",
@@ -987,19 +1042,20 @@ impl StructurePreset {
             Self::Boleslavsky => "Boleslavsky Hole (d6-e5 vs e4)",
             Self::Scheveningen => "Small Center (d6-e6 vs e4)",
             Self::Dragon => "Dragon Formation (d6-g6-Bg7 vs e4)",
-            Self::NajdorfStructure => "Najdorf Type I (a6-d6 vs e4)",
-            Self::NajdorfTypeII => "Najdorf Type II (a6-b5-d6 vs e4)",
-            Self::NajdorfTypeIII => "Najdorf Type III (a6-d6-e5 vs e4+f4)",
+            Self::NajdorfStructure => "Najdorf — Classical / Flexible (a6-d6, e5/e6)",
+            Self::NajdorfTypeII => "Najdorf — Queenside ...b5 (a6-b5-d6)",
+            Self::NajdorfTypeIII => "Najdorf — ...e5 vs e4+f4 (a6-d6-e5)",
             Self::SlavCaroKann => "Slav / Caro-Kann (c6-d5 vs d4)",
             Self::SlavFormation => "Semi-Slav Triangle (c3/c4-d4-e3 vs c6-d5-e6)",
-            Self::GrunfeldCenter => "Grünfeld Center (d4+e4 vs c5/c6+g6+Bg7)",
+            Self::GrunfeldCenter => "Grünfeld Center (d4+e4 vs g6+Bg7)",
+            Self::Botvinnik => "Botvinnik",
             Self::BotvinnikTriangle => "Botvinnik Triangle (c4-d3-e4 + g3+Bg2)",
             Self::FrenchChain => "French Chain (d4-e5 vs d5-e6)",
             Self::FrenchTarraschDxE => "Open French Tension (d4 vs c5+e6)",
             Self::KingsIndianChain => "KID Locked Center (c4-d5-e4 vs d6-e5)",
             Self::KingsIndianC5Chain => "KID + ...c5 Break (c4-d5-e4 vs c5-d6-e5)",
             Self::BenoniStructure => "Benoni Wedge (c5-d6 vs d5-e4)",
-            Self::NimzoDoubledCPawns => "Doubled c-Pawns (c3+c4, DSB off)",
+            Self::NimzoDoubledCPawns => "Doubled c-Pawns (Nimzo: c3+c4, opp DSB off)",
         }
     }
 
@@ -1042,10 +1098,40 @@ impl StructurePreset {
             Self::IqpDFile => {
                 "Isolated d-pawn (d4/d5) with open c- and e-files and no opposing d-pawn."
             }
+            Self::IqpVsEPawnNoFianchetto => {
+                "Isolated d-pawn vs opponent's e-pawn (open c-file) without a K-side fianchetto (g7, no Bg7)."
+            }
+            Self::IqpVsEPawnFianchetto => {
+                "Isolated d-pawn vs opponent's e-pawn (open c-file) with a K-side fianchetto (g6+Bg7)."
+            }
+            Self::IqpVsCPawnNoFianchetto => {
+                "Isolated d-pawn vs opponent's c-pawn (open e-file) without a K-side fianchetto (g7, no Bg7)."
+            }
+            Self::IqpVsCPawnFianchetto => {
+                "Isolated d-pawn vs opponent's c-pawn (open e-file) with a K-side fianchetto (g6+Bg7)."
+            }
+            Self::IqpVsEPawn => {
+                "Isolated d-pawn vs opponent's e-pawn (open c-file), any kingside setup."
+            }
+            Self::IqpVsCPawn => {
+                "Isolated d-pawn vs opponent's c-pawn (open e-file), any kingside setup."
+            }
+            Self::IqpVsNoFianchetto => {
+                "Isolated d-pawn facing a non-fianchettoed kingside (g7, no Bg7)."
+            }
+            Self::IqpVsFianchetto => "Isolated d-pawn facing a kingside fianchetto (g6+Bg7).",
             Self::IqpDynamic => "IQP middlegame with at least 2 minor pieces for the IQP holder.",
             Self::IqpBlockaded => "d4-pawn directly blockaded on d5 by opponent minor piece + e6.",
             Self::IqpAnyCentralFile => "Any isolated pawn on c, d, or e files on ranks 4–6.",
-            Self::HangingPawnsClassic => "Hanging c4+d4 pawns with half-open/open b and e files.",
+            Self::HangingPawnsClassic => {
+                "Hand-tuned hanging c4+d4 pawns (no own b/e pawns, no opp c/d pawns, opp b6/b7 & e6/e7)."
+            }
+            Self::HangingPawnsVsNoFianchetto => {
+                "Hanging c4+d4 pawns facing an opponent without a K-side fianchetto (g7, no Bg7)."
+            }
+            Self::HangingPawnsVsFianchetto => {
+                "Hanging c4+d4 pawns facing an opponent K-side fianchetto (g6+Bg7)."
+            }
             Self::HangingPawnsDynamic => {
                 "Advanced or level hanging c/d pawn pair (ranks 4–5) without b/e support."
             }
@@ -1053,22 +1139,20 @@ impl StructurePreset {
                 "c4+e4 bind clamping d5 against Black's d6 setup (any kingside)."
             }
             Self::MaroczyBindNoFianchetto => {
-                "Maróczy bind without White kingside fianchetto (c4+e4, a2/g2/h2, b2|b3, f2|f3 vs Black d6/g6, no W d-pawn or B c-pawn)."
+                "Hand-tuned Maróczy bind without K-side fianchetto (a2/g2/c4/e4, b2|b3, f2|f3, h2|h3 vs b7/d6/f7/g6, a6|a7, e6|e7, h6|h7)."
             }
             Self::MaroczyBindFianchetto => {
-                "Maróczy bind with White kingside fianchetto (c4+e4+g3/Bg2 vs Black d6 without c-pawn)."
+                "Maróczy bind with K-side fianchetto (a2/c4/f2/g3+Bg2, b2|b3, e2|e3|e4, h2|h3 vs b7/d6/f7/g6/h7+Bg7, a7|a6, e7|e6, no W d-pawn or B c-pawn)."
             }
             Self::Hedgehog => "a6-b6-d6-e6 Hedgehog shell without c-pawn facing c4+e4.",
             Self::Boleslavsky => "d6+e5 Sicilian center leaving a backward d5 square vs White e4.",
             Self::Scheveningen => "d6+e6 Small Center vs White e4 with open c- and d-files.",
             Self::Dragon => "d6+g6+Bg7 fianchetto vs e4 with open c- and d-files.",
-            Self::NajdorfStructure => "a6+d6+(e5/e6) flexible Najdorf Type I shell vs White e4.",
+            Self::NajdorfStructure => "a6+d6+(e5/e6) flexible classical Najdorf shell vs White e4.",
             Self::NajdorfTypeII => {
-                "Najdorf Type II queenside expansion: a6+b5+d6 without c-pawn vs White e4."
+                "Najdorf queenside expansion: a6+b5+d6 without c-pawn vs White e4."
             }
-            Self::NajdorfTypeIII => {
-                "Najdorf Type III e5+f4 battle: a6+d6+e5 without c-pawn vs White e4+f4."
-            }
+            Self::NajdorfTypeIII => "Najdorf e5+f4 battle: a6+d6+e5 without c-pawn vs White e4+f4.",
             Self::PanovFormation => {
                 "Panov Attack tension: White c4+d4 (no e-pawn) vs Black d5+e6 (no c-pawn)."
             }
@@ -1076,7 +1160,10 @@ impl StructurePreset {
                 "Semi-Slav / Triangle shell: c3/c4+d4+e3 against Black's solid c6-d5-e6."
             }
             Self::GrunfeldCenter => {
-                "Grünfeld central duo: White d4+e4 (no c-pawn) vs Black g6+Bg7+c5/c6 (no d-pawn)."
+                "Grünfeld central duo: White d4+e4 (no c4-pawn, allowing Exchange c3) vs Black g6+Bg7 (no d-pawn)."
+            }
+            Self::Botvinnik => {
+                "Botvinnik System: c4-d3-e4 + b2-f2-g3-h2 + a2/a3 with Nc3, Ne2, and Bg2."
             }
             Self::BotvinnikTriangle => {
                 "Botvinnik English/Closed Sicilian setup: c4-d3-e4 triangle with g3+Bg2."
@@ -1094,7 +1181,7 @@ impl StructurePreset {
                 "Solid c6-d5 foundation vs White d4+(c4/e4) with e-file half-open."
             }
             Self::NimzoDoubledCPawns => {
-                "Structural doubled c-pawns (Nimzo/Sämisch) with c1/c8 bishop absent."
+                "Structural doubled c-pawns (Nimzo/Sämisch: c3+c4 + d/e pawns, opponent DSB traded off)."
             }
         }
     }
@@ -1158,70 +1245,76 @@ impl StructurePreset {
     pub fn to_pattern_components(self) -> (String, [SquareConstraint; 64], Vec<PatternClause>) {
         let side = self.primary_side();
         let opp = side.other();
-        let mut squares = [SquareConstraint::Any; 64];
+        let squares = std::cell::RefCell::new([SquareConstraint::Any; 64]);
         let mut clauses: Vec<PatternClause> = Vec::new();
 
-        let norm_sq = |file: usize, rank_0: usize, perspective: Color| -> Square {
-            let r = if perspective == Color::White {
+        let sq_in_frame = |file: usize, rank_0: usize| -> Square {
+            let r = if side == Color::White {
                 rank_0
             } else {
                 7 - rank_0
             };
             Square::from_coords(ChessFile::new(file as u32), Rank::new(r as u32))
         };
-        let mut put = |file: usize, rank_0: usize, perspective: Color, role: Role| {
-            let sq = norm_sq(file, rank_0, perspective);
-            squares[sq.to_u32() as usize] = SquareConstraint::Piece(Piece::new(perspective, role));
-        };
         let own_pawn = |f: usize, r: usize| {
-            AtomPredicate::HasPiece(norm_sq(f, r, side), Piece::new(side, Role::Pawn))
+            AtomPredicate::HasPiece(sq_in_frame(f, r), Piece::new(side, Role::Pawn))
         };
         let opp_pawn = |f: usize, r: usize| {
-            AtomPredicate::HasPiece(norm_sq(f, r, side), Piece::new(opp, Role::Pawn))
+            AtomPredicate::HasPiece(sq_in_frame(f, r), Piece::new(opp, Role::Pawn))
         };
         let no_own_pawn_file =
             |f: usize| AtomPredicate::NoPieceOnFile(ChessFile::new(f as u32), side, Role::Pawn);
         let no_opp_pawn_file =
             |f: usize| AtomPredicate::NoPieceOnFile(ChessFile::new(f as u32), opp, Role::Pawn);
         let not_own_pawn = |f: usize, r: usize| {
-            AtomPredicate::NotPiece(norm_sq(f, r, side), Piece::new(side, Role::Pawn))
+            AtomPredicate::NotPiece(sq_in_frame(f, r), Piece::new(side, Role::Pawn))
+        };
+        let put_own = |file: usize, rank_0: usize, role: Role| {
+            let sq = sq_in_frame(file, rank_0);
+            squares.borrow_mut()[sq.to_u32() as usize] =
+                SquareConstraint::Piece(Piece::new(side, role));
+        };
+        let put_opp = |file: usize, rank_0: usize, role: Role| {
+            let sq = sq_in_frame(file, rank_0);
+            squares.borrow_mut()[sq.to_u32() as usize] =
+                SquareConstraint::Piece(Piece::new(opp, role));
         };
 
         match self {
             Self::StonewallAny => {
-                put(3, 3, side, Role::Pawn);
-                put(4, 2, side, Role::Pawn);
-                put(5, 3, side, Role::Pawn);
+                put_own(3, 3, Role::Pawn);
+                put_own(4, 2, Role::Pawn);
+                put_own(5, 3, Role::Pawn);
                 clauses.push(PatternClause {
                     op: ClauseOp::NoneOf,
                     atoms: vec![own_pawn(4, 3)],
                 });
             }
             Self::StonewallClassic => {
-                put(2, 2, side, Role::Pawn);
-                put(3, 3, side, Role::Pawn);
-                put(4, 2, side, Role::Pawn);
-                put(5, 3, side, Role::Pawn);
+                put_own(2, 2, Role::Pawn);
+                put_own(3, 3, Role::Pawn);
+                put_own(4, 2, Role::Pawn);
+                put_own(5, 3, Role::Pawn);
                 clauses.push(PatternClause {
                     op: ClauseOp::NoneOf,
                     atoms: vec![own_pawn(4, 3)],
                 });
             }
             Self::StonewallNc6 => {
-                put(3, 3, side, Role::Pawn);
-                put(4, 2, side, Role::Pawn);
-                put(5, 3, side, Role::Pawn);
-                put(2, 2, side, Role::Knight);
+                put_own(3, 3, Role::Pawn);
+                put_own(4, 2, Role::Pawn);
+                put_own(5, 3, Role::Pawn);
+                put_own(2, 2, Role::Knight);
                 clauses.push(PatternClause {
                     op: ClauseOp::NoneOf,
                     atoms: vec![own_pawn(4, 3)],
                 });
             }
             Self::StonewallBadBishopTrade => {
-                put(1, 2, side, Role::Pawn);
-                put(3, 3, side, Role::Pawn);
-                put(4, 2, side, Role::Pawn);
-                put(5, 3, side, Role::Pawn);
+                put_own(1, 2, Role::Pawn);
+                put_own(3, 3, Role::Pawn);
+                put_own(4, 2, Role::Pawn);
+                put_own(5, 3, Role::Pawn);
                 clauses.push(PatternClause {
                     op: ClauseOp::NoneOf,
                     atoms: vec![own_pawn(4, 3)],
@@ -1229,45 +1322,33 @@ impl StructurePreset {
                 clauses.push(PatternClause {
                     op: ClauseOp::AnyOf,
                     atoms: vec![
-                        AtomPredicate::HasPiece(
-                            norm_sq(0, 2, side),
-                            Piece::new(side, Role::Bishop),
-                        ),
-                        AtomPredicate::IsEmpty(norm_sq(2, 0, side)),
+                        AtomPredicate::HasPiece(sq_in_frame(0, 2), Piece::new(side, Role::Bishop)),
+                        AtomPredicate::IsEmpty(sq_in_frame(2, 0)),
                     ],
                 });
             }
             Self::StonewallC5Break => {
-                put(2, 3, side, Role::Pawn);
-                put(3, 3, side, Role::Pawn);
-                put(4, 2, side, Role::Pawn);
-                put(5, 3, side, Role::Pawn);
+                put_own(2, 3, Role::Pawn);
+                put_own(3, 3, Role::Pawn);
+                put_own(4, 2, Role::Pawn);
+                put_own(5, 3, Role::Pawn);
                 clauses.push(PatternClause {
                     op: ClauseOp::NoneOf,
                     atoms: vec![own_pawn(4, 3)],
                 });
             }
             Self::StonewallBd2e1h4 => {
-                put(2, 2, side, Role::Pawn);
-                put(3, 3, side, Role::Pawn);
-                put(4, 2, side, Role::Pawn);
-                put(5, 3, side, Role::Pawn);
-                put(5, 5, opp, Role::Knight);
+                put_own(2, 2, Role::Pawn);
+                put_own(3, 3, Role::Pawn);
+                put_own(4, 2, Role::Pawn);
+                put_own(5, 3, Role::Pawn);
+                put_opp(5, 5, Role::Knight);
                 clauses.push(PatternClause {
                     op: ClauseOp::AnyOf,
                     atoms: vec![
-                        AtomPredicate::HasPiece(
-                            norm_sq(3, 1, side),
-                            Piece::new(side, Role::Bishop),
-                        ),
-                        AtomPredicate::HasPiece(
-                            norm_sq(4, 0, side),
-                            Piece::new(side, Role::Bishop),
-                        ),
-                        AtomPredicate::HasPiece(
-                            norm_sq(7, 3, side),
-                            Piece::new(side, Role::Bishop),
-                        ),
+                        AtomPredicate::HasPiece(sq_in_frame(3, 1), Piece::new(side, Role::Bishop)),
+                        AtomPredicate::HasPiece(sq_in_frame(4, 0), Piece::new(side, Role::Bishop)),
+                        AtomPredicate::HasPiece(sq_in_frame(7, 3), Piece::new(side, Role::Bishop)),
                     ],
                 });
                 clauses.push(PatternClause {
@@ -1277,32 +1358,29 @@ impl StructurePreset {
             }
             Self::BadewanneAny | Self::BadewanneFlexibleRim => {
                 // Seed the classic central Badewanne pattern plus an OR option shifted one rank higher.
-                put(2, 3, side, Role::Pawn);
-                put(3, 2, side, Role::Pawn);
-                put(4, 2, side, Role::Pawn);
-                put(5, 3, side, Role::Pawn);
+                put_own(2, 3, Role::Pawn);
+                put_own(3, 2, Role::Pawn);
+                put_own(4, 2, Role::Pawn);
+                put_own(5, 3, Role::Pawn);
                 clauses.push(PatternClause {
                     op: ClauseOp::AnyOf,
                     atoms: vec![own_pawn(3, 2), own_pawn(3, 3)],
                 });
             }
             Self::BadewanneCentral => {
-                put(2, 3, side, Role::Pawn);
-                put(3, 2, side, Role::Pawn);
-                put(4, 2, side, Role::Pawn);
-                put(5, 3, side, Role::Pawn);
+                put_own(2, 3, Role::Pawn);
+                put_own(3, 2, Role::Pawn);
+                put_own(4, 2, Role::Pawn);
+                put_own(5, 3, Role::Pawn);
                 clauses.push(PatternClause {
                     op: ClauseOp::AllOf,
-                    atoms: vec![no_own_pawn_file(2), not_own_pawn(3, 3), not_own_pawn(4, 3)]
-                        .into_iter()
-                        .skip(1)
-                        .collect(),
+                    atoms: vec![not_own_pawn(3, 3), not_own_pawn(4, 3)],
                 });
             }
             Self::CarlsbadAny => {
-                put(3, 3, side, Role::Pawn);
-                put(2, 5, opp, Role::Pawn);
-                put(3, 4, opp, Role::Pawn);
+                put_own(3, 3, Role::Pawn);
+                put_opp(2, 5, Role::Pawn);
+                put_opp(3, 4, Role::Pawn);
                 clauses.push(PatternClause {
                     op: ClauseOp::AnyOf,
                     atoms: vec![own_pawn(4, 2), own_pawn(4, 3)],
@@ -1313,9 +1391,9 @@ impl StructurePreset {
                 });
             }
             Self::CarlsbadMinorityAttack => {
-                put(3, 3, side, Role::Pawn);
-                put(2, 5, opp, Role::Pawn);
-                put(3, 4, opp, Role::Pawn);
+                put_own(3, 3, Role::Pawn);
+                put_opp(2, 5, Role::Pawn);
+                put_opp(3, 4, Role::Pawn);
                 clauses.push(PatternClause {
                     op: ClauseOp::AnyOf,
                     atoms: vec![own_pawn(4, 2), own_pawn(4, 3)],
@@ -1330,20 +1408,20 @@ impl StructurePreset {
                 });
             }
             Self::CarlsbadCentralE4 => {
-                put(3, 3, side, Role::Pawn);
-                put(4, 3, side, Role::Pawn);
-                put(2, 5, opp, Role::Pawn);
-                put(3, 4, opp, Role::Pawn);
+                put_own(3, 3, Role::Pawn);
+                put_own(4, 3, Role::Pawn);
+                put_opp(2, 5, Role::Pawn);
+                put_opp(3, 4, Role::Pawn);
                 clauses.push(PatternClause {
                     op: ClauseOp::AllOf,
                     atoms: vec![no_own_pawn_file(2), no_opp_pawn_file(4)],
                 });
             }
             Self::CarlsbadF3E4 => {
-                put(3, 3, side, Role::Pawn);
-                put(5, 2, side, Role::Pawn);
-                put(2, 5, opp, Role::Pawn);
-                put(3, 4, opp, Role::Pawn);
+                put_own(3, 3, Role::Pawn);
+                put_own(5, 2, Role::Pawn);
+                put_opp(2, 5, Role::Pawn);
+                put_opp(3, 4, Role::Pawn);
                 clauses.push(PatternClause {
                     op: ClauseOp::AnyOf,
                     atoms: vec![own_pawn(4, 2), own_pawn(4, 3)],
@@ -1367,14 +1445,79 @@ impl StructurePreset {
                     ],
                 });
             }
+            Self::IqpVsEPawnNoFianchetto
+            | Self::IqpVsEPawnFianchetto
+            | Self::IqpVsCPawnNoFianchetto
+            | Self::IqpVsCPawnFianchetto
+            | Self::IqpVsEPawn
+            | Self::IqpVsCPawn
+            | Self::IqpVsNoFianchetto
+            | Self::IqpVsFianchetto => {
+                clauses.push(PatternClause {
+                    op: ClauseOp::AnyOf,
+                    atoms: vec![own_pawn(3, 3), own_pawn(3, 4)],
+                });
+                let mut file_atoms = vec![
+                    no_own_pawn_file(2),
+                    no_own_pawn_file(4),
+                    no_opp_pawn_file(3),
+                ];
+                if matches!(
+                    self,
+                    Self::IqpVsEPawnNoFianchetto | Self::IqpVsEPawnFianchetto | Self::IqpVsEPawn
+                ) {
+                    clauses.push(PatternClause {
+                        op: ClauseOp::AnyOf,
+                        atoms: vec![opp_pawn(4, 5), opp_pawn(4, 6)],
+                    });
+                    file_atoms.push(no_opp_pawn_file(2));
+                } else if matches!(
+                    self,
+                    Self::IqpVsCPawnNoFianchetto | Self::IqpVsCPawnFianchetto | Self::IqpVsCPawn
+                ) {
+                    clauses.push(PatternClause {
+                        op: ClauseOp::AnyOf,
+                        atoms: vec![opp_pawn(2, 5), opp_pawn(2, 6)],
+                    });
+                    file_atoms.push(no_opp_pawn_file(4));
+                }
+                clauses.push(PatternClause {
+                    op: ClauseOp::AllOf,
+                    atoms: file_atoms,
+                });
+                if matches!(
+                    self,
+                    Self::IqpVsEPawnNoFianchetto
+                        | Self::IqpVsCPawnNoFianchetto
+                        | Self::IqpVsNoFianchetto
+                ) {
+                    put_opp(6, 6, Role::Pawn);
+                    clauses.push(PatternClause {
+                        op: ClauseOp::NoneOf,
+                        atoms: vec![
+                            opp_pawn(6, 5),
+                            AtomPredicate::HasPiece(
+                                sq_in_frame(6, 6),
+                                Piece::new(opp, Role::Bishop),
+                            ),
+                        ],
+                    });
+                } else if matches!(
+                    self,
+                    Self::IqpVsEPawnFianchetto | Self::IqpVsCPawnFianchetto | Self::IqpVsFianchetto
+                ) {
+                    put_opp(6, 5, Role::Pawn);
+                    put_opp(6, 6, Role::Bishop);
+                }
+            }
             Self::IqpBlockaded => {
-                put(3, 3, side, Role::Pawn);
-                put(4, 5, opp, Role::Pawn);
+                put_own(3, 3, Role::Pawn);
+                put_opp(4, 5, Role::Pawn);
                 clauses.push(PatternClause {
                     op: ClauseOp::AnyOf,
                     atoms: vec![
-                        AtomPredicate::HasPiece(norm_sq(3, 4, side), Piece::new(opp, Role::Knight)),
-                        AtomPredicate::HasPiece(norm_sq(3, 4, side), Piece::new(opp, Role::Bishop)),
+                        AtomPredicate::HasPiece(sq_in_frame(3, 4), Piece::new(opp, Role::Knight)),
+                        AtomPredicate::HasPiece(sq_in_frame(3, 4), Piece::new(opp, Role::Bishop)),
                     ],
                 });
                 clauses.push(PatternClause {
@@ -1392,18 +1535,44 @@ impl StructurePreset {
                     atoms: vec![own_pawn(2, 3), own_pawn(3, 3), own_pawn(4, 3)],
                 });
             }
-            Self::HangingPawnsClassic => {
-                put(2, 3, side, Role::Pawn);
-                put(3, 3, side, Role::Pawn);
+            Self::HangingPawnsClassic
+            | Self::HangingPawnsVsNoFianchetto
+            | Self::HangingPawnsVsFianchetto => {
+                put_own(2, 3, Role::Pawn);
+                put_own(3, 3, Role::Pawn);
                 clauses.push(PatternClause {
                     op: ClauseOp::AllOf,
                     atoms: vec![
-                        no_own_pawn_file(1),
                         no_own_pawn_file(4),
+                        no_own_pawn_file(1),
                         no_opp_pawn_file(2),
                         no_opp_pawn_file(3),
                     ],
                 });
+                clauses.push(PatternClause {
+                    op: ClauseOp::AnyOf,
+                    atoms: vec![opp_pawn(1, 6), opp_pawn(1, 5)],
+                });
+                clauses.push(PatternClause {
+                    op: ClauseOp::AnyOf,
+                    atoms: vec![opp_pawn(4, 6), opp_pawn(4, 5)],
+                });
+                if self == Self::HangingPawnsVsNoFianchetto {
+                    put_opp(6, 6, Role::Pawn);
+                    clauses.push(PatternClause {
+                        op: ClauseOp::NoneOf,
+                        atoms: vec![
+                            opp_pawn(6, 5),
+                            AtomPredicate::HasPiece(
+                                sq_in_frame(6, 6),
+                                Piece::new(opp, Role::Bishop),
+                            ),
+                        ],
+                    });
+                } else if self == Self::HangingPawnsVsFianchetto {
+                    put_opp(6, 5, Role::Pawn);
+                    put_opp(6, 6, Role::Bishop);
+                }
             }
             Self::HangingPawnsDynamic => {
                 clauses.push(PatternClause {
@@ -1425,25 +1594,23 @@ impl StructurePreset {
                 });
             }
             Self::MaroczyBindAny => {
-                put(2, 3, side, Role::Pawn);
-                put(4, 3, side, Role::Pawn);
-                put(3, 5, opp, Role::Pawn);
+                put_own(2, 3, Role::Pawn);
+                put_own(4, 3, Role::Pawn);
+                put_opp(3, 5, Role::Pawn);
                 clauses.push(PatternClause {
                     op: ClauseOp::AllOf,
                     atoms: vec![no_own_pawn_file(3), no_opp_pawn_file(2)],
                 });
             }
             Self::MaroczyBindNoFianchetto => {
-                for f in [0usize, 6, 7] {
-                    put(f, 1, side, Role::Pawn);
-                }
-                put(2, 3, side, Role::Pawn);
-                put(4, 3, side, Role::Pawn);
-                for f in [1usize, 5, 7] {
-                    put(f, 6, opp, Role::Pawn);
-                }
-                put(3, 5, opp, Role::Pawn);
-                put(6, 5, opp, Role::Pawn);
+                put_own(0, 1, Role::Pawn);
+                put_own(6, 1, Role::Pawn);
+                put_own(2, 3, Role::Pawn);
+                put_own(4, 3, Role::Pawn);
+                put_opp(3, 5, Role::Pawn);
+                put_opp(6, 5, Role::Pawn);
+                put_opp(1, 6, Role::Pawn);
+                put_opp(5, 6, Role::Pawn);
                 clauses.push(PatternClause {
                     op: ClauseOp::AnyOf,
                     atoms: vec![own_pawn(1, 2), own_pawn(1, 1)],
@@ -1454,78 +1621,106 @@ impl StructurePreset {
                 });
                 clauses.push(PatternClause {
                     op: ClauseOp::AnyOf,
-                    atoms: vec![
-                        AtomPredicate::HasPiece(norm_sq(4, 6, opp), Piece::new(opp, Role::Pawn)),
-                        AtomPredicate::HasPiece(norm_sq(4, 5, opp), Piece::new(opp, Role::Pawn)),
-                    ],
+                    atoms: vec![opp_pawn(4, 6), opp_pawn(4, 5)],
                 });
                 clauses.push(PatternClause {
                     op: ClauseOp::AnyOf,
-                    atoms: vec![
-                        AtomPredicate::HasPiece(norm_sq(0, 6, opp), Piece::new(opp, Role::Pawn)),
-                        AtomPredicate::HasPiece(norm_sq(0, 5, opp), Piece::new(opp, Role::Pawn)),
-                    ],
+                    atoms: vec![opp_pawn(0, 6), opp_pawn(0, 5)],
                 });
                 clauses.push(PatternClause {
                     op: ClauseOp::AllOf,
                     atoms: vec![no_own_pawn_file(3), no_opp_pawn_file(2)],
+                });
+                clauses.push(PatternClause {
+                    op: ClauseOp::AnyOf,
+                    atoms: vec![opp_pawn(7, 6), opp_pawn(7, 5)],
+                });
+                clauses.push(PatternClause {
+                    op: ClauseOp::AnyOf,
+                    atoms: vec![own_pawn(7, 1), own_pawn(7, 2)],
                 });
             }
             Self::MaroczyBindFianchetto => {
-                put(2, 3, side, Role::Pawn);
-                put(4, 3, side, Role::Pawn);
-                put(6, 2, side, Role::Pawn);
-                put(6, 1, side, Role::Bishop);
-                put(3, 5, opp, Role::Pawn);
+                put_own(0, 1, Role::Pawn);
+                put_own(5, 1, Role::Pawn);
+                put_own(6, 1, Role::Bishop);
+                put_own(6, 2, Role::Pawn);
+                put_own(2, 3, Role::Pawn);
+                put_opp(3, 5, Role::Pawn);
+                put_opp(6, 5, Role::Pawn);
+                put_opp(1, 6, Role::Pawn);
+                put_opp(5, 6, Role::Pawn);
+                put_opp(6, 6, Role::Bishop);
+                put_opp(7, 6, Role::Pawn);
+                clauses.push(PatternClause {
+                    op: ClauseOp::AnyOf,
+                    atoms: vec![own_pawn(7, 1), own_pawn(7, 2)],
+                });
+                clauses.push(PatternClause {
+                    op: ClauseOp::AnyOf,
+                    atoms: vec![own_pawn(4, 1), own_pawn(4, 2), own_pawn(4, 3)],
+                });
+                clauses.push(PatternClause {
+                    op: ClauseOp::AnyOf,
+                    atoms: vec![own_pawn(1, 1), own_pawn(1, 2)],
+                });
+                clauses.push(PatternClause {
+                    op: ClauseOp::AnyOf,
+                    atoms: vec![opp_pawn(4, 6), opp_pawn(4, 5)],
+                });
+                clauses.push(PatternClause {
+                    op: ClauseOp::AnyOf,
+                    atoms: vec![opp_pawn(0, 6), opp_pawn(0, 5)],
+                });
                 clauses.push(PatternClause {
                     op: ClauseOp::AllOf,
-                    atoms: vec![no_own_pawn_file(3), no_opp_pawn_file(2)],
+                    atoms: vec![no_opp_pawn_file(2), no_own_pawn_file(3)],
                 });
             }
             Self::Hedgehog => {
-                put(0, 2, side, Role::Pawn);
-                put(1, 2, side, Role::Pawn);
-                put(3, 2, side, Role::Pawn);
-                put(4, 2, side, Role::Pawn);
-                put(2, 4, opp, Role::Pawn);
-                put(4, 4, opp, Role::Pawn);
+                put_own(0, 2, Role::Pawn);
+                put_own(1, 2, Role::Pawn);
+                put_own(3, 2, Role::Pawn);
+                put_own(4, 2, Role::Pawn);
+                put_opp(2, 4, Role::Pawn);
+                put_opp(4, 4, Role::Pawn);
                 clauses.push(PatternClause {
                     op: ClauseOp::AllOf,
                     atoms: vec![no_own_pawn_file(2), no_opp_pawn_file(3)],
                 });
             }
             Self::Boleslavsky => {
-                put(3, 2, side, Role::Pawn);
-                put(4, 3, side, Role::Pawn);
-                put(4, 4, opp, Role::Pawn);
+                put_own(3, 2, Role::Pawn);
+                put_own(4, 3, Role::Pawn);
+                put_opp(4, 4, Role::Pawn);
                 clauses.push(PatternClause {
                     op: ClauseOp::AllOf,
                     atoms: vec![no_own_pawn_file(2), no_opp_pawn_file(3)],
                 });
             }
             Self::Scheveningen => {
-                put(3, 2, side, Role::Pawn);
-                put(4, 2, side, Role::Pawn);
-                put(4, 4, opp, Role::Pawn);
+                put_own(3, 2, Role::Pawn);
+                put_own(4, 2, Role::Pawn);
+                put_opp(4, 4, Role::Pawn);
                 clauses.push(PatternClause {
                     op: ClauseOp::AllOf,
                     atoms: vec![no_own_pawn_file(2), no_opp_pawn_file(3)],
                 });
             }
             Self::Dragon => {
-                put(3, 2, side, Role::Pawn);
-                put(6, 2, side, Role::Pawn);
-                put(6, 1, side, Role::Bishop);
-                put(4, 4, opp, Role::Pawn);
+                put_own(3, 2, Role::Pawn);
+                put_own(6, 2, Role::Pawn);
+                put_own(6, 1, Role::Bishop);
+                put_opp(4, 4, Role::Pawn);
                 clauses.push(PatternClause {
                     op: ClauseOp::AllOf,
                     atoms: vec![no_own_pawn_file(2), no_opp_pawn_file(3)],
                 });
             }
             Self::NajdorfStructure => {
-                put(0, 2, side, Role::Pawn);
-                put(3, 2, side, Role::Pawn);
-                put(4, 4, opp, Role::Pawn);
+                put_own(0, 2, Role::Pawn);
+                put_own(3, 2, Role::Pawn);
+                put_opp(4, 4, Role::Pawn);
                 clauses.push(PatternClause {
                     op: ClauseOp::AnyOf,
                     atoms: vec![own_pawn(4, 2), own_pawn(4, 3)],
@@ -1536,117 +1731,133 @@ impl StructurePreset {
                 });
             }
             Self::NajdorfTypeII => {
-                put(0, 2, side, Role::Pawn);
-                put(1, 3, side, Role::Pawn);
-                put(3, 2, side, Role::Pawn);
-                put(4, 3, opp, Role::Pawn);
+                put_own(0, 2, Role::Pawn);
+                put_own(1, 3, Role::Pawn);
+                put_own(3, 2, Role::Pawn);
+                put_opp(4, 4, Role::Pawn);
                 clauses.push(PatternClause {
                     op: ClauseOp::AllOf,
                     atoms: vec![no_own_pawn_file(2), no_opp_pawn_file(3)],
                 });
             }
             Self::NajdorfTypeIII => {
-                put(0, 2, side, Role::Pawn);
-                put(3, 2, side, Role::Pawn);
-                put(4, 3, side, Role::Pawn);
-                put(4, 3, opp, Role::Pawn);
-                put(5, 3, opp, Role::Pawn);
+                put_own(0, 2, Role::Pawn);
+                put_own(3, 2, Role::Pawn);
+                put_own(4, 3, Role::Pawn);
+                put_opp(4, 4, Role::Pawn);
+                put_opp(5, 4, Role::Pawn);
                 clauses.push(PatternClause {
                     op: ClauseOp::AllOf,
                     atoms: vec![no_own_pawn_file(2), no_opp_pawn_file(3)],
                 });
             }
             Self::PanovFormation => {
-                put(2, 3, side, Role::Pawn);
-                put(3, 3, side, Role::Pawn);
-                put(3, 4, opp, Role::Pawn);
-                put(4, 5, opp, Role::Pawn);
+                put_own(2, 3, Role::Pawn);
+                put_own(3, 3, Role::Pawn);
+                put_opp(3, 4, Role::Pawn);
+                put_opp(4, 5, Role::Pawn);
                 clauses.push(PatternClause {
                     op: ClauseOp::AllOf,
                     atoms: vec![no_own_pawn_file(4), no_opp_pawn_file(2)],
                 });
             }
             Self::SlavFormation => {
-                put(3, 3, side, Role::Pawn);
-                put(4, 2, side, Role::Pawn);
-                put(2, 5, opp, Role::Pawn);
-                put(3, 4, opp, Role::Pawn);
-                put(4, 5, opp, Role::Pawn);
+                put_own(3, 3, Role::Pawn);
+                put_own(4, 2, Role::Pawn);
+                put_opp(2, 5, Role::Pawn);
+                put_opp(3, 4, Role::Pawn);
+                put_opp(4, 5, Role::Pawn);
                 clauses.push(PatternClause {
                     op: ClauseOp::AnyOf,
                     atoms: vec![own_pawn(2, 2), own_pawn(2, 3)],
                 });
             }
             Self::GrunfeldCenter => {
-                put(3, 3, side, Role::Pawn);
-                put(4, 3, side, Role::Pawn);
-                put(6, 5, opp, Role::Pawn);
-                put(6, 6, opp, Role::Bishop);
+                put_own(3, 3, Role::Pawn);
+                put_own(4, 3, Role::Pawn);
+                put_opp(6, 5, Role::Pawn);
+                put_opp(6, 6, Role::Bishop);
                 clauses.push(PatternClause {
-                    op: ClauseOp::AnyOf,
-                    atoms: vec![opp_pawn(2, 4), opp_pawn(2, 5)],
+                    op: ClauseOp::NoneOf,
+                    atoms: vec![own_pawn(2, 3)],
                 });
                 clauses.push(PatternClause {
                     op: ClauseOp::AllOf,
-                    atoms: vec![no_own_pawn_file(2), no_opp_pawn_file(3)],
+                    atoms: vec![no_opp_pawn_file(3)],
+                });
+            }
+            Self::Botvinnik => {
+                put_own(1, 1, Role::Pawn);
+                put_own(4, 1, Role::Knight);
+                put_own(5, 1, Role::Pawn);
+                put_own(6, 1, Role::Bishop);
+                put_own(7, 1, Role::Pawn);
+                put_own(2, 2, Role::Knight);
+                put_own(3, 2, Role::Pawn);
+                put_own(6, 2, Role::Pawn);
+                put_own(2, 3, Role::Pawn);
+                put_own(4, 3, Role::Pawn);
+                clauses.push(PatternClause {
+                    op: ClauseOp::AnyOf,
+                    atoms: vec![own_pawn(0, 1), own_pawn(0, 2)],
                 });
             }
             Self::BotvinnikTriangle => {
-                put(2, 3, side, Role::Pawn);
-                put(3, 2, side, Role::Pawn);
-                put(4, 3, side, Role::Pawn);
-                put(6, 2, side, Role::Pawn);
-                put(6, 1, side, Role::Bishop);
+                put_own(2, 3, Role::Pawn);
+                put_own(3, 2, Role::Pawn);
+                put_own(4, 3, Role::Pawn);
+                put_own(6, 2, Role::Pawn);
+                put_own(6, 1, Role::Bishop);
             }
             Self::FrenchChain => {
-                put(3, 3, side, Role::Pawn);
-                put(4, 4, side, Role::Pawn);
-                put(3, 4, opp, Role::Pawn);
-                put(4, 5, opp, Role::Pawn);
+                put_own(3, 3, Role::Pawn);
+                put_own(4, 4, Role::Pawn);
+                put_opp(3, 4, Role::Pawn);
+                put_opp(4, 5, Role::Pawn);
                 clauses.push(PatternClause {
                     op: ClauseOp::NoneOf,
                     atoms: vec![own_pawn(4, 3)],
                 });
             }
             Self::FrenchTarraschDxE => {
-                put(3, 3, side, Role::Pawn);
-                put(2, 4, opp, Role::Pawn);
-                put(4, 5, opp, Role::Pawn);
+                put_own(3, 3, Role::Pawn);
+                put_opp(2, 4, Role::Pawn);
+                put_opp(4, 5, Role::Pawn);
                 clauses.push(PatternClause {
                     op: ClauseOp::AllOf,
                     atoms: vec![no_own_pawn_file(4), no_opp_pawn_file(3)],
                 });
             }
             Self::KingsIndianChain => {
-                put(2, 3, side, Role::Pawn);
-                put(3, 4, side, Role::Pawn);
-                put(4, 3, side, Role::Pawn);
-                put(3, 5, opp, Role::Pawn);
-                put(4, 4, opp, Role::Pawn);
-                put(6, 5, opp, Role::Pawn);
+                put_own(2, 3, Role::Pawn);
+                put_own(3, 4, Role::Pawn);
+                put_own(4, 3, Role::Pawn);
+                put_opp(3, 5, Role::Pawn);
+                put_opp(4, 4, Role::Pawn);
+                put_opp(6, 5, Role::Pawn);
             }
             Self::KingsIndianC5Chain => {
-                put(2, 3, side, Role::Pawn);
-                put(3, 4, side, Role::Pawn);
-                put(4, 3, side, Role::Pawn);
-                put(2, 4, opp, Role::Pawn);
-                put(3, 5, opp, Role::Pawn);
-                put(4, 4, opp, Role::Pawn);
+                put_own(2, 3, Role::Pawn);
+                put_own(3, 4, Role::Pawn);
+                put_own(4, 3, Role::Pawn);
+                put_opp(2, 4, Role::Pawn);
+                put_opp(3, 5, Role::Pawn);
+                put_opp(4, 4, Role::Pawn);
             }
             Self::BenoniStructure => {
-                put(2, 3, side, Role::Pawn);
-                put(3, 2, side, Role::Pawn);
-                put(3, 3, opp, Role::Pawn);
-                put(4, 4, opp, Role::Pawn);
+                put_own(2, 3, Role::Pawn);
+                put_own(3, 2, Role::Pawn);
+                put_opp(3, 3, Role::Pawn);
+                put_opp(4, 4, Role::Pawn);
                 clauses.push(PatternClause {
                     op: ClauseOp::AllOf,
                     atoms: vec![no_own_pawn_file(4), no_opp_pawn_file(2)],
                 });
             }
             Self::SlavCaroKann => {
-                put(2, 2, side, Role::Pawn);
-                put(3, 3, side, Role::Pawn);
-                put(3, 4, opp, Role::Pawn);
+                put_own(2, 2, Role::Pawn);
+                put_own(3, 3, Role::Pawn);
+                put_opp(3, 4, Role::Pawn);
                 clauses.push(PatternClause {
                     op: ClauseOp::AnyOf,
                     atoms: vec![opp_pawn(2, 4), opp_pawn(4, 4)],
@@ -1655,18 +1866,24 @@ impl StructurePreset {
                     op: ClauseOp::AllOf,
                     atoms: vec![
                         no_own_pawn_file(4),
-                        AtomPredicate::NotPiece(norm_sq(3, 3, side), Piece::new(opp, Role::Pawn)),
+                        AtomPredicate::NotPiece(sq_in_frame(3, 3), Piece::new(opp, Role::Pawn)),
                     ],
                 });
             }
             Self::NimzoDoubledCPawns => {
-                put(2, 2, side, Role::Pawn);
-                put(2, 3, side, Role::Pawn);
-                put(3, 2, side, Role::Pawn);
-                put(4, 3, side, Role::Pawn);
+                put_own(2, 2, Role::Pawn);
+                put_own(2, 3, Role::Pawn);
+                clauses.push(PatternClause {
+                    op: ClauseOp::AnyOf,
+                    atoms: vec![own_pawn(3, 2), own_pawn(3, 3)],
+                });
+                clauses.push(PatternClause {
+                    op: ClauseOp::AnyOf,
+                    atoms: vec![own_pawn(4, 2), own_pawn(4, 3)],
+                });
             }
         }
-        (self.label().to_string(), squares, clauses)
+        (self.label().to_string(), squares.into_inner(), clauses)
     }
 }
 
@@ -1826,6 +2043,38 @@ impl NormalizedBoard {
         false
     }
 
+    fn has_iqp_d_core(self) -> bool {
+        (self.own_pawns & (sq_bit(3, 3) | sq_bit(3, 4))) != 0
+            && self.no_own_pawns(FILE_MASKS[2] | FILE_MASKS[4])
+            && self.no_opp_pawns(FILE_MASKS[3])
+    }
+
+    fn has_opp_k_fianchetto(self) -> bool {
+        self.has_opp_pawns(sq_bit(6, 5)) && (self.opp_bishops & sq_bit(6, 6)) != 0
+    }
+
+    fn has_opp_no_k_fianchetto(self) -> bool {
+        self.has_opp_pawns(sq_bit(6, 6))
+            && self.no_opp_pawns(sq_bit(6, 5))
+            && (self.is_union || (self.opp_bishops & sq_bit(6, 6)) == 0)
+    }
+
+    fn has_opp_e_pawn_iqp(self) -> bool {
+        (self.opp_pawns & (sq_bit(4, 5) | sq_bit(4, 6))) != 0 && self.no_opp_pawns(FILE_MASKS[2])
+    }
+
+    fn has_opp_c_pawn_iqp(self) -> bool {
+        (self.opp_pawns & (sq_bit(2, 5) | sq_bit(2, 6))) != 0 && self.no_opp_pawns(FILE_MASKS[4])
+    }
+
+    fn has_hanging_pawns_classic(self) -> bool {
+        self.has_own_pawns(sq_bit(2, 3) | sq_bit(3, 3))
+            && self.no_own_pawns(FILE_MASKS[1] | FILE_MASKS[4])
+            && self.no_opp_pawns(FILE_MASKS[2] | FILE_MASKS[3])
+            && (self.opp_pawns & (sq_bit(1, 6) | sq_bit(1, 5))) != 0
+            && (self.opp_pawns & (sq_bit(4, 6) | sq_bit(4, 5))) != 0
+    }
+
     fn has_stonewall_core(self) -> bool {
         let intact = self.has_own_pawns(sq_bit(3, 3) | sq_bit(4, 2) | sq_bit(5, 3))
             && self.no_own_pawns(sq_bit(4, 3));
@@ -1894,13 +2143,29 @@ impl NormalizedBoard {
                     && self.has_opp_pawns(sq_bit(2, 5) | sq_bit(3, 4))
                     && self.no_opp_pawns(FILE_MASKS[4])
             }
-            StructurePreset::IqpDFile => {
-                (self.own_pawns & (sq_bit(3, 3) | sq_bit(3, 4))) != 0
-                    && self.no_own_pawns(FILE_MASKS[2] | FILE_MASKS[4])
-                    && self.no_opp_pawns(FILE_MASKS[3])
+            StructurePreset::IqpDFile => self.has_iqp_d_core(),
+            StructurePreset::IqpVsEPawnNoFianchetto => {
+                self.has_iqp_d_core() && self.has_opp_e_pawn_iqp() && self.has_opp_no_k_fianchetto()
+            }
+            StructurePreset::IqpVsEPawnFianchetto => {
+                self.has_iqp_d_core() && self.has_opp_e_pawn_iqp() && self.has_opp_k_fianchetto()
+            }
+            StructurePreset::IqpVsCPawnNoFianchetto => {
+                self.has_iqp_d_core() && self.has_opp_c_pawn_iqp() && self.has_opp_no_k_fianchetto()
+            }
+            StructurePreset::IqpVsCPawnFianchetto => {
+                self.has_iqp_d_core() && self.has_opp_c_pawn_iqp() && self.has_opp_k_fianchetto()
+            }
+            StructurePreset::IqpVsEPawn => self.has_iqp_d_core() && self.has_opp_e_pawn_iqp(),
+            StructurePreset::IqpVsCPawn => self.has_iqp_d_core() && self.has_opp_c_pawn_iqp(),
+            StructurePreset::IqpVsNoFianchetto => {
+                self.has_iqp_d_core() && self.has_opp_no_k_fianchetto()
+            }
+            StructurePreset::IqpVsFianchetto => {
+                self.has_iqp_d_core() && self.has_opp_k_fianchetto()
             }
             StructurePreset::IqpDynamic => {
-                self.matches_structure(StructurePreset::IqpDFile)
+                self.has_iqp_d_core()
                     && (self.own_knights | self.own_bishops).count_ones() >= 2
                     && (self.opp_knights | self.opp_bishops).count_ones() >= 1
             }
@@ -1924,10 +2189,12 @@ impl NormalizedBoard {
                 }
                 false
             }
-            StructurePreset::HangingPawnsClassic => {
-                self.has_own_pawns(sq_bit(2, 3) | sq_bit(3, 3))
-                    && self.no_own_pawns(FILE_MASKS[1] | FILE_MASKS[4])
-                    && self.no_opp_pawns(FILE_MASKS[2] | FILE_MASKS[3])
+            StructurePreset::HangingPawnsClassic => self.has_hanging_pawns_classic(),
+            StructurePreset::HangingPawnsVsNoFianchetto => {
+                self.has_hanging_pawns_classic() && self.has_opp_no_k_fianchetto()
+            }
+            StructurePreset::HangingPawnsVsFianchetto => {
+                self.has_hanging_pawns_classic() && self.has_opp_k_fianchetto()
             }
             StructurePreset::HangingPawnsDynamic => {
                 (self.own_pawns & (sq_bit(2, 3) | sq_bit(2, 4))) != 0
@@ -1942,26 +2209,31 @@ impl NormalizedBoard {
                     && self.no_opp_pawns(FILE_MASKS[2])
             }
             StructurePreset::MaroczyBindNoFianchetto => {
-                self.has_own_pawns(
-                    sq_bit(0, 1) | sq_bit(2, 3) | sq_bit(4, 3) | sq_bit(6, 1) | sq_bit(7, 1),
-                ) && (self.own_pawns & (sq_bit(1, 1) | sq_bit(1, 2))) != 0
+                self.has_own_pawns(sq_bit(0, 1) | sq_bit(2, 3) | sq_bit(4, 3) | sq_bit(6, 1))
+                    && (self.own_pawns & (sq_bit(1, 1) | sq_bit(1, 2))) != 0
                     && (self.own_pawns & (sq_bit(5, 1) | sq_bit(5, 2))) != 0
+                    && (self.own_pawns & (sq_bit(7, 1) | sq_bit(7, 2))) != 0
                     && self.no_own_pawns(FILE_MASKS[3])
-                    && self.no_own_pawns(sq_bit(6, 2))
-                    && (self.own_bishops & sq_bit(6, 1)) == 0
-                    && self.has_opp_pawns(
-                        sq_bit(1, 6) | sq_bit(3, 5) | sq_bit(5, 6) | sq_bit(6, 5) | sq_bit(7, 6),
-                    )
+                    && self.has_opp_pawns(sq_bit(1, 6) | sq_bit(3, 5) | sq_bit(5, 6) | sq_bit(6, 5))
                     && (self.opp_pawns & (sq_bit(4, 5) | sq_bit(4, 6))) != 0
                     && (self.opp_pawns & (sq_bit(0, 5) | sq_bit(0, 6))) != 0
+                    && (self.opp_pawns & (sq_bit(7, 5) | sq_bit(7, 6))) != 0
                     && self.no_opp_pawns(FILE_MASKS[2])
             }
             StructurePreset::MaroczyBindFianchetto => {
-                self.has_own_pawns(sq_bit(2, 3) | sq_bit(4, 3))
+                self.has_own_pawns(sq_bit(0, 1) | sq_bit(5, 1) | sq_bit(6, 2) | sq_bit(2, 3))
+                    && (self.own_bishops & sq_bit(6, 1)) != 0
+                    && (self.own_pawns & (sq_bit(7, 1) | sq_bit(7, 2))) != 0
+                    && (self.own_pawns & (sq_bit(4, 1) | sq_bit(4, 2) | sq_bit(4, 3))) != 0
+                    && (self.own_pawns & (sq_bit(1, 1) | sq_bit(1, 2))) != 0
                     && self.no_own_pawns(FILE_MASKS[3])
-                    && self.has_opp_pawns(sq_bit(3, 5))
+                    && self.has_opp_pawns(
+                        sq_bit(3, 5) | sq_bit(6, 5) | sq_bit(1, 6) | sq_bit(5, 6) | sq_bit(7, 6),
+                    )
+                    && (self.opp_bishops & sq_bit(6, 6)) != 0
+                    && (self.opp_pawns & (sq_bit(4, 6) | sq_bit(4, 5))) != 0
+                    && (self.opp_pawns & (sq_bit(0, 6) | sq_bit(0, 5))) != 0
                     && self.no_opp_pawns(FILE_MASKS[2])
-                    && (self.has_own_pawns(sq_bit(6, 2)) || (self.own_bishops & sq_bit(6, 1)) != 0)
             }
             StructurePreset::Hedgehog => {
                 // Normalized Black -> own on a3, b3, d3, e3 (Black a6, b6, d6, e6), opp on c5+e5 (White c4+e4)
@@ -2026,11 +2298,24 @@ impl NormalizedBoard {
             }
             StructurePreset::GrunfeldCenter => {
                 self.has_own_pawns(sq_bit(3, 3) | sq_bit(4, 3))
-                    && self.no_own_pawns(FILE_MASKS[2])
+                    && self.no_own_pawns(sq_bit(2, 3))
                     && self.has_opp_pawns(sq_bit(6, 5))
                     && (self.opp_bishops & sq_bit(6, 6)) != 0
-                    && (self.opp_pawns & (sq_bit(2, 4) | sq_bit(2, 5))) != 0
                     && self.no_opp_pawns(FILE_MASKS[3])
+            }
+            StructurePreset::Botvinnik => {
+                self.has_own_pawns(
+                    sq_bit(1, 1)
+                        | sq_bit(5, 1)
+                        | sq_bit(7, 1)
+                        | sq_bit(3, 2)
+                        | sq_bit(6, 2)
+                        | sq_bit(2, 3)
+                        | sq_bit(4, 3),
+                ) && (self.own_pawns & (sq_bit(0, 1) | sq_bit(0, 2))) != 0
+                    && (self.own_knights & (sq_bit(2, 2) | sq_bit(4, 1)))
+                        == (sq_bit(2, 2) | sq_bit(4, 1))
+                    && (self.own_bishops & sq_bit(6, 1)) != 0
             }
             StructurePreset::BotvinnikTriangle => {
                 self.has_own_pawns(sq_bit(2, 3) | sq_bit(3, 2) | sq_bit(4, 3) | sq_bit(6, 2))
@@ -2072,8 +2357,9 @@ impl NormalizedBoard {
             }
             StructurePreset::NimzoDoubledCPawns => {
                 (self.own_pawns & FILE_MASKS[2]).count_ones() >= 2
-                    && (self.is_union || (self.own_bishops & DARK_SQUARES_MASK) == 0)
-                    && self.has_own_pawns(sq_bit(3, 2) | sq_bit(4, 3))
+                    && (self.is_union || (self.opp_bishops & DARK_SQUARES_MASK) == 0)
+                    && (self.own_pawns & (sq_bit(3, 2) | sq_bit(3, 3))) != 0
+                    && (self.own_pawns & (sq_bit(4, 2) | sq_bit(4, 3))) != 0
             }
         }
     }
@@ -2514,6 +2800,7 @@ pub struct PositionQuery {
     /// Color mirroring (`ON` by default for flexible structure & endgame search).
     pub ignore_color_flip: bool,
     pub structure: Option<StructurePreset>,
+    pub primary_side_override: Option<Color>,
     pub endgame: Option<EndgameFilter>,
     pub metadata: MetadataFilter,
     pub min_ply: u32,
@@ -2529,6 +2816,7 @@ impl Default for PositionQuery {
             side_to_move: SideToMoveFilter::Any,
             ignore_color_flip: true,
             structure: None,
+            primary_side_override: None,
             endgame: None,
             metadata: MetadataFilter::default(),
             min_ply: 0,
@@ -2556,6 +2844,7 @@ impl PositionQuery {
             side_to_move: SideToMoveFilter::from_color(pos.turn()),
             ignore_color_flip: mode != PositionSearchMode::Absolute,
             structure: None,
+            primary_side_override: None,
             endgame: None,
             metadata: MetadataFilter::default(),
             min_ply: 0,
@@ -2564,9 +2853,57 @@ impl PositionQuery {
     }
 
     #[must_use]
+    pub fn from_pawn_skeleton(pos: &Chess) -> Self {
+        let board = pos.board();
+        let mut squares = [SquareConstraint::Any; 64];
+        for color in [Color::White, Color::Black] {
+            let pawns = board.colored_pieces_mask(color, Role::Pawn);
+            for sq in Square::ALL {
+                if (pawns & (1u64 << sq.to_u32())) != 0 {
+                    squares[sq.to_u32() as usize] =
+                        SquareConstraint::Piece(Piece::new(color, Role::Pawn));
+                }
+            }
+        }
+        let mut file_atoms = Vec::new();
+        let w_pawns = board.colored_pieces_mask(Color::White, Role::Pawn);
+        let b_pawns = board.colored_pieces_mask(Color::Black, Role::Pawn);
+        for (fi, &mask) in FILE_MASKS.iter().enumerate() {
+            let f = ChessFile::new(fi as u32);
+            if (w_pawns & mask) == 0 {
+                file_atoms.push(AtomPredicate::NoPieceOnFile(f, Color::White, Role::Pawn));
+            }
+            if (b_pawns & mask) == 0 {
+                file_atoms.push(AtomPredicate::NoPieceOnFile(f, Color::Black, Role::Pawn));
+            }
+        }
+        let extra_clauses = if file_atoms.is_empty() {
+            Vec::new()
+        } else {
+            vec![PatternClause {
+                op: ClauseOp::AllOf,
+                atoms: file_atoms,
+            }]
+        };
+        Self {
+            mode: PositionSearchMode::Partial,
+            squares,
+            extra_clauses,
+            side_to_move: SideToMoveFilter::Any,
+            ignore_color_flip: true,
+            structure: None,
+            primary_side_override: None,
+            endgame: None,
+            metadata: MetadataFilter::default(),
+            min_ply: 8,
+            max_ply: 140,
+        }
+    }
+
+    #[must_use]
     pub fn primary_side(&self) -> Color {
-        self.structure
-            .map(StructurePreset::primary_side)
+        self.primary_side_override
+            .or_else(|| self.structure.map(StructurePreset::primary_side))
             .unwrap_or(Color::White)
     }
 
@@ -2688,7 +3025,7 @@ impl PatternMasks {
     }
 }
 
-fn parse_eco_ranges(spec: &str) -> Vec<(u16, u16)> {
+pub fn parse_eco_ranges(spec: &str) -> Vec<(u16, u16)> {
     let mut ranges = Vec::new();
     for raw in spec.split([',', ';']) {
         let token = raw.trim().to_ascii_uppercase();
@@ -3147,12 +3484,177 @@ impl CompiledPattern {
     }
 }
 
-/// One game hit returned by [`search_library`].
+/// Default board orientation when browsing games compiled from a structure or pattern search.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SearchBoardPerspective {
+    #[default]
+    StructureSide,
+    OpponentSide,
+    FixedWhite,
+}
+
+impl SearchBoardPerspective {
+    #[must_use]
+    pub fn orientation_for(self, structure_side: Color) -> Option<Color> {
+        match self {
+            Self::StructureSide => Some(structure_side),
+            Self::OpponentSide => Some(structure_side.other()),
+            Self::FixedWhite => None,
+        }
+    }
+
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::StructureSide => "Structure side",
+            Self::OpponentSide => "Opponent side",
+            Self::FixedWhite => "Fixed White",
+        }
+    }
+}
+
+/// Auto-detected open/half-open files and matching middlegame structures for a board position.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PositionFacts {
+    pub open_files: Vec<ChessFile>,
+    pub half_open_white: Vec<ChessFile>,
+    pub half_open_black: Vec<ChessFile>,
+    pub matched_structures: Vec<(StructurePreset, Color)>,
+}
+
+fn is_generic_structure_preset(preset: StructurePreset) -> bool {
+    matches!(
+        preset,
+        StructurePreset::StonewallAny
+            | StructurePreset::BadewanneAny
+            | StructurePreset::CarlsbadAny
+            | StructurePreset::IqpDFile
+            | StructurePreset::IqpVsEPawn
+            | StructurePreset::IqpVsCPawn
+            | StructurePreset::IqpVsNoFianchetto
+            | StructurePreset::IqpVsFianchetto
+            | StructurePreset::IqpAnyCentralFile
+            | StructurePreset::HangingPawnsClassic
+            | StructurePreset::HangingPawnsDynamic
+            | StructurePreset::MaroczyBindAny
+    )
+}
+
+#[must_use]
+pub fn analyze_position_facts(pos: &Chess) -> PositionFacts {
+    let board = pos.board();
+    let w_pawns = board.colored_pieces_mask(Color::White, Role::Pawn);
+    let b_pawns = board.colored_pieces_mask(Color::Black, Role::Pawn);
+
+    let mut facts = PositionFacts::default();
+    for (fi, &mask) in FILE_MASKS.iter().enumerate() {
+        let f = ChessFile::new(fi as u32);
+        let has_w = (w_pawns & mask) != 0;
+        let has_b = (b_pawns & mask) != 0;
+        match (has_w, has_b) {
+            (false, false) => facts.open_files.push(f),
+            (false, true) => facts.half_open_white.push(f),
+            (true, false) => facts.half_open_black.push(f),
+            (true, true) => {}
+        }
+    }
+
+    let mut matched_families: Vec<StructureFamily> = Vec::new();
+    // Pass 1: specific presets
+    for &preset in StructurePreset::ALL
+        .iter()
+        .filter(|&&p| !is_generic_structure_preset(p))
+    {
+        if preset.matches_oriented(pos, false) {
+            facts
+                .matched_structures
+                .push((preset, preset.primary_side()));
+            if !matched_families.contains(&preset.family()) {
+                matched_families.push(preset.family());
+            }
+        } else if preset.matches_oriented(pos, true) {
+            facts
+                .matched_structures
+                .push((preset, preset.primary_side().other()));
+            if !matched_families.contains(&preset.family()) {
+                matched_families.push(preset.family());
+            }
+        }
+    }
+    // Pass 2: generic *Any fallbacks for families without a more specific match
+    for &preset in StructurePreset::ALL
+        .iter()
+        .filter(|&&p| is_generic_structure_preset(p))
+    {
+        if matched_families.contains(&preset.family()) {
+            continue;
+        }
+        if preset.matches_oriented(pos, false) {
+            facts
+                .matched_structures
+                .push((preset, preset.primary_side()));
+            matched_families.push(preset.family());
+        } else if preset.matches_oriented(pos, true) {
+            facts
+                .matched_structures
+                .push((preset, preset.primary_side().other()));
+            matched_families.push(preset.family());
+        }
+    }
+    facts.matched_structures.truncate(4);
+    facts
+}
+
+/// Sort order for position / structure search hits and derived search game lists.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PositionHitSort {
+    #[default]
+    DbOrder,
+    StructureEloDesc,
+    OpponentEloDesc,
+    AverageEloDesc,
+    DateDesc,
+}
+
+impl PositionHitSort {
+    pub const ALL: [Self; 5] = [
+        Self::DbOrder,
+        Self::StructureEloDesc,
+        Self::OpponentEloDesc,
+        Self::AverageEloDesc,
+        Self::DateDesc,
+    ];
+
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::DbOrder => "Database order",
+            Self::StructureEloDesc => "Structure holder Elo ↓",
+            Self::OpponentEloDesc => "Facing opponent Elo ↓",
+            Self::AverageEloDesc => "Average Elo ↓",
+            Self::DateDesc => "Newest ↓",
+        }
+    }
+
+    #[must_use]
+    pub fn short_label(self) -> &'static str {
+        match self {
+            Self::DbOrder => "Default",
+            Self::StructureEloDesc => "Structure Elo",
+            Self::OpponentEloDesc => "Opponent Elo",
+            Self::AverageEloDesc => "Avg Elo",
+            Self::DateDesc => "Date",
+        }
+    }
+}
+
+/// One game hit returned by [`search_library`] / [`search_library_from`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PositionHit {
     pub game_index: usize,
     pub matched_ply: usize,
     pub matched_flipped: bool,
+    pub structure_side: Color,
     pub white: String,
     pub black: String,
     pub white_elo: u16,
@@ -3160,9 +3662,79 @@ pub struct PositionHit {
     pub result: String,
     pub eco: String,
     pub date: String,
+    pub date_num: u32,
     pub event: String,
     pub medals: u16,
     pub vcs_flags: u32,
+}
+
+impl PositionHit {
+    /// Elo of the player holding the searched structure/featured side.
+    #[must_use]
+    pub fn structure_elo(&self) -> u16 {
+        match self.structure_side {
+            Color::White => self.white_elo,
+            Color::Black => self.black_elo,
+        }
+    }
+
+    /// Elo of the player facing/playing against the searched structure/featured side.
+    #[must_use]
+    pub fn opponent_elo(&self) -> u16 {
+        match self.structure_side {
+            Color::White => self.black_elo,
+            Color::Black => self.white_elo,
+        }
+    }
+
+    /// Average Elo across both players (or the single available Elo if only one is rated).
+    #[must_use]
+    pub fn avg_elo(&self) -> u16 {
+        match (self.white_elo, self.black_elo) {
+            (w, b) if w > 0 && b > 0 => ((u32::from(w) + u32::from(b)) / 2) as u16,
+            (w, b) => w.max(b),
+        }
+    }
+}
+
+/// Sort `hits` deterministically according to `sort`.
+pub fn sort_position_hits(hits: &mut [PositionHit], sort: PositionHitSort) {
+    hits.sort_by(|a, b| match sort {
+        PositionHitSort::DbOrder => a.game_index.cmp(&b.game_index),
+        PositionHitSort::StructureEloDesc => b
+            .structure_elo()
+            .cmp(&a.structure_elo())
+            .then_with(|| b.opponent_elo().cmp(&a.opponent_elo()))
+            .then_with(|| b.date_num.cmp(&a.date_num))
+            .then_with(|| a.game_index.cmp(&b.game_index)),
+        PositionHitSort::OpponentEloDesc => b
+            .opponent_elo()
+            .cmp(&a.opponent_elo())
+            .then_with(|| b.structure_elo().cmp(&a.structure_elo()))
+            .then_with(|| b.date_num.cmp(&a.date_num))
+            .then_with(|| a.game_index.cmp(&b.game_index)),
+        PositionHitSort::AverageEloDesc => b
+            .avg_elo()
+            .cmp(&a.avg_elo())
+            .then_with(|| b.structure_elo().cmp(&a.structure_elo()))
+            .then_with(|| b.date_num.cmp(&a.date_num))
+            .then_with(|| a.game_index.cmp(&b.game_index)),
+        PositionHitSort::DateDesc => b
+            .date_num
+            .cmp(&a.date_num)
+            .then_with(|| b.avg_elo().cmp(&a.avg_elo()))
+            .then_with(|| a.game_index.cmp(&b.game_index)),
+    });
+}
+
+/// Batch output from [`search_library_from`] supporting incremental 1,000-hit pagination.
+#[derive(Clone, Debug)]
+pub struct SearchBatchResult {
+    pub hits: Vec<PositionHit>,
+    pub next_start_index: usize,
+    pub total_candidates: usize,
+    pub truncated: bool,
+    pub cancelled: bool,
 }
 
 fn intersect_sorted(a: Vec<usize>, b: &[usize]) -> Vec<usize> {
@@ -3527,24 +4099,30 @@ where
     open_validated_struct_cache(&target, total, library.file_len())
 }
 
-/// Search `library` in parallel across games for positions & metadata matching `query`.
-/// Uses O(1) header/flag pre-filtering, optional `.brettstruct` signature pruning,
-/// accelerated player indexes (when present), and zero-allocation mainline bitboard
-/// streaming before ever falling back to `load()`.
-pub fn search_library<F>(
+/// Search `library` in parallel across games starting at candidate index
+/// `start_candidate_index`, returning at most `max_hits` hits along with the
+/// exact cursor (`next_start_index`) to resume searching in intervals.
+pub fn search_library_from<F>(
     library: &dyn GameLibrary,
     query: &PositionQuery,
+    start_candidate_index: usize,
     max_hits: usize,
     mut on_progress: F,
     cancel: &AtomicBool,
-) -> Vec<PositionHit>
+) -> SearchBatchResult
 where
     F: FnMut(usize, usize, usize) + Send,
 {
     let total = library.len();
     if total == 0 || max_hits == 0 {
         on_progress(total, total, 0);
-        return Vec::new();
+        return SearchBatchResult {
+            hits: Vec::new(),
+            next_start_index: total,
+            total_candidates: total,
+            truncated: false,
+            cancelled: false,
+        };
     }
     let compiled = query.compile();
     let sig_cache = compiled
@@ -3571,12 +4149,18 @@ where
     }
 
     let candidate_total = candidate_indices.as_ref().map_or(total, Vec::len);
-    if candidate_total == 0 {
-        on_progress(total, total, 0);
-        return Vec::new();
+    let start_pos = start_candidate_index.min(candidate_total);
+    if candidate_total == 0 || start_pos >= candidate_total {
+        on_progress(candidate_total, candidate_total, 0);
+        return SearchBatchResult {
+            hits: Vec::new(),
+            next_start_index: candidate_total,
+            total_candidates: candidate_total,
+            truncated: false,
+            cancelled: false,
+        };
     }
 
-    let hit_count = AtomicUsize::new(0);
     let mut hits = Vec::new();
     let chunk_size: usize = if !compiled.has_position_criteria() || candidate_indices.is_some() {
         2048
@@ -3584,14 +4168,24 @@ where
         512
     };
     let pos_criteria = compiled.has_position_criteria();
+    let mut next_start_index = start_pos;
+    let mut truncated = false;
+    let mut cancelled = false;
 
-    for chunk_start in (0..candidate_total).step_by(chunk_size) {
-        if cancel.load(Ordering::Relaxed) || hit_count.load(Ordering::Relaxed) >= max_hits {
+    for chunk_start in (start_pos..candidate_total).step_by(chunk_size) {
+        if cancel.load(Ordering::Relaxed) {
+            cancelled = true;
+            next_start_index = chunk_start;
+            break;
+        }
+        if hits.len() >= max_hits {
+            truncated = chunk_start < candidate_total;
+            next_start_index = chunk_start;
             break;
         }
         let chunk_end = (chunk_start + chunk_size).min(candidate_total);
-        let process_game = |idx: usize| -> Option<PositionHit> {
-            if cancel.load(Ordering::Relaxed) || hit_count.load(Ordering::Relaxed) >= max_hits {
+        let process_game = |cand_pos: usize, idx: usize| -> Option<(usize, PositionHit)> {
+            if cancel.load(Ordering::Relaxed) {
                 return None;
             }
             // Tier 1: O(1) numeric metadata & Mega medal/flag filter.
@@ -3634,8 +4228,10 @@ where
                     return None;
                 }
                 let h = headers.unwrap_or_else(|| library.game_headers(idx));
-                hit_count.fetch_add(1, Ordering::Relaxed);
-                return Some(hit_from_headers(idx, 0, false, &meta, &h));
+                return Some((
+                    cand_pos,
+                    hit_from_headers(idx, 0, false, compiled.primary_side, &meta, &h),
+                ));
             }
 
             // Tier 2.5: O(1) `.brettstruct` signature prune when index is present.
@@ -3692,43 +4288,89 @@ where
             }
 
             let (matched_ply, matched_flipped) = match_found?;
+            let structure_side = if matched_flipped {
+                compiled.primary_side.other()
+            } else {
+                compiled.primary_side
+            };
             let h = headers.unwrap_or_else(|| library.game_headers(idx));
-            hit_count.fetch_add(1, Ordering::Relaxed);
-            Some(hit_from_headers(
-                idx,
-                matched_ply,
-                matched_flipped,
-                &meta,
-                &h,
+            Some((
+                cand_pos,
+                hit_from_headers(idx, matched_ply, matched_flipped, structure_side, &meta, &h),
             ))
         };
 
-        let mut chunk_hits: Vec<PositionHit> = match &candidate_indices {
+        let mut chunk_hits: Vec<(usize, PositionHit)> = match &candidate_indices {
             Some(ids) => ids[chunk_start..chunk_end]
-                .into_par_iter()
-                .filter_map(|&idx| process_game(idx))
+                .par_iter()
+                .enumerate()
+                .filter_map(|(offset, &idx)| process_game(chunk_start + offset, idx))
                 .collect(),
             None => (chunk_start..chunk_end)
                 .into_par_iter()
-                .filter_map(process_game)
+                .filter_map(|idx| process_game(idx, idx))
                 .collect(),
         };
-        chunk_hits.sort_by_key(|h| h.game_index);
-        for hit in chunk_hits {
-            if hits.len() >= max_hits {
-                break;
+        if cancel.load(Ordering::Relaxed) {
+            cancelled = true;
+            next_start_index = chunk_start;
+            break;
+        }
+        chunk_hits.sort_by_key(|(cand_pos, _)| *cand_pos);
+        if hits.len().saturating_add(chunk_hits.len()) > max_hits {
+            let remaining = max_hits - hits.len();
+            let mut last_cand = chunk_start;
+            for (cand_pos, hit) in chunk_hits.into_iter().take(remaining) {
+                last_cand = cand_pos;
+                hits.push(hit);
             }
+            next_start_index = (last_cand + 1).min(candidate_total);
+            truncated = next_start_index < candidate_total;
+            on_progress(next_start_index, candidate_total, hits.len());
+            break;
+        }
+        for (_, hit) in chunk_hits {
             hits.push(hit);
         }
-        on_progress(chunk_end, candidate_total, hits.len());
+        next_start_index = chunk_end;
+        on_progress(next_start_index, candidate_total, hits.len());
+        if hits.len() >= max_hits {
+            truncated = next_start_index < candidate_total;
+            break;
+        }
     }
-    hits
+
+    SearchBatchResult {
+        hits,
+        next_start_index,
+        total_candidates: candidate_total,
+        truncated,
+        cancelled,
+    }
+}
+
+/// Search `library` in parallel across games for positions & metadata matching `query`.
+/// Uses O(1) header/flag pre-filtering, optional `.brettstruct` signature pruning,
+/// accelerated player indexes (when present), and zero-allocation mainline bitboard
+/// streaming before ever falling back to `load()`.
+pub fn search_library<F>(
+    library: &dyn GameLibrary,
+    query: &PositionQuery,
+    max_hits: usize,
+    on_progress: F,
+    cancel: &AtomicBool,
+) -> Vec<PositionHit>
+where
+    F: FnMut(usize, usize, usize) + Send,
+{
+    search_library_from(library, query, 0, max_hits, on_progress, cancel).hits
 }
 
 fn hit_from_headers(
     game_index: usize,
     matched_ply: usize,
     matched_flipped: bool,
+    structure_side: Color,
     meta: &GameRecordMeta,
     headers: &[(crate::library::SharedStr, crate::library::SharedStr)],
 ) -> PositionHit {
@@ -3749,6 +4391,7 @@ fn hit_from_headers(
         game_index,
         matched_ply,
         matched_flipped,
+        structure_side,
         white: hval("White", "?"),
         black: hval("Black", "?"),
         white_elo: meta.white_elo,
@@ -3756,6 +4399,7 @@ fn hit_from_headers(
         result: hval("Result", "*"),
         eco,
         date: hval("Date", "????.??.??"),
+        date_num: meta.date_num,
         event: hval("Event", "?"),
         medals: meta.medals,
         vcs_flags: meta.vcs_flags,
@@ -4420,8 +5064,254 @@ mod tests {
             ignore_color_flip: true,
         };
         let found = find_custom_override(std::slice::from_ref(&ov), StructurePreset::NajdorfTypeII);
-        assert_eq!(found.map(|p| p.name.as_str()), Some(StructurePreset::NajdorfTypeII.label()));
+        assert_eq!(
+            found.map(|p| p.name.as_str()),
+            Some(StructurePreset::NajdorfTypeII.label())
+        );
         assert!(find_custom_override(&[ov], StructurePreset::najdorf_type_i_compat()).is_none());
+    }
+
+    #[test]
+    fn handcrafted_maroczy_botvinnik_grunfeld_and_nimzo_presets_work() {
+        // 1. Handcrafted MaroczyBindFianchetto matches both Normal & to_pattern_components, rejects missing b7/Bg7
+        let maroczy_fian =
+            pos_from_fen("r2q1rk1/1p1bppbp/p2p1np1/8/2P1P3/2N1B1P1/PP3PBP/R2Q1RK1 w - - 0 1");
+        assert!(StructurePreset::MaroczyBindFianchetto.matches_oriented(&maroczy_fian, false));
+        let (_, sqs, clauses) = StructurePreset::MaroczyBindFianchetto.to_pattern_components();
+        let q_m = PositionQuery {
+            squares: sqs,
+            extra_clauses: clauses,
+            ..PositionQuery::default()
+        };
+        assert!(q_m.compile().matches_position(&maroczy_fian));
+
+        // 2. Handcrafted Botvinnik default preset (White and mirrored Black)
+        let botvinnik_w =
+            pos_from_fen("r2q1rk1/ppp2pbp/2npbnp1/4p3/2P1P3/2NP2P1/PP2NPBP/R1BQ1RK1 w - - 5 9");
+        assert!(StructurePreset::Botvinnik.matches_oriented(&botvinnik_w, false));
+        let (_, b_sqs, b_clauses) = StructurePreset::Botvinnik.to_pattern_components();
+        let q_b = PositionQuery {
+            squares: b_sqs,
+            extra_clauses: b_clauses,
+            ..PositionQuery::default()
+        };
+        assert!(q_b.compile().matches_position(&botvinnik_w));
+        let botvinnik_b =
+            pos_from_fen("r1bq1rk1/pp2npbp/2np2p1/2p1p3/4P3/2NPBNP1/PPP2PBP/R2Q1RK1 b - - 0 9");
+        assert!(StructurePreset::Botvinnik.matches_oriented(&botvinnik_b, true));
+        assert!(q_b.compile().matches_position(&botvinnik_b));
+
+        // 3. Exchange Grünfeld with c3 pawn matches GrunfeldCenter; KID (Black d6) does not
+        let grunfeld_ex =
+            pos_from_fen("r1bq1rk1/pp2ppbp/2n3p1/2p5/3PP3/2P1BN2/P3BPPP/R2Q1RK1 b - - 5 10");
+        assert!(StructurePreset::GrunfeldCenter.matches_oriented(&grunfeld_ex, false));
+        let kid = pos_from_fen("r1bq1rk1/ppp1ppbp/3p1np1/8/2PPP3/2N2N2/PP2BPPP/R1BQ1RK1 w - - 0 1");
+        assert!(!StructurePreset::GrunfeldCenter.matches_oriented(&kid, false));
+
+        // 4. Nimzo doubled c-pawns: opponent dark-squared bishop traded on c3
+        let nimzo = pos_from_fen("r1bqk2r/pp1ppppp/2n2n2/8/2PP4/2P1P3/P4PPP/R1BQKBNR w KQkq - 0 6");
+        assert!(StructurePreset::NimzoDoubledCPawns.matches_oriented(&nimzo, false));
+        let (_, n_sqs, n_clauses) = StructurePreset::NimzoDoubledCPawns.to_pattern_components();
+        let q_n = PositionQuery {
+            squares: n_sqs,
+            extra_clauses: n_clauses,
+            ..PositionQuery::default()
+        };
+        assert!(q_n.compile().matches_position(&nimzo));
+    }
+
+    #[test]
+    fn position_facts_and_skeleton_query_detect_files_and_structures() {
+        let iqp = pos_from_fen("r2q1rk1/pp3ppp/2n1pn2/8/3P4/2NB1N2/PP3PPP/R2Q1RK1 w - - 0 1");
+        let facts = analyze_position_facts(&iqp);
+        assert_eq!(facts.open_files, vec![ChessFile::C]);
+        assert_eq!(facts.half_open_white, vec![ChessFile::E]);
+        assert_eq!(facts.half_open_black, vec![ChessFile::D]);
+        assert!(
+            facts
+                .matched_structures
+                .iter()
+                .any(|&(p, side)| p.family() == StructureFamily::Iqp && side == Color::White)
+        );
+        let skel = PositionQuery::from_pawn_skeleton(&iqp);
+        assert!(skel.compile().matches_position(&iqp));
+    }
+
+    #[test]
+    fn handcrafted_hanging_pawns_maroczy_and_iqp_differentiation_work() {
+        // 1. Hand-tuned Hanging Pawns (c4+d4) + fianchetto vs no-fianchetto differentiation
+        let hp_no_fian =
+            pos_from_fen("r3r1k1/pbqnbppp/1p2pn2/8/2PP4/2NB1N2/PB2QPPP/R2R2K1 w - - 3 14");
+        let hp_fian =
+            pos_from_fen("r2qr1k1/pbqn1pbp/1p2pnp1/8/2PP4/2NB1N2/PB2QPPP/R2R2K1 w - - 0 14");
+        let hp_missing_e =
+            pos_from_fen("r3r1k1/pbqn1ppp/1p3n2/8/2PP4/2NB1N2/PB2QPPP/R2R2K1 w - - 0 14");
+        assert!(StructurePreset::HangingPawnsClassic.matches_oriented(&hp_no_fian, false));
+        assert!(StructurePreset::HangingPawnsVsNoFianchetto.matches_oriented(&hp_no_fian, false));
+        assert!(!StructurePreset::HangingPawnsVsFianchetto.matches_oriented(&hp_no_fian, false));
+
+        assert!(StructurePreset::HangingPawnsClassic.matches_oriented(&hp_fian, false));
+        assert!(StructurePreset::HangingPawnsVsFianchetto.matches_oriented(&hp_fian, false));
+        assert!(!StructurePreset::HangingPawnsVsNoFianchetto.matches_oriented(&hp_fian, false));
+
+        // Missing Black e6/e7 pawn fails hand-tuned HangingPawnsClassic
+        assert!(!StructurePreset::HangingPawnsClassic.matches_oriented(&hp_missing_e, false));
+
+        // 2. Hand-tuned Maróczy no K-side fianchetto (a2/g2/c4/e4, h2|h3 vs d6/g6/b7/f7, h7|h6)
+        let maroczy_no_fian =
+            pos_from_fen("r2q1rk1/1p2ppbp/p1bp1np1/8/2PBP3/2N2P2/PP1QB1PP/R4RK1 w - - 0 13");
+        assert!(StructurePreset::MaroczyBindNoFianchetto.matches_oriented(&maroczy_no_fian, false));
+        let (_, mnf_sqs, mnf_clauses) =
+            StructurePreset::MaroczyBindNoFianchetto.to_pattern_components();
+        let q_mnf = PositionQuery {
+            squares: mnf_sqs,
+            extra_clauses: mnf_clauses,
+            ..PositionQuery::default()
+        };
+        assert!(q_mnf.compile().matches_position(&maroczy_no_fian));
+
+        // 3. IQP 2x2 differentiation: (e-pawn vs c-pawn) x (no-fianchetto vs fianchetto)
+        let iqp_e_no_fian =
+            pos_from_fen("r1bq1rk1/1p2bppp/p1n1pn2/8/3P4/1BN2N2/PP3PPP/R1BQR1K1 w - - 5 11");
+        let iqp_e_fian =
+            pos_from_fen("r1bq1rk1/1p3pbp/p1n1pnp1/8/3P4/1BN2N2/PP3PPP/R1BQR1K1 w - - 0 11");
+        let iqp_c_no_fian =
+            pos_from_fen("r2q1rk1/pp2bppp/2p1bn2/8/3P4/2NB1N2/PP3PPP/R1BQR1K1 w - - 0 11");
+        let iqp_c_fian =
+            pos_from_fen("r2q1rk1/pp3pbp/2p1bnp1/8/3P4/2NB1N2/PP3PPP/R1BQR1K1 w - - 0 11");
+
+        assert!(StructurePreset::IqpVsEPawnNoFianchetto.matches_oriented(&iqp_e_no_fian, false));
+        assert!(!StructurePreset::IqpVsEPawnFianchetto.matches_oriented(&iqp_e_no_fian, false));
+        assert!(!StructurePreset::IqpVsCPawnNoFianchetto.matches_oriented(&iqp_e_no_fian, false));
+        assert!(StructurePreset::IqpVsEPawn.matches_oriented(&iqp_e_no_fian, false));
+        assert!(StructurePreset::IqpVsNoFianchetto.matches_oriented(&iqp_e_no_fian, false));
+
+        assert!(StructurePreset::IqpVsEPawnFianchetto.matches_oriented(&iqp_e_fian, false));
+        assert!(!StructurePreset::IqpVsEPawnNoFianchetto.matches_oriented(&iqp_e_fian, false));
+        assert!(StructurePreset::IqpVsEPawn.matches_oriented(&iqp_e_fian, false));
+        assert!(StructurePreset::IqpVsFianchetto.matches_oriented(&iqp_e_fian, false));
+
+        assert!(StructurePreset::IqpVsCPawnNoFianchetto.matches_oriented(&iqp_c_no_fian, false));
+        assert!(!StructurePreset::IqpVsEPawnNoFianchetto.matches_oriented(&iqp_c_no_fian, false));
+        assert!(StructurePreset::IqpVsCPawn.matches_oriented(&iqp_c_no_fian, false));
+        assert!(StructurePreset::IqpVsNoFianchetto.matches_oriented(&iqp_c_no_fian, false));
+
+        assert!(StructurePreset::IqpVsCPawnFianchetto.matches_oriented(&iqp_c_fian, false));
+        assert!(!StructurePreset::IqpVsCPawnNoFianchetto.matches_oriented(&iqp_c_fian, false));
+        assert!(StructurePreset::IqpVsCPawn.matches_oriented(&iqp_c_fian, false));
+        assert!(StructurePreset::IqpVsFianchetto.matches_oriented(&iqp_c_fian, false));
+
+        // Verify to_pattern_components round-trip matches every new preset cleanly
+        for (preset, sample) in [
+            (StructurePreset::HangingPawnsVsNoFianchetto, &hp_no_fian),
+            (StructurePreset::HangingPawnsVsFianchetto, &hp_fian),
+            (StructurePreset::IqpVsEPawnNoFianchetto, &iqp_e_no_fian),
+            (StructurePreset::IqpVsEPawnFianchetto, &iqp_e_fian),
+            (StructurePreset::IqpVsCPawnNoFianchetto, &iqp_c_no_fian),
+            (StructurePreset::IqpVsCPawnFianchetto, &iqp_c_fian),
+        ] {
+            let (_, sqs, clauses) = preset.to_pattern_components();
+            let q = PositionQuery {
+                squares: sqs,
+                extra_clauses: clauses,
+                ..PositionQuery::default()
+            };
+            assert!(
+                q.compile().matches_position(sample),
+                "to_pattern_components failed for {preset:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn resumable_search_batches_and_elo_sorting_are_exact() {
+        let mut pgn = String::new();
+        for i in 0..7usize {
+            pgn.push_str(&format!(
+                "[Event \"T{i}\"]\n[White \"W{i}\"]\n[Black \"B{i}\"]\n[WhiteElo \"{}\"]\n[BlackElo \"{}\"]\n[Date \"2024.01.0{}\"]\n[Result \"*\"]\n\n1. e4 e5 2. Nf3 Nc6 *\n\n",
+                2400 + i * 50,
+                2700 - i * 40,
+                i + 1
+            ));
+        }
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "brett-batch-search-{}-{nanos}.pgn",
+            std::process::id()
+        ));
+        fs::write(&path, pgn.as_bytes()).unwrap();
+        let lib = PgnLibrary::build(&path).unwrap();
+        let q = PositionQuery::default();
+        let cancel = AtomicBool::new(false);
+
+        let all = search_library_from(&lib, &q, 0, usize::MAX, |_, _, _| {}, &cancel);
+        assert_eq!(all.hits.len(), 7);
+        assert!(!all.truncated);
+
+        // Resume in batches of 3 -> 3 + 3 + 1 == exact match with zero duplicates/skips
+        let mut combined = Vec::new();
+        let mut cursor = 0;
+        loop {
+            let batch = search_library_from(&lib, &q, cursor, 3, |_, _, _| {}, &cancel);
+            combined.extend(batch.hits);
+            cursor = batch.next_start_index;
+            if !batch.truncated {
+                break;
+            }
+        }
+        assert_eq!(combined, all.hits);
+
+        // Structure/Opponent Elo sorting respects structure_side
+        let mut hits = vec![
+            PositionHit {
+                game_index: 0,
+                matched_ply: 10,
+                matched_flipped: false,
+                structure_side: Color::White,
+                white: "A".into(),
+                black: "B".into(),
+                white_elo: 2500,
+                black_elo: 2800,
+                result: "*".into(),
+                eco: "D31".into(),
+                date: "2024.01.01".into(),
+                date_num: 20240101,
+                event: "E".into(),
+                medals: 0,
+                vcs_flags: 0,
+            },
+            PositionHit {
+                game_index: 1,
+                matched_ply: 10,
+                matched_flipped: true,
+                structure_side: Color::Black,
+                white: "C".into(),
+                black: "D".into(),
+                white_elo: 2400,
+                black_elo: 2750,
+                result: "*".into(),
+                eco: "D31".into(),
+                date: "2024.01.02".into(),
+                date_num: 20240102,
+                event: "E".into(),
+                medals: 0,
+                vcs_flags: 0,
+            },
+        ];
+        assert_eq!(hits[0].structure_elo(), 2500);
+        assert_eq!(hits[0].opponent_elo(), 2800);
+        assert_eq!(hits[1].structure_elo(), 2750);
+        assert_eq!(hits[1].opponent_elo(), 2400);
+
+        sort_position_hits(&mut hits, PositionHitSort::StructureEloDesc);
+        assert_eq!(hits[0].game_index, 1);
+        sort_position_hits(&mut hits, PositionHitSort::OpponentEloDesc);
+        assert_eq!(hits[0].game_index, 0);
+
+        let _ = fs::remove_file(path);
     }
 
     trait StructurePresetCompat {

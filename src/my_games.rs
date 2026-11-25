@@ -757,10 +757,367 @@ pub struct MyGamesSyncReport {
     pub fetched: usize,
     pub added: usize,
     pub skipped: usize,
+    pub skipped_deleted: usize,
     pub skipped_variants: usize,
     pub total_games: usize,
     pub errors: Vec<String>,
     pub updated_timestamps: Vec<(OnlineSource, String, u64)>,
+}
+
+/// Persistent fingerprint of a manually deleted game so automatic Lichess,
+/// Chess.com, and ChessABC syncs do not re-import it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeletedGameEntry {
+    pub online_id: Option<String>,
+    pub white_key: String,
+    pub black_key: String,
+    pub white: String,
+    pub black: String,
+    pub date: String,
+    pub date_num: u32,
+    pub result: String,
+    pub event: String,
+    pub move_prefix: Vec<String>,
+    pub spine_hash: u64,
+    pub spine_plies: usize,
+    pub deleted_unix: u64,
+}
+
+fn hash_uci_list(ucis: &[String]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for u in ucis {
+        for &b in u.as_bytes() {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x100_0000_01b3);
+        }
+        h ^= 0xff;
+        h = h.wrapping_mul(0x100_0000_01b3);
+    }
+    h
+}
+
+fn date_num_to_days(date_num: u32) -> Option<i64> {
+    if date_num < 10_000 {
+        return None;
+    }
+    let y = (date_num / 10_000) as i64;
+    let m = ((date_num / 100) % 100).clamp(1, 12) as i64;
+    let d = (date_num % 100).clamp(1, 31) as i64;
+    Some(y * 366 + m * 31 + d)
+}
+
+fn deleted_dates_compatible(a: u32, b: u32, window_days: i64) -> bool {
+    let (Some(da), Some(db)) = (date_num_to_days(a), date_num_to_days(b)) else {
+        return true;
+    };
+    if a.is_multiple_of(10_000) || b.is_multiple_of(10_000) {
+        return a / 10_000 == b / 10_000;
+    }
+    (da - db).abs() <= window_days
+}
+
+fn deleted_names_compatible(a_raw: &str, a_key: &str, b_raw: &str, b_key: &str) -> bool {
+    if !a_key.is_empty() && !b_key.is_empty() && a_key == b_key {
+        return true;
+    }
+    let a_low = a_raw.trim().to_ascii_lowercase();
+    let b_low = b_raw.trim().to_ascii_lowercase();
+    !a_low.is_empty() && a_low == b_low
+}
+
+impl DeletedGameEntry {
+    #[must_use]
+    pub fn from_game(game: &Game) -> Self {
+        let ucis = game_spine_ucis(game);
+        let spine_hash = hash_uci_list(&ucis);
+        let spine_plies = ucis.len();
+        let move_prefix: Vec<String> = ucis.into_iter().take(24).collect();
+        let white = game.white().trim().to_string();
+        let black = game.black().trim().to_string();
+        let white_key = crate::players::player_key(&white).unwrap_or_default();
+        let black_key = crate::players::player_key(&black).unwrap_or_default();
+        let date = game.date().trim().to_string();
+        let date_num = crate::library::parse_date_num(&date);
+        let deleted_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        Self {
+            online_id: crate::players::online_game_id(game),
+            white_key,
+            black_key,
+            white,
+            black,
+            date,
+            date_num,
+            result: game.result().trim().to_string(),
+            event: game.event().trim().to_string(),
+            move_prefix,
+            spine_hash,
+            spine_plies,
+            deleted_unix,
+        }
+    }
+
+    #[must_use]
+    pub fn matches(&self, game: &Game) -> bool {
+        if let (Some(a), Some(b)) = (&self.online_id, crate::players::online_game_id(game))
+            && *a == b
+        {
+            return true;
+        }
+        let ucis = game_spine_ucis(game);
+        let shared = self.move_prefix.len().min(ucis.len());
+        let both_empty = self.spine_plies == 0
+            && ucis.is_empty()
+            && !self.event.is_empty()
+            && self.event.eq_ignore_ascii_case(game.event().trim());
+        let spine_match = both_empty
+            || (self.spine_plies == ucis.len() && self.spine_hash == hash_uci_list(&ucis))
+            || (shared >= 12 && self.move_prefix[..shared] == ucis[..shared]);
+        if !spine_match {
+            return false;
+        }
+
+        let res_a = self.result.trim();
+        let res_b = game.result().trim();
+        let res_ok =
+            res_a == res_b || res_a.is_empty() || res_a == "*" || res_b.is_empty() || res_b == "*";
+        if !res_ok {
+            return false;
+        }
+
+        let inc_date_num = crate::library::parse_date_num(game.date());
+        let is_online = self.online_id.is_some() || crate::players::online_game_id(game).is_some();
+        let window = if shared >= 14 && !is_online { 14 } else { 3 };
+        if !deleted_dates_compatible(self.date_num, inc_date_num, window) {
+            return false;
+        }
+
+        let w_key = crate::players::player_key(game.white()).unwrap_or_default();
+        let b_key = crate::players::player_key(game.black()).unwrap_or_default();
+        if deleted_names_compatible(&self.white, &self.white_key, game.white(), &w_key)
+            && deleted_names_compatible(&self.black, &self.black_key, game.black(), &b_key)
+        {
+            return true;
+        }
+
+        self.date_num > 0
+            && self.date_num == inc_date_num
+            && shared >= 16
+            && !res_a.is_empty()
+            && res_a != "*"
+            && res_a == res_b
+    }
+
+    #[must_use]
+    pub fn summary_label(&self) -> String {
+        let mut s = format!("{} – {}", self.white, self.black);
+        if !self.result.is_empty() && self.result != "*" {
+            s.push_str(&format!(" ({})", self.result));
+        }
+        if !self.date.is_empty() && self.date != "????.??.??" {
+            s.push_str(&format!(" · {}", self.date));
+        }
+        if !self.event.is_empty() && self.event != "?" {
+            s.push_str(&format!(" · {}", self.event));
+        }
+        s
+    }
+
+    fn to_json_value(&self) -> serde_json::Value {
+        serde_json::json!({
+            "online_id": self.online_id,
+            "white_key": self.white_key,
+            "black_key": self.black_key,
+            "white": self.white,
+            "black": self.black,
+            "date": self.date,
+            "date_num": self.date_num,
+            "result": self.result,
+            "event": self.event,
+            "move_prefix": self.move_prefix,
+            "spine_hash": format!("{:016x}", self.spine_hash),
+            "spine_plies": self.spine_plies,
+            "deleted_unix": self.deleted_unix,
+        })
+    }
+
+    fn from_json_value(v: &serde_json::Value) -> Option<Self> {
+        let spine_hash_raw = v.get("spine_hash").and_then(serde_json::Value::as_str)?;
+        let spine_hash = u64::from_str_radix(spine_hash_raw.trim(), 16).ok()?;
+        let move_prefix = v
+            .get("move_prefix")
+            .and_then(serde_json::Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        Some(Self {
+            online_id: v
+                .get("online_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            white_key: v
+                .get("white_key")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            black_key: v
+                .get("black_key")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            white: v
+                .get("white")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?")
+                .to_string(),
+            black: v
+                .get("black")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?")
+                .to_string(),
+            date: v
+                .get("date")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("????.??.??")
+                .to_string(),
+            date_num: v
+                .get("date_num")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0) as u32,
+            result: v
+                .get("result")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("*")
+                .to_string(),
+            event: v
+                .get("event")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?")
+                .to_string(),
+            move_prefix,
+            spine_hash,
+            spine_plies: v
+                .get("spine_plies")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0) as usize,
+            deleted_unix: v
+                .get("deleted_unix")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+        })
+    }
+}
+
+/// Persistent list of games manually deleted by the user so online/ChessABC
+/// syncs remember not to re-import them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DeletedGamesRegistry {
+    entries: Vec<DeletedGameEntry>,
+}
+
+impl DeletedGamesRegistry {
+    #[must_use]
+    pub fn config_path() -> Option<PathBuf> {
+        config_dir().map(|dir| dir.join("deleted_games.json"))
+    }
+
+    #[must_use]
+    pub fn load() -> Self {
+        Self::config_path().map_or_else(Self::default, |p| Self::load_from(&p))
+    }
+
+    #[must_use]
+    pub fn load_from(path: &Path) -> Self {
+        read_with_backup_json(path).map_or_else(Self::default, |text| Self::from_json(&text))
+    }
+
+    #[must_use]
+    pub fn from_json(text: &str) -> Self {
+        let Ok(serde_json::Value::Array(arr)) = serde_json::from_str::<serde_json::Value>(text)
+        else {
+            return Self::default();
+        };
+        let entries = arr
+            .iter()
+            .filter_map(DeletedGameEntry::from_json_value)
+            .collect();
+        Self { entries }
+    }
+
+    #[must_use]
+    pub fn to_json(&self) -> String {
+        let arr: Vec<serde_json::Value> = self
+            .entries
+            .iter()
+            .map(DeletedGameEntry::to_json_value)
+            .collect();
+        serde_json::to_string_pretty(&arr).unwrap_or_else(|_| "[]".to_string())
+    }
+
+    pub fn save(&self) -> Result<()> {
+        let Some(path) = Self::config_path() else {
+            return Ok(());
+        };
+        self.save_to(&path)
+    }
+
+    pub fn save_to(&self, path: &Path) -> Result<()> {
+        write_atomic_with_backup(path, &self.to_json())
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    #[must_use]
+    pub fn entries(&self) -> &[DeletedGameEntry] {
+        &self.entries
+    }
+
+    #[must_use]
+    pub fn contains(&self, game: &Game) -> bool {
+        self.entries.iter().any(|entry| entry.matches(game))
+    }
+
+    pub fn add_game(&mut self, game: &Game) -> bool {
+        if self.contains(game) {
+            return false;
+        }
+        self.entries.push(DeletedGameEntry::from_game(game));
+        true
+    }
+
+    pub fn remove(&mut self, index: usize) -> Option<DeletedGameEntry> {
+        (index < self.entries.len()).then(|| self.entries.remove(index))
+    }
+
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    /// Filter out any games recorded as deleted, returning `(kept, skipped_count)`.
+    #[must_use]
+    pub fn filter_games(&self, games: Vec<Game>) -> (Vec<Game>, usize) {
+        if self.entries.is_empty() {
+            return (games, 0);
+        }
+        let total = games.len();
+        let kept: Vec<Game> = games.into_iter().filter(|g| !self.contains(g)).collect();
+        let skipped = total.saturating_sub(kept.len());
+        (kept, skipped)
+    }
 }
 
 fn db_supports_game_variant(path: &Path, game: &Game) -> bool {
@@ -797,6 +1154,16 @@ pub fn sync_online_accounts_into_db(
     config: &MyGamesConfig,
     lichess_token: Option<&str>,
 ) -> Result<MyGamesSyncReport> {
+    let deleted = DeletedGamesRegistry::load();
+    sync_online_accounts_into_db_with_deleted(config, lichess_token, &deleted)
+}
+
+/// Same as [`sync_online_accounts_into_db`], using an explicit [`DeletedGamesRegistry`].
+pub fn sync_online_accounts_into_db_with_deleted(
+    config: &MyGamesConfig,
+    lichess_token: Option<&str>,
+    deleted: &DeletedGamesRegistry,
+) -> Result<MyGamesSyncReport> {
     let Some(db_path) = config.path.as_deref() else {
         bail!("No My Games database path is configured.");
     };
@@ -828,6 +1195,8 @@ pub fn sync_online_accounts_into_db(
         ) {
             Ok(games) => {
                 let games = filter_and_tag_synced_games(account, games);
+                let (games, skipped_deleted) = deleted.filter_games(games);
+                report.skipped_deleted += skipped_deleted;
                 let mut supported = Vec::with_capacity(games.len());
                 for game in games {
                     if db_supports_game_variant(db_path, &game) {
@@ -1490,5 +1859,55 @@ mod tests {
         );
 
         cleanup_db(&path);
+    }
+
+    #[test]
+    fn deleted_games_registry_round_trips_and_suppresses_online_and_otb_resync() {
+        let dir = temp_path("deleted-reg");
+        fs::create_dir_all(&dir).unwrap();
+        let reg_path = dir.join("deleted_games.json");
+
+        let lichess_game = crate::domain::parse_pgn(
+            b"[Event \"Rated Blitz game\"]\n[Site \"https://lichess.org/XyZ12345\"]\n[White \"GermanoMosconi32\"]\n[Black \"Opponent\"]\n[Date \"2025.08.01\"]\n[Result \"1-0\"]\n\n1. e4 e5 2. Nf3 Nc6 3. Bb5 a6 4. Ba4 Nf6 5. O-O Be7 6. Re1 b5 1-0\n",
+        )
+        .unwrap()
+        .remove(0);
+
+        let otb_game = crate::domain::parse_pgn(
+            b"[Event \"Bavaria Liga\"]\n[Site \"Munich\"]\n[White \"Hinterreiter, Markus\"]\n[Black \"Mueller, Hans\"]\n[Date \"2025.10.12\"]\n[Result \"1/2-1/2\"]\n\n1. d4 d5 2. c4 c6 3. Nf3 Nf6 4. Nc3 e6 5. e3 Nbd7 6. Bd3 dxc4 7. Bxc4 b5 1/2-1/2\n",
+        )
+        .unwrap()
+        .remove(0);
+
+        let distinct_game = crate::domain::parse_pgn(
+            b"[Event \"Rated Blitz game\"]\n[Site \"https://lichess.org/AbCd9999\"]\n[White \"GermanoMosconi32\"]\n[Black \"Other\"]\n[Date \"2025.08.02\"]\n[Result \"0-1\"]\n\n1. c4 e5 2. Nc3 Nf6 3. g3 d5 0-1\n",
+        )
+        .unwrap()
+        .remove(0);
+
+        let mut reg = DeletedGamesRegistry::default();
+        assert!(reg.add_game(&lichess_game));
+        assert!(!reg.add_game(&lichess_game));
+        assert!(reg.add_game(&otb_game));
+        reg.save_to(&reg_path).unwrap();
+
+        let reloaded = DeletedGamesRegistry::load_from(&reg_path);
+        assert_eq!(reloaded.len(), 2);
+        assert!(reloaded.contains(&lichess_game));
+        // Even if White/Black tag is formatted differently on re-fetch, online ID still matches
+        let mut renamed_lichess = lichess_game.clone();
+        renamed_lichess.set_header("White", "Markus Hinterreiter".to_string());
+        assert!(reloaded.contains(&renamed_lichess));
+        // OTB / ChessABC match by move spine + players + date
+        assert!(reloaded.contains(&otb_game));
+        assert!(!reloaded.contains(&distinct_game));
+
+        let (kept, skipped) =
+            reloaded.filter_games(vec![lichess_game, otb_game, distinct_game.clone()]);
+        assert_eq!(skipped, 2);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].header("Site"), distinct_game.header("Site"));
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }
