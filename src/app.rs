@@ -3169,16 +3169,15 @@ impl App {
             self.annotation_focus = false;
         }
         let mut old_pieces = HashMap::<Square, Piece>::new();
-        if changed && animate {
-            if let Some(cp) = self.current_position() {
+        if changed && animate
+            && let Some(cp) = self.current_position() {
                 for index in 0..64 {
                     let sq = Square::new(index);
                     if let Some(p) = cp.board().piece_at(sq) {
-                        old_pieces.insert(sq,p);
+                        old_pieces.insert(sq, p);
                     }
                 }
             }
-        }
         self.node = node;
         self.selected = None;
         self.targets.clear();
@@ -3193,14 +3192,14 @@ impl App {
             self.orientation = locked;
         }
 
-        if changed && animate {
-            if let Some(cp) = self.current_position() {
+        if changed && animate
+            && let Some(cp) = self.current_position() {
                 let mut anim_pairs = HashMap::<Square, Square>::new();
                 for (sqold, p) in &old_pieces {
                     if cp.board().piece_at(*sqold).is_none() {
                         for indexnew in 0..64 {
                             let sq = Square::new(indexnew);
-                            if sq == *sqold || anim_pairs.contains_key(&sq)  {
+                            if sq == *sqold || anim_pairs.contains_key(&sq) {
                                 continue;
                             }
                             let np = cp.board().piece_at(sq);
@@ -3213,7 +3212,6 @@ impl App {
                 }
                 self.board_anim = Some(BoardAnimData::from_animated_pairs(anim_pairs));
             }
-        }
     }
 
     fn open_date_picker(&mut self) {
@@ -33190,8 +33188,8 @@ impl eframe::App for App {
                 redraw_req = true;
             }
         }
-        if !redraw_req {
-            if self.open_rx.is_some()
+        if !redraw_req
+            && (self.open_rx.is_some()
                 || self.file_dialog_rx.is_some()
                 || self.merge_load_rx.is_some()
                 || self.index_rx.is_some()
@@ -33217,11 +33215,10 @@ impl eframe::App for App {
                 || self.league_detail_rx.is_some()
                 || self.league_download_rx.is_some()
                 || self.account_finder_rx.is_some()
-                || self.pos_search_rx.is_some()
+                || self.pos_search_rx.is_some())
             {
                 ctx.request_repaint_after(Duration::from_millis(150));
             }
-        }
         if self.engine_searching
             || self
                 .engine_slots

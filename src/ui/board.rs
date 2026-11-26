@@ -37,12 +37,12 @@ impl BoardAnimData {
     }
 
     pub fn duration() -> f32 {
-        return 0.2;
+        0.2
     }
 
     pub fn handle_dt(&mut self, dt: f32) -> bool {
         self.time_elapsed += dt;
-        return self.time_elapsed > Self::duration();
+        self.time_elapsed > Self::duration()
     }
 }
 
@@ -110,7 +110,7 @@ pub fn mix_rects_for_anim(anim_prog: f32, rect1: Rect, rect2: Rect) -> Rect {
         x: center1.x * anim_left + center2.x * anim_prog,
         y: center1.y * anim_left + center2.y * anim_prog,
     };
-    return Rect::from_center_size(center_mixed, rect2.size());
+    Rect::from_center_size(center_mixed, rect2.size())
 }
 
 /// Draw an interactive board. Pieces can be moved by clicking or by dragging.
@@ -290,12 +290,11 @@ pub fn draw(ui: &mut Ui, tex: &PieceTextures, st: BoardState<'_>, side: f32) -> 
                 && let Some(texture) = tex.get(piece)
             {
                 let mut r = square_rect(sq).shrink(cell * 0.04);
-                if let Some(anim) = &st.animation {
-                    if let Some(oldsq) = anim.animated.get(&sq) {
+                if let Some(anim) = &st.animation
+                    && let Some(oldsq) = anim.animated.get(&sq) {
                         let oldr = square_rect(*oldsq).shrink(cell * 0.04);
                         r = mix_rects_for_anim(anim.progress(), oldr, r);
                     }
-                }
                 painter.image(
                     texture.id(),
                     r,
