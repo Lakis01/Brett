@@ -5,7 +5,7 @@ use std::sync::mpsc::{self, TryRecvError};
 use std::time::{Duration, Instant};
 
 use crate::chess::{
-    CastlingMode, Chess, Color, EnPassantMode, Fen, Move, Position, SanPlus, Square, UciMove,
+    CastlingMode, Chess, Color, EnPassantMode, Fen, Move, Piece, Position, SanPlus, Square, UciMove,
 };
 use eframe::egui::{
     self, Align, Align2, Color32, CornerRadius, FontId, Key, Layout, Rect, RichText, Sense, Stroke,
@@ -60,7 +60,7 @@ use crate::settings::{
 };
 use crate::titles;
 use crate::twic::{self, TwicIssue, TwicTournament};
-use crate::ui::board::{self, BoardEvent, BoardState};
+use crate::ui::board::{self, BoardAnimData, BoardEvent, BoardState};
 use crate::ui::eval_bar;
 use crate::ui::fonts;
 use crate::ui::pieces::PieceTextures;
@@ -1992,6 +1992,7 @@ pub struct App {
     touch_mode: TouchMode,
     touch_detected: bool,
     board_draw_mode: Option<crate::domain::ShapeColor>,
+    board_anim: Option<BoardAnimData>,
     show_pgn_tags: bool,
     show_annotations: bool,
     engine_bar: bool,
@@ -2460,6 +2461,7 @@ impl App {
             .collect();
 
         let mut app = Self {
+            board_anim: None,
             library: None,
             session: crate::session::GameList::empty(),
             current: None,
@@ -3146,6 +3148,10 @@ impl App {
     }
 
     fn goto(&mut self, node: usize) {
+        self.goto_ex(node, true);
+    }
+
+    fn goto_ex(&mut self, node: usize, animate: bool) {
         self.branch_choice = None;
         if let Some(game) = &self.current
             && let Some(parent) = game.nodes.get(node).and_then(|node| node.parent)
@@ -3162,10 +3168,22 @@ impl App {
             self.annotation_editor = None;
             self.annotation_focus = false;
         }
+        let mut old_pieces = HashMap::<Square, Piece>::new();
+        if changed && animate {
+            if let Some(cp) = self.current_position() {
+                for index in 0..64 {
+                    let sq = Square::new(index);
+                    if let Some(p) = cp.board().piece_at(sq) {
+                        old_pieces.insert(sq,p);
+                    }
+                }
+            }
+        }
         self.node = node;
         self.selected = None;
         self.targets.clear();
         self.drag_from = None;
+        self.board_anim = None;
         if changed {
             self.clear_engine_results();
         }
@@ -3173,6 +3191,28 @@ impl App {
         // (or the opponent's in the swapped view).
         if let Some(locked) = self.prep_locked_orientation() {
             self.orientation = locked;
+        }
+
+        if changed && animate {
+            if let Some(cp) = self.current_position() {
+                let mut anim_pairs = HashMap::<Square, Square>::new();
+                for (sqold, p) in &old_pieces {
+                    if cp.board().piece_at(*sqold).is_none() {
+                        for indexnew in 0..64 {
+                            let sq = Square::new(indexnew);
+                            if sq == *sqold || anim_pairs.contains_key(&sq)  {
+                                continue;
+                            }
+                            let np = cp.board().piece_at(sq);
+                            if np == Some(*p) && np != old_pieces.get(&sq).copied() {
+                                anim_pairs.insert(sq, *sqold);
+                                break;
+                            }
+                        }
+                    }
+                }
+                self.board_anim = Some(BoardAnimData::from_animated_pairs(anim_pairs));
+            }
         }
     }
 
@@ -16001,7 +16041,7 @@ impl App {
         if self.recent_preview.is_none() {
             self.dirty = true;
         }
-        self.goto(id);
+        self.goto_ex(id, false);
         true
     }
 
@@ -25314,7 +25354,7 @@ impl App {
         if self.recent_preview.is_none() {
             self.dirty = true;
         }
-        self.goto(id);
+        self.goto_ex(id, false);
     }
 
     fn play_uci(&mut self, uci: &str) {
@@ -33101,6 +33141,7 @@ impl eframe::App for App {
     }
 
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+        let dt = ui.input(|i| i.stable_dt);
         let ctx = ui.ctx().clone();
         self.poll_open();
         self.poll_file_dialog();
@@ -33140,35 +33181,46 @@ impl eframe::App for App {
         self.poll_review();
         self.maybe_engine_analysis();
         self.maybe_request_bar_cloud();
-        if self.open_rx.is_some()
-            || self.file_dialog_rx.is_some()
-            || self.merge_load_rx.is_some()
-            || self.index_rx.is_some()
-            || self.tree_index_rx.is_some()
-            || self.players_rx.is_some()
-            || self.book_rx.is_some()
-            || self.player_book_rx.is_some()
-            || self.prep_load_rx.is_some()
-            || self.reference_rx.is_some()
-            || self.ref_position_games_rx.is_some()
-            || self.online_rx.is_some()
-            || self.online_game_rx.is_some()
-            || self.online_ref_rx.is_some()
-            || self.cloud_rx.is_some()
-            || self.bar_cloud_rx.is_some()
-            || self.explorer_rx.is_some()
-            || self.chessabc_pos_rx.is_some()
-            || self.review_book_rx.is_some()
-            || self.my_games_sync_rx.is_some()
-            || self.twic_index_rx.is_some()
-            || self.twic_download_rx.is_some()
-            || self.league_dir_rx.is_some()
-            || self.league_detail_rx.is_some()
-            || self.league_download_rx.is_some()
-            || self.account_finder_rx.is_some()
-            || self.pos_search_rx.is_some()
-        {
-            ctx.request_repaint_after(Duration::from_millis(150));
+        let mut redraw_req = false;
+        if let Some(board_anim) = &mut self.board_anim {
+            if board_anim.handle_dt(dt) {
+                self.board_anim = None;
+            } else {
+                ctx.request_repaint_after(Duration::from_millis(10));
+                redraw_req = true;
+            }
+        }
+        if !redraw_req {
+            if self.open_rx.is_some()
+                || self.file_dialog_rx.is_some()
+                || self.merge_load_rx.is_some()
+                || self.index_rx.is_some()
+                || self.tree_index_rx.is_some()
+                || self.players_rx.is_some()
+                || self.book_rx.is_some()
+                || self.player_book_rx.is_some()
+                || self.prep_load_rx.is_some()
+                || self.reference_rx.is_some()
+                || self.ref_position_games_rx.is_some()
+                || self.online_rx.is_some()
+                || self.online_game_rx.is_some()
+                || self.online_ref_rx.is_some()
+                || self.cloud_rx.is_some()
+                || self.bar_cloud_rx.is_some()
+                || self.explorer_rx.is_some()
+                || self.chessabc_pos_rx.is_some()
+                || self.review_book_rx.is_some()
+                || self.my_games_sync_rx.is_some()
+                || self.twic_index_rx.is_some()
+                || self.twic_download_rx.is_some()
+                || self.league_dir_rx.is_some()
+                || self.league_detail_rx.is_some()
+                || self.league_download_rx.is_some()
+                || self.account_finder_rx.is_some()
+                || self.pos_search_rx.is_some()
+            {
+                ctx.request_repaint_after(Duration::from_millis(150));
+            }
         }
         if self.engine_searching
             || self
@@ -33353,6 +33405,21 @@ impl eframe::App for App {
                         None,
                     );
                     ui.add_space(2.0);
+                    let create_bord_state = || {
+            BoardState {
+                                        pos: &meta.pos,
+                                        orientation: display_orientation,
+                                        last_move: meta.last_move,
+                                        selected: self.selected,
+                                        targets: &self.targets,
+                                        shapes: &meta.shapes,
+                                        drag_from: self.drag_from,
+                                        shape_drag_from: self.shape_drag_from,
+                                        draw_mode: self.board_draw_mode,
+                                        touch_swipe,
+                                        animation: &self.board_anim,
+                                    }
+        };
                     let event = if self.engine_bar {
                         let mut event = None;
                         let mut bar_response = None;
@@ -33366,18 +33433,7 @@ impl eframe::App for App {
                                 event = board::draw(
                                     ui,
                                     &self.textures,
-                                    BoardState {
-                                        pos: &meta.pos,
-                                        orientation: display_orientation,
-                                        last_move: meta.last_move,
-                                        selected: self.selected,
-                                        targets: &self.targets,
-                                        shapes: &meta.shapes,
-                                        drag_from: self.drag_from,
-                                        shape_drag_from: self.shape_drag_from,
-                                        draw_mode: self.board_draw_mode,
-                                        touch_swipe,
-                                    },
+                                    create_bord_state(),
                                     side,
                                 );
                             },
@@ -33396,18 +33452,7 @@ impl eframe::App for App {
                         board::draw(
                             ui,
                             &self.textures,
-                            BoardState {
-                                pos: &meta.pos,
-                                orientation: display_orientation,
-                                last_move: meta.last_move,
-                                selected: self.selected,
-                                targets: &self.targets,
-                                shapes: &meta.shapes,
-                                drag_from: self.drag_from,
-                                shape_drag_from: self.shape_drag_from,
-                                draw_mode: self.board_draw_mode,
-                                touch_swipe,
-                            },
+                            create_bord_state(),
                             side,
                         )
                     };
@@ -40980,6 +41025,7 @@ mod tests {
         let mut games = domain::parse_pgn(crate::test_data::OPERA_PGN.as_bytes()).unwrap();
         let ctx = egui::Context::default();
         App {
+            board_anim: None,
             library: None,
             session: crate::session::GameList::empty(),
             current: Some(games.remove(0)),

@@ -62,6 +62,7 @@ fn run_frame(
             ui,
             textures,
             BoardState {
+                animation: &None,
                 pos,
                 orientation: Color::White,
                 last_move: None,
