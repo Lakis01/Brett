@@ -5,8 +5,24 @@
 //! original chess concepts and terminology so they illustrate classic plans
 //! without copying external books or game scores.
 
-use crate::chess::{Color, Piece, Role, Square};
-use crate::search::{StructureFamily, StructurePreset};
+use crate::chess::{Color, Fen, Piece, Position as _, Role, San, Square};
+use crate::search::{AtomPredicate, StructureFamily, StructurePreset};
+
+/// Unique identifier for a [`StructurePlan`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlanId {
+    pub family: StructureFamily,
+    pub side: Color,
+    pub plan_number: u8,
+}
+
+/// Chronological search specification compiled from a [`StructurePlan`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlanSearchSpec {
+    pub base_structure: Option<StructurePreset>,
+    pub base_flipped: bool,
+    pub stages: Vec<Vec<AtomPredicate>>,
+}
 
 /// Animated multi-step piece trajectory rendered on the illustrative preview board.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -33,6 +49,17 @@ pub struct StructurePlan {
     pub animated_moves: &'static [&'static str],
 }
 
+impl StructurePlan {
+    #[must_use]
+    pub const fn id(&self) -> PlanId {
+        PlanId {
+            family: self.family,
+            side: self.side,
+            plan_number: self.plan_number,
+        }
+    }
+}
+
 const WK: Piece = Piece::new(Color::White, Role::King);
 const WQ: Piece = Piece::new(Color::White, Role::Queen);
 const WR: Piece = Piece::new(Color::White, Role::Rook);
@@ -52,16 +79,20 @@ static PLANS: &[StructurePlan] = &[
         family: StructureFamily::Stonewall,
         side: Color::White,
         plan_number: 1,
-        title: "Bd2-e1-h4 bishop transfer vs Nf6",
-        summary: "Transfer the dark-squared bishop via d2 and e1 to h4 to pin or pressure the f6-knight and kingside.",
-        setup_fen: "r2q1rk1/pb2bppp/1pn1pn2/2pp4/3P1P2/2PBPN2/PP1BQ1PP/RN3RK1 w - - 2 10",
+        title: "Bc1-d2-e1-h4 bishop transfer",
+        summary: "Transfer the dark-squared bishop from its original square c1 via d2 and e1 to h4 to pressure the kingside.",
+        setup_fen: "r2q1rk1/pb2bppp/1pn1pn2/2pp4/3P1P2/2PBPN2/PP2Q1PP/RNB2RK1 w - - 2 10",
         search_preset: Some(StructurePreset::StonewallBd2e1h4),
         green_squares: &[Square::H4],
-        gold_squares: &[Square::D2, Square::E1, Square::F6],
-        arrows: &[(Square::D2, Square::E1), (Square::E1, Square::H4)],
+        gold_squares: &[Square::C1, Square::D2, Square::E1],
+        arrows: &[
+            (Square::C1, Square::D2),
+            (Square::D2, Square::E1),
+            (Square::E1, Square::H4),
+        ],
         animated_maneuver: Some(AnimatedManeuver {
             piece: WB,
-            waypoints: &[Square::D2, Square::E1, Square::H4],
+            waypoints: &[Square::C1, Square::D2, Square::E1, Square::H4],
         }),
         animated_moves: &[],
     },
@@ -116,7 +147,7 @@ static PLANS: &[StructurePlan] = &[
         plan_number: 2,
         title: "Central ...Ne4 outpost & ...c5 break",
         summary: "Challenge the center with ...c5 and anchor a knight on the strong e4 outpost.",
-        setup_fen: "r1bq1rk1/pp2b1pp/2n1pn2/2pp1p2/2PP4/1P2PNP1/PB3PBP/RN1Q1RK1 b - - 0 9",
+        setup_fen: "r2q1rk1/pb1nb1pp/1p2pn2/2pp1p2/2PP4/1P2PNP1/PB3PBP/RN1Q1RK1 b - - 0 9",
         search_preset: Some(StructurePreset::StonewallC5Break),
         green_squares: &[Square::E4, Square::C5],
         gold_squares: &[Square::D5, Square::F5],
@@ -245,7 +276,7 @@ static PLANS: &[StructurePlan] = &[
         title: "Restrain ...b5 and occupy c5 outpost",
         summary: "After a3-a4/b4-b5 queenside probes or ...b5, route a knight to the c5 hole.",
         setup_fen: "r2qrnk1/p3bppp/2pb1n2/1p1p2B1/PP1P4/2NBPN2/2Q2PPP/1R3RK1 w - - 0 15",
-        search_preset: Some(StructurePreset::CarlsbadMinorityAttack),
+        search_preset: None,
         green_squares: &[Square::C5],
         gold_squares: &[Square::B4, Square::C6],
         arrows: &[
@@ -255,6 +286,20 @@ static PLANS: &[StructurePlan] = &[
         ],
         animated_maneuver: None,
         animated_moves: &["axb5", "cxb5", "Ne2"],
+    },
+    StructurePlan {
+        family: StructureFamily::Carlsbad,
+        side: Color::White,
+        plan_number: 5,
+        title: "Kingside fianchetto (g3 + Bg2) central squeeze",
+        summary: "Fianchetto Bg2 to reinforce d5/b7 and combine central pressure with a4 queenside restraint.",
+        setup_fen: "r1bqrnk1/pp2bppp/2p2n2/3p4/3P4/2NBPNP1/PPQ2PBP/1R2R1K1 w - - 0 12",
+        search_preset: Some(StructurePreset::CarlsbadWhiteFianchetto),
+        green_squares: &[Square::G2, Square::D5],
+        gold_squares: &[Square::G3, Square::D4, Square::E3],
+        arrows: &[(Square::E3, Square::E4), (Square::G2, Square::D5)],
+        animated_maneuver: None,
+        animated_moves: &["e4"],
     },
     StructurePlan {
         family: StructureFamily::Carlsbad,
@@ -277,7 +322,7 @@ static PLANS: &[StructurePlan] = &[
         title: "Queenside ...b5 counter-clamp & ...Nc4",
         summary: "Meet White's b4 advance with ...a6 and ...b5 to deny b4-b5 and fix a c4 outpost.",
         setup_fen: "r1bqrnk1/5ppp/p1pb1n2/1p1p2B1/1P1P4/2NBPN2/P1Q2PPP/1R3RK1 b - - 1 13",
-        search_preset: Some(StructurePreset::CarlsbadMinorityAttack),
+        search_preset: None,
         green_squares: &[Square::B5, Square::C4],
         gold_squares: &[Square::C6, Square::D5],
         arrows: &[
@@ -301,6 +346,20 @@ static PLANS: &[StructurePlan] = &[
         arrows: &[(Square::F5, Square::D3)],
         animated_maneuver: None,
         animated_moves: &["Bxd3", "Qxd3"],
+    },
+    StructurePlan {
+        family: StructureFamily::Carlsbad,
+        side: Color::Black,
+        plan_number: 4,
+        title: "Black K-side fianchetto (...g6 + ...Bg7) pressure",
+        summary: "Deploy the bishop on g7 to target d4 and support ...Ne4 central counterplay.",
+        setup_fen: "r1bqr1k1/pp3pbp/2p2np1/3p4/3P4/2NBPN2/PPQ2PPP/1R2R1K1 b - - 0 12",
+        search_preset: Some(StructurePreset::CarlsbadBlackFianchetto),
+        green_squares: &[Square::G7, Square::E4],
+        gold_squares: &[Square::G6, Square::D5],
+        arrows: &[(Square::F6, Square::E4), (Square::G7, Square::D4)],
+        animated_maneuver: None,
+        animated_moves: &["Ne4"],
     },
     // --- IQP & PANOV (9 plans: 5 White, 4 Black) ---
     StructurePlan {
@@ -531,9 +590,9 @@ static PLANS: &[StructurePlan] = &[
         animated_maneuver: None,
         animated_moves: &["Na5"],
     },
-    // --- MARÓCZY & HEDGEHOG (7 plans: 3 White, 4 Black) ---
+    // --- MARÓCZY BIND (6 plans: 2 White, 4 Black) ---
     StructurePlan {
-        family: StructureFamily::MaroczyAndHedgehog,
+        family: StructureFamily::Maroczy,
         side: Color::White,
         plan_number: 1,
         title: "Maróczy clamp (no K-side fianchetto): restrain d5 & b5",
@@ -547,7 +606,7 @@ static PLANS: &[StructurePlan] = &[
         animated_moves: &["Nd5"],
     },
     StructurePlan {
-        family: StructureFamily::MaroczyAndHedgehog,
+        family: StructureFamily::Maroczy,
         side: Color::White,
         plan_number: 2,
         title: "Maróczy with K-side fianchetto (g3+Bg2): control d5",
@@ -561,21 +620,7 @@ static PLANS: &[StructurePlan] = &[
         animated_moves: &["Nd5"],
     },
     StructurePlan {
-        family: StructureFamily::MaroczyAndHedgehog,
-        side: Color::White,
-        plan_number: 3,
-        title: "Anti-Hedgehog space grab with f4-f5",
-        summary: "Against Black's passive Hedgehog shell, expand on the kingside with f4-f5 to probe e6.",
-        setup_fen: "r4rk1/1bqnbppp/pp1ppn2/8/2PQP3/1PN3P1/PB2NPBP/2RR2K1 w - - 4 13",
-        search_preset: Some(StructurePreset::MaroczyBindAny),
-        green_squares: &[Square::F5, Square::E6],
-        gold_squares: &[Square::C4, Square::E4],
-        arrows: &[(Square::F2, Square::F4), (Square::F4, Square::F5)],
-        animated_maneuver: None,
-        animated_moves: &["f4", "Rac8", "f5"],
-    },
-    StructurePlan {
-        family: StructureFamily::MaroczyAndHedgehog,
+        family: StructureFamily::Maroczy,
         side: Color::Black,
         plan_number: 1,
         title: "Maróczy queenside break with ...a6 & ...b5",
@@ -589,7 +634,7 @@ static PLANS: &[StructurePlan] = &[
         animated_moves: &["b5"],
     },
     StructurePlan {
-        family: StructureFamily::MaroczyAndHedgehog,
+        family: StructureFamily::Maroczy,
         side: Color::Black,
         plan_number: 2,
         title: "Maróczy kingside ...f5 strike",
@@ -603,12 +648,12 @@ static PLANS: &[StructurePlan] = &[
         animated_moves: &["f5"],
     },
     StructurePlan {
-        family: StructureFamily::MaroczyAndHedgehog,
+        family: StructureFamily::Maroczy,
         side: Color::Black,
         plan_number: 3,
         title: "Trade pieces to ease Maróczy cramp",
-        summary: "Swap dark-squared bishops or knights via ...Nxd4 / ...Bxd4 so White's space advantage shrinks.",
-        setup_fen: "r2q1rk1/1p2ppbp/p1np1np1/8/2P1P3/2N1BP2/PP1QB1PP/R4RK1 b - - 2 12",
+        summary: "Swap knights or dark-squared bishops via ...Nxd4 / ...Bxd4 so White's space advantage shrinks.",
+        setup_fen: "r2q1rk1/1p1bppbp/p1np1np1/8/2PNP3/2N1BP2/PP1QB1PP/R4RK1 b - - 2 12",
         search_preset: Some(StructurePreset::MaroczyBindNoFianchetto),
         green_squares: &[Square::D4],
         gold_squares: &[Square::C6, Square::G7],
@@ -617,18 +662,79 @@ static PLANS: &[StructurePlan] = &[
         animated_moves: &["Nxd4", "Bxd4"],
     },
     StructurePlan {
-        family: StructureFamily::MaroczyAndHedgehog,
+        family: StructureFamily::Maroczy,
         side: Color::Black,
         plan_number: 4,
-        title: "Hedgehog counterbreaks (...b5 or ...d5)",
-        summary: "Coil minor pieces behind a6-b6-d6-e6 and strike dynamically with ...b5 or ...d5.",
+        title: "Queenside regrouping (...Qa5 + ...Rfc8)",
+        summary: "Post the queen on a5 and swing the f8-rook to c8 to pressure c4 and prepare ...b5 or ...Ne5.",
+        setup_fen: "r2q1rk1/1p1bppbp/p2p1np1/8/2PBP3/2N2P2/PP1QB1PP/R4RK1 b - - 0 13",
+        search_preset: Some(StructurePreset::MaroczyBindNoFianchetto),
+        green_squares: &[Square::A5, Square::C8, Square::C4],
+        gold_squares: &[Square::B7, Square::D6],
+        arrows: &[
+            (Square::D8, Square::A5),
+            (Square::F8, Square::C8),
+            (Square::C8, Square::C4),
+        ],
+        animated_maneuver: None,
+        animated_moves: &["Qa5", "Rfd1", "Rfc8"],
+    },
+    // --- HEDGEHOG (4 plans: 2 White, 2 Black) ---
+    StructurePlan {
+        family: StructureFamily::Hedgehog,
+        side: Color::White,
+        plan_number: 1,
+        title: "Anti-Hedgehog space grab with f4-f5",
+        summary: "Against Black's passive Hedgehog shell, expand on the kingside with f4-f5 to probe e6.",
+        setup_fen: "r4rk1/1bqnbppp/pp1ppn2/8/2PQP3/1PN3P1/PB2NPBP/2RR2K1 w - - 4 13",
+        search_preset: Some(StructurePreset::HedgehogVsBg2),
+        green_squares: &[Square::F5, Square::E6],
+        gold_squares: &[Square::C4, Square::E4],
+        arrows: &[(Square::F2, Square::F4), (Square::F4, Square::F5)],
+        animated_maneuver: None,
+        animated_moves: &["f4", "Rac8", "f5"],
+    },
+    StructurePlan {
+        family: StructureFamily::Hedgehog,
+        side: Color::White,
+        plan_number: 2,
+        title: "Prophylactic b3 + Rac1 & pressure on b6/d6",
+        summary: "Guard c4 firmly, dominate the open c- and d-files, and tie Black down before ...b5 or ...d5.",
+        setup_fen: "r2q1rk1/1b1nbppp/pp1ppn2/8/2P1P3/1PN1BN2/PB1Q1PPP/R3R1K1 w - - 0 13",
+        search_preset: Some(StructurePreset::Hedgehog),
+        green_squares: &[Square::C1, Square::D5],
+        gold_squares: &[Square::C4, Square::E4],
+        arrows: &[(Square::A1, Square::C1), (Square::C3, Square::D5)],
+        animated_maneuver: None,
+        animated_moves: &["Rac1"],
+    },
+    StructurePlan {
+        family: StructureFamily::Hedgehog,
+        side: Color::Black,
+        plan_number: 1,
+        title: "Hedgehog queenside break with ...b5",
+        summary: "Coil minor pieces behind a6-b6-d6-e6 and strike dynamically with ...b6-b5.",
         setup_fen: "r4rk1/1bqnbppp/pp1ppn2/8/2PQP3/1PN2NP1/PB3PBP/2RR2K1 b - - 6 13",
         search_preset: Some(StructurePreset::Hedgehog),
-        green_squares: &[Square::B5, Square::D5],
+        green_squares: &[Square::B5, Square::C4],
         gold_squares: &[Square::A6, Square::B6, Square::D6, Square::E6],
-        arrows: &[(Square::B6, Square::B5), (Square::D6, Square::D5)],
+        arrows: &[(Square::B6, Square::B5)],
         animated_maneuver: None,
         animated_moves: &["b5"],
+    },
+    StructurePlan {
+        family: StructureFamily::Hedgehog,
+        side: Color::Black,
+        plan_number: 2,
+        title: "Hedgehog central liberation with ...d5",
+        summary: "Time the ...d6-d5 break when White's minor pieces overextend to blow open the center.",
+        setup_fen: "r4rk1/1bqnbppp/pp1ppn2/8/2PQP3/1PN3P1/PB2NPBP/2RR2K1 b - - 4 13",
+        search_preset: Some(StructurePreset::HedgehogVsBg2),
+        green_squares: &[Square::D5, Square::E4],
+        gold_squares: &[Square::D6, Square::E6, Square::F6],
+        arrows: &[(Square::D6, Square::D5)],
+        animated_maneuver: None,
+        animated_moves: &["d5"],
     },
     // --- SICILIAN STRUCTURES (8 plans: 4 White, 4 Black) ---
     StructurePlan {
@@ -652,7 +758,7 @@ static PLANS: &[StructurePlan] = &[
         title: "Najdorf vs ...e5: f4-f5 & d5 pressure",
         summary: "Exploit the backward d5 square and kingside f4-f5 lever before Black stabilizes with ...d5.",
         setup_fen: "2rq1rk1/1b1nbppp/p2p1n2/1p2p3/4PP2/PNN1BB2/1PP3PP/R2Q1RK1 w - - 3 13",
-        search_preset: Some(StructurePreset::NajdorfTypeIII),
+        search_preset: Some(StructurePreset::NajdorfE5VsF4),
         green_squares: &[Square::F5, Square::D5],
         gold_squares: &[Square::F4, Square::E5],
         arrows: &[(Square::F4, Square::F5), (Square::C3, Square::D5)],
@@ -708,7 +814,7 @@ static PLANS: &[StructurePlan] = &[
         title: "Najdorf queenside ...b5 + ...Bb7 counterplay",
         summary: "Press the c-file and e4 pawn with ...b5 and ...Bb7 in queenside-expanded Najdorf setups.",
         setup_fen: "r1bqkb1r/3n1pp1/p2ppn1p/1p6/3NP1P1/2N1BP2/PPPQ3P/2KR1B1R b kq - 1 10",
-        search_preset: Some(StructurePreset::NajdorfTypeII),
+        search_preset: Some(StructurePreset::NajdorfQueensideB5),
         green_squares: &[Square::B7, Square::E4],
         gold_squares: &[Square::B5, Square::A6],
         arrows: &[(Square::C8, Square::B7), (Square::B7, Square::E4)],
@@ -743,9 +849,66 @@ static PLANS: &[StructurePlan] = &[
         animated_maneuver: None,
         animated_moves: &["Nc4", "Bxc4", "Rxc4"],
     },
-    // --- SLAV, TRIANGLE & GRÜNFELD (8 plans: 4 White, 4 Black) ---
+    // --- SLAV & CARO-KANN (4 plans: 2 White, 2 Black) ---
     StructurePlan {
-        family: StructureFamily::SlavAndGrunfeld,
+        family: StructureFamily::Slav,
+        side: Color::White,
+        plan_number: 1,
+        title: "Caro-Kann Formation: Ne5 outpost & kingside play",
+        summary: "Control e5 with the half-open e-file, develop actively with Bd3/Bf4, and build kingside pressure.",
+        setup_fen: "rnbqkbnr/pp2pppp/2p5/8/3P4/2P2N2/PP3PPP/RNBQKB1R w KQkq - 0 6",
+        search_preset: Some(StructurePreset::SlavCaroKann),
+        green_squares: &[Square::E5, Square::D3],
+        gold_squares: &[Square::D4, Square::C3],
+        arrows: &[(Square::F1, Square::D3), (Square::F3, Square::E5)],
+        animated_maneuver: None,
+        animated_moves: &["Bd3"],
+    },
+    StructurePlan {
+        family: StructureFamily::Slav,
+        side: Color::White,
+        plan_number: 2,
+        title: "Open Slav: central e3-e4 push",
+        summary: "When Black captures ...dxc4, seize central space with e3-e4 and strong piece coordination.",
+        setup_fen: "rnbqk2r/pp2bppp/2p1pn2/8/3P4/2N1PN2/PP3PPP/R1BQKB1R w KQkq - 0 8",
+        search_preset: Some(StructurePreset::SlavMainline),
+        green_squares: &[Square::E4],
+        gold_squares: &[Square::D4, Square::E3],
+        arrows: &[(Square::E3, Square::E4)],
+        animated_maneuver: None,
+        animated_moves: &["e4"],
+    },
+    StructurePlan {
+        family: StructureFamily::Slav,
+        side: Color::Black,
+        plan_number: 1,
+        title: "Caro-Kann Formation: develop LSB & prepare ...c5",
+        summary: "Clarify the c8-bishop early via ...Bf5 or ...Bg4 before challenging d4 with ...c5 or ...e6.",
+        setup_fen: "rnbqkbnr/pp2pppp/2p5/8/3P4/2PB1N2/PP3PPP/RNBQK2R b KQkq - 1 6",
+        search_preset: Some(StructurePreset::SlavCaroKann),
+        green_squares: &[Square::G4, Square::C5],
+        gold_squares: &[Square::C6, Square::D4],
+        arrows: &[(Square::C8, Square::G4), (Square::C6, Square::C5)],
+        animated_maneuver: None,
+        animated_moves: &["Bg4"],
+    },
+    StructurePlan {
+        family: StructureFamily::Slav,
+        side: Color::Black,
+        plan_number: 2,
+        title: "Open Slav: ...c6-c5 central counterstrike",
+        summary: "Challenge White's d4+e4 pawn center immediately with ...c6-c5 before White consolidates.",
+        setup_fen: "r1bq1rk1/pp1nbppp/2p1pn2/8/3PP3/2N2N2/PP3PPP/R1BQKB1R b KQkq - 0 8",
+        search_preset: Some(StructurePreset::SlavMainline),
+        green_squares: &[Square::C5, Square::D4],
+        gold_squares: &[Square::C6, Square::E6],
+        arrows: &[(Square::C6, Square::C5)],
+        animated_maneuver: None,
+        animated_moves: &["c5"],
+    },
+    // --- SEMI-SLAV / TRIANGLE (4 plans: 2 White, 2 Black) ---
+    StructurePlan {
+        family: StructureFamily::SemiSlav,
         side: Color::White,
         plan_number: 1,
         title: "Central e3-e4 break against the Semi-Slav triangle",
@@ -759,49 +922,21 @@ static PLANS: &[StructurePlan] = &[
         animated_moves: &["e4"],
     },
     StructurePlan {
-        family: StructureFamily::SlavAndGrunfeld,
+        family: StructureFamily::SemiSlav,
         side: Color::White,
         plan_number: 2,
-        title: "Slav / Caro-Kann space gain & minority clamp",
-        summary: "Develop actively around d4+c4 while restraining ...c5 and probing the queenside.",
-        setup_fen: "r2q1rk1/pp1nbppp/2p1bn2/3p4/2PP4/2N1PN2/PP2BPPP/R1BQ1RK1 w - - 0 9",
-        search_preset: Some(StructurePreset::SlavCaroKann),
-        green_squares: &[Square::D5, Square::C5],
-        gold_squares: &[Square::C4, Square::D4],
-        arrows: &[(Square::C4, Square::D5), (Square::D4, Square::C5)],
-        animated_maneuver: None,
-        animated_moves: &["cxd5", "cxd5"],
-    },
-    StructurePlan {
-        family: StructureFamily::SlavAndGrunfeld,
-        side: Color::White,
-        plan_number: 3,
-        title: "Grünfeld d4-d5 passed-pawn advance",
-        summary: "Use the broad d4+e4 pawn center to push d4-d5, seizing space and driving back Black's knight.",
-        setup_fen: "r1bq1rk1/pp2ppbp/2n3p1/8/3PP3/2P1BN2/P3BPPP/R2Q1RK1 w - - 4 10",
-        search_preset: Some(StructurePreset::GrunfeldCenter),
-        green_squares: &[Square::D5],
+        title: "Meran e4-e5 central advance & kingside initiative",
+        summary: "Push e4-e5 against Black's ...a6/...b5 expansion to open diagonals toward the kingside.",
+        setup_fen: "r1b2rk1/2qnbppp/p1p1pn2/1p6/3PP3/2NB1N2/PP3PPP/R1BQR1K1 w - - 0 11",
+        search_preset: Some(StructurePreset::SemiSlavMeran),
+        green_squares: &[Square::E5, Square::H7],
         gold_squares: &[Square::D4, Square::E4],
-        arrows: &[(Square::D4, Square::D5)],
+        arrows: &[(Square::E4, Square::E5)],
         animated_maneuver: None,
-        animated_moves: &["d5"],
+        animated_moves: &["e5"],
     },
     StructurePlan {
-        family: StructureFamily::SlavAndGrunfeld,
-        side: Color::White,
-        plan_number: 4,
-        title: "Botvinnik System: Ne2 + kingside f4 break",
-        summary: "Guard d4 with c4-d3-e4 while developing Nc3/Ne2/Bg2 and preparing a timed f2-f4 storm.",
-        setup_fen: "r2q1rk1/ppp2pbp/2npbnp1/4p3/2P1P3/2NP2P1/PP2NPBP/R1BQ1RK1 w - - 5 9",
-        search_preset: Some(StructurePreset::Botvinnik),
-        green_squares: &[Square::F4, Square::D5],
-        gold_squares: &[Square::C4, Square::D3, Square::E4, Square::E2],
-        arrows: &[(Square::F2, Square::F4), (Square::F4, Square::F5)],
-        animated_maneuver: None,
-        animated_moves: &["f4"],
-    },
-    StructurePlan {
-        family: StructureFamily::SlavAndGrunfeld,
+        family: StructureFamily::SemiSlav,
         side: Color::Black,
         plan_number: 1,
         title: "Semi-Slav ...dxc4 and ...b5/...c5 liberation",
@@ -815,23 +950,52 @@ static PLANS: &[StructurePlan] = &[
         animated_moves: &["dxc4", "Bxc4", "b5"],
     },
     StructurePlan {
-        family: StructureFamily::SlavAndGrunfeld,
+        family: StructureFamily::SemiSlav,
         side: Color::Black,
         plan_number: 2,
-        title: "Slav / Caro-Kann ...c5 counterstrike",
-        summary: "After solving the light-squared bishop via ...Bf5, strike the center with ...c6-c5.",
-        setup_fen: "r2q1rk1/pp1nbppp/2p2n2/3p1b2/2PP4/2N1PN2/PP2BPPP/R1BQ1RK1 b - - 4 9",
-        search_preset: Some(StructurePreset::SlavCaroKann),
-        green_squares: &[Square::C5, Square::D4],
-        gold_squares: &[Square::C6, Square::D5],
-        arrows: &[(Square::C6, Square::C5)],
+        title: "Meran ...Bb7 fianchetto & ...c5 counterplay",
+        summary: "Deploy the c8-bishop to b7 along the long diagonal and follow up with ...c5 against d4.",
+        setup_fen: "r1bq1rk1/2pnbppp/p3pn2/1p6/3PP3/2NB1N2/PP2QPPP/R1B2RK1 b - - 0 10",
+        search_preset: Some(StructurePreset::SemiSlavMeran),
+        green_squares: &[Square::B7, Square::E4],
+        gold_squares: &[Square::A6, Square::B5, Square::E6],
+        arrows: &[(Square::C8, Square::B7), (Square::B7, Square::E4)],
         animated_maneuver: None,
-        animated_moves: &["dxc4", "Bxc4", "Nb6"],
+        animated_moves: &["Bb7"],
+    },
+    // --- GRÜNFELD (5 plans: 2 White, 3 Black) ---
+    StructurePlan {
+        family: StructureFamily::Grunfeld,
+        side: Color::White,
+        plan_number: 1,
+        title: "Grünfeld d4-d5 passed-pawn advance",
+        summary: "Use the broad d4+e4 pawn center to push d4-d5, seizing space and driving back Black's knight.",
+        setup_fen: "r1bq1rk1/pp2ppbp/2n3p1/8/3PP3/2P1BN2/P3BPPP/R2Q1RK1 w - - 4 10",
+        search_preset: Some(StructurePreset::GrunfeldCenter),
+        green_squares: &[Square::D5],
+        gold_squares: &[Square::D4, Square::E4],
+        arrows: &[(Square::D4, Square::D5)],
+        animated_maneuver: None,
+        animated_moves: &["d5"],
     },
     StructurePlan {
-        family: StructureFamily::SlavAndGrunfeld,
+        family: StructureFamily::Grunfeld,
+        side: Color::White,
+        plan_number: 2,
+        title: "Consolidate passed d5-pawn & open c-file",
+        summary: "Back up the advanced d5-pawn with Rc1 and Qd2 to restrict Black's queenside counterplay.",
+        setup_fen: "r1bq1rk1/pp2ppbp/2n3p1/3P4/4P3/4BN2/PP2BPPP/R2Q1RK1 w - - 0 12",
+        search_preset: Some(StructurePreset::GrunfeldD5PassedPawn),
+        green_squares: &[Square::C1, Square::D5],
+        gold_squares: &[Square::D5, Square::E4],
+        arrows: &[(Square::A1, Square::C1)],
+        animated_maneuver: None,
+        animated_moves: &["Rc1"],
+    },
+    StructurePlan {
+        family: StructureFamily::Grunfeld,
         side: Color::Black,
-        plan_number: 3,
+        plan_number: 1,
         title: "Grünfeld pressure on d4 with ...c5 and ...Bg7",
         summary: "Target the broad e4-d4 pawn center along the dark diagonal while striking d4 with ...cxd4.",
         setup_fen: "r1bq1rk1/pp2ppbp/2n3p1/2p5/3PP3/2P1BN2/P3BPPP/R2Q1RK1 b - - 5 10",
@@ -843,9 +1007,66 @@ static PLANS: &[StructurePlan] = &[
         animated_moves: &["cxd4", "cxd4"],
     },
     StructurePlan {
-        family: StructureFamily::SlavAndGrunfeld,
+        family: StructureFamily::Grunfeld,
         side: Color::Black,
-        plan_number: 4,
+        plan_number: 2,
+        title: "Undermine passed d5-pawn with ...e6",
+        summary: "Attack the head of White's d5-e4 center with ...e7-e6 to open the e-file and c5 outpost.",
+        setup_fen: "r1bq1rk1/pp1nppbp/2n3p1/3P4/4P3/2N1BN2/PP2BPPP/R2Q1RK1 b - - 0 12",
+        search_preset: Some(StructurePreset::GrunfeldD5PassedPawn),
+        green_squares: &[Square::E6, Square::D5],
+        gold_squares: &[Square::G7, Square::C5],
+        arrows: &[(Square::E7, Square::E6)],
+        animated_maneuver: None,
+        animated_moves: &["e6"],
+    },
+    StructurePlan {
+        family: StructureFamily::Grunfeld,
+        side: Color::Black,
+        plan_number: 3,
+        title: "Push 2-vs-1 queenside majority (...b5 & ...a5)",
+        summary: "Trade toward the endgame and march the healthy queenside majority to create a passed b/a pawn.",
+        setup_fen: "2rq1rk1/pp2ppbp/2n1b1p1/8/4P3/P3BN2/4BPPP/2RQR1K1 b - - 0 15",
+        search_preset: Some(StructurePreset::GrunfeldQueensideMajority),
+        green_squares: &[Square::B5, Square::A5],
+        gold_squares: &[Square::A7, Square::B7],
+        arrows: &[(Square::B7, Square::B5)],
+        animated_maneuver: None,
+        animated_moves: &["b5"],
+    },
+    // --- BOTVINNIK (4 plans: 2 White, 2 Black) ---
+    StructurePlan {
+        family: StructureFamily::Botvinnik,
+        side: Color::White,
+        plan_number: 1,
+        title: "Botvinnik System: Ne2 + kingside f4 break",
+        summary: "Guard d4 with c4-d3-e4 while developing Nc3/Ne2/Bg2 and preparing a timed f2-f4 storm.",
+        setup_fen: "r2q1rk1/ppp2pbp/2npbnp1/4p3/2P1P3/2NP2P1/PP2NPBP/R1BQ1RK1 w - - 5 9",
+        search_preset: Some(StructurePreset::Botvinnik),
+        green_squares: &[Square::F4, Square::D5],
+        gold_squares: &[Square::C4, Square::D3, Square::E4, Square::E2],
+        arrows: &[(Square::F2, Square::F4), (Square::F4, Square::F5)],
+        animated_maneuver: None,
+        animated_moves: &["f4"],
+    },
+    StructurePlan {
+        family: StructureFamily::Botvinnik,
+        side: Color::White,
+        plan_number: 2,
+        title: "Flexible Botvinnik triangle (Ne2 before f4)",
+        summary: "Complete development with Nge2 so Black's ...Bg4/...Nd4 plans lack targets before f2-f4.",
+        setup_fen: "r1bq1rk1/ppp2pbp/2np1np1/4p3/2P1P3/2NP2P1/PP3PBP/R1BQK1NR w KQ - 0 9",
+        search_preset: Some(StructurePreset::BotvinnikTriangle),
+        green_squares: &[Square::E2, Square::F4],
+        gold_squares: &[Square::C4, Square::D3, Square::E4],
+        arrows: &[(Square::G1, Square::E2), (Square::F2, Square::F4)],
+        animated_maneuver: None,
+        animated_moves: &["Nge2"],
+    },
+    StructurePlan {
+        family: StructureFamily::Botvinnik,
+        side: Color::Black,
+        plan_number: 1,
         title: "Anti-Botvinnik ...Nd4 outpost & ...c6-b5 play",
         summary: "Exploit the d4 hole left by White's c4-d3-e4 structure with ...Nd4 or queenside ...b5 expansion.",
         setup_fen: "r2q1rk1/pp1bnpbp/2np2p1/4p3/2P1P3/2NP2P1/PP2NPBP/R1BQ1RK1 b - - 2 9",
@@ -856,9 +1077,23 @@ static PLANS: &[StructurePlan] = &[
         animated_maneuver: None,
         animated_moves: &["Nd4"],
     },
-    // --- CLOSED CHAINS, FRENCH & KID (8 plans: 4 White, 4 Black) ---
     StructurePlan {
-        family: StructureFamily::ClosedChains,
+        family: StructureFamily::Botvinnik,
+        side: Color::Black,
+        plan_number: 2,
+        title: "Reverse kingside counterattack with ...f5",
+        summary: "Reroute the knight via e7 and challenge White's e4+f2 wing with ...f7-f5.",
+        setup_fen: "r1bq1rk1/ppp1npbp/2np2p1/4p3/2P1P3/2NP2P1/PP2NPBP/R1BQ1RK1 b - - 0 9",
+        search_preset: Some(StructurePreset::BotvinnikTriangle),
+        green_squares: &[Square::F5, Square::E4],
+        gold_squares: &[Square::E5, Square::G7],
+        arrows: &[(Square::F7, Square::F5)],
+        animated_maneuver: None,
+        animated_moves: &["f5"],
+    },
+    // --- FRENCH (6 plans: 3 White, 3 Black) ---
+    StructurePlan {
+        family: StructureFamily::French,
         side: Color::White,
         plan_number: 1,
         title: "French Chain: kingside space & f4-f5 storm",
@@ -872,49 +1107,35 @@ static PLANS: &[StructurePlan] = &[
         animated_moves: &["f5"],
     },
     StructurePlan {
-        family: StructureFamily::ClosedChains,
+        family: StructureFamily::French,
         side: Color::White,
         plan_number: 2,
-        title: "King's Indian Chain: queenside c4-c5 storm",
-        summary: "Expand where White's pawns point with c4-c5 to open the c-file and attack d6.",
-        setup_fen: "r1bq1rk1/ppp1n1bp/3p1np1/3Pp3/2P1Pp2/2NN1P2/PP1BB1PP/R2Q1RK1 w - - 0 13",
-        search_preset: Some(StructurePreset::KingsIndianChain),
-        green_squares: &[Square::C5, Square::D6],
-        gold_squares: &[Square::C4, Square::D5, Square::E4],
-        arrows: &[(Square::C4, Square::C5), (Square::C5, Square::D6)],
+        title: "Winawer c3+c4 clamp & knight transfer via d2/g5",
+        summary: "Hold the d4+c4+e5 chain under ...c5 pressure and fight for dark squares on the kingside.",
+        setup_fen: "r1bq1rk1/pp2bppp/2n1pn2/2ppP3/2PP4/2PB1N2/P2N1PPP/R1BQ1RK1 w - - 0 9",
+        search_preset: Some(StructurePreset::FrenchWinawerC4),
+        green_squares: &[Square::G5, Square::E5],
+        gold_squares: &[Square::C4, Square::D4],
+        arrows: &[(Square::F3, Square::G5)],
         animated_maneuver: None,
-        animated_moves: &["c5"],
+        animated_moves: &["Re1"],
     },
     StructurePlan {
-        family: StructureFamily::ClosedChains,
+        family: StructureFamily::French,
         side: Color::White,
         plan_number: 3,
-        title: "Benoni central breakthrough with e4-e5",
-        summary: "Coordinate f4, Nf3, and Bd3/Re1 to push e4-e5 and shatter Black's d6-pawn.",
-        setup_fen: "r1bq1rk1/1p1nbppp/p2p1n2/2pP4/4PP2/2NB1N2/PP4PP/R1BQR1K1 w - - 2 13",
-        search_preset: Some(StructurePreset::BenoniStructure),
-        green_squares: &[Square::E5, Square::D6],
-        gold_squares: &[Square::D5, Square::E4],
-        arrows: &[(Square::E4, Square::E5)],
+        title: "Open French active piece play vs isolated/hanging center",
+        summary: "Develop bishops swiftly to f4/d3 and use open c/e files once central tension eases.",
+        setup_fen: "r2q1rk1/pp1nbppp/4pn2/2p5/3P4/2PB1N2/PP3PPP/R1BQR1K1 w - - 0 10",
+        search_preset: Some(StructurePreset::FrenchTarraschDxE),
+        green_squares: &[Square::F4, Square::E5],
+        gold_squares: &[Square::D4, Square::D3],
+        arrows: &[(Square::C1, Square::F4)],
         animated_maneuver: None,
-        animated_moves: &["e5"],
+        animated_moves: &["Bf4"],
     },
     StructurePlan {
-        family: StructureFamily::ClosedChains,
-        side: Color::White,
-        plan_number: 4,
-        title: "Nimzo doubled c-pawns: f3 + e4 central roller",
-        summary: "Turn the bishop pair and extra central pawn into a decisive e4+f3 kingside and central steamroller.",
-        setup_fen: "r1bq1rk1/pp1n1ppp/2p1pn2/3p4/2PP4/2PBPN2/P4PPP/R1BQ1RK1 w - - 0 10",
-        search_preset: Some(StructurePreset::NimzoDoubledCPawns),
-        green_squares: &[Square::E4, Square::F3],
-        gold_squares: &[Square::C3, Square::C4, Square::D4],
-        arrows: &[(Square::F2, Square::F3), (Square::E3, Square::E4)],
-        animated_maneuver: None,
-        animated_moves: &["e4"],
-    },
-    StructurePlan {
-        family: StructureFamily::ClosedChains,
+        family: StructureFamily::French,
         side: Color::Black,
         plan_number: 1,
         title: "French Chain: undermine e5 with ...f6",
@@ -928,9 +1149,80 @@ static PLANS: &[StructurePlan] = &[
         animated_moves: &["f6", "exf6", "Rxf6"],
     },
     StructurePlan {
-        family: StructureFamily::ClosedChains,
+        family: StructureFamily::French,
         side: Color::Black,
         plan_number: 2,
+        title: "Winawer ...c5 & ...Qa5/...Na5 target c4/d4",
+        summary: "Pile pressure onto the c4+d4 pawns with ...c5, ...Nc6, and ...Qa5.",
+        setup_fen: "r1bq1rk1/pp3ppp/2n1pn2/2ppP3/2PP4/P1P2N2/4BPPP/R1BQ1RK1 b - - 0 9",
+        search_preset: Some(StructurePreset::FrenchWinawerC4),
+        green_squares: &[Square::A5, Square::C4],
+        gold_squares: &[Square::C5, Square::D5],
+        arrows: &[(Square::D8, Square::A5), (Square::C6, Square::A5)],
+        animated_maneuver: None,
+        animated_moves: &["Na5"],
+    },
+    StructurePlan {
+        family: StructureFamily::French,
+        side: Color::Black,
+        plan_number: 3,
+        title: "Open French ...cxd4 & ...Rc8 queenside counterplay",
+        summary: "Trade ...cxd4 cleanly and place heavy pieces on the c-file against White's c3/d4 base.",
+        setup_fen: "r2q1rk1/pp1nbppp/4pn2/2p5/3P4/2PB1N2/PP3PPP/R1BQR1K1 b - - 0 10",
+        search_preset: Some(StructurePreset::FrenchTarraschDxE),
+        green_squares: &[Square::C8, Square::D4],
+        gold_squares: &[Square::C5, Square::E6],
+        arrows: &[(Square::C5, Square::D4), (Square::A8, Square::C8)],
+        animated_maneuver: None,
+        animated_moves: &["Rc8"],
+    },
+    // --- KING'S INDIAN (6 plans: 3 White, 3 Black) ---
+    StructurePlan {
+        family: StructureFamily::KingsIndian,
+        side: Color::White,
+        plan_number: 1,
+        title: "King's Indian Chain: queenside c4-c5 storm",
+        summary: "Expand where White's pawns point with c4-c5 to open the c-file and attack d6.",
+        setup_fen: "r1bq1rk1/ppp1n1bp/3p1np1/3Pp3/2P1Pp2/2NN1P2/PP1BB1PP/R2Q1RK1 w - - 0 13",
+        search_preset: Some(StructurePreset::KingsIndianChain),
+        green_squares: &[Square::C5, Square::D6],
+        gold_squares: &[Square::C4, Square::D5, Square::E4],
+        arrows: &[(Square::C4, Square::C5), (Square::C5, Square::D6)],
+        animated_maneuver: None,
+        animated_moves: &["c5"],
+    },
+    StructurePlan {
+        family: StructureFamily::KingsIndian,
+        side: Color::White,
+        plan_number: 2,
+        title: "Vs ...c5 Benoni-KID hybrid: lock & play Nd3-f2/b4",
+        summary: "Stabilize the kingside against ...f5 and mobilize queenside play via a3 + b4.",
+        setup_fen: "r1bq1rk1/pp1n1pbp/3p1np1/2pPp3/2P1P3/2N1BN2/PP2BPPP/R2Q1RK1 w - - 0 10",
+        search_preset: Some(StructurePreset::KingsIndianC5Chain),
+        green_squares: &[Square::B4, Square::E1],
+        gold_squares: &[Square::C4, Square::D5],
+        arrows: &[(Square::F3, Square::E1), (Square::B2, Square::B4)],
+        animated_maneuver: None,
+        animated_moves: &["Ne1"],
+    },
+    StructurePlan {
+        family: StructureFamily::KingsIndian,
+        side: Color::White,
+        plan_number: 3,
+        title: "KID Exchange: d5 outpost domination",
+        summary: "Clamp down on the d5 hole with Nd5/Be3 and keep Black's queenside pawns under control.",
+        setup_fen: "r1bq1rk1/ppp2pbp/2n2np1/4p3/2P1P3/2N2N2/PP2BPPP/R1BQ1RK1 w - - 0 8",
+        search_preset: Some(StructurePreset::KingsIndianExchange),
+        green_squares: &[Square::D5],
+        gold_squares: &[Square::C4, Square::E4],
+        arrows: &[(Square::C1, Square::G5), (Square::C3, Square::D5)],
+        animated_maneuver: None,
+        animated_moves: &["Bg5"],
+    },
+    StructurePlan {
+        family: StructureFamily::KingsIndian,
+        side: Color::Black,
+        plan_number: 1,
         title: "King's Indian Chain: kingside ...f5 attack",
         summary: "Launch ...f7-f5 after ...Ne8/Nd7 to undermine e4 and build a kingside pawn storm.",
         setup_fen: "r1bq1rk1/pppnnpbp/3p2p1/3Pp3/2P1P3/2N1B3/PP2BPPP/R2QNRK1 b - - 4 10",
@@ -942,9 +1234,80 @@ static PLANS: &[StructurePlan] = &[
         animated_moves: &["f5"],
     },
     StructurePlan {
-        family: StructureFamily::ClosedChains,
+        family: StructureFamily::KingsIndian,
+        side: Color::Black,
+        plan_number: 2,
+        title: "Symmetrical ...c5 Benoni break: ...Ne8 + ...f5",
+        summary: "Once White stalls on the queenside, redeploy ...Ne8 and strike with ...f5.",
+        setup_fen: "r1bq1rk1/pp1n1pbp/3p1np1/2pPp3/2P1P3/2N1BN2/PP2BPPP/R2Q1RK1 b - - 0 10",
+        search_preset: Some(StructurePreset::KingsIndianC5Chain),
+        green_squares: &[Square::E8, Square::F5],
+        gold_squares: &[Square::C5, Square::D6],
+        arrows: &[(Square::F6, Square::E8), (Square::F7, Square::F5)],
+        animated_maneuver: None,
+        animated_moves: &["Ne8"],
+    },
+    StructurePlan {
+        family: StructureFamily::KingsIndian,
         side: Color::Black,
         plan_number: 3,
+        title: "KID Exchange: ...Nd4 outpost & d4 counterplay",
+        summary: "Jump into the weakened d4 square with ...Nd4/...Nc5 and target White's c4-e4 structure.",
+        setup_fen: "r1bq1rk1/ppp2pbp/2n2np1/4p3/2P1P3/2N1BN2/PP2BPPP/R2Q1RK1 b - - 0 8",
+        search_preset: Some(StructurePreset::KingsIndianExchange),
+        green_squares: &[Square::D4],
+        gold_squares: &[Square::E5, Square::G7],
+        arrows: &[(Square::C6, Square::D4)],
+        animated_maneuver: None,
+        animated_moves: &["Nd4"],
+    },
+    // --- BENONI (6 plans: 3 White, 3 Black) ---
+    StructurePlan {
+        family: StructureFamily::Benoni,
+        side: Color::White,
+        plan_number: 1,
+        title: "Benoni central breakthrough with e4-e5",
+        summary: "Coordinate f4, Nf3, and Bd3/Re1 to push e4-e5 and shatter Black's d6-pawn.",
+        setup_fen: "r1bq1rk1/1p1n1pbp/p2p1np1/2pP4/4PP2/2NB1N2/PP4PP/R1BQR1K1 w - - 2 13",
+        search_preset: Some(StructurePreset::BenoniStructure),
+        green_squares: &[Square::E5, Square::D6],
+        gold_squares: &[Square::D5, Square::E4],
+        arrows: &[(Square::E4, Square::E5)],
+        animated_maneuver: None,
+        animated_moves: &["e5"],
+    },
+    StructurePlan {
+        family: StructureFamily::Benoni,
+        side: Color::White,
+        plan_number: 2,
+        title: "Vs Benko Gambit: consolidate & prepare e4-e5",
+        summary: "Contain Black's a/b-file pressure with Qc2/Rb1 and capitalize on White's extra central pawns.",
+        setup_fen: "r1bq1rk1/3n1pbp/3p1np1/2pP4/4P3/P1N2N2/4BPPP/R1BQ1RK1 w - - 0 11",
+        search_preset: Some(StructurePreset::BenkoGambit),
+        green_squares: &[Square::C2, Square::E5],
+        gold_squares: &[Square::D5, Square::E4],
+        arrows: &[(Square::D1, Square::C2), (Square::E4, Square::E5)],
+        animated_maneuver: None,
+        animated_moves: &["Qc2"],
+    },
+    StructurePlan {
+        family: StructureFamily::Benoni,
+        side: Color::White,
+        plan_number: 3,
+        title: "Czech Benoni queenside expansion (b2-b4)",
+        summary: "Against Black's locked e5-d6-c5 wedge, prepare a3 and b2-b4 or g3 + kingside f4.",
+        setup_fen: "r1bq1rk1/pp1nbppp/3p1n2/2pPp3/2P1P3/2N2N2/PP2BPPP/R1BQ1RK1 w - - 0 9",
+        search_preset: Some(StructurePreset::CzechBenoni),
+        green_squares: &[Square::B4, Square::F4],
+        gold_squares: &[Square::C4, Square::D5],
+        arrows: &[(Square::F3, Square::E1), (Square::B2, Square::B4)],
+        animated_maneuver: None,
+        animated_moves: &["Ne1"],
+    },
+    StructurePlan {
+        family: StructureFamily::Benoni,
+        side: Color::Black,
+        plan_number: 1,
         title: "Benoni queenside ...a6 + ...b5 majority push",
         summary: "Mobilize the 3-vs-2 queenside majority with ...a6 and ...b5, aided by the g7-bishop.",
         setup_fen: "r1bq1rk1/1p1n1pbp/p2p1np1/2pP4/4P3/2N2N2/PP2BPPP/R1BQ1RK1 b - - 0 11",
@@ -956,9 +1319,66 @@ static PLANS: &[StructurePlan] = &[
         animated_moves: &["b5"],
     },
     StructurePlan {
-        family: StructureFamily::ClosedChains,
+        family: StructureFamily::Benoni,
         side: Color::Black,
-        plan_number: 4,
+        plan_number: 2,
+        title: "Benko queenside piece pressure (...Qa5 & ...Rfb8)",
+        summary: "Use the open a- and b-files with ...Qa5, ...Ba6, and heavy-piece infiltration.",
+        setup_fen: "r1bq1rk1/3n1pbp/3p1np1/2pP4/4P3/P1N2N2/4BPPP/R1BQ1RK1 b - - 0 11",
+        search_preset: Some(StructurePreset::BenkoGambit),
+        green_squares: &[Square::A5, Square::B2],
+        gold_squares: &[Square::G7, Square::C5],
+        arrows: &[(Square::D8, Square::A5), (Square::G7, Square::C3)],
+        animated_maneuver: None,
+        animated_moves: &["Qa5"],
+    },
+    StructurePlan {
+        family: StructureFamily::Benoni,
+        side: Color::Black,
+        plan_number: 3,
+        title: "Czech Benoni kingside counterplay (...Ne8 & ...f5)",
+        summary: "Close the queenside or anchor c5, then shift pieces for a ...f7-f5 pawn break.",
+        setup_fen: "r1bq1rk1/pp1nbppp/3p1n2/2pPp3/2P1P3/2N2N2/PP2BPPP/R1BQ1RK1 b - - 0 9",
+        search_preset: Some(StructurePreset::CzechBenoni),
+        green_squares: &[Square::E8, Square::F5],
+        gold_squares: &[Square::C5, Square::E5],
+        arrows: &[(Square::F6, Square::E8), (Square::F7, Square::F5)],
+        animated_maneuver: None,
+        animated_moves: &["Ne8"],
+    },
+    // --- NIMZO DOUBLED C-PAWNS (4 plans: 2 White, 2 Black) ---
+    StructurePlan {
+        family: StructureFamily::NimzoDoubledC,
+        side: Color::White,
+        plan_number: 1,
+        title: "Nimzo doubled c-pawns: f3 + e4 central roller",
+        summary: "Turn the bishop pair and extra central pawn into a decisive e4+f3 kingside and central steamroller.",
+        setup_fen: "r1bq1rk1/pp1n1ppp/2p1pn2/3p4/2PP4/2PBPN2/P4PPP/R1BQ1RK1 w - - 0 10",
+        search_preset: Some(StructurePreset::NimzoDoubledCPawns),
+        green_squares: &[Square::E4, Square::F3],
+        gold_squares: &[Square::C3, Square::C4, Square::D4],
+        arrows: &[(Square::F2, Square::F3), (Square::E3, Square::E4)],
+        animated_maneuver: None,
+        animated_moves: &["e4"],
+    },
+    StructurePlan {
+        family: StructureFamily::NimzoDoubledC,
+        side: Color::White,
+        plan_number: 2,
+        title: "Nimzo bishop pair & c4-c5 dissolution/initiative",
+        summary: "Recapture with cxd5 when appropriate to dissolve the weak c4 pawn and activate the dark-squared bishop.",
+        setup_fen: "r1bq1rk1/pp1n1ppp/2p1pn2/3p4/2PP4/2PBPN2/P4PPP/R1BQ1RK1 w - - 0 10",
+        search_preset: Some(StructurePreset::NimzoDoubledCPawns),
+        green_squares: &[Square::C2, Square::H7],
+        gold_squares: &[Square::D3, Square::C4],
+        arrows: &[(Square::D1, Square::C2), (Square::D3, Square::H7)],
+        animated_maneuver: None,
+        animated_moves: &["Qc2"],
+    },
+    StructurePlan {
+        family: StructureFamily::NimzoDoubledC,
+        side: Color::Black,
+        plan_number: 1,
         title: "Blockade doubled c-pawns with ...Ba6 & ...Na5",
         summary: "Fix White's doubled c4-pawn and pile ...Ba6, ...Rc8, and ...Na5 onto the static target.",
         setup_fen: "r1bq1rk1/p2n1ppp/1pp1pn2/3p4/2PP4/2PBPN2/P4PPP/R1BQ1RK1 b - - 0 10",
@@ -969,12 +1389,110 @@ static PLANS: &[StructurePlan] = &[
         animated_maneuver: None,
         animated_moves: &["Ba6"],
     },
+    StructurePlan {
+        family: StructureFamily::NimzoDoubledC,
+        side: Color::Black,
+        plan_number: 2,
+        title: "Fix c4 with ...c5 and double rooks on the c-file",
+        summary: "Strike with ...c7-c5 to leave White's c4-pawn backward and attack it along the c-file.",
+        setup_fen: "r1bq1rk1/pp1n1ppp/4pn2/2pp4/2PP4/2PBPN2/P4PPP/R1BQ1RK1 b - - 0 10",
+        search_preset: Some(StructurePreset::NimzoDoubledCPawns),
+        green_squares: &[Square::C5, Square::C4],
+        gold_squares: &[Square::C3, Square::C4],
+        arrows: &[(Square::A8, Square::C8), (Square::C5, Square::D4)],
+        animated_maneuver: None,
+        animated_moves: &["Qc7"],
+    },
 ];
 
 /// Return all White or Black plans belonging to a [`StructureFamily`].
 #[must_use]
 pub fn plans_for_family(family: StructureFamily) -> Vec<&'static StructurePlan> {
     PLANS.iter().filter(|p| p.family == family).collect()
+}
+
+/// Find a specific plan by its [`PlanId`].
+#[must_use]
+pub fn find_plan(id: PlanId) -> Option<&'static StructurePlan> {
+    PLANS.iter().find(|p| p.id() == id)
+}
+
+/// Compile a [`StructurePlan`] into a chronological [`PlanSearchSpec`].
+#[must_use]
+pub fn plan_search_spec(plan: &StructurePlan) -> PlanSearchSpec {
+    let base_structure = match plan.search_preset {
+        // `StonewallBd2e1h4` already encodes the post-transfer bishop square; use
+        // `StonewallAny` as the base structure so games enter Stonewall first and
+        // then verify the `Bc1 -> Bd2 -> Be1 -> Bh4` waypoints chronologically.
+        Some(StructurePreset::StonewallBd2e1h4) => Some(StructurePreset::StonewallAny),
+        other => other,
+    };
+
+    let mut stages: Vec<Vec<AtomPredicate>> = Vec::new();
+    if let Some(m) = plan.animated_maneuver {
+        let waypoints = if m.waypoints.len() >= 3 {
+            &m.waypoints[1..]
+        } else {
+            m.waypoints
+        };
+        for &sq in waypoints {
+            stages.push(vec![AtomPredicate::HasPiece(sq, m.piece)]);
+        }
+    } else if !plan.animated_moves.is_empty()
+        && let Ok(fen) = plan.setup_fen.parse::<Fen>()
+        && let Ok(mut cur) = fen.into_position(crate::chess::CastlingMode::Standard)
+    {
+        let mut cleared_enemy_squares: Vec<(Square, Piece)> = Vec::new();
+        for san_str in plan.animated_moves {
+            let mover_color = cur.turn();
+            let Ok(mv) = San::Raw((*san_str).to_string()).to_move(&cur) else {
+                continue;
+            };
+            let captured = cur
+                .board()
+                .piece_at(mv.to())
+                .filter(|p| p.color != mover_color);
+            cur = cur.play_unchecked(mv);
+            if mover_color == plan.side {
+                if let Some(cap_piece) = captured
+                    && !cleared_enemy_squares.iter().any(|(sq, _)| *sq == mv.to())
+                {
+                    cleared_enemy_squares.push((mv.to(), cap_piece));
+                }
+                if let Some(piece_after) = cur.board().piece_at(mv.to()) {
+                    let mut atoms = vec![AtomPredicate::HasPiece(mv.to(), piece_after)];
+                    for &(cap_sq, cap_piece) in &cleared_enemy_squares {
+                        if cap_sq != mv.to() {
+                            atoms.push(AtomPredicate::NotPiece(cap_sq, cap_piece));
+                        }
+                    }
+                    stages.push(atoms);
+                }
+            }
+        }
+    }
+
+    let parsed_setup = plan
+        .setup_fen
+        .parse::<Fen>()
+        .ok()
+        .and_then(|f| f.into_position(crate::chess::CastlingMode::Standard).ok());
+    let base_flipped = match (base_structure, parsed_setup.as_ref()) {
+        (Some(base), Some(pos)) => {
+            if base.matches_oriented(pos, false) {
+                false
+            } else {
+                base.matches_oriented(pos, true)
+            }
+        }
+        _ => false,
+    };
+
+    PlanSearchSpec {
+        base_structure,
+        base_flipped,
+        stages,
+    }
 }
 
 /// Find the closest plan matching a specific [`StructurePreset`], if one exists.
@@ -1034,25 +1552,7 @@ mod tests {
                     plan.title
                 );
 
-                if let Some(preset) = plan.search_preset {
-                    assert!(
-                        preset.to_query().compile().matches_position(&pos),
-                        "setup_fen for '{}' does not match preset {preset:?}",
-                        plan.title
-                    );
-                    let (_, sqs, clauses) = preset.to_pattern_components();
-                    let exported = PositionQuery {
-                        squares: sqs,
-                        extra_clauses: clauses,
-                        ..PositionQuery::default()
-                    };
-                    assert!(
-                        exported.compile().matches_position(&pos),
-                        "setup_fen for '{}' does not match exported pattern of {preset:?}",
-                        plan.title
-                    );
-                }
-
+                let mut candidate_positions = vec![pos.clone()];
                 if !plan.animated_moves.is_empty() {
                     assert_eq!(
                         pos.turn(),
@@ -1066,8 +1566,22 @@ mod tests {
                         let mv = san.to_move(&cur).unwrap_or_else(|e| {
                             panic!("illegal move '{san_str}' in '{}': {e}", plan.title)
                         });
+                        if san_str.contains('x') {
+                            assert!(
+                                matches!(
+                                    mv,
+                                    crate::chess::Move::Normal {
+                                        capture: Some(_),
+                                        ..
+                                    } | crate::chess::Move::EnPassant { .. }
+                                ),
+                                "SAN '{san_str}' in '{}' contains 'x' but is not a capture",
+                                plan.title
+                            );
+                        }
                         cur = cur.play_unchecked(mv);
                     }
+                    candidate_positions.push(cur);
                 }
 
                 if let Some(m) = plan.animated_maneuver {
@@ -1092,6 +1606,40 @@ mod tests {
                             plan.title
                         );
                     }
+                    let dest = *m.waypoints.last().unwrap();
+                    if dest != m.waypoints[0] {
+                        let mut setup = pos.to_setup(crate::chess::EnPassantMode::Legal);
+                        setup.board.remove_piece_at(m.waypoints[0]);
+                        setup.board.set_piece_at(dest, m.piece);
+                        if let Ok(relocated) =
+                            Chess::from_setup(setup, crate::chess::CastlingMode::Standard)
+                        {
+                            candidate_positions.push(relocated);
+                        }
+                    }
+                }
+
+                if let Some(preset) = plan.search_preset {
+                    let comp = preset.to_query().compile();
+                    assert!(
+                        candidate_positions.iter().any(|p| comp.matches_position(p)),
+                        "setup_fen (and its animated result) for '{}' does not match preset {preset:?}",
+                        plan.title
+                    );
+                    let (_, sqs, clauses) = preset.to_pattern_components();
+                    let exported = PositionQuery {
+                        squares: sqs,
+                        extra_clauses: clauses,
+                        ..PositionQuery::default()
+                    };
+                    let comp_exp = exported.compile();
+                    assert!(
+                        candidate_positions
+                            .iter()
+                            .any(|p| comp_exp.matches_position(p)),
+                        "setup_fen (and its animated result) for '{}' does not match exported pattern of {preset:?}",
+                        plan.title
+                    );
                 }
             }
         }
@@ -1106,8 +1654,8 @@ mod tests {
             .expect("Boleslavsky d5 plan present");
         assert_eq!(d5_plan.animated_moves, &["Bxf6", "Bxf6", "Nd5"]);
 
-        let closed = plans_for_family(StructureFamily::ClosedChains);
-        let french = closed
+        let french_fam = plans_for_family(StructureFamily::French);
+        let french = french_fam
             .iter()
             .find(|p| {
                 p.side == Color::Black && p.search_preset == Some(StructurePreset::FrenchChain)
@@ -1121,5 +1669,71 @@ mod tests {
             .unwrap();
         assert_eq!(pos.board().piece_at(Square::F6), None);
         assert_eq!(french.animated_moves, &["f6", "exf6", "Rxf6"]);
+    }
+
+    #[test]
+    fn maroczy_black_plan3_captures_knight_and_plan4_regroups_qa5_rfc8() {
+        let maroczy = plans_for_family(StructureFamily::Maroczy);
+        let plan3 = maroczy
+            .iter()
+            .find(|p| p.side == Color::Black && p.plan_number == 3)
+            .expect("Maroczy Black Plan 3 present");
+        let pos3: Chess = plan3
+            .setup_fen
+            .parse::<Fen>()
+            .unwrap()
+            .into_position(crate::chess::CastlingMode::Standard)
+            .unwrap();
+        assert_eq!(pos3.board().piece_at(Square::D4), Some(WN));
+        assert_eq!(plan3.animated_moves, &["Nxd4", "Bxd4"]);
+
+        let plan4 = maroczy
+            .iter()
+            .find(|p| p.side == Color::Black && p.plan_number == 4)
+            .expect("Maroczy Black Plan 4 present");
+        assert!(plan4.title.contains("Qa5") && plan4.title.contains("Rfc8"));
+        assert_eq!(plan4.animated_moves, &["Qa5", "Rfd1", "Rfc8"]);
+        let mut cur: Chess = plan4
+            .setup_fen
+            .parse::<Fen>()
+            .unwrap()
+            .into_position(crate::chess::CastlingMode::Standard)
+            .unwrap();
+        for san_str in plan4.animated_moves {
+            let mv = San::Raw((*san_str).to_string()).to_move(&cur).unwrap();
+            cur = cur.play_unchecked(mv);
+        }
+        assert_eq!(cur.board().piece_at(Square::A5), Some(BQ));
+        assert_eq!(cur.board().piece_at(Square::C8), Some(BR));
+    }
+
+    #[test]
+    fn plan_search_spec_builds_stages_for_all_plans() {
+        for plan in PLANS {
+            let spec = plan_search_spec(plan);
+            assert!(
+                !spec.stages.is_empty(),
+                "plan '{}' produced empty search stages",
+                plan.title
+            );
+            assert_eq!(find_plan(plan.id()), Some(plan));
+        }
+
+        let stonewall_b = find_plan(PlanId {
+            family: StructureFamily::Stonewall,
+            side: Color::White,
+            plan_number: 1,
+        })
+        .expect("Stonewall White Plan 1");
+        let spec = plan_search_spec(stonewall_b);
+        assert_eq!(spec.base_structure, Some(StructurePreset::StonewallAny));
+        assert_eq!(
+            spec.stages,
+            vec![
+                vec![AtomPredicate::HasPiece(Square::D2, WB)],
+                vec![AtomPredicate::HasPiece(Square::E1, WB)],
+                vec![AtomPredicate::HasPiece(Square::H4, WB)],
+            ]
+        );
     }
 }

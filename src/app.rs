@@ -27,8 +27,9 @@ use crate::eval::{self, BoardEval};
 use crate::fide;
 use crate::flags;
 use crate::league_import::{
-    self, DiscoveredPgnLink, DsbDirectory, DsbLeaguePgn, LeaguePortal, LichessBroadcastTour,
-    LigaManagerDirectory, LigaManagerDownloads, ProviderKind, ResolvedLeagueUrl,
+    self, DiscoveredPgnLink, DsbDirectory, DsbLeaguePgn, LeaguePortal, LeagueRosterIndex,
+    LichessBroadcastTour, LigaManagerDirectory, LigaManagerDownloads, ProviderKind,
+    ResolvedLeagueUrl,
 };
 #[cfg(test)]
 use crate::library::PgnLibrary;
@@ -51,8 +52,9 @@ use crate::review_book::{self, BookSource};
 use crate::scid::ScidLibrary;
 use crate::search::{
     self, AtomPredicate, BishopColorRelation, ClauseOp, CustomStructurePreset, EloFilterMode,
-    EndgamePreset, PatternClause, PieceCountRange, PositionHit, PositionQuery, PositionSearchMode,
-    SideToMoveFilter, SquareConstraint, StructureFamily, WinnerFilter,
+    EndgameFamily, EndgamePawnBalance, EndgamePawnWings, EndgamePreset, PatternClause,
+    PieceCountRange, PositionHit, PositionQuery, PositionSearchMode, SideToMoveFilter,
+    SquareConstraint, StructureFamily, WinnerFilter,
 };
 use crate::settings::{
     self, ChampionLineage, CloudPrefs, DisplayPrefs, EnginePrefs, PhotoSize, PreparationPrefs,
@@ -121,6 +123,8 @@ struct PlayerBadge {
     rating: Option<String>,
     team: Option<String>,
     clock: Option<Clock>,
+    clock_ticking: bool,
+    initial_clock_centis: Option<u64>,
     color: Color,
 }
 
@@ -300,6 +304,7 @@ enum LeagueDirMsg {
     LigaManager(Result<(String, LigaManagerDirectory), String>),
     Dsb(Result<(String, DsbDirectory), String>),
     Broadcasts(Result<Vec<LichessBroadcastTour>, String>),
+    ChessResults(Result<Vec<league_import::ChessResultsTournament>, String>),
     PortalLinks(Result<(String, Vec<DiscoveredPgnLink>), String>),
 }
 
@@ -328,6 +333,19 @@ enum LeagueDownloadMsg {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LeagueRosterTab {
+    Players,
+    Clubs,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LeagueRosterSort {
+    GamesDesc,
+    EloDesc,
+    Name,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum OnlineHubTab {
     LiveBroadcasts,
     Twic,
@@ -346,6 +364,36 @@ enum LiveSubSource {
 type ChessAbcPosMsg = (u64, Result<Vec<position::MoveStat>, String>);
 type LiveAvatarMsg = (String, Option<(Vec<u8>, u32, u32)>);
 type PositionSearchTarget = Result<(Option<Arc<dyn GameLibrary>>, Option<PathBuf>), &'static str>;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum LiveBroadcastFilter {
+    #[default]
+    All,
+    LiveOnly,
+    RecentPast,
+}
+
+#[derive(Clone, Debug)]
+struct LiveClockState {
+    game_key: String,
+    initial_centis: Option<u64>,
+    white_centis: Option<u64>,
+    black_centis: Option<u64>,
+    active_turn: Option<Color>,
+    anchored_at: Instant,
+    ongoing: bool,
+}
+
+#[derive(Clone, Debug)]
+struct LiveRematchWatch {
+    source: crate::live::LiveSource,
+    game_id: String,
+    game_url: String,
+    white: String,
+    black: String,
+    finished_at: Option<Instant>,
+    last_poll: Option<Instant>,
+}
 
 #[allow(clippy::large_enum_variant)]
 enum LiveMsg {
@@ -1391,12 +1439,37 @@ struct RecentPreview {
     label: String,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct SaveDiffSummary {
+    target_exists: bool,
+    same_as_open_source: bool,
+    previous_games: Option<usize>,
+    new_games: usize,
+    added_count: usize,
+    modified_count: usize,
+    removed_count: usize,
+    unchanged_count: usize,
+    added_samples: Vec<String>,
+    modified_samples: Vec<String>,
+    removed_samples: Vec<String>,
+    unsupported_variants: Vec<(usize, String)>,
+}
+
+#[derive(Clone, Debug)]
+struct PendingInPlaceSave {
+    format: DatabaseFormat,
+    path: PathBuf,
+    close_after: bool,
+    diff: SaveDiffSummary,
+}
+
 #[derive(Clone, Debug)]
 struct PendingPgnExport {
     path: PathBuf,
     games: usize,
     estimate: u64,
     close_after: bool,
+    diff: SaveDiffSummary,
 }
 
 #[derive(Clone, Debug)]
@@ -1405,6 +1478,7 @@ struct PendingScidExport {
     games: usize,
     existing: Vec<PathBuf>,
     close_after: bool,
+    diff: SaveDiffSummary,
 }
 
 #[derive(Clone, Debug)]
@@ -1413,6 +1487,7 @@ struct PendingCbhExport {
     games: usize,
     existing: Vec<PathBuf>,
     close_after: bool,
+    diff: SaveDiffSummary,
 }
 
 #[derive(Clone, Debug)]
@@ -1422,6 +1497,7 @@ struct PendingTwoCbhExport {
     existing: Vec<PathBuf>,
     annotations: bool,
     close_after: bool,
+    diff: SaveDiffSummary,
 }
 
 /// A database container Brett can open and write. 2CBH writing covers moves,
@@ -1598,6 +1674,21 @@ struct PendingDeleteGames {
     is_read_only_db: bool,
 }
 
+#[derive(Clone, Debug)]
+struct PendingDeleteDatabase {
+    shelf_index: usize,
+    title: String,
+    path: Option<PathBuf>,
+    files: Vec<PathBuf>,
+    count: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum MedalMenuAction {
+    Toggle(u16),
+    Clear,
+}
+
 struct ParkedDatabase {
     library: Option<Arc<dyn GameLibrary>>,
     session: crate::session::GameList,
@@ -1736,6 +1827,9 @@ pub struct App {
     search_list_sort: search::PositionHitSort,
     deleted_games: my_games::DeletedGamesRegistry,
     pending_delete_games: Option<PendingDeleteGames>,
+    pending_delete_database: Option<PendingDeleteDatabase>,
+    shelf_focused: bool,
+    hovered_shelf_index: Option<usize>,
     player_profile_sorted_games: Option<PlayerSortedGamesCache>,
     /// The game list changed independently of the current game's edits.
     session_dirty: bool,
@@ -1754,6 +1848,9 @@ pub struct App {
     save_database_path: String,
     save_database_close_after: bool,
     save_database_error: String,
+    save_dialog_diff_cache: Option<(String, DatabaseFormat, usize, usize, bool, SaveDiffSummary)>,
+    close_confirm_diff_cache: Option<(usize, usize, bool, SaveDiffSummary)>,
+    pending_in_place_save: Option<PendingInPlaceSave>,
     /// Optional default opening-tree database, indexed separately from the
     /// currently open database.
     tree_path: String,
@@ -1953,6 +2050,8 @@ pub struct App {
     annotation_focus: bool,
     /// Whether the additional (less common) PGN tags are expanded.
     tags_expanded: bool,
+    /// Whether the Flags & Medals selector drawer below PGN tags is expanded.
+    flags_expanded: bool,
     /// Show PGN fields that are absent or empty.
     show_empty_pgn_tags: bool,
     /// Board was added manually to the current game even though its Round
@@ -1993,6 +2092,9 @@ pub struct App {
     touch_detected: bool,
     board_draw_mode: Option<crate::domain::ShapeColor>,
     show_pgn_tags: bool,
+    header_card_expanded: bool,
+    pgn_tags_card_expanded: bool,
+    review_panel_expanded: bool,
     show_annotations: bool,
     engine_bar: bool,
     bar_cloud_cache: BTreeMap<String, Option<cloud::CloudEval>>,
@@ -2014,6 +2116,8 @@ pub struct App {
     hovered_game_browse: Option<HoveredGameBrowse>,
     /// True while a game row is hovered in the current frame.
     hovered_game_active_this_frame: bool,
+    secondary_hover_active: bool,
+    secondary_hover_preview: Option<HoverPreview>,
     online_open: bool,
     online_source: OnlineSource,
     online_username: String,
@@ -2023,13 +2127,29 @@ pub struct App {
     hub_open: bool,
     hub_tab: OnlineHubTab,
     live_sub_source: LiveSubSource,
+    live_broadcast_filter: LiveBroadcastFilter,
     live_username_input: String,
     live_broadcasts: Vec<crate::live::LiveBroadcastSummary>,
+    live_selected_tour: Option<String>,
     live_selected_round: Option<String>,
+    live_tour_rounds_cache: HashMap<String, Vec<crate::league_import::LichessBroadcastRound>>,
+    live_tour_rounds_rx: Option<mpsc::Receiver<(String, Result<Vec<crate::league_import::LichessBroadcastRound>, String>)>>,
     live_entries: Vec<crate::live::LiveGameEntry>,
     live_rx: Option<mpsc::Receiver<LiveMsg>>,
+    live_stream_rx: Option<mpsc::Receiver<crate::live::LiveStreamUpdate>>,
+    live_stream_stop: Option<Arc<std::sync::atomic::AtomicBool>>,
+    live_clock_state: Option<LiveClockState>,
+    live_preview_cache: HashMap<String, crate::live::LiveGameEntry>,
+    live_preview_in_flight: HashSet<String>,
+    live_preview_rx: Option<mpsc::Receiver<(String, Option<crate::live::LiveGameEntry>)>>,
+    live_preview_tx: mpsc::Sender<(String, Option<crate::live::LiveGameEntry>)>,
+    live_close_on_open: bool,
     live_status: String,
     live_auto_refresh: bool,
+    live_auto_rematch: bool,
+    live_watching_ephemeral: bool,
+    live_rematch_watch: Option<LiveRematchWatch>,
+    live_rematch_rx: Option<mpsc::Receiver<Option<crate::live::LiveGameEntry>>>,
     live_watching_target: Option<crate::live::LiveRefreshTarget>,
     live_watching_meta: Option<(crate::live::LivePlayerInfo, crate::live::LivePlayerInfo)>,
     live_last_refresh: Option<Instant>,
@@ -2037,6 +2157,10 @@ pub struct App {
     live_avatar_rx: Option<mpsc::Receiver<LiveAvatarMsg>>,
     live_avatar_tx: mpsc::Sender<LiveAvatarMsg>,
     live_avatar_in_flight: HashSet<String>,
+    online_identity_cache: online::OnlineIdentityCache,
+    online_identity_in_flight: HashSet<String>,
+    online_identity_tx: mpsc::Sender<(OnlineSource, String, Option<online::OnlinePlayerIdentity>)>,
+    online_identity_rx: Option<mpsc::Receiver<(OnlineSource, String, Option<online::OnlinePlayerIdentity>)>>,
     twic_open: bool,
     twic_tab: TwicTab,
     twic_issue_spec: String,
@@ -2090,6 +2214,23 @@ pub struct App {
     league_portal_links: Vec<DiscoveredPgnLink>,
     league_portal_selected_url: Option<String>,
     league_portal_selected_label: String,
+    league_roster: Option<LeagueRosterIndex>,
+    league_roster_rx: Option<mpsc::Receiver<Result<LeagueRosterIndex, String>>>,
+    league_roster_tab: LeagueRosterTab,
+    league_roster_sort: LeagueRosterSort,
+    league_roster_query: String,
+    league_selected_players: BTreeSet<String>,
+    league_selected_clubs: BTreeSet<String>,
+    league_round_spec: String,
+    league_target_shelf_index: Option<usize>,
+    league_excluded_game_indices: BTreeSet<usize>,
+    league_cr_fed: String,
+    league_cr_type: league_import::ChessResultsTournamentType,
+    league_cr_only_games: bool,
+    league_cr_query: String,
+    league_cr_results: Vec<league_import::ChessResultsTournament>,
+    league_cr_selected_url: Option<String>,
+    league_cr_selected_label: String,
     account_finder_open: bool,
     account_finder_player_idx: Option<usize>,
     account_finder_player_key: String,
@@ -2105,8 +2246,10 @@ pub struct App {
     account_finder_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
     account_finder_repertoire_games: usize,
     pos_search_open: bool,
+    pos_search_close_on_open: bool,
     pos_search_tab: PositionSearchTab,
     pos_search_structure_family: StructureFamily,
+    pos_search_endgame_family: EndgameFamily,
     pos_search_selected_plan: usize,
     pos_search_hover_plan: Option<usize>,
     pos_search_plan_anim_start: Option<Instant>,
@@ -2361,6 +2504,18 @@ fn calc_player_outcome(result: &str, player_color: Color) -> Option<f32> {
     }
 }
 
+struct PosSearchFrameActions {
+    start_search_batch: bool,
+    start_search_more: bool,
+    start_search_all_remaining: bool,
+    start_struct_build: bool,
+    cancel_search: bool,
+    clicked_hit: Option<usize>,
+    hovered_hit: Option<(String, Game, usize, Option<Color>)>,
+    load_hits_into_list: bool,
+    append_hits_to_db: bool,
+}
+
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let start = std::env::args_os().nth(1).map(std::path::PathBuf::from);
@@ -2514,6 +2669,9 @@ impl App {
             search_list_sort: search::PositionHitSort::default(),
             deleted_games: my_games::DeletedGamesRegistry::load(),
             pending_delete_games: None,
+            pending_delete_database: None,
+            shelf_focused: false,
+            hovered_shelf_index: None,
             player_profile_sorted_games: None,
             session_dirty: false,
             close_confirm_open: false,
@@ -2525,6 +2683,9 @@ impl App {
             save_database_path: String::new(),
             save_database_close_after: false,
             save_database_error: String::new(),
+            save_dialog_diff_cache: None,
+            close_confirm_diff_cache: None,
+            pending_in_place_save: None,
             tree_path: display_prefs.opening_tree_path.clone(),
             reference_mode: ReferenceMode::default(),
             ref_games_sort: RefGamesSort::default(),
@@ -2690,6 +2851,7 @@ impl App {
             annotation_editor: None,
             annotation_focus: false,
             tags_expanded: false,
+            flags_expanded: false,
             show_empty_pgn_tags: display_prefs.show_empty_pgn_tags,
             board_tag_visible: false,
             forced_tag_visibility: HashSet::new(),
@@ -2723,6 +2885,9 @@ impl App {
             touch_detected: false,
             board_draw_mode: None,
             show_pgn_tags: display_prefs.show_pgn_tags,
+            header_card_expanded: display_prefs.header_card_expanded,
+            pgn_tags_card_expanded: display_prefs.pgn_tags_card_expanded,
+            review_panel_expanded: display_prefs.review_panel_expanded,
             show_annotations: display_prefs.show_annotations,
             engine_bar: display_prefs.engine_bar,
             bar_cloud_cache: BTreeMap::new(),
@@ -2736,6 +2901,8 @@ impl App {
             hover_preview: None,
             hovered_game_browse: None,
             hovered_game_active_this_frame: false,
+            secondary_hover_active: false,
+            secondary_hover_preview: None,
             online_open: false,
             online_source: OnlineSource::Lichess,
             online_username: String::new(),
@@ -2745,13 +2912,29 @@ impl App {
             hub_open: false,
             hub_tab: OnlineHubTab::LiveBroadcasts,
             live_sub_source: LiveSubSource::LichessBroadcasts,
+            live_broadcast_filter: LiveBroadcastFilter::All,
             live_username_input: String::new(),
             live_broadcasts: Vec::new(),
+            live_selected_tour: None,
             live_selected_round: None,
+            live_tour_rounds_cache: HashMap::new(),
+            live_tour_rounds_rx: None,
             live_entries: Vec::new(),
             live_rx: None,
+            live_stream_rx: None,
+            live_stream_stop: None,
+            live_clock_state: None,
+            live_preview_cache: HashMap::new(),
+            live_preview_in_flight: HashSet::new(),
+            live_preview_rx: None,
+            live_preview_tx: mpsc::channel().0,
+            live_close_on_open: false,
             live_status: String::new(),
             live_auto_refresh: true,
+            live_auto_rematch: true,
+            live_watching_ephemeral: false,
+            live_rematch_watch: None,
+            live_rematch_rx: None,
             live_watching_target: None,
             live_watching_meta: None,
             live_last_refresh: None,
@@ -2759,6 +2942,10 @@ impl App {
             live_avatar_rx: None,
             live_avatar_tx: mpsc::channel().0,
             live_avatar_in_flight: HashSet::new(),
+            online_identity_cache: online::OnlineIdentityCache::load(),
+            online_identity_in_flight: HashSet::new(),
+            online_identity_tx: mpsc::channel().0,
+            online_identity_rx: None,
             twic_open: false,
             twic_tab: TwicTab::Weekly,
             twic_issue_spec: String::new(),
@@ -2812,6 +2999,23 @@ impl App {
             league_portal_links: Vec::new(),
             league_portal_selected_url: None,
             league_portal_selected_label: String::new(),
+            league_roster: None,
+            league_roster_rx: None,
+            league_roster_tab: LeagueRosterTab::Players,
+            league_roster_sort: LeagueRosterSort::GamesDesc,
+            league_roster_query: String::new(),
+            league_selected_players: BTreeSet::new(),
+            league_selected_clubs: BTreeSet::new(),
+            league_round_spec: String::new(),
+            league_target_shelf_index: None,
+            league_excluded_game_indices: BTreeSet::new(),
+            league_cr_fed: "AUT".to_string(),
+            league_cr_type: league_import::ChessResultsTournamentType::TeamRoundRobin,
+            league_cr_only_games: true,
+            league_cr_query: String::new(),
+            league_cr_results: Vec::new(),
+            league_cr_selected_url: None,
+            league_cr_selected_label: String::new(),
             account_finder_open: false,
             account_finder_player_idx: None,
             account_finder_player_key: String::new(),
@@ -2827,8 +3031,10 @@ impl App {
             account_finder_cancel: None,
             account_finder_repertoire_games: 0,
             pos_search_open: false,
+            pos_search_close_on_open: false,
             pos_search_tab: PositionSearchTab::PlansStructures,
             pos_search_structure_family: StructureFamily::Stonewall,
+            pos_search_endgame_family: EndgameFamily::Rook,
             pos_search_selected_plan: 0,
             pos_search_hover_plan: None,
             pos_search_plan_anim_start: None,
@@ -4349,15 +4555,24 @@ impl App {
             .find(|s| !s.is_empty())
     }
 
-    /// Map any configured online account username back to the primary player name
-    /// for list and board display, leaving underlying PGN tags untouched.
-    fn display_player_name<'a>(&'a self, raw_name: &'a str) -> &'a str {
+    fn primary_my_player_pgn_name(&self) -> Option<String> {
+        self.primary_my_player_display_name()
+            .map(players::canonical_pgn_player_name)
+    }
+
+    /// Map any configured online account username (or abbreviated ChessABC spelling)
+    /// back to the primary player name for list and board display.
+    fn display_player_name(&self, raw_name: &str) -> String {
         let Some(primary) = self.primary_my_player_display_name() else {
-            return raw_name;
+            return raw_name.to_string();
         };
         let trimmed = raw_name.trim();
         if trimmed.is_empty() {
-            return raw_name;
+            return raw_name.to_string();
+        }
+        let canon = players::canonical_pgn_player_name(primary);
+        if players::matches_truncated_or_enumerated_name(&canon, trimmed) {
+            return canon;
         }
         let raw_key = players::player_key(trimmed);
         let matches_account = self.my_games_config.accounts.iter().any(|acc| {
@@ -4368,7 +4583,32 @@ impl App {
                         && raw_key.is_some()
                         && players::player_key(u) == raw_key))
         });
-        if matches_account { primary } else { raw_name }
+        if matches_account {
+            primary.to_string()
+        } else {
+            raw_name.to_string()
+        }
+    }
+
+    fn display_name_with_online_identity(
+        &self,
+        raw_name: &str,
+        source_hint: Option<OnlineSource>,
+    ) -> String {
+        let base = self.display_player_name(raw_name);
+        if base != raw_name {
+            return base;
+        }
+        let id = source_hint
+            .filter(|src| *src != OnlineSource::ChessAbc)
+            .and_then(|src| self.online_identity_cache.get(src, &base).and_then(|v| v.as_ref()))
+            .or_else(|| self.online_identity_cache.get_any_source(&base));
+        if let Some(id) = id
+            && let Some(real) = id.real_name.as_deref()
+        {
+            return online::format_online_display_name(&base, Some(real));
+        }
+        base
     }
 
     fn is_my_player_name(&self, name: &str) -> bool {
@@ -4531,13 +4771,15 @@ impl App {
         let config = self.my_games_config.clone();
         let deleted = self.deleted_games.clone();
         let token = self.effective_lichess_token();
+        let canonical_my_name = self.primary_my_player_pgn_name();
         let (tx, rx) = mpsc::channel();
         let ctx = self.ctx.clone();
         std::thread::spawn(move || {
-            let res = my_games::sync_online_accounts_into_db_with_deleted(
+            let res = my_games::sync_online_accounts_into_db_with_options(
                 &config,
                 token.as_deref(),
                 &deleted,
+                canonical_my_name.as_deref(),
             )
             .map(|report| (config, report))
             .map_err(|err| format!("{err:#}"));
@@ -4695,12 +4937,21 @@ impl App {
     fn finish_my_games_import(
         &mut self,
         label: &str,
-        scan: my_games::ImportScan,
+        mut scan: my_games::ImportScan,
         choices: &[my_games::ConflictChoice],
     ) {
         let Some(db_path) = self.my_games_config.path.clone() else {
             return;
         };
+        let canonical = self.primary_my_player_pgn_name();
+        if let Some(canon) = canonical.as_deref() {
+            for g in &mut scan.existing {
+                players::canonicalize_player_tags(g, canon);
+            }
+            for g in &mut scan.incoming {
+                players::canonicalize_player_tags(g, canon);
+            }
+        }
         match my_games::apply_deduplicated_import(&db_path, scan, choices, None) {
             Ok(report) => {
                 self.reload_database_at_path_if_open(&db_path);
@@ -4877,17 +5128,26 @@ impl App {
             self.status = "Configure a My Games database in Settings first.".to_string();
             return;
         };
+        let canonical = self.primary_my_player_pgn_name();
         if let Some(idx) = self.my_games_shelf_index()
             && self.shelf_entry_dirty(idx)
         {
             let mut tagged = games;
             for g in &mut tagged {
                 my_games::tag_game_section(g, &section);
+                if let Some(canon) = canonical.as_deref() {
+                    players::canonicalize_player_tags(g, canon);
+                }
             }
             self.copy_games_to_shelf(tagged, idx, None);
             return;
         }
-        match my_games::merge_games_into_my_games(&db_path, games, &section) {
+        match my_games::merge_games_into_my_games_canonical(
+            &db_path,
+            games,
+            &section,
+            canonical.as_deref(),
+        ) {
             Ok(report) => {
                 self.reload_database_at_path_if_open(&db_path);
                 self.status = format!(
@@ -5068,6 +5328,14 @@ impl App {
     }
 
     fn pack_active_database(&mut self) -> ParkedDatabase {
+        if self.live_watching_ephemeral {
+            self.live_watching_ephemeral = false;
+            self.stop_live_stream();
+            self.live_rematch_watch = None;
+            self.live_rematch_rx = None;
+            self.current = None;
+            self.dirty = false;
+        }
         self.persist_current_edit();
         self.players_rx = None;
         self.players_job = None;
@@ -5221,6 +5489,86 @@ impl App {
         self.active_db_index = next_idx;
         self.status = format!("Closed {title}.");
         self.save_display_prefs();
+    }
+
+    /// Close a shelf tab and drop its memory-mapped library handles on the calling
+    /// thread before deleting companion files from disk.
+    fn close_shelf_database_sync(&mut self, index: usize) {
+        if index >= self.shelf_entries.len() {
+            return;
+        }
+        let title = self.shelf_entry_title(index);
+        if self.shelf_entries.len() <= 1 {
+            let old = self.pack_active_database();
+            drop(old);
+            self.shelf_entries = vec![None];
+            self.active_db_index = 0;
+            self.status = format!("Closed {title}.");
+            self.save_display_prefs();
+            return;
+        }
+        if index != self.active_db_index {
+            let removed = self.shelf_entries.remove(index);
+            drop(removed);
+            if index < self.active_db_index {
+                self.active_db_index -= 1;
+            }
+            self.status = format!("Closed {title}.");
+            self.save_display_prefs();
+            return;
+        }
+        let next = if index + 1 < self.shelf_entries.len() {
+            index + 1
+        } else {
+            index - 1
+        };
+        let old_active = self.pack_active_database();
+        drop(old_active);
+        self.shelf_entries.remove(index);
+        let next_idx = if next > index { next - 1 } else { next };
+        if let Some(target) = self.shelf_entries[next_idx].take() {
+            self.unpack_database(target);
+        }
+        self.active_db_index = next_idx;
+        self.status = format!("Closed {title}.");
+        self.save_display_prefs();
+    }
+
+    fn execute_pending_delete_database(&mut self, pending: PendingDeleteDatabase) {
+        if let Some(target_path) = &pending.path
+            && !self.reference_path.trim().is_empty()
+            && same_path(target_path, Path::new(self.reference_path.trim()))
+        {
+            self.reference_path.clear();
+            self.reference_enabled = false;
+        }
+        self.close_shelf_database_sync(pending.shelf_index);
+
+        let mut removed = 0usize;
+        let mut errors = Vec::new();
+        for file in &pending.files {
+            if !file.exists() {
+                continue;
+            }
+            match std::fs::remove_file(file) {
+                Ok(()) => removed += 1,
+                Err(err) => errors.push(format!("{}: {err}", file.display())),
+            }
+        }
+        if errors.is_empty() {
+            self.status = format!(
+                "Deleted database {} ({} file{} removed from disk).",
+                pending.title,
+                removed,
+                if removed == 1 { "" } else { "s" }
+            );
+        } else {
+            self.status = format!(
+                "Partially deleted {} ({removed} removed, errors: {}).",
+                pending.title,
+                errors.join("; ")
+            );
+        }
     }
 
     fn resolve_dragged_games(&mut self, payload: &GameRowDrag) -> Vec<Game> {
@@ -5498,13 +5846,15 @@ impl App {
     }
 
     fn can_save_database(&self) -> bool {
-        !self.session.is_empty() || self.current.is_some()
+        !self.session.is_empty() || (self.current.is_some() && !self.live_watching_ephemeral)
     }
 
     /// Promote an open standalone board/game (`current_slot == None`) into
     /// the working session so it can be saved even when no DB was opened first.
+    /// Ephemeral live-watched games are kept out of the database unless the
+    /// user explicitly saves them into the session.
     fn ensure_current_game_in_session(&mut self) {
-        if self.current_slot.is_some() {
+        if self.current_slot.is_some() || self.live_watching_ephemeral {
             return;
         }
         let Some(game) = self.current.clone() else {
@@ -5617,6 +5967,320 @@ impl App {
             DatabaseFormat::TwoCbh => {
                 self.start_two_cbh_save_mode(target, close_after, allow_in_place)
             }
+        }
+    }
+
+    fn request_save_database_ui(&mut self, close_after: bool) {
+        self.ensure_current_game_in_session();
+        self.persist_current_edit();
+        if self.session.is_empty() && !(self.session_dirty && self.writable_save_target().is_some())
+        {
+            self.status = "There are no games to save.".to_string();
+            return;
+        }
+        if let Some((format, path)) = self.writable_save_target()
+            && self.save_diff_target_exists(&path, format)
+        {
+            let diff = self.compute_save_diff(&path, format);
+            self.pending_in_place_save = Some(PendingInPlaceSave {
+                format,
+                path,
+                close_after,
+                diff,
+            });
+            return;
+        }
+        self.save_database_now(close_after);
+    }
+
+    fn save_diff_target_exists(&self, path: &std::path::Path, format: DatabaseFormat) -> bool {
+        match format {
+            DatabaseFormat::Pgn => path.exists(),
+            DatabaseFormat::Scid => scid_triple(path).iter().any(|p| p.exists()),
+            DatabaseFormat::Cbh => !crate::cbh::existing_companion_files(path).is_empty(),
+            DatabaseFormat::TwoCbh => !crate::twocbh::existing_companion_files(path).is_empty(),
+        }
+    }
+
+    fn compute_save_diff(
+        &self,
+        target_path: &std::path::Path,
+        format: DatabaseFormat,
+    ) -> SaveDiffSummary {
+        let target_exists = self.save_diff_target_exists(target_path, format);
+        let new_games = self.session.len();
+        let open_same_format = self
+            .current_database_format()
+            .is_some_and(|open_fmt| open_fmt == format);
+        let same_as_open_source = self.library.is_some()
+            && open_same_format
+            && match format {
+                DatabaseFormat::Pgn => self.pgn_export_would_overwrite_source(target_path),
+                DatabaseFormat::Scid => self.scid_export_would_overwrite_source(target_path),
+                DatabaseFormat::Cbh => self.cbh_export_would_overwrite_source(target_path),
+                DatabaseFormat::TwoCbh => self.two_cbh_export_would_overwrite_source(target_path),
+            };
+
+        let header_val = |headers: &[(crate::library::SharedStr, crate::library::SharedStr)],
+                          key: &str|
+         -> String {
+            headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(key))
+                .map(|(_, v)| v.as_str().to_string())
+                .unwrap_or_default()
+        };
+
+        let mut summary = SaveDiffSummary {
+            target_exists,
+            same_as_open_source,
+            previous_games: None,
+            new_games,
+            ..SaveDiffSummary::default()
+        };
+
+        if same_as_open_source && let Some(lib) = &self.library {
+            let orig_len = lib.len();
+            summary.previous_games = Some(orig_len);
+            let mut kept_primary = vec![false; orig_len];
+
+            for slot in self.session.slots() {
+                let (white, black, event, result, variant) =
+                    if let Some(game) = self.edited.get(&slot.id) {
+                        (
+                            game.header("White").unwrap_or("?").to_string(),
+                            game.header("Black").unwrap_or("?").to_string(),
+                            game.header("Event").unwrap_or("?").to_string(),
+                            game.header("Result").unwrap_or("*").to_string(),
+                            game.header("Variant").unwrap_or("").to_string(),
+                        )
+                    } else if self.current_slot == Some(slot.id)
+                        && let Some(game) = self.current.as_ref()
+                    {
+                        (
+                            game.header("White").unwrap_or("?").to_string(),
+                            game.header("Black").unwrap_or("?").to_string(),
+                            game.header("Event").unwrap_or("?").to_string(),
+                            game.header("Result").unwrap_or("*").to_string(),
+                            game.header("Variant").unwrap_or("").to_string(),
+                        )
+                    } else {
+                        let hdrs = slot.headers_with(Some(lib));
+                        (
+                            header_val(hdrs, "White"),
+                            header_val(hdrs, "Black"),
+                            header_val(hdrs, "Event"),
+                            header_val(hdrs, "Result"),
+                            header_val(hdrs, "Variant"),
+                        )
+                    };
+
+                if !is_supported_save_variant(&variant) {
+                    summary.unsupported_variants.push((
+                        slot.id,
+                        format!(
+                            "{} [Variant: {}]",
+                            format_save_game_label(&white, &black, &event, &result),
+                            variant.trim()
+                        ),
+                    ));
+                }
+
+                if slot.is_primary()
+                    && let Some(orig_idx) = slot.source_index()
+                    && orig_idx < orig_len
+                {
+                    kept_primary[orig_idx] = true;
+                    let is_modified = self.edited.contains_key(&slot.id)
+                        || slot.has_header_override()
+                        || (self.dirty && self.current_slot == Some(slot.id));
+                    if is_modified {
+                        summary.modified_count += 1;
+                        if summary.modified_samples.len() < 25 {
+                            summary.modified_samples.push(format_save_game_label(
+                                &white,
+                                &black,
+                                &event,
+                                &result,
+                            ));
+                        }
+                    } else {
+                        summary.unchanged_count += 1;
+                    }
+                } else {
+                    summary.added_count += 1;
+                    if summary.added_samples.len() < 25 {
+                        summary.added_samples.push(format_save_game_label(
+                            &white,
+                            &black,
+                            &event,
+                            &result,
+                        ));
+                    }
+                }
+            }
+
+            for (orig_idx, &kept) in kept_primary.iter().enumerate() {
+                if !kept {
+                    summary.removed_count += 1;
+                    if summary.removed_samples.len() < 25 {
+                        let hdrs = lib.game_headers(orig_idx);
+                        summary.removed_samples.push(format_save_game_label(
+                            &header_val(&hdrs, "White"),
+                            &header_val(&hdrs, "Black"),
+                            &header_val(&hdrs, "Event"),
+                            &header_val(&hdrs, "Result"),
+                        ));
+                    }
+                }
+            }
+        } else {
+            for slot in self.session.slots() {
+                let (white, black, event, result, variant) =
+                    if let Some(game) = self.edited.get(&slot.id) {
+                        (
+                            game.header("White").unwrap_or("?").to_string(),
+                            game.header("Black").unwrap_or("?").to_string(),
+                            game.header("Event").unwrap_or("?").to_string(),
+                            game.header("Result").unwrap_or("*").to_string(),
+                            game.header("Variant").unwrap_or("").to_string(),
+                        )
+                    } else if self.current_slot == Some(slot.id)
+                        && let Some(game) = self.current.as_ref()
+                    {
+                        (
+                            game.header("White").unwrap_or("?").to_string(),
+                            game.header("Black").unwrap_or("?").to_string(),
+                            game.header("Event").unwrap_or("?").to_string(),
+                            game.header("Result").unwrap_or("*").to_string(),
+                            game.header("Variant").unwrap_or("").to_string(),
+                        )
+                    } else {
+                        let hdrs = slot.headers_with(self.library.as_ref());
+                        (
+                            header_val(hdrs, "White"),
+                            header_val(hdrs, "Black"),
+                            header_val(hdrs, "Event"),
+                            header_val(hdrs, "Result"),
+                            header_val(hdrs, "Variant"),
+                        )
+                    };
+                if !is_supported_save_variant(&variant) {
+                    summary.unsupported_variants.push((
+                        slot.id,
+                        format!(
+                            "{} [Variant: {}]",
+                            format_save_game_label(&white, &black, &event, &result),
+                            variant.trim()
+                        ),
+                    ));
+                }
+            }
+            if target_exists
+                && format == DatabaseFormat::Pgn
+                && std::fs::metadata(target_path).is_ok_and(|m| m.len() <= 20 * 1024 * 1024)
+                && let Ok(text) = std::fs::read_to_string(target_path)
+            {
+                let count = text
+                    .lines()
+                    .filter(|l| l.trim_start().starts_with("[Event \""))
+                    .count();
+                summary.previous_games = Some(if count > 0 || text.trim().is_empty() {
+                    count
+                } else {
+                    1
+                });
+            }
+        }
+        summary
+    }
+
+    fn remove_unsupported_variant_slots(&mut self, unsupported: &[(usize, String)]) {
+        if unsupported.is_empty() {
+            return;
+        }
+        let mut removed_current = false;
+        for &(slot_id, _) in unsupported {
+            self.session.remove(slot_id);
+            self.edited.remove(&slot_id);
+            if self.current_slot == Some(slot_id) {
+                removed_current = true;
+            }
+        }
+        if removed_current {
+            self.current_slot = None;
+            self.current = None;
+            self.dirty = false;
+            self.node = 0;
+            if let Some(next_id) = self.session.id_at(0) {
+                self.select_slot(next_id);
+            }
+        }
+        self.session_dirty = true;
+        self.session_revision = self.session_revision.wrapping_add(1);
+        self.games_filter_cache = None;
+        self.player_profile_sorted_games = None;
+        self.save_dialog_diff_cache = None;
+        self.close_confirm_diff_cache = None;
+    }
+
+    fn in_place_save_dialog(&mut self, ctx: &egui::Context) {
+        let Some(pending) = self.pending_in_place_save.clone() else {
+            return;
+        };
+        let mut open = true;
+        let mut confirm = false;
+        let mut strip_and_save = false;
+        let mut cancel = false;
+        egui::Window::new("Overwrite database")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.set_min_width(480.0);
+                ui.label(format!(
+                    "Save {} to {}:",
+                    pending.format.short_label(),
+                    games_label(pending.diff.new_games)
+                ));
+                ui.label(RichText::new(pending.path.display().to_string()).monospace());
+                ui.add_space(6.0);
+                render_save_diff_ui(ui, &pending.diff);
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Overwrite & Save").clicked() {
+                        confirm = true;
+                    }
+                    if !pending.diff.unsupported_variants.is_empty()
+                        && ui.button("Remove unsupported variants & save").clicked()
+                    {
+                        strip_and_save = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        if strip_and_save {
+            self.pending_in_place_save = None;
+            self.remove_unsupported_variant_slots(&pending.diff.unsupported_variants);
+            self.start_format_save_with_overwrite(
+                pending.format,
+                Some(pending.path),
+                pending.close_after,
+                true,
+            );
+        } else if confirm {
+            self.pending_in_place_save = None;
+            self.start_format_save_with_overwrite(
+                pending.format,
+                Some(pending.path),
+                pending.close_after,
+                true,
+            );
+        } else if cancel || !open {
+            self.pending_in_place_save = None;
+            self.status = "Save cancelled.".to_string();
         }
     }
 
@@ -5745,6 +6409,41 @@ impl App {
                     ui.add_space(4.0);
                     ui.label(RichText::new(&self.save_database_error).small().color(GOLD));
                 }
+                let raw_path = self.save_database_path.trim().to_string();
+                if !raw_path.is_empty() {
+                    let mut preview_path = PathBuf::from(&raw_path);
+                    if !preview_path.extension().is_some_and(|extension| {
+                        extension.eq_ignore_ascii_case(self.save_database_format.extension())
+                    }) {
+                        preview_path.set_extension(self.save_database_format.extension());
+                    }
+                    let key_matches = self.save_dialog_diff_cache.as_ref().is_some_and(
+                        |(p, fmt, len, ed, dirty, _)| {
+                            *p == raw_path
+                                && *fmt == self.save_database_format
+                                && *len == self.session.len()
+                                && *ed == self.edited.len()
+                                && *dirty == self.dirty
+                        },
+                    );
+                    if !key_matches {
+                        let diff = self.compute_save_diff(&preview_path, self.save_database_format);
+                        self.save_dialog_diff_cache = Some((
+                            raw_path,
+                            self.save_database_format,
+                            self.session.len(),
+                            self.edited.len(),
+                            self.dirty,
+                            diff,
+                        ));
+                    }
+                    if let Some((_, _, _, _, _, ref diff)) = self.save_dialog_diff_cache
+                        && (diff.target_exists || !diff.unsupported_variants.is_empty())
+                    {
+                        ui.add_space(6.0);
+                        render_save_diff_ui(ui, diff);
+                    }
+                }
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     if ui.button("Save").clicked() {
@@ -5835,11 +6534,13 @@ impl App {
         let games = self.session.len();
         let estimate = self.pgn_export_estimate();
         if !allowed_in_place && estimate >= LARGE_PGN_BYTES {
+            let diff = self.compute_save_diff(&path, DatabaseFormat::Pgn);
             self.pending_pgn_export = Some(PendingPgnExport {
                 path,
                 games,
                 estimate,
                 close_after,
+                diff,
             });
             self.status = format!("Confirm saving {} games.", games_label(games));
         } else {
@@ -5961,6 +6662,10 @@ impl App {
                     )
                     .weak(),
                 );
+                if pending.diff.target_exists || !pending.diff.unsupported_variants.is_empty() {
+                    ui.add_space(6.0);
+                    render_save_diff_ui(ui, &pending.diff);
+                }
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     if ui.button("Export anyway").clicked() {
@@ -6014,6 +6719,8 @@ impl App {
                     )
                     .weak(),
                 );
+                ui.add_space(6.0);
+                render_save_diff_ui(ui, &pending.diff);
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     if ui.button("Replace database").clicked() {
@@ -6082,11 +6789,13 @@ impl App {
         if existing.is_empty() || allowed_in_place {
             self.write_scid_export(&path, close_after);
         } else {
+            let diff = self.compute_save_diff(&path, DatabaseFormat::Scid);
             self.pending_scid_export = Some(PendingScidExport {
                 path,
                 games,
                 existing,
                 close_after,
+                diff,
             });
             self.status = format!(
                 "Confirm replacing the existing SCID database for {}.",
@@ -6185,6 +6894,8 @@ impl App {
                     )
                     .weak(),
                 );
+                ui.add_space(6.0);
+                render_save_diff_ui(ui, &pending.diff);
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     if ui.button("Replace database").clicked() {
@@ -6250,11 +6961,13 @@ impl App {
         if existing.is_empty() || allowed_in_place {
             self.write_cbh_export(&path, close_after);
         } else {
+            let diff = self.compute_save_diff(&path, DatabaseFormat::Cbh);
             self.pending_cbh_export = Some(PendingCbhExport {
                 path,
                 games,
                 existing,
                 close_after,
+                diff,
             });
             self.status = format!(
                 "Confirm replacing the existing CBH database for {}.",
@@ -6367,6 +7080,10 @@ impl App {
                     )
                     .weak(),
                 );
+                if pending.diff.target_exists || !pending.diff.unsupported_variants.is_empty() {
+                    ui.add_space(6.0);
+                    render_save_diff_ui(ui, &pending.diff);
+                }
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     if ui.button("Write database").clicked() {
@@ -6449,12 +7166,14 @@ impl App {
         if (existing.is_empty() || allowed_in_place) && !annotations {
             self.write_two_cbh_export(&path, false, close_after);
         } else {
+            let diff = self.compute_save_diff(&path, DatabaseFormat::TwoCbh);
             self.pending_two_cbh_export = Some(PendingTwoCbhExport {
                 path,
                 games,
                 existing,
                 annotations,
                 close_after,
+                diff,
             });
             self.status = format!(
                 "Confirm writing the 2CBH database for {}.",
@@ -8086,6 +8805,9 @@ impl App {
             show_nav_buttons: self.show_nav_buttons,
             touch_mode: self.touch_mode,
             show_pgn_tags: self.show_pgn_tags,
+            header_card_expanded: self.header_card_expanded,
+            pgn_tags_card_expanded: self.pgn_tags_card_expanded,
+            review_panel_expanded: self.review_panel_expanded,
             show_annotations: self.show_annotations,
             show_clocks: self.show_clocks,
             engine_bar: self.engine_bar,
@@ -8626,6 +9348,9 @@ impl App {
         self.show_clocks = bundle.display.show_clocks;
         self.show_annotations = bundle.display.show_annotations;
         self.show_pgn_tags = bundle.display.show_pgn_tags;
+        self.header_card_expanded = bundle.display.header_card_expanded;
+        self.pgn_tags_card_expanded = bundle.display.pgn_tags_card_expanded;
+        self.review_panel_expanded = bundle.display.review_panel_expanded;
         self.show_nav_buttons = bundle.display.show_nav_buttons;
         self.touch_mode = bundle.display.touch_mode;
         self.show_player_photos = bundle.display.show_player_photos;
@@ -10878,6 +11603,11 @@ impl App {
     /// abbreviated given name (`Svane, R` -> `Rasmus Svane`), never overwriting
     /// an already-spelled-out given name.
     fn wiki_lookup_name(&self, player: &PlayerSummary) -> String {
+        if let Some(id) = self.online_identity_cache.get_any_source(&player.name)
+            && let Some(real) = &id.real_name
+        {
+            return real.clone();
+        }
         if Self::has_abbreviated_given_name(&player.name)
             && let Some(full) = self
                 .photos
@@ -10887,6 +11617,165 @@ impl App {
             return full;
         }
         player.name.clone()
+    }
+
+    fn detect_game_online_source(game: &Game) -> Option<OnlineSource> {
+        for tag in ["Site", "Event", "Source", "Annotator"] {
+            if let Some(v) = game.header(tag) {
+                let lower = v.to_ascii_lowercase();
+                if lower.contains("lichess.org") {
+                    return Some(OnlineSource::Lichess);
+                }
+                if lower.contains("chess.com") {
+                    return Some(OnlineSource::ChessCom);
+                }
+            }
+        }
+        None
+    }
+
+    fn detect_player_online_source(&self, player: &PlayerSummary) -> Option<OnlineSource> {
+        if let Some(cur) = self.current.as_ref()
+            && (self.name_belongs_to_player(cur.white(), player)
+                || self.name_belongs_to_player(cur.black(), player))
+            && let Some(src) = Self::detect_game_online_source(cur)
+        {
+            return Some(src);
+        }
+        if let Some(lib) = self.library.as_ref() {
+            for &idx in player.game_indices.iter().take(6) {
+                if let Some(entry) = lib.get(idx) {
+                    for (_, v) in entry.headers() {
+                        let lower = v.to_ascii_lowercase();
+                        if lower.contains("lichess.org") {
+                            return Some(OnlineSource::Lichess);
+                        }
+                        if lower.contains("chess.com") {
+                            return Some(OnlineSource::ChessCom);
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn request_online_identity(&mut self, source: OnlineSource, username: &str) {
+        if source == OnlineSource::ChessAbc {
+            return;
+        }
+        let clean = username.trim();
+        if clean.is_empty()
+            || clean.contains(',')
+            || clean.contains(' ')
+            || clean.len() < 2
+            || clean.eq_ignore_ascii_case("?")
+        {
+            return;
+        }
+        if self.online_identity_cache.get(source, clean).is_some() {
+            return;
+        }
+        let key = online::OnlineIdentityCache::key(source, clean);
+        if !self.online_identity_in_flight.insert(key) {
+            return;
+        }
+        if self.online_identity_rx.is_none() {
+            let (tx, rx) = mpsc::channel();
+            self.online_identity_tx = tx;
+            self.online_identity_rx = Some(rx);
+        }
+        let tx = self.online_identity_tx.clone();
+        let token = self.lichess_token.clone();
+        let ctx = self.ctx.clone();
+        let uname = clean.to_string();
+        std::thread::spawn(move || {
+            let resolved =
+                online::resolve_online_player_identity(source, &uname, token.as_deref()).ok();
+            let _ = tx.send((source, uname, resolved));
+            ctx.request_repaint();
+        });
+    }
+
+    fn poll_online_identity(&mut self) {
+        let Some(rx) = self.online_identity_rx.as_ref() else {
+            return;
+        };
+        let mut updated = Vec::new();
+        while let Ok((src, uname, id)) = rx.try_recv() {
+            let key = online::OnlineIdentityCache::key(src, &uname);
+            self.online_identity_in_flight.remove(&key);
+            let has_real = id.as_ref().is_some_and(|i| i.real_name.is_some());
+            self.online_identity_cache.insert(src, &uname, id);
+            updated.push((uname, has_real));
+        }
+        if updated.is_empty() {
+            return;
+        }
+        if updated.iter().any(|(_, real)| *real) {
+            let _ = self.online_identity_cache.save();
+        }
+        if let Some(sel) = self.selected_player
+            && let Some(player) = self.players.get(sel).cloned()
+            && updated.iter().any(|(u, real)| {
+                *real && u.eq_ignore_ascii_case(player.name.trim())
+            })
+        {
+            self.wiki_cache.remove(&player.name);
+            self.wiki_cache.remove(&player.key);
+            self.start_wiki_lookup(&player);
+        }
+    }
+
+    fn apply_medal_mask(current: u16, action: MedalMenuAction) -> u16 {
+        match action {
+            MedalMenuAction::Toggle(bit) => current ^ bit,
+            MedalMenuAction::Clear => 0,
+        }
+    }
+
+    fn apply_medal_toggle_to_slots(&mut self, slot_ids: &[usize], action: MedalMenuAction) {
+        for &id in slot_ids {
+            let Some(mut game) = self
+                .edited
+                .get(&id)
+                .cloned()
+                .or_else(|| self.session.load(id, &self.edited).ok())
+            else {
+                continue;
+            };
+            let next = Self::apply_medal_mask(db_medals::from_game(&game), action);
+            db_medals::set_on_game(&mut game, next);
+            self.session.update_headers(id, &game);
+            if self.current_slot == Some(id) {
+                self.current = Some(game.clone());
+                self.dirty = true;
+            } else {
+                self.session_dirty = true;
+            }
+            self.edited.insert(id, game);
+        }
+    }
+
+    fn apply_medal_toggle_to_current(&mut self, action: MedalMenuAction) {
+        let Some(game) = self.current.as_mut() else {
+            return;
+        };
+        let next = Self::apply_medal_mask(db_medals::from_game(game), action);
+        db_medals::set_on_game(game, next);
+        if let Some(slot_id) = self.current_slot {
+            self.session.update_headers(slot_id, game);
+            self.edited.insert(slot_id, game.clone());
+        }
+        self.dirty = true;
+    }
+
+    fn apply_medal_toggle_to_prep_game(&mut self, position: usize, action: MedalMenuAction) {
+        let Some(game) = self.prep_merged_games.get_mut(position) else {
+            return;
+        };
+        let next = Self::apply_medal_mask(db_medals::from_game(game), action);
+        db_medals::set_on_game(game, next);
     }
 
     fn start_wiki_lookup(&mut self, player: &PlayerSummary) {
@@ -11175,7 +12064,7 @@ impl App {
             Color::Black => game.black(),
         };
         let display_name = self.display_player_name(name);
-        self.title_for_player_date(display_name, game.date(), fallback)
+        self.title_for_player_date(&display_name, game.date(), fallback)
     }
 
     /// Number of players selected by the batch scope, how many still need a
@@ -13938,6 +14827,10 @@ impl App {
         self.print_diagrams.clear();
         self.current = Some(game);
         self.current_slot = None;
+        self.live_watching_ephemeral = false;
+        self.stop_live_stream();
+        self.live_rematch_watch = None;
+        self.live_rematch_rx = None;
         self.dirty = false;
         self.focus_right_tab(RightTab::Preparation);
         self.goto(0);
@@ -14858,31 +15751,12 @@ impl App {
         self.eval_for_node(self.node)
     }
 
-    /// Current eval plus whether it was inherited from the nearest ancestor
-    /// that still has a reliable score. While a new ply's eval is pending the
-    /// bar holds that ancestor value instead of snapping to `0.00`.
+    /// Current eval plus whether an evaluation update is currently in flight.
+    /// Positions without a direct evaluation return `None` so the eval bar shows
+    /// a neutral grey state rather than holding a stale ancestor/book score.
     fn current_board_eval_with_hold(&self) -> (Option<BoardEval>, bool) {
-        if let Some(direct) = self.eval_for_node(self.node) {
-            return (Some(direct), false);
-        }
-        let Some(game) = self.current.as_ref() else {
-            return (None, false);
-        };
-        let mut visited = HashSet::new();
-        let mut cursor = game.nodes.get(self.node).and_then(|node| node.parent);
-        for _ in 0..game.nodes.len() {
-            let Some(parent) = cursor else {
-                break;
-            };
-            if !visited.insert(parent) {
-                break;
-            }
-            if let Some(ancestor_eval) = self.eval_for_node(parent) {
-                return (Some(ancestor_eval), true);
-            }
-            cursor = game.nodes.get(parent).and_then(|node| node.parent);
-        }
-        (None, false)
+        let computing = self.engine_searching || self.bar_cloud_rx.is_some();
+        (self.eval_for_node(self.node), computing)
     }
 
     /// Deepest available local evaluation for `fen`: live engine slots, the
@@ -14975,6 +15849,16 @@ impl App {
     fn select_slot(&mut self, id: usize) {
         if self.current_slot == Some(id) && self.current.is_some() && self.prep.is_none() {
             return;
+        }
+        if self.live_watching_ephemeral {
+            self.live_watching_ephemeral = false;
+            self.stop_live_stream();
+            self.live_rematch_watch = None;
+            self.live_rematch_rx = None;
+            self.live_watching_target = None;
+            self.live_clock_state = None;
+            self.current = None;
+            self.dirty = false;
         }
         self.print_diagrams.clear();
         self.clear_review();
@@ -15816,6 +16700,7 @@ impl App {
         }
         if self.close_confirm_open
             || self.save_database_dialog_open
+            || self.pending_in_place_save.is_some()
             || self.pending_pgn_export.is_some()
             || self.pending_scid_export.is_some()
             || self.pending_cbh_export.is_some()
@@ -15838,6 +16723,7 @@ impl App {
         }
         let mut open = true;
         let mut save = false;
+        let mut strip_and_save = false;
         let mut discard = false;
         let mut cancel = false;
         let can_save = self.can_save_database();
@@ -15848,12 +16734,37 @@ impl App {
             .filter(|(idx, _)| *idx != self.active_db_index)
             .filter_map(|(_, entry)| entry.as_ref())
             .any(|db| db.dirty || db.session_dirty);
+
+        let diff = if can_save
+            && let Some((fmt, target)) = self.writable_save_target()
+        {
+            let key_ok = self.close_confirm_diff_cache.as_ref().is_some_and(
+                |(len, ed, dirty, _)| {
+                    *len == self.session.len() && *ed == self.edited.len() && *dirty == self.dirty
+                },
+            );
+            if !key_ok {
+                let computed = self.compute_save_diff(&target, fmt);
+                self.close_confirm_diff_cache = Some((
+                    self.session.len(),
+                    self.edited.len(),
+                    self.dirty,
+                    computed,
+                ));
+            }
+            self.close_confirm_diff_cache
+                .as_ref()
+                .map(|(_, _, _, d)| d.clone())
+        } else {
+            None
+        };
+
         egui::Window::new("Unsaved changes")
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
             .show(ctx, |ui| {
-                ui.set_min_width(420.0);
+                ui.set_min_width(450.0);
                 ui.label("This database has unsaved changes. Save before closing?");
                 if other_tabs_dirty {
                     ui.label(
@@ -15862,6 +16773,11 @@ impl App {
                             .color(GOLD),
                     );
                 }
+                if let Some(ref d) = diff {
+                    ui.add_space(4.0);
+                    render_save_diff_ui(ui, d);
+                }
+                ui.add_space(4.0);
                 ui.label(
                     RichText::new(
                         "Save database keeps the current format. 2CBH writes moves, variations, and metadata; comments, NAGs, clocks, and evaluations are not written yet.",
@@ -15878,6 +16794,13 @@ impl App {
                     {
                         save = true;
                     }
+                    if diff
+                        .as_ref()
+                        .is_some_and(|d| !d.unsupported_variants.is_empty())
+                        && ui.button("Remove unsupported variants & save").clicked()
+                    {
+                        strip_and_save = true;
+                    }
                     if ui.button("Discard changes").clicked() {
                         discard = true;
                     }
@@ -15887,16 +16810,26 @@ impl App {
                 });
             });
 
-        if save {
+        if strip_and_save {
+            if let Some(ref d) = diff {
+                self.remove_unsupported_variant_slots(&d.unsupported_variants);
+            }
             self.close_confirm_open = false;
+            self.close_confirm_diff_cache = None;
+            self.save_database_now(true);
+        } else if save {
+            self.close_confirm_open = false;
+            self.close_confirm_diff_cache = None;
             self.save_database_now(true);
         } else if discard {
             self.close_confirm_open = false;
+            self.close_confirm_diff_cache = None;
             self.clear_all_dirty_flags();
             self.force_close_confirmed = true;
             self.pending_window_close = true;
         } else if cancel || !open {
             self.close_confirm_open = false;
+            self.close_confirm_diff_cache = None;
         }
     }
 
@@ -16409,20 +17342,14 @@ impl App {
             self.open_date_picker();
         }
         if delete_key
-            && self.left_tab == LeftTab::Games
-            && self.prep.is_none()
             && self.pending_delete_games.is_none()
+            && self.pending_delete_database.is_none()
         {
-            let ids: Vec<usize> = if !self.selected_slots.is_empty() {
-                self.selected_slots.iter().copied().collect()
-            } else if let Some(slot_id) = self.current_slot {
-                vec![slot_id]
-            } else {
-                Vec::new()
-            };
-            if !ids.is_empty() {
-                self.request_delete_session_slots(ids);
-            }
+            let target = self
+                .hovered_shelf_index
+                .filter(|&idx| idx < self.shelf_entries.len())
+                .unwrap_or(self.active_db_index);
+            self.close_shelf_database(target);
         }
     }
 
@@ -16500,7 +17427,7 @@ impl App {
                         )
                         .clicked()
                     {
-                        self.save_database_now(false);
+                        self.request_save_database_ui(false);
                         ui.close();
                     }
                     if ui
@@ -16534,37 +17461,24 @@ impl App {
                         ui.close();
                     }
                     ui.separator();
-                    if ui.button("Online, Live & Tournament Hub…").clicked() {
+                    if ui.button("Live Broadcasts & Games…").clicked() {
                         self.open_online_hub(OnlineHubTab::LiveBroadcasts);
                         ui.close();
                     }
-                    if ui.button("Live Broadcasts & Server Games…").clicked() {
-                        self.open_online_hub(OnlineHubTab::LiveBroadcasts);
-                        ui.close();
-                    }
-                    if ui.button("Import from Lichess…").clicked() {
-                        self.online_source = OnlineSource::Lichess;
-                        self.open_online_hub(OnlineHubTab::Accounts);
-                        ui.close();
-                    }
-                    if ui.button("Import from Chess.com…").clicked() {
-                        self.online_source = OnlineSource::ChessCom;
-                        self.open_online_hub(OnlineHubTab::Accounts);
-                        ui.close();
-                    }
-                    if ui.button("Import from ChessABC…").clicked() {
-                        self.online_source = OnlineSource::ChessAbc;
-                        self.open_online_hub(OnlineHubTab::Accounts);
-                        ui.close();
-                    }
-                    if ui.button("Download from TWIC…").clicked() {
-                        self.open_twic_dialog();
-                        ui.close();
-                    }
-                    if ui.button("Import from League / Provider…").clicked() {
-                        self.open_league_import_dialog();
-                        ui.close();
-                    }
+                    ui.menu_button("Import Online & Tournaments", |ui| {
+                        if ui.button("Online Accounts (Lichess / Chess.com / ChessABC)…").clicked() {
+                            self.open_online_hub(OnlineHubTab::Accounts);
+                            ui.close();
+                        }
+                        if ui.button("Leagues & Tournament Portals…").clicked() {
+                            self.open_online_hub(OnlineHubTab::Leagues);
+                            ui.close();
+                        }
+                        if ui.button("TWIC Weekly & Archives…").clicked() {
+                            self.open_online_hub(OnlineHubTab::Twic);
+                            ui.close();
+                        }
+                    });
                     ui.separator();
                     ui.label("Or drop a .pgn, .si4, .si3, .cbh, or .2cbh onto the window.");
                 });
@@ -16864,16 +17778,20 @@ impl App {
             self.active_db_index = 0;
         }
         let mut open_new_file = false;
+        let mut save_db_as = false;
         let mut create_scratch = false;
         let mut set_active_as_ref = false;
         let mut open_classify = false;
         let mut switch_to = None;
         let mut close_idx = None;
+        let mut delete_db: Option<PendingDeleteDatabase> = None;
+        let mut hovered_shelf: Option<usize> = None;
         let mut set_ref_path = None;
         let mut drop_games_into: Option<(usize, GameRowDrag)> = None;
         let mut start_shelf_merge: Option<PendingShelfMerge> = None;
         let mut hovered_shelf_with_drag = None;
         let has_library = self.library.is_some();
+        let can_save = self.can_save_database();
         let can_classify = self.current.is_some() || !self.session.is_empty();
         let is_active_ref = self.reference_enabled
             && self.library.as_ref().is_some_and(|lib| {
@@ -16885,6 +17803,15 @@ impl App {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if folder_open_button(ui, "Open another database into the shelf").clicked() {
                     open_new_file = true;
+                }
+                if save_database_as_button(
+                    ui,
+                    can_save,
+                    "Save database as… (PGN, SCID4, CBH, or 2CBH)",
+                )
+                .clicked()
+                {
+                    save_db_as = true;
                 }
                 if classify_openings_button(
                     ui,
@@ -16929,6 +17856,9 @@ impl App {
                 });
             });
         });
+        if save_db_as {
+            self.save_database_as_now(false);
+        }
         if set_active_as_ref {
             self.set_current_database_as_reference();
         }
@@ -16950,6 +17880,9 @@ impl App {
             let row_h = 24.0;
             let (rect, response) =
                 ui.allocate_exact_size(vec2(row_w, row_h), Sense::click_and_drag());
+            if response.hovered() {
+                hovered_shelf = Some(idx);
+            }
             let hovering_game_drag = response.dnd_hover_payload::<GameRowDrag>().is_some();
             let hovering_db_drag = response
                 .dnd_hover_payload::<ShelfDbDrag>()
@@ -17081,6 +18014,13 @@ impl App {
             }
 
             response.context_menu(|ui| {
+                if idx == self.active_db_index
+                    && can_save
+                    && ui.button("Save database as…").clicked()
+                {
+                    save_db_as = true;
+                    ui.close();
+                }
                 if let Some(path) = &path_opt
                     && ui.button("★ Set as Reference Database").clicked()
                 {
@@ -17103,9 +18043,34 @@ impl App {
                     close_idx = Some(idx);
                     ui.close();
                 }
+                if let Some(path) = &path_opt {
+                    let files = crate::library::database_companion_files_for_deletion(path);
+                    if !files.is_empty() {
+                        ui.separator();
+                        if ui
+                            .button(
+                                RichText::new("Delete database…")
+                                    .color(Color32::from_rgb(0xE0, 0x6C, 0x75)),
+                            )
+                            .clicked()
+                        {
+                            delete_db = Some(PendingDeleteDatabase {
+                                shelf_index: idx,
+                                title: title.clone(),
+                                path: Some(path.clone()),
+                                files,
+                                count,
+                            });
+                            ui.close();
+                        }
+                    }
+                }
             });
         }
 
+        if save_db_as {
+            self.save_database_as_now(false);
+        }
         if let Some(hover_idx) = hovered_shelf_with_drag {
             let now = Instant::now();
             match self.shelf_hover_switch {
@@ -17210,11 +18175,16 @@ impl App {
         if let Some(pending) = start_shelf_merge {
             self.pending_shelf_merge = Some(pending);
         }
+        self.hovered_shelf_index = hovered_shelf;
         if let Some(idx) = switch_to {
+            self.shelf_focused = true;
             self.switch_shelf_database(idx);
         }
         if let Some(idx) = close_idx {
             self.close_shelf_database(idx);
+        }
+        if let Some(pending) = delete_db {
+            self.pending_delete_database = Some(pending);
         }
 
         self.my_games_shelf_tree_ui(ui);
@@ -17740,7 +18710,8 @@ impl App {
                                     .and_then(|color| calc_player_outcome(game.result(), color));
                                 let site_owned = game.header("Site").map(str::to_string);
                                 let width = ui.available_width();
-                                if game_row(
+                                let row_medals = db_medals::from_game(game);
+                                let resp = game_row(
                                     ui,
                                     false,
                                     &prefix,
@@ -17754,10 +18725,21 @@ impl App {
                                     42.0,
                                     None,
                                     player_color.map(|_| (result_badge.as_str(), outcome)),
-                                )
-                                .clicked()
-                                {
+                                );
+                                paint_game_row_medals(ui, resp.rect, row_medals, player_color.is_some());
+                                if resp.clicked() {
                                     selected = Some(index);
+                                }
+                                let mut online_medal_action = None;
+                                resp.context_menu(|ui| {
+                                    online_medal_action =
+                                        medals_context_submenu(ui, row_medals);
+                                });
+                                if let Some(action) = online_medal_action
+                                    && let Some(g) = self.online_ref_games.get_mut(index)
+                                {
+                                    let next = Self::apply_medal_mask(db_medals::from_game(g), action);
+                                    db_medals::set_on_game(g, next);
                                 }
                             }
                         });
@@ -17906,6 +18888,7 @@ impl App {
             }
             let mut merged_preview = None;
             let mut ctx_delete_prep: Option<usize> = None;
+            let mut ctx_medal_prep: Option<(usize, MedalMenuAction)> = None;
             egui::ScrollArea::vertical()
                 .id_salt("game-list")
                 .auto_shrink([false, false])
@@ -17925,13 +18908,14 @@ impl App {
                         let width = ui.available_width();
                         let white_disp = self.display_player_name(game.white());
                         let black_disp = self.display_player_name(game.black());
+                        let row_medals = db_medals::from_game(game);
                         let mut response = game_row(
                             ui,
                             false,
                             "",
-                            RowName::new(white_disp, self.title_for_game(game, Color::White)),
+                            RowName::new(&white_disp, self.title_for_game(game, Color::White)),
                             Some(RowName::new(
-                                black_disp,
+                                &black_disp,
                                 self.title_for_game(game, Color::Black),
                             )),
                             "",
@@ -17943,6 +18927,7 @@ impl App {
                             Some(type_color),
                             None,
                         );
+                        paint_game_row_medals(ui, response.rect, row_medals, false);
                         response = response.on_hover_text(cat.label());
                         if response.sense.senses_drag() {
                             response.dnd_set_drag_payload(GameRowDrag {
@@ -17961,6 +18946,9 @@ impl App {
                             merged_preview = Some(position);
                         }
                         response.context_menu(|ui| {
+                            if let Some(action) = medals_context_submenu(ui, row_medals) {
+                                ctx_medal_prep = Some((position, action));
+                            }
                             if ui.button("Delete / hide game…").clicked() {
                                 ctx_delete_prep = Some(position);
                                 ui.close();
@@ -17968,6 +18956,9 @@ impl App {
                         });
                     }
                 });
+            if let Some((position, action)) = ctx_medal_prep {
+                self.apply_medal_toggle_to_prep_game(position, action);
+            }
             if let Some(position) = ctx_delete_prep {
                 self.request_delete_prep_game(position);
             }
@@ -18205,6 +19196,7 @@ impl App {
         let mut ctx_copy_to_shelf: Option<(usize, Vec<usize>)> = None;
         let mut ctx_copy_to_my_games: Option<(MyGamesSection, Vec<usize>)> = None;
         let mut ctx_delete_slots: Option<Vec<usize>> = None;
+        let mut ctx_medal_slots: Option<(Vec<usize>, MedalMenuAction)> = None;
         let my_games_configured = self.my_games_config.path.is_some();
         let shelf_targets: Vec<(usize, String)> = (0..self.shelf_entries.len())
             .filter(|&idx| idx != self.active_db_index && !self.shelf_entry_read_only(idx))
@@ -18278,12 +19270,13 @@ impl App {
                     let width = ui.available_width();
                     let white_disp = self.display_player_name(&white_name);
                     let black_disp = self.display_player_name(&black_name);
+                    let row_medals = self.session.slot_medals(id, &self.edited);
                     let mut response = game_row(
                         ui,
                         selected,
                         "",
-                        RowName::new(white_disp, white_title),
-                        Some(RowName::new(black_disp, black_title)),
+                        RowName::new(&white_disp, white_title),
+                        Some(RowName::new(&black_disp, black_title)),
                         "",
                         &subtitle,
                         site_owned.as_deref(),
@@ -18293,6 +19286,7 @@ impl App {
                         Some(type_color),
                         show_result_badge.then_some((result_badge.as_str(), badge_outcome)),
                     );
+                    paint_game_row_medals(ui, response.rect, row_medals, show_result_badge);
                     response = response.on_hover_text(cat.label());
                     if response.hovered() {
                         let browse_id = format!("session:{id}");
@@ -18464,6 +19458,9 @@ impl App {
                                 },
                             );
                         }
+                        if let Some(action) = medals_context_submenu(ui, row_medals) {
+                            ctx_medal_slots = Some((drag_ids.clone(), action));
+                        }
                         if self.prep.is_none() {
                             ui.separator();
                             if ui
@@ -18477,6 +19474,9 @@ impl App {
                     });
                 }
             });
+        if let Some((slot_ids, action)) = ctx_medal_slots {
+            self.apply_medal_toggle_to_slots(&slot_ids, action);
+        }
         if let Some(slot_ids) = ctx_delete_slots {
             self.request_delete_session_slots(slot_ids);
         }
@@ -18851,9 +19851,15 @@ impl App {
                                         )
                                         .on_hover_text(tip);
                                     }
+                                    let detected_online_src = self.detect_player_online_source(&player);
+                                    if let Some(src) = detected_online_src {
+                                        self.request_online_identity(src, &player.name);
+                                    }
+                                    let header_display_name =
+                                        self.display_name_with_online_identity(&player.name, detected_online_src);
                                     ui.add(
                                         egui::Label::new(
-                                            RichText::new(&player.name).size(15.5).strong(),
+                                            RichText::new(header_display_name).size(15.5).strong(),
                                         )
                                         .truncate(),
                                     );
@@ -19086,6 +20092,8 @@ impl App {
         }
         let mut delete_prep_pos: Option<usize> = None;
         let mut delete_lib_slot: Option<usize> = None;
+        let mut medal_prep_action: Option<(usize, MedalMenuAction)> = None;
+        let mut medal_lib_action: Option<(usize, MedalMenuAction)> = None;
         if total == 0 {
             ui.label(RichText::new("No games for this player.").weak());
         } else if merged_active {
@@ -19114,11 +20122,12 @@ impl App {
                         let result_badge = standardize_result_badge(game.result());
                         let site_owned = game.header("Site").map(str::to_string);
                         let width = ui.available_width();
+                        let row_medals = db_medals::from_game(game);
                         let mut response = game_row(
                             ui,
                             false,
                             &format!("{} vs ", color_name(player_color)),
-                            RowName::new(opponent_disp, self.title_for_game(game, opponent_color)),
+                            RowName::new(&opponent_disp, self.title_for_game(game, opponent_color)),
                             None,
                             "",
                             &subtitle,
@@ -19132,6 +20141,7 @@ impl App {
                                 calc_player_outcome(game.result(), player_color),
                             )),
                         );
+                        paint_game_row_medals(ui, response.rect, row_medals, true);
                         response = response.on_hover_text(cat.label());
                         if response.sense.senses_drag() {
                             response.dnd_set_drag_payload(GameRowDrag {
@@ -19150,6 +20160,9 @@ impl App {
                             merged_preview = Some(position);
                         }
                         response.context_menu(|ui| {
+                            if let Some(action) = medals_context_submenu(ui, row_medals) {
+                                medal_prep_action = Some((position, action));
+                            }
                             if ui.button("Delete / hide game…").clicked() {
                                 delete_prep_pos = Some(position);
                                 ui.close();
@@ -19276,11 +20289,14 @@ impl App {
                             .is_some_and(|id| self.current_slot == Some(id))
                             && self.prep.is_none();
                         let width = ui.available_width();
+                        let row_medals = slot_id_for_row
+                            .map(|sid| self.session.slot_medals(sid, &self.edited))
+                            .unwrap_or(0);
                         let mut response = game_row(
                             ui,
                             selected,
                             &format!("{color} vs "),
-                            RowName::new(opponent_disp, opponent_title),
+                            RowName::new(&opponent_disp, opponent_title),
                             None,
                             "",
                             &subtitle,
@@ -19291,6 +20307,7 @@ impl App {
                             Some(type_color),
                             Some((result_badge.as_str(), outcome)),
                         );
+                        paint_game_row_medals(ui, response.rect, row_medals, true);
                         response = response.on_hover_text(type_label);
                         if response.sense.senses_drag() {
                             response.dnd_set_drag_payload(GameRowDrag {
@@ -19310,11 +20327,12 @@ impl App {
                         if response.clicked() {
                             select_game = Some(idx);
                         }
-                        if let Some(slot_id) = slot_id_for_row
-                            && self.prep.is_none()
-                        {
+                        if let Some(slot_id) = slot_id_for_row {
                             response.context_menu(|ui| {
-                                if ui.button("Delete game…").clicked() {
+                                if let Some(action) = medals_context_submenu(ui, row_medals) {
+                                    medal_lib_action = Some((slot_id, action));
+                                }
+                                if self.prep.is_none() && ui.button("Delete game…").clicked() {
                                     delete_lib_slot = Some(slot_id);
                                     ui.close();
                                 }
@@ -19322,6 +20340,11 @@ impl App {
                         }
                     }
                 });
+        }
+        if let Some((pos, action)) = medal_prep_action {
+            self.apply_medal_toggle_to_prep_game(pos, action);
+        } else if let Some((slot_id, action)) = medal_lib_action {
+            self.apply_medal_toggle_to_slots(&[slot_id], action);
         }
         if let Some(pos) = delete_prep_pos {
             self.request_delete_prep_game(pos);
@@ -19709,6 +20732,10 @@ impl App {
         self.recent_preview = None;
         self.hovered_game_browse = None;
         self.current_slot = None;
+        self.live_watching_ephemeral = false;
+        self.stop_live_stream();
+        self.live_rematch_watch = None;
+        self.live_rematch_rx = None;
         self.dirty = false;
         self.current = Some(game);
         self.orientation = rep.color;
@@ -19744,6 +20771,10 @@ impl App {
         self.clear_engine_results();
         self.recent_preview = None;
         self.current_slot = None;
+        self.live_watching_ephemeral = false;
+        self.stop_live_stream();
+        self.live_rematch_watch = None;
+        self.live_rematch_rx = None;
         self.dirty = false;
         self.current = Some(game);
         self.orientation = rep.color;
@@ -19815,6 +20846,10 @@ impl App {
         self.clear_engine_results();
         self.recent_preview = None;
         self.current_slot = None;
+        self.live_watching_ephemeral = false;
+        self.stop_live_stream();
+        self.live_rematch_watch = None;
+        self.live_rematch_rx = None;
         self.dirty = false;
         self.current = Some(game);
         self.orientation = rep.color;
@@ -20817,18 +21852,56 @@ impl App {
             .inner_margin(10.0)
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.heading("Game review");
+                    let arrow = if self.review_panel_expanded { "▾" } else { "▸" };
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new(format!("{arrow}  Game review")).size(15.5).strong(),
+                            )
+                            .frame(false),
+                        )
+                        .on_hover_text(if self.review_panel_expanded {
+                            "Collapse Game review options"
+                        } else {
+                            "Expand Game review options and analysis"
+                        })
+                        .clicked()
+                    {
+                        self.review_panel_expanded = !self.review_panel_expanded;
+                        prefs_changed = true;
+                    }
                     if running {
                         ui.spinner();
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.label(
-                            RichText::new(if running { "analyzing" } else { "idle" })
-                                .small()
-                                .weak(),
-                        );
+                        let status_text = if running {
+                            if let Some(review) = &self.review {
+                                let (done, total) = review.progress();
+                                format!("analyzing {done}/{total}")
+                            } else {
+                                "analyzing".to_string()
+                            }
+                        } else if !self.review_panel_expanded
+                            && let (Some(review), Some(game)) = (&self.review, &self.current)
+                        {
+                            let moves = review.moves(game);
+                            let summary = review::accuracy_summary(&moves);
+                            if summary.white.is_some() || summary.black.is_some() {
+                                let w = summary.white.map(|v| format!("{v:.0}%")).unwrap_or_else(|| "—".to_string());
+                                let b = summary.black.map(|v| format!("{v:.0}%")).unwrap_or_else(|| "—".to_string());
+                                format!("{w} · {b}")
+                            } else {
+                                "idle".to_string()
+                            }
+                        } else {
+                            "idle".to_string()
+                        };
+                        ui.label(RichText::new(status_text).small().weak());
                     });
                 });
+                if !self.review_panel_expanded {
+                    return;
+                }
                 ui.label(
                     RichText::new(
                         "Lichess Cloud Eval is reused first; the selected engine fills any remaining positions.",
@@ -20917,6 +21990,9 @@ impl App {
         }
         if cancel {
             self.cancel_review();
+        }
+        if !self.review_panel_expanded {
+            return;
         }
 
         let mut clicked_node = None;
@@ -21349,6 +22425,28 @@ impl App {
                 );
             });
             ui.add_space(4.0);
+        } else if self.live_watching_ephemeral {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new("Live watch (not added to database)")
+                        .small()
+                        .color(GOLD),
+                );
+                if ui
+                    .small_button("Save live game to DB")
+                    .on_hover_text("Insert this watched live game into the active database")
+                    .clicked()
+                {
+                    let id = self.session.insert_game(game.clone(), None);
+                    self.current_slot = Some(id);
+                    self.live_watching_ephemeral = false;
+                    self.session_dirty = true;
+                    self.session_revision = self.session_revision.wrapping_add(1);
+                    self.games_filter_cache = None;
+                    self.status = "Added watched live game to the active database.".to_string();
+                }
+            });
+            ui.add_space(4.0);
         }
         let editor = if is_hover_overlay {
             None
@@ -21373,13 +22471,14 @@ impl App {
         let mut diagram_toggle = None;
         let mut crosstable_clicked = false;
 
+        let online_src = Self::detect_game_online_source(&game);
+        let white_disp = self.display_name_with_online_identity(game.white(), online_src);
+        let black_disp = self.display_name_with_online_identity(game.black(), online_src);
+        let prev_header_expanded = self.header_card_expanded;
         game_header_card(
             ui,
             &game,
-            (
-                self.display_player_name(game.white()),
-                self.display_player_name(game.black()),
-            ),
+            (&white_disp, &black_disp),
             (
                 self.title_for_game(&game, Color::White),
                 self.title_for_game(&game, Color::Black),
@@ -21387,11 +22486,16 @@ impl App {
             prep.as_ref(),
             self.rating_priority,
             self.show_all_ratings,
+            &mut self.header_card_expanded,
             &mut date_clicked,
         );
+        if self.header_card_expanded != prev_header_expanded {
+            self.save_display_prefs();
+        }
         ui.add_space(6.0);
         let mut show_empty = self.show_empty_pgn_tags;
         if self.show_pgn_tags {
+            let prev_pgn_expanded = self.pgn_tags_card_expanded;
             let tags_ui = ui.scope(|ui| {
                 game_tags_card(
                     ui,
@@ -21400,6 +22504,7 @@ impl App {
                     &mut tag_delete,
                     &mut tag_add,
                     &mut tag_add_value,
+                    &mut self.pgn_tags_card_expanded,
                     &mut self.tags_expanded,
                     &mut show_empty,
                     &mut self.board_tag_visible,
@@ -21409,6 +22514,9 @@ impl App {
                     &mut crosstable_clicked,
                 );
             });
+            if self.pgn_tags_card_expanded != prev_pgn_expanded {
+                self.save_display_prefs();
+            }
             tags_ui.response.context_menu(|ui| {
                 if ui.button("Hide PGN tags").clicked() {
                     self.show_pgn_tags = false;
@@ -21420,8 +22528,15 @@ impl App {
                 self.show_empty_pgn_tags = show_empty;
                 self.save_display_prefs();
             }
-            ui.add_space(8.0);
+            ui.add_space(6.0);
         }
+        let header_medal_action = game_flags_drawer(
+            ui,
+            &game,
+            &mut self.flags_expanded,
+            !is_hover_overlay,
+        );
+        ui.add_space(8.0);
 
         let mut hide_annotations = false;
         let ann_visible = self.show_annotations || editor.is_some();
@@ -21655,6 +22770,9 @@ impl App {
         }
 
         if !is_hover_overlay {
+            if let Some(action) = header_medal_action {
+                self.apply_medal_toggle_to_current(action);
+            }
             if tag_update.is_some()
                 || tag_delete.is_some()
                 || tag_add.is_some()
@@ -24593,9 +25711,19 @@ impl App {
                                 .max_height(self.prep_recent_games_height)
                                 .auto_shrink([false, false])
                                 .show_rows(ui, 40.0, shown, |ui, row_range| {
+                                    let mut recent_medal_action: Option<(Option<usize>, usize, MedalMenuAction)> = None;
                                     for row_index in row_range {
                                         let Some(row) = recent_rows.get(row_index) else {
                                             continue;
+                                        };
+                                        let row_medals = if let Some(merged) = row.merged_index {
+                                            self.prep_merged_games
+                                                .get(merged)
+                                                .map_or(0, db_medals::from_game)
+                                        } else if let Some(sid) = self.session.source_slot(row.index) {
+                                            self.session.slot_medals(sid, &self.edited)
+                                        } else {
+                                            0
                                         };
                                         let mut row_response = game_row(
                                             ui,
@@ -24612,6 +25740,7 @@ impl App {
                                             Some(row.type_color),
                                             Some((&row.result_badge, row.player_outcome)),
                                         );
+                                        paint_game_row_medals(ui, row_response.rect, row_medals, true);
                                         row_response =
                                             row_response.on_hover_text(row.type_label);
                                         if row_response.hovered() {
@@ -24639,6 +25768,19 @@ impl App {
                                             } else {
                                                 preview = Some(row.index);
                                             }
+                                        }
+                                        row_response.context_menu(|ui| {
+                                            if let Some(action) = medals_context_submenu(ui, row_medals) {
+                                                recent_medal_action =
+                                                    Some((row.merged_index, row.index, action));
+                                            }
+                                        });
+                                    }
+                                    if let Some((merged_opt, lib_idx, action)) = recent_medal_action {
+                                        if let Some(merged) = merged_opt {
+                                            self.apply_medal_toggle_to_prep_game(merged, action);
+                                        } else if let Some(sid) = self.session.source_slot(lib_idx) {
+                                            self.apply_medal_toggle_to_slots(&[sid], action);
                                         }
                                     }
                                 });
@@ -25035,6 +26177,10 @@ impl App {
         self.print_diagrams.clear();
         self.current = Some(game);
         self.current_slot = None;
+        self.live_watching_ephemeral = false;
+        self.stop_live_stream();
+        self.live_rematch_watch = None;
+        self.live_rematch_rx = None;
         self.dirty = false;
         let orientation = self
             .current
@@ -25119,13 +26265,13 @@ impl App {
         );
         ui.add_space(6.0);
         let mut date_clicked: Option<egui::Pos2> = None;
+        let white_disp = self.display_player_name(game.white());
+        let black_disp = self.display_player_name(game.black());
+        let mut header_expanded_preview = true;
         game_header_card(
             ui,
             &game,
-            (
-                self.display_player_name(game.white()),
-                self.display_player_name(game.black()),
-            ),
+            (&white_disp, &black_disp),
             (
                 self.title_for_game(&game, Color::White),
                 self.title_for_game(&game, Color::Black),
@@ -25133,6 +26279,7 @@ impl App {
             None,
             self.rating_priority,
             self.show_all_ratings,
+            &mut header_expanded_preview,
             &mut date_clicked,
         );
         ui.add_space(8.0);
@@ -25213,6 +26360,10 @@ impl App {
         self.board_tag_visible = false;
         self.forced_tag_visibility.clear();
         self.current_slot = None;
+        self.live_watching_ephemeral = false;
+        self.stop_live_stream();
+        self.live_rematch_watch = None;
+        self.live_rematch_rx = None;
         self.dirty = false;
         self.current = Some(Game::default());
         self.node = 0;
@@ -25556,13 +26707,34 @@ impl App {
                     }
                     ProviderKind::DsbErgebnisdienst => {
                         self.league_portal = LeaguePortal::DsbErgebnisdienst;
+                        if let Some(q) = provider.default_query
+                            && self.league_dsb_query.trim().is_empty()
+                        {
+                            self.league_dsb_query = q.to_string();
+                        }
                         if self.league_dsb_dir.is_none() && self.league_dir_rx.is_none() {
                             self.fetch_dsb_directory(self.league_dsb_season_prefix.clone());
                         }
                     }
                     ProviderKind::LichessBroadcast => {
+                        if let Some(q) = provider.default_query
+                            && self.league_broadcast_query.trim().is_empty()
+                        {
+                            self.league_broadcast_query = q.to_string();
+                        }
                         if self.league_broadcast_tours.is_empty() && self.league_dir_rx.is_none() {
-                            self.fetch_lichess_broadcasts(None);
+                            let q = (!self.league_broadcast_query.trim().is_empty())
+                                .then(|| self.league_broadcast_query.clone());
+                            self.fetch_lichess_broadcasts(q);
+                        }
+                    }
+                    ProviderKind::ChessResultsFederation => {
+                        let (fed, ttype) =
+                            league_import::parse_cr_default_query(provider.default_query);
+                        self.league_cr_fed = fed;
+                        self.league_cr_type = ttype;
+                        if self.league_cr_results.is_empty() && self.league_dir_rx.is_none() {
+                            self.fetch_league_chess_results();
                         }
                     }
                     ProviderKind::RegionalHtmlPortal | ProviderKind::CustomUrl => {
@@ -25649,6 +26821,69 @@ impl App {
         self.live_rx = Some(rx);
     }
 
+    fn fetch_live_broadcast_tour_rounds(&mut self, tour_id: String) {
+        if self.live_tour_rounds_cache.contains_key(&tour_id)
+            || self.live_tour_rounds_rx.is_some()
+        {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        let ctx = self.ctx.clone();
+        std::thread::spawn(move || {
+            let res = crate::live::fetch_lichess_broadcast_tour_rounds(&tour_id)
+                .map_err(|e| format!("{e:#}"));
+            let _ = tx.send((tour_id, res));
+            ctx.request_repaint();
+        });
+        self.live_tour_rounds_rx = Some(rx);
+    }
+
+    fn request_live_preview(&mut self, game_id: &str) {
+        let gid = game_id.trim().to_string();
+        if gid.is_empty()
+            || self.live_preview_cache.contains_key(&gid)
+            || self.live_preview_in_flight.contains(&gid)
+        {
+            return;
+        }
+        if self.live_preview_rx.is_none() {
+            let (tx, rx) = mpsc::channel();
+            self.live_preview_tx = tx;
+            self.live_preview_rx = Some(rx);
+        }
+        self.live_preview_in_flight.insert(gid.clone());
+        let tx = self.live_preview_tx.clone();
+        let ctx = self.ctx.clone();
+        std::thread::spawn(move || {
+            let entry = crate::live::fetch_lichess_game_full(&gid, None).ok();
+            let _ = tx.send((gid, entry));
+            ctx.request_repaint();
+        });
+    }
+
+    fn stop_live_stream(&mut self) {
+        if let Some(stop) = self.live_stream_stop.take() {
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.live_stream_rx = None;
+    }
+
+    fn start_live_game_stream(&mut self, game_id: String) {
+        self.stop_live_stream();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_worker = stop.clone();
+        let (tx, rx) = mpsc::channel();
+        let ctx = self.ctx.clone();
+        std::thread::spawn(move || {
+            crate::live::stream_lichess_game(&game_id, stop_worker, |update| {
+                let _ = tx.send(update);
+                ctx.request_repaint();
+            });
+        });
+        self.live_stream_stop = Some(stop);
+        self.live_stream_rx = Some(rx);
+    }
+
     fn request_live_avatar(&mut self, url: &str) {
         let trimmed = url.trim().to_string();
         if trimmed.is_empty()
@@ -25672,6 +26907,30 @@ impl App {
         });
     }
 
+    fn load_ephemeral_live_game(&mut self, game: Game, tip: usize) {
+        self.print_diagrams.clear();
+        self.clear_review();
+        self.reset_branch_state();
+        self.recent_preview = None;
+        self.annotation_editor = None;
+        self.annotation_focus = false;
+        if self.prep.take().is_some() {
+            self.dirty = false;
+            self.current = None;
+        }
+        if self.dirty {
+            if let (Some(leaving), Some(prev)) = (self.current_slot, self.current.take()) {
+                self.edited.insert(leaving, prev);
+            }
+            self.dirty = false;
+        }
+        self.current_slot = None;
+        self.current = Some(game);
+        self.live_watching_ephemeral = true;
+        self.dirty = false;
+        self.goto(tip);
+    }
+
     fn open_live_game_entry(&mut self, entry: crate::live::LiveGameEntry) {
         if let Some(u) = &entry.white.avatar_url {
             self.request_live_avatar(u);
@@ -25679,11 +26938,32 @@ impl App {
         if let Some(u) = &entry.black.avatar_url {
             self.request_live_avatar(u);
         }
-        if let Some(mut game) = entry.game.clone() {
-            crate::live::apply_live_metadata_to_game(&mut game, &entry);
-            self.live_watching_target = entry.refresh_target.clone();
-            self.live_watching_meta = Some((entry.white.clone(), entry.black.clone()));
-            self.live_last_refresh = Some(Instant::now());
+        let resolved = if entry.game.is_none() {
+            self.live_preview_cache
+                .get(&entry.id)
+                .cloned()
+                .unwrap_or(entry)
+        } else {
+            entry
+        };
+        if let Some(mut game) = resolved.game.clone() {
+            if let Some(var) = game.header("Variant")
+                && !crate::live::is_supported_standard_variant(var)
+            {
+                self.stop_live_stream();
+                self.live_rematch_watch = None;
+                self.live_status = format!(
+                    "Variant '{var}' is not supported for live board replay ({} – {}).",
+                    resolved.white.name, resolved.black.name
+                );
+                self.status = self.live_status.clone();
+                return;
+            }
+            crate::live::apply_live_metadata_to_game(&mut game, &resolved);
+            let is_lichess_server_game = matches!(
+                resolved.refresh_target,
+                Some(crate::live::LiveRefreshTarget::LichessGameId(_))
+            );
             let tip = {
                 let mut cur = 0usize;
                 while let Some(&n) = game.nodes.get(cur).and_then(|n| n.children.first()) {
@@ -25691,34 +26971,83 @@ impl App {
                 }
                 cur
             };
-            self.session.insert_game(game, None);
-            let last_idx = self.session.len().saturating_sub(1);
-            if let Some(slot_id) = self.session.id_at(last_idx) {
-                self.select_slot(slot_id);
-                self.goto(tip);
+            let (w_clk, b_clk) = crate::live::extract_latest_clocks(&game);
+            let init_centis = crate::live::parse_initial_time_centis(&game);
+            let active_turn = game.nodes.get(tip).map(|n| n.pos.turn());
+            self.live_watching_target = resolved.refresh_target.clone();
+            self.live_watching_meta = Some((resolved.white.clone(), resolved.black.clone()));
+            self.live_rematch_rx = None;
+            self.live_rematch_watch = matches!(
+                resolved.source,
+                crate::live::LiveSource::LichessServer | crate::live::LiveSource::ChessComLive
+            )
+            .then(|| LiveRematchWatch {
+                source: resolved.source,
+                game_id: resolved.id.clone(),
+                game_url: resolved.url.clone(),
+                white: resolved.white.name.clone(),
+                black: resolved.black.name.clone(),
+                finished_at: if resolved.ongoing
+                    && resolved.source == crate::live::LiveSource::LichessServer
+                {
+                    None
+                } else {
+                    Some(Instant::now())
+                },
+                last_poll: None,
+            });
+            self.live_last_refresh = Some(Instant::now());
+            self.live_clock_state = Some(LiveClockState {
+                game_key: format!(
+                    "{}|{}",
+                    players::player_key(game.white()).unwrap_or_else(|| game.white().to_lowercase()),
+                    players::player_key(game.black()).unwrap_or_else(|| game.black().to_lowercase())
+                ),
+                initial_centis: init_centis,
+                white_centis: w_clk.map(|c| c.centis).or(resolved.white.clock.map(|c| c.centis)),
+                black_centis: b_clk.map(|c| c.centis).or(resolved.black.clock.map(|c| c.centis)),
+                active_turn,
+                anchored_at: Instant::now(),
+                ongoing: resolved.ongoing,
+            });
+            self.load_ephemeral_live_game(game, tip);
+            if is_lichess_server_game
+                && resolved.ongoing
+                && let Some(crate::live::LiveRefreshTarget::LichessGameId(gid)) =
+                    resolved.refresh_target.clone()
+            {
+                self.start_live_game_stream(gid);
+            } else {
+                self.stop_live_stream();
             }
-            self.status = format!("Watching live: {} – {}", entry.white.name, entry.black.name);
+            if self.live_close_on_open {
+                self.hub_open = false;
+            }
+            self.status = format!(
+                "Watching live: {} – {}",
+                resolved.white.name, resolved.black.name
+            );
             return;
         }
-        if let Some(crate::live::LiveRefreshTarget::LichessGameId(game_id)) = entry.refresh_target {
-            if self.live_rx.is_some() {
-                return;
+        if let Some(crate::live::LiveRefreshTarget::LichessGameId(game_id)) = resolved.refresh_target
+        {
+            if self.live_close_on_open {
+                self.hub_open = false;
             }
-            self.live_status = format!("Loading live Lichess game {game_id}…");
-            let token = self.lichess_token.clone();
-            let (tx, rx) = mpsc::channel();
-            let ctx = self.ctx.clone();
-            std::thread::spawn(move || {
-                let res = crate::live::fetch_lichess_game_full(&game_id, token.as_deref())
-                    .map_err(|e| format!("{e:#}"));
-                let _ = tx.send(LiveMsg::FullGame {
-                    open_on_board: true,
-                    auto_refresh: false,
-                    entry: res,
-                });
-                ctx.request_repaint();
+            self.live_watching_target =
+                Some(crate::live::LiveRefreshTarget::LichessGameId(game_id.clone()));
+            self.live_rematch_rx = None;
+            self.live_rematch_watch = Some(LiveRematchWatch {
+                source: resolved.source,
+                game_id: game_id.clone(),
+                game_url: resolved.url.clone(),
+                white: resolved.white.name.clone(),
+                black: resolved.black.name.clone(),
+                finished_at: None,
+                last_poll: None,
             });
-            self.live_rx = Some(rx);
+            self.start_live_game_stream(game_id.clone());
+            self.live_status = format!("Streaming live Lichess game {game_id}…");
         }
     }
 
@@ -25740,18 +27069,252 @@ impl App {
             self.live_avatar_rx = Some(rx);
         }
 
+        if let Some(rx) = self.live_preview_rx.take() {
+            while let Ok((gid, entry_opt)) = rx.try_recv() {
+                self.live_preview_in_flight.remove(&gid);
+                if let Some(full_entry) = entry_opt {
+                    for stub in &mut self.live_entries {
+                        if stub.id == gid && stub.game.is_none() {
+                            stub.white = full_entry.white.clone();
+                            stub.black = full_entry.black.clone();
+                            stub.time_control = full_entry.time_control.clone();
+                            stub.ongoing = full_entry.ongoing;
+                            stub.status_text = full_entry.status_text.clone();
+                            stub.game = full_entry.game.clone();
+                        }
+                    }
+                    self.live_preview_cache.insert(gid, full_entry);
+                }
+            }
+            self.live_preview_rx = Some(rx);
+        }
+
+        if let Some(rx) = self.live_tour_rounds_rx.take() {
+            match rx.try_recv() {
+                Ok((tid, Ok(rounds))) => {
+                    self.live_tour_rounds_cache.insert(tid, rounds);
+                }
+                Ok((_, Err(_))) => {}
+                Err(TryRecvError::Empty) => self.live_tour_rounds_rx = Some(rx),
+                Err(TryRecvError::Disconnected) => {}
+            }
+        }
+
+        if let Some(rx) = self.live_stream_rx.take() {
+            let mut latest_snapshot = None;
+            let mut rematch_id: Option<String> = None;
+            let mut keep_stream = true;
+            loop {
+                match rx.try_recv() {
+                    Ok(crate::live::LiveStreamUpdate::Snapshot {
+                        entry,
+                        initial_centis,
+                        increment_centis: _,
+                        white_centis,
+                        black_centis,
+                        ongoing,
+                    }) => {
+                        latest_snapshot =
+                            Some((entry, initial_centis, white_centis, black_centis, ongoing));
+                    }
+                    Ok(crate::live::LiveStreamUpdate::Rematch(next_id)) => {
+                        rematch_id = Some(next_id);
+                    }
+                    Ok(crate::live::LiveStreamUpdate::Error(err)) => {
+                        self.live_status = format!("Live stream: {err}");
+                        keep_stream = false;
+                        break;
+                    }
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        keep_stream = false;
+                        break;
+                    }
+                }
+            }
+            if keep_stream {
+                self.live_stream_rx = Some(rx);
+            }
+            if let Some((entry, initial_centis, white_centis, black_centis, ongoing)) =
+                latest_snapshot
+                && let Some(mut fresh) = entry.game.clone()
+            {
+                crate::live::apply_live_metadata_to_game(&mut fresh, &entry);
+                self.live_watching_meta = Some((entry.white.clone(), entry.black.clone()));
+                if let Some(w) = &mut self.live_rematch_watch {
+                    w.white = entry.white.name.clone();
+                    w.black = entry.black.name.clone();
+                    if !ongoing && w.finished_at.is_none() {
+                        w.finished_at = Some(Instant::now());
+                    }
+                }
+                let new_tip = {
+                    let mut c = 0usize;
+                    while let Some(&n) = fresh.nodes.get(c).and_then(|n| n.children.first()) {
+                        c = n;
+                    }
+                    c
+                };
+                let active_turn = fresh.nodes.get(new_tip).map(|n| n.pos.turn());
+                let gkey = format!(
+                    "{}|{}",
+                    players::player_key(fresh.white())
+                        .unwrap_or_else(|| fresh.white().to_lowercase()),
+                    players::player_key(fresh.black())
+                        .unwrap_or_else(|| fresh.black().to_lowercase())
+                );
+                let prev_init = self
+                    .live_clock_state
+                    .as_ref()
+                    .and_then(|s| s.initial_centis);
+                self.live_clock_state = Some(LiveClockState {
+                    game_key: gkey,
+                    initial_centis: initial_centis
+                        .or(prev_init)
+                        .or_else(|| crate::live::parse_initial_time_centis(&fresh)),
+                    white_centis,
+                    black_centis,
+                    active_turn,
+                    anchored_at: Instant::now(),
+                    ongoing,
+                });
+                let same_game_open = self.current.as_ref().is_some_and(|cur| {
+                    players::player_key(cur.white()) == players::player_key(fresh.white())
+                        && players::player_key(cur.black()) == players::player_key(fresh.black())
+                        && cur.header("Site") == fresh.header("Site")
+                });
+                if same_game_open && let Some(cur) = self.current.as_mut() {
+                    let was_at_tip = cur
+                        .nodes
+                        .get(self.node)
+                        .is_some_and(|n| n.children.is_empty());
+                    *cur = fresh;
+                    if was_at_tip {
+                        self.goto(new_tip);
+                    }
+                } else {
+                    self.load_ephemeral_live_game(fresh, new_tip);
+                }
+                self.live_status = if ongoing {
+                    format!(
+                        "Live streaming: {} – {}",
+                        entry.white.name, entry.black.name
+                    )
+                } else {
+                    format!(
+                        "Finished ({}) · {} – {}",
+                        entry.status_text, entry.white.name, entry.black.name
+                    )
+                };
+            } else if !keep_stream
+                && let Some(w) = &mut self.live_rematch_watch
+                && w.finished_at.is_none()
+            {
+                w.finished_at = Some(Instant::now());
+            }
+            if self.live_auto_rematch
+                && let Some(next_id) = rematch_id
+            {
+                self.live_watching_target =
+                    Some(crate::live::LiveRefreshTarget::LichessGameId(next_id.clone()));
+                self.live_rematch_watch = self.live_rematch_watch.take().map(|mut w| {
+                    w.game_id = next_id.clone();
+                    w.game_url = format!("https://lichess.org/{next_id}");
+                    w.finished_at = None;
+                    w.last_poll = None;
+                    w
+                });
+                self.start_live_game_stream(next_id.clone());
+                self.live_status = format!("Auto-following Lichess rematch ({next_id})…");
+                self.status = self.live_status.clone();
+            }
+        }
+
+        if let Some(rx) = self.live_rematch_rx.take() {
+            match rx.try_recv() {
+                Ok(Some(next_entry)) => {
+                    self.live_status = format!(
+                        "Auto-following rematch: {} – {}",
+                        next_entry.white.name, next_entry.black.name
+                    );
+                    self.open_live_game_entry(next_entry);
+                }
+                Ok(None) => {}
+                Err(TryRecvError::Empty) => {
+                    self.live_rematch_rx = Some(rx);
+                }
+                Err(TryRecvError::Disconnected) => {}
+            }
+        }
+
+        if self.live_auto_rematch
+            && self.live_watching_ephemeral
+            && self.live_stream_rx.is_none()
+            && self.live_rematch_rx.is_none()
+            && let Some(watch) = &mut self.live_rematch_watch
+            && let Some(finished_at) = watch.finished_at
+        {
+            let max_wait = match watch.source {
+                crate::live::LiveSource::LichessServer => Duration::from_secs(90),
+                crate::live::LiveSource::ChessComLive => Duration::from_secs(180),
+                _ => Duration::ZERO,
+            };
+            let interval = match watch.source {
+                crate::live::LiveSource::LichessServer => Duration::from_secs(3),
+                crate::live::LiveSource::ChessComLive => Duration::from_secs(5),
+                _ => Duration::from_secs(60),
+            };
+            if finished_at.elapsed() < max_wait
+                && watch
+                    .last_poll
+                    .is_none_or(|t| t.elapsed() >= interval)
+            {
+                watch.last_poll = Some(Instant::now());
+                let src = watch.source;
+                let gid = watch.game_id.clone();
+                let gurl = watch.game_url.clone();
+                let w_name = watch.white.clone();
+                let b_name = watch.black.clone();
+                let token = self.lichess_token.clone();
+                let (tx, rx) = mpsc::channel();
+                let ctx = self.ctx.clone();
+                std::thread::spawn(move || {
+                    let found = match src {
+                        crate::live::LiveSource::LichessServer => {
+                            crate::live::poll_lichess_rematch(&gid, &w_name, &b_name, token.as_deref())
+                        }
+                        crate::live::LiveSource::ChessComLive => {
+                            crate::live::poll_chesscom_rematch(&gurl, &w_name, &b_name)
+                        }
+                        _ => None,
+                    };
+                    let _ = tx.send(found);
+                    ctx.request_repaint();
+                });
+                self.live_rematch_rx = Some(rx);
+            }
+        }
+
         if let Some(rx) = self.live_rx.take() {
             match rx.try_recv() {
                 Ok(LiveMsg::Broadcasts(Ok(list))) => {
                     self.live_status = format!("Loaded {} Lichess broadcasts.", list.len());
-                    let first_ongoing = list
+                    let first_pick = list
                         .first()
-                        .map(|b| (b.round_id.clone(), b.tour_name.clone()));
+                        .map(|b| (b.tour_id.clone(), b.round_id.clone(), b.tour_name.clone()));
+                    for b in &list {
+                        if !b.rounds.is_empty() {
+                            self.live_tour_rounds_cache
+                                .insert(b.tour_id.clone(), b.rounds.clone());
+                        }
+                    }
                     self.live_broadcasts = list;
-                    if let Some((rid, tname)) = first_ongoing
-                        && self.live_entries.is_empty()
-                    {
-                        self.fetch_live_broadcast_round(rid, tname);
+                    if let Some((tid, rid, tname)) = first_pick {
+                        self.live_selected_tour = Some(tid.clone());
+                        self.fetch_live_broadcast_tour_rounds(tid);
+                        if self.live_entries.is_empty() {
+                            self.fetch_live_broadcast_round(rid, tname);
+                        }
                     }
                 }
                 Ok(LiveMsg::Broadcasts(Err(err))) => {
@@ -25805,6 +27368,29 @@ impl App {
                             }
                             c
                         };
+                        let (w_clk, b_clk) = crate::live::extract_latest_clocks(&fresh);
+                        let active_turn = fresh.nodes.get(new_tip).map(|n| n.pos.turn());
+                        let gkey = format!(
+                            "{}|{}",
+                            players::player_key(fresh.white())
+                                .unwrap_or_else(|| fresh.white().to_lowercase()),
+                            players::player_key(fresh.black())
+                                .unwrap_or_else(|| fresh.black().to_lowercase())
+                        );
+                        let init_centis = self
+                            .live_clock_state
+                            .as_ref()
+                            .and_then(|s| s.initial_centis)
+                            .or_else(|| crate::live::parse_initial_time_centis(&fresh));
+                        self.live_clock_state = Some(LiveClockState {
+                            game_key: gkey,
+                            initial_centis: init_centis,
+                            white_centis: w_clk.map(|c| c.centis),
+                            black_centis: b_clk.map(|c| c.centis),
+                            active_turn,
+                            anchored_at: Instant::now(),
+                            ongoing: entry.ongoing,
+                        });
                         *cur = fresh;
                         if was_at_tip {
                             self.goto(new_tip);
@@ -25823,60 +27409,82 @@ impl App {
             }
         }
 
-        // Optional 10-second live auto-refresh while watching an ongoing game
+        // Fast 3-second polling for live broadcast rounds (while Lichess Server TV uses NDJSON streaming).
         if self.live_auto_refresh
             && self.live_rx.is_none()
+            && self.live_stream_rx.is_none()
+            && self.live_clock_state.as_ref().is_none_or(|s| s.ongoing)
             && let Some(target) = self.live_watching_target.clone()
-            && self
-                .live_last_refresh
-                .is_none_or(|t| t.elapsed() >= Duration::from_secs(10))
         {
-            self.live_last_refresh = Some(Instant::now());
-            let token = self.lichess_token.clone();
-            let (tx, rx) = mpsc::channel();
-            let ctx = self.ctx.clone();
-            std::thread::spawn(move || {
-                match target {
-                    crate::live::LiveRefreshTarget::LichessGameId(gid) => {
-                        let res = crate::live::fetch_lichess_game_full(&gid, token.as_deref())
+            let interval_secs = match &target {
+                crate::live::LiveRefreshTarget::LichessBroadcastRound { .. } => 3,
+                crate::live::LiveRefreshTarget::LichessGameId(_) => 2,
+                crate::live::LiveRefreshTarget::ChessComPlayer(_) => 10,
+            };
+            if self
+                .live_last_refresh
+                .is_none_or(|t| t.elapsed() >= Duration::from_secs(interval_secs))
+            {
+                self.live_last_refresh = Some(Instant::now());
+                let token = self.lichess_token.clone();
+                let (tx, rx) = mpsc::channel();
+                let ctx = self.ctx.clone();
+                std::thread::spawn(move || {
+                    match target {
+                        crate::live::LiveRefreshTarget::LichessGameId(gid) => {
+                            let res = crate::live::fetch_lichess_game_full(&gid, token.as_deref())
+                                .map_err(|e| format!("{e:#}"));
+                            let _ = tx.send(LiveMsg::FullGame {
+                                open_on_board: false,
+                                auto_refresh: true,
+                                entry: res,
+                            });
+                        }
+                        crate::live::LiveRefreshTarget::LichessBroadcastRound {
+                            round_id,
+                            game_key,
+                        } => {
+                            let res = crate::live::fetch_lichess_broadcast_round_games(
+                                &round_id,
+                                "Broadcast",
+                                token.as_deref(),
+                            )
+                            .and_then(|mut list| {
+                                list.retain(|e| e.id == game_key);
+                                list.into_iter()
+                                    .next()
+                                    .ok_or_else(|| anyhow::anyhow!("game not found in broadcast round"))
+                            })
                             .map_err(|e| format!("{e:#}"));
-                        let _ = tx.send(LiveMsg::FullGame {
-                            open_on_board: false,
-                            auto_refresh: true,
-                            entry: res,
-                        });
+                            let _ = tx.send(LiveMsg::FullGame {
+                                open_on_board: false,
+                                auto_refresh: true,
+                                entry: res,
+                            });
+                        }
+                        crate::live::LiveRefreshTarget::ChessComPlayer(player) => {
+                            let res = crate::live::fetch_chesscom_live_games(Some(&player))
+                                .and_then(|list| {
+                                    list.into_iter()
+                                        .next()
+                                        .ok_or_else(|| anyhow::anyhow!("no recent Chess.com games"))
+                                })
+                                .map_err(|e| format!("{e:#}"));
+                            let _ = tx.send(LiveMsg::FullGame {
+                                open_on_board: false,
+                                auto_refresh: true,
+                                entry: res,
+                            });
+                        }
                     }
-                    crate::live::LiveRefreshTarget::LichessBroadcastRound {
-                        round_id,
-                        game_key,
-                    } => {
-                        let res = crate::live::fetch_lichess_broadcast_round_games(
-                            &round_id,
-                            "Broadcast",
-                            token.as_deref(),
-                        )
-                        .and_then(|mut list| {
-                            list.retain(|e| e.id == game_key);
-                            list.into_iter()
-                                .next()
-                                .ok_or_else(|| anyhow::anyhow!("game not found in broadcast round"))
-                        })
-                        .map_err(|e| format!("{e:#}"));
-                        let _ = tx.send(LiveMsg::FullGame {
-                            open_on_board: false,
-                            auto_refresh: true,
-                            entry: res,
-                        });
-                    }
-                    crate::live::LiveRefreshTarget::ChessComPlayer(_) => {}
-                }
-                ctx.request_repaint();
-            });
-            self.live_rx = Some(rx);
+                    ctx.request_repaint();
+                });
+                self.live_rx = Some(rx);
+            }
         }
     }
 
-    fn hub_live_panel_ui(&mut self, ui: &mut Ui) {
+    fn hub_live_panel_ui(&mut self, ui: &mut Ui) -> Option<(String, Game, usize)> {
         ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new("Live Feed:").small().strong());
             for (src, lbl) in [
@@ -25920,9 +27528,14 @@ impl App {
             }
             ui.checkbox(
                 &mut self.live_auto_refresh,
-                "Auto-refresh watching game (10s)",
+                "Auto-refresh / live stream",
             );
-            if self.live_rx.is_some() {
+            ui.checkbox(
+                &mut self.live_auto_rematch,
+                "Auto-follow rematch",
+            )
+            .on_hover_text("Automatically attach to rematches between the same players on Lichess or Chess.com");
+            if self.live_rx.is_some() || self.live_stream_rx.is_some() {
                 ui.spinner();
             }
         });
@@ -25934,23 +27547,105 @@ impl App {
         if self.live_sub_source == LiveSubSource::LichessBroadcasts
             && !self.live_broadcasts.is_empty()
         {
-            let mut pick_round: Option<(String, String)> = None;
             ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new("Broadcasts:").small().strong());
-                for b in self.live_broadcasts.iter().take(12) {
-                    let active = self.live_selected_round.as_deref() == Some(b.round_id.as_str());
-                    let badge = if b.ongoing { "● " } else { "" };
-                    if ui
-                        .selectable_label(
-                            active,
-                            format!("{badge}{} · {}", b.tour_name, b.round_name),
-                        )
-                        .clicked()
-                    {
-                        pick_round = Some((b.round_id.clone(), b.tour_name.clone()));
-                    }
-                }
+                ui.label(RichText::new("Show:").small().strong());
+                ui.selectable_value(
+                    &mut self.live_broadcast_filter,
+                    LiveBroadcastFilter::All,
+                    "Live & Recent",
+                );
+                ui.selectable_value(
+                    &mut self.live_broadcast_filter,
+                    LiveBroadcastFilter::LiveOnly,
+                    "Live only",
+                );
+                ui.selectable_value(
+                    &mut self.live_broadcast_filter,
+                    LiveBroadcastFilter::RecentPast,
+                    "Recent / Past",
+                );
             });
+            let mut pick_tour: Option<(String, String, String)> = None;
+            let mut pick_round: Option<(String, String)> = None;
+            egui::ScrollArea::vertical()
+                .id_salt("live-broadcast-tours-scroll")
+                .max_height(110.0)
+                .show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        for b in &self.live_broadcasts {
+                            let show = match self.live_broadcast_filter {
+                                LiveBroadcastFilter::All => true,
+                                LiveBroadcastFilter::LiveOnly => b.ongoing,
+                                LiveBroadcastFilter::RecentPast => b.is_past || !b.ongoing,
+                            };
+                            if !show {
+                                continue;
+                            }
+                            let active = self.live_selected_tour.as_deref()
+                                == Some(b.tour_id.as_str())
+                                || (self.live_selected_tour.is_none()
+                                    && self.live_selected_round.as_deref()
+                                        == Some(b.round_id.as_str()));
+                            let badge = if b.ongoing {
+                                "● "
+                            } else if b.finished {
+                                "✓ "
+                            } else {
+                                ""
+                            };
+                            if ui
+                                .selectable_label(
+                                    active,
+                                    format!("{badge}{} · {}", b.tour_name, b.round_name),
+                                )
+                                .clicked()
+                            {
+                                pick_tour = Some((
+                                    b.tour_id.clone(),
+                                    b.round_id.clone(),
+                                    b.tour_name.clone(),
+                                ));
+                            }
+                        }
+                    });
+                });
+            if let Some((tid, rid, tname)) = pick_tour {
+                self.live_selected_tour = Some(tid.clone());
+                self.fetch_live_broadcast_tour_rounds(tid);
+                self.live_entries.clear();
+                self.fetch_live_broadcast_round(rid, tname);
+            }
+            if let Some(tid) = self.live_selected_tour.clone()
+                && let Some(rounds) = self.live_tour_rounds_cache.get(&tid).cloned()
+                && !rounds.is_empty()
+            {
+                let tour_name = self
+                    .live_broadcasts
+                    .iter()
+                    .find(|b| b.tour_id == tid)
+                    .map(|b| b.tour_name.clone())
+                    .unwrap_or_else(|| "Broadcast".to_string());
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("Round:").small().strong());
+                    for r in &rounds {
+                        let active =
+                            self.live_selected_round.as_deref() == Some(r.id.as_str());
+                        let badge = if r.ongoing {
+                            "● "
+                        } else if r.finished {
+                            "✓ "
+                        } else {
+                            ""
+                        };
+                        if ui
+                            .selectable_label(active, format!("{badge}{}", r.name))
+                            .clicked()
+                        {
+                            pick_round = Some((r.id.clone(), tour_name.clone()));
+                        }
+                    }
+                });
+            }
             if let Some((rid, tname)) = pick_round {
                 self.live_entries.clear();
                 self.fetch_live_broadcast_round(rid, tname);
@@ -25959,9 +27654,12 @@ impl App {
         }
 
         let mut open_entry: Option<crate::live::LiveGameEntry> = None;
+        let mut hovered_preview: Option<(String, Game, usize)> = None;
+        let mut preview_fetch_id: Option<String> = None;
+        let preview_cache = &self.live_preview_cache;
         egui::ScrollArea::vertical()
             .id_salt("live-hub-games-scroll")
-            .max_height(340.0)
+            .max_height(320.0)
             .show(ui, |ui| {
                 if self.live_entries.is_empty() {
                     ui.label(
@@ -25970,30 +27668,48 @@ impl App {
                     return;
                 }
                 for entry in &self.live_entries {
+                    let cached = preview_cache.get(&entry.id);
+                    let display = cached.unwrap_or(entry);
                     let mut row_text = String::new();
-                    if let Some(t) = entry.white.title {
+                    if let Some(t) = display.white.title {
                         row_text.push_str(&format!("{} ", t.short()));
                     }
-                    row_text.push_str(&entry.white.name);
-                    if let Some(r) = entry.white.rating {
+                    let w_real = display.white.real_name.as_deref().or_else(|| {
+                        self.online_identity_cache
+                            .get_any_source(&display.white.name)
+                            .and_then(|id| id.real_name.as_deref())
+                    });
+                    row_text.push_str(&online::format_online_display_name(
+                        &display.white.name,
+                        w_real,
+                    ));
+                    if let Some(r) = display.white.rating {
                         row_text.push_str(&format!(" ({r})"));
                     }
-                    if let Some(c) = entry.white.clock {
+                    if let Some(c) = display.white.clock {
                         row_text.push_str(&format!(" [{}]", crate::live::format_live_clock(c)));
                     }
                     row_text.push_str("  vs  ");
-                    if let Some(t) = entry.black.title {
+                    if let Some(t) = display.black.title {
                         row_text.push_str(&format!("{} ", t.short()));
                     }
-                    row_text.push_str(&entry.black.name);
-                    if let Some(r) = entry.black.rating {
+                    let b_real = display.black.real_name.as_deref().or_else(|| {
+                        self.online_identity_cache
+                            .get_any_source(&display.black.name)
+                            .and_then(|id| id.real_name.as_deref())
+                    });
+                    row_text.push_str(&online::format_online_display_name(
+                        &display.black.name,
+                        b_real,
+                    ));
+                    if let Some(r) = display.black.rating {
                         row_text.push_str(&format!(" ({r})"));
                     }
-                    if let Some(c) = entry.black.clock {
+                    if let Some(c) = display.black.clock {
                         row_text.push_str(&format!(" [{}]", crate::live::format_live_clock(c)));
                     }
                     ui.horizontal(|ui| {
-                        if let Some(url) = &entry.white.avatar_url
+                        if let Some(url) = &display.white.avatar_url
                             && let Some(tex) = self.live_avatar_cache.get(url)
                         {
                             ui.add(
@@ -26002,29 +27718,48 @@ impl App {
                                     .fit_to_exact_size(vec2(20.0, 20.0)),
                             );
                         }
-                        if ui
+                        let btn = ui
                             .button(RichText::new(row_text).small())
                             .on_hover_text(format!(
-                                "{} · {} — Watch on board",
-                                entry.event, entry.status_text
-                            ))
-                            .clicked()
-                        {
-                            open_entry = Some(entry.clone());
+                                "{} · {} — Hover to preview · Click to watch on board",
+                                display.event, display.status_text
+                            ));
+                        if btn.hovered() {
+                            if let Some(g) = &display.game {
+                                let mut tip = 0usize;
+                                while let Some(&n) =
+                                    g.nodes.get(tip).and_then(|n| n.children.first())
+                                {
+                                    tip = n;
+                                }
+                                hovered_preview = Some((
+                                    format!("live-hover:{}", display.id),
+                                    g.clone(),
+                                    tip,
+                                ));
+                            } else if matches!(
+                                entry.refresh_target,
+                                Some(crate::live::LiveRefreshTarget::LichessGameId(_))
+                            ) {
+                                preview_fetch_id = Some(entry.id.clone());
+                            }
+                        }
+                        if btn.clicked() {
+                            open_entry = Some(display.clone());
                         }
                         ui.label(
                             RichText::new(format!(
                                 "{} · {}",
-                                if entry.ongoing {
+                                if display.ongoing {
                                     "LIVE"
                                 } else {
-                                    &entry.status_text
+                                    &display.status_text
                                 },
-                                entry.time_control
+                                display.time_control
                             ))
                             .small()
                             .monospace()
-                            .color(if entry.ongoing {
+                            .color(if display.ongoing {
                                 GOLD
                             } else {
                                 MUTED
@@ -26033,8 +27768,53 @@ impl App {
                     });
                 }
             });
+        if let Some(gid) = preview_fetch_id {
+            self.request_live_preview(&gid);
+        }
         if let Some(entry) = open_entry {
             self.open_live_game_entry(entry);
+        }
+        hovered_preview
+    }
+
+    fn apply_secondary_hover_preview(
+        &mut self,
+        root_ctx: &egui::Context,
+        hovered: Option<(String, Game, usize, Option<Color>)>,
+    ) {
+        if let Some((browse_id, game, target_node, orient)) = hovered {
+            let changed = self
+                .hovered_game_browse
+                .as_ref()
+                .is_none_or(|b| b.id != browse_id);
+            if !self.touch_hovered_game(&browse_id) {
+                self.activate_hovered_game_browse(browse_id, game);
+            }
+            if let Some(browse) = self.hovered_game_browse.as_mut() {
+                browse.hover_orientation = orient;
+                let clamped = target_node.min(browse.game.nodes.len().saturating_sub(1));
+                if changed || clamped != browse.anchor_node {
+                    browse.anchor_node = clamped;
+                    browse.cursor_node = clamped;
+                }
+                let disp = browse
+                    .cursor_node
+                    .min(browse.game.nodes.len().saturating_sub(1));
+                let preview = browse.game.nodes.get(disp).map(|node| HoverPreview {
+                    pos: node.pos.clone(),
+                    last_move: domain::last_move_squares(node),
+                });
+                self.secondary_hover_active = true;
+                self.secondary_hover_preview = preview.clone();
+                self.hover_preview = preview;
+            }
+            if changed {
+                root_ctx.request_repaint();
+            }
+        } else if self.secondary_hover_active {
+            self.secondary_hover_active = false;
+            self.secondary_hover_preview = None;
+            root_ctx.request_repaint();
         }
     }
 
@@ -26043,35 +27823,115 @@ impl App {
             return;
         }
         let mut open = self.hub_open;
-        let max_h = (ctx.content_rect().height() - 48.0).clamp(440.0, 820.0);
-        egui::Window::new("Online, Live & Tournament Hub")
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(true)
-            .default_width(760.0)
-            .max_height(max_h)
-            .show(ctx, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    for (tab, label) in [
-                        (OnlineHubTab::LiveBroadcasts, "Live Broadcasts & Server"),
-                        (OnlineHubTab::Twic, "TWIC Archives"),
-                        (OnlineHubTab::Accounts, "Lichess / Chess.com / ChessABC"),
-                        (OnlineHubTab::Leagues, "Leagues & Portals"),
-                    ] {
-                        if ui.selectable_label(self.hub_tab == tab, label).clicked() {
-                            self.open_online_hub(tab);
-                        }
+        let max_h = (ctx.content_rect().height() - 48.0).clamp(440.0, 860.0);
+        let mut secondary_hover: Option<(String, Game, usize, Option<Color>)> = None;
+        let mut hub_hover_step: Option<isize> = None;
+
+        let render_tab_bar = |this: &mut Self, ui: &mut Ui| {
+            ui.horizontal_wrapped(|ui| {
+                for (tab, label) in [
+                    (OnlineHubTab::LiveBroadcasts, "Live Broadcasts & Server"),
+                    (OnlineHubTab::Accounts, "Lichess / Chess.com / ChessABC"),
+                    (OnlineHubTab::Leagues, "Leagues & Portals"),
+                    (OnlineHubTab::Twic, "TWIC Archives"),
+                ] {
+                    if ui.selectable_label(this.hub_tab == tab, label).clicked() {
+                        this.open_online_hub(tab);
+                    }
+                }
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.checkbox(&mut this.live_close_on_open, "Close on open")
+                        .on_hover_text("Automatically close this window when opening a live game");
+                });
+            });
+        };
+
+        let vp_id = egui::ViewportId::from_hash_of("brett-online-hub-viewport");
+        let builder = egui::ViewportBuilder::default()
+            .with_title("Brett — Online, Live & Tournament Hub")
+            .with_inner_size([1080.0, 760.0])
+            .with_min_inner_size([720.0, 480.0])
+            .with_resizable(true);
+        ctx.show_viewport_immediate(vp_id, builder, |ui, class| {
+            if ui.ctx().input(|i| i.viewport().close_requested()) {
+                open = false;
+            }
+            if class == egui::ViewportClass::Immediate
+                && self.hovered_game_browse.is_some()
+                && !ui.ctx().egui_wants_keyboard_input()
+            {
+                hub_hover_step = ui.ctx().input(|i| {
+                    if i.key_pressed(Key::ArrowRight) {
+                        Some(1)
+                    } else if i.key_pressed(Key::ArrowLeft) {
+                        Some(-1)
+                    } else if i.key_pressed(Key::Home) {
+                        Some(isize::MIN / 2)
+                    } else if i.key_pressed(Key::End) {
+                        Some(isize::MAX / 2)
+                    } else {
+                        None
                     }
                 });
+            }
+            if class == egui::ViewportClass::EmbeddedWindow {
+                render_tab_bar(self, ui);
                 ui.separator();
-                match self.hub_tab {
-                    OnlineHubTab::LiveBroadcasts => self.hub_live_panel_ui(ui),
-                    OnlineHubTab::Twic => self.twic_panel_contents(ui),
-                    OnlineHubTab::Accounts => self.online_panel_contents(ui),
-                    OnlineHubTab::Leagues => self.league_panel_contents(ui, max_h),
+                egui::ScrollArea::vertical()
+                    .id_salt(("hub-embedded-scroll", self.hub_tab as u8))
+                    .max_height((max_h - 44.0).max(320.0))
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| match self.hub_tab {
+                        OnlineHubTab::LiveBroadcasts => {
+                            if let Some((bid, g, tip)) = self.hub_live_panel_ui(ui) {
+                                secondary_hover = Some((bid, g, tip, None));
+                            }
+                        }
+                        OnlineHubTab::Accounts => self.online_panel_contents(ui),
+                        OnlineHubTab::Leagues => {
+                            self.league_panel_contents_with_hover(ui, max_h, false, &mut secondary_hover);
+                        }
+                        OnlineHubTab::Twic => self.twic_panel_contents(ui),
+                    });
+            } else {
+                egui::Panel::top("online-hub-tabs").show(ui, |panel_ui| {
+                    render_tab_bar(self, panel_ui);
+                });
+                if self.hub_tab == OnlineHubTab::Leagues {
+                    self.league_panel_contents_in_viewport(ui, &mut secondary_hover);
+                } else {
+                    egui::CentralPanel::default_margins().show(ui, |panel_ui| {
+                        egui::ScrollArea::vertical()
+                            .id_salt(("hub-tab-scroll", self.hub_tab as u8))
+                            .auto_shrink([false, false])
+                            .show(panel_ui, |ui| match self.hub_tab {
+                                OnlineHubTab::LiveBroadcasts => {
+                                    if let Some((bid, g, tip)) = self.hub_live_panel_ui(ui) {
+                                        secondary_hover = Some((bid, g, tip, None));
+                                    }
+                                }
+                                OnlineHubTab::Accounts => self.online_panel_contents(ui),
+                                OnlineHubTab::Twic => self.twic_panel_contents(ui),
+                                OnlineHubTab::Leagues => {}
+                            });
+                    });
                 }
-            });
+            }
+        });
         self.hub_open = open;
+        if matches!(
+            self.hub_tab,
+            OnlineHubTab::LiveBroadcasts | OnlineHubTab::Leagues
+        ) {
+            self.apply_secondary_hover_preview(ctx, secondary_hover);
+            if let Some(delta) = hub_hover_step
+                && self.hovered_game_browse.is_some()
+            {
+                self.step_hovered_game(delta);
+                self.secondary_hover_preview = self.hover_preview.clone();
+                ctx.request_repaint();
+            }
+        }
     }
 
     fn online_dialog(&mut self, ctx: &egui::Context) {
@@ -26167,6 +28027,7 @@ impl App {
         }
     }
 
+    #[allow(dead_code)]
     fn open_twic_dialog(&mut self) {
         self.open_online_hub(OnlineHubTab::Twic);
     }
@@ -26841,6 +28702,40 @@ impl App {
         self.league_dir_rx = Some(rx);
     }
 
+    fn fetch_league_chess_results(&mut self) {
+        if self.league_dir_rx.is_some() {
+            return;
+        }
+        let fed = self.league_cr_fed.trim().to_ascii_uppercase();
+        let fed_disp = if fed.is_empty() || fed == "-" {
+            "All Countries".to_string()
+        } else {
+            fed.clone()
+        };
+        let tour_type = self.league_cr_type;
+        let only_games = self.league_cr_only_games;
+        let name_filter = self.league_cr_query.clone();
+        self.league_status = format!(
+            "Searching Chess-Results ({fed_disp} · {})…",
+            tour_type.label()
+        );
+        let (tx, rx) = mpsc::channel();
+        let ctx = self.ctx.clone();
+        std::thread::spawn(move || {
+            let res = league_import::fetch_chess_results_tournaments(
+                &fed,
+                tour_type,
+                only_games,
+                &name_filter,
+                "1",
+            )
+            .map_err(|e| format!("{e:#}"));
+            let _ = tx.send(LeagueDirMsg::ChessResults(res));
+            ctx.request_repaint();
+        });
+        self.league_dir_rx = Some(rx);
+    }
+
     fn fetch_portal_pgn_links(&mut self, url: String) {
         if self.league_dir_rx.is_some() {
             return;
@@ -26904,6 +28799,112 @@ impl App {
         }
     }
 
+    fn is_my_league_player(&self, name: &str) -> bool {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+        let target_key = players::player_key(trimmed);
+        for raw in self.effective_my_player_names() {
+            let clean = players::parse_player_alias(&raw).1.trim();
+            if raw.trim().eq_ignore_ascii_case(trimmed) || clean.eq_ignore_ascii_case(trimmed) {
+                return true;
+            }
+            if let Some(tk) = target_key.as_ref()
+                && (players::player_key(&raw).as_ref() == Some(tk)
+                    || players::player_key(clean).as_ref() == Some(tk))
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn start_league_roster_compile(&mut self, pgn_url: String, title: String) {
+        if self
+            .league_roster
+            .as_ref()
+            .is_some_and(|r| r.source_url == pgn_url)
+        {
+            return;
+        }
+        self.league_roster = None;
+        self.league_roster_rx = None;
+        self.league_selected_players.clear();
+        self.league_selected_clubs.clear();
+        self.league_excluded_game_indices.clear();
+        self.league_status = format!("Compiling players & clubs index for {title}…");
+        let (tx, rx) = mpsc::channel();
+        let ctx = self.ctx.clone();
+        std::thread::spawn(move || {
+            let res = league_import::fetch_league_roster_index(&pgn_url, &title)
+                .map_err(|e| format!("{e:#}"));
+            let _ = tx.send(res);
+            ctx.request_repaint();
+        });
+        self.league_roster_rx = Some(rx);
+    }
+
+    fn import_filtered_league_games(&mut self, downloaded: usize, games: Vec<Game>, label: &str) {
+        let kept = games.len();
+        if games.is_empty() {
+            self.league_status = if downloaded == 0 {
+                format!("{label}: no games found in PGN.")
+            } else {
+                format!(
+                    "{label}: {downloaded} games checked, 0 matched current player/club/round filters."
+                )
+            };
+            return;
+        }
+        match self.league_destination {
+            TwicDestination::ActiveDb => {
+                let target = self
+                    .league_target_shelf_index
+                    .filter(|&idx| idx < self.shelf_entries.len() && !self.shelf_entry_read_only(idx))
+                    .unwrap_or(self.active_db_index);
+                let target_title = self.shelf_entry_title(target);
+                let (added, skipped) = self.copy_games_to_shelf(games, target, None);
+                self.league_status = format!(
+                    "{label}: {downloaded} available, {kept} matched · {added} added to {target_title} ({skipped} duplicates skipped)."
+                );
+            }
+            TwicDestination::MyGames => {
+                let sec = self.league_my_games_section.clone();
+                self.merge_games_into_my_games_section(games, sec);
+                self.league_status = format!(
+                    "{label}: {downloaded} available, {kept} merged into My Games."
+                );
+            }
+            TwicDestination::NewDatabase => {
+                if let Some(path) = self.league_new_db_path.take() {
+                    let merged = players::deduplicate_and_merge_games(vec![(
+                        players::SourceTag::Owoju,
+                        games,
+                    )]);
+                    let unique: Vec<Game> = merged.into_iter().map(|(_, g)| g).collect();
+                    match my_games::write_games_to_path(&path, unique) {
+                        Ok(written) => {
+                            self.league_status = format!(
+                                "Saved {} to {}.",
+                                games_label(written),
+                                path.display()
+                            );
+                            self.open_into_new_shelf = true;
+                            self.load_file(&path);
+                        }
+                        Err(err) => {
+                            self.league_status = format!(
+                                "Could not write {}: {err:#}",
+                                path.display()
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fn start_league_pgn_download(&mut self, pgn_url: String, label: String) {
         if self.league_download_rx.is_some() {
             return;
@@ -26923,13 +28924,66 @@ impl App {
             });
             return;
         }
+        let active_roster_source = self.league_roster.as_ref().map(|r| r.source_url.as_str());
+        let lm_is_all = self
+            .league_lm_downloads
+            .as_ref()
+            .and_then(|dl| dl.all_pgn_url.as_deref())
+            == Some(pgn_url.as_str());
+        let dsb_matches = self
+            .league_dsb_pgn
+            .as_ref()
+            .is_some_and(|p| p.pgn_url == pgn_url);
+        let can_use_cached_roster = active_roster_source == Some(pgn_url.as_str())
+            || (lm_is_all && active_roster_source == Some(pgn_url.as_str()))
+            || (dsb_matches && active_roster_source == Some(pgn_url.as_str()));
+        if can_use_cached_roster
+            && let Some(roster) = self.league_roster.as_ref()
+        {
+            let total = roster.games.len();
+            let indices = league_import::filter_roster_game_indices(
+                roster,
+                &self.league_selected_players,
+                &self.league_selected_clubs,
+                &self.league_player_filter,
+                &self.league_round_spec,
+            );
+            let filtered: Vec<Game> = indices
+                .into_iter()
+                .filter(|idx| !self.league_excluded_game_indices.contains(idx))
+                .filter_map(|idx| roster.games.get(idx).cloned())
+                .collect();
+            self.import_filtered_league_games(total, filtered, &label);
+            return;
+        }
+        let selected_players = self.league_selected_players.clone();
+        let selected_clubs = self.league_selected_clubs.clone();
         let filter_expr = self.league_player_filter.clone();
+        let round_spec = self.league_round_spec.clone();
+        let label_for_thread = label.clone();
         self.league_status = format!("Downloading {label}…");
         let (tx, rx) = mpsc::channel();
         let ctx = self.ctx.clone();
         std::thread::spawn(move || {
-            let res = league_import::download_and_parse_league_pgn(&pgn_url, &filter_expr)
-                .map(|(downloaded, games)| (downloaded, games, label))
+            let res = league_import::download_and_parse_league_pgn(&pgn_url, "")
+                .map(|(downloaded, games)| {
+                    let temp = LeagueRosterIndex {
+                        source_url: pgn_url.clone(),
+                        title: label_for_thread.clone(),
+                        games,
+                        players: Vec::new(),
+                        clubs: Vec::new(),
+                        rounds: Vec::new(),
+                    };
+                    let filtered = league_import::filter_roster_games(
+                        &temp,
+                        &selected_players,
+                        &selected_clubs,
+                        &filter_expr,
+                        &round_spec,
+                    );
+                    (downloaded, filtered, label_for_thread)
+                })
                 .map_err(|e| format!("{e:#}"));
             let _ = tx.send(LeagueDownloadMsg::Done(res));
             ctx.request_repaint();
@@ -26960,18 +29014,37 @@ impl App {
                 }
                 Ok(LeagueDirMsg::Broadcasts(Ok(tours))) => {
                     let count = tours.len();
+                    let mut auto_compile: Option<(String, String)> = None;
                     if self.league_broadcast_selected_tour.is_none()
                         && let Some(first) = tours.first()
                     {
                         self.league_broadcast_selected_tour = Some(first.id.clone());
                         self.league_broadcast_selected_url = Some(first.all_pgn_url.clone());
                         self.league_broadcast_selected_label = first.name.clone();
+                        auto_compile = Some((first.all_pgn_url.clone(), first.name.clone()));
                     }
                     self.league_broadcast_tours = tours;
                     self.league_status = format!("Loaded {count} Lichess broadcasts.");
+                    if let Some((url, title)) = auto_compile {
+                        self.start_league_roster_compile(url, title);
+                    }
                 }
                 Ok(LeagueDirMsg::Broadcasts(Err(err))) => {
                     self.league_status = format!("Lichess broadcasts failed: {err}");
+                }
+                Ok(LeagueDirMsg::ChessResults(Ok(items))) => {
+                    let count = items.len();
+                    self.league_cr_results = items;
+                    self.league_status = if count == 0 {
+                        "Chess-Results returned 0 tournaments with those filters.".to_string()
+                    } else {
+                        format!(
+                            "Loaded {count} Chess-Results tournament(s). Click one to index players & games."
+                        )
+                    };
+                }
+                Ok(LeagueDirMsg::ChessResults(Err(err))) => {
+                    self.league_status = format!("Chess-Results search failed: {err}");
                 }
                 Ok(LeagueDirMsg::PortalLinks(Ok((url, links)))) => {
                     self.league_portal_url = url;
@@ -26979,7 +29052,19 @@ impl App {
                     if let Some(first) = links.first() {
                         self.league_portal_selected_url = Some(first.pgn_url.clone());
                         self.league_portal_selected_label = first.title.clone();
+                        self.league_excluded_game_indices.clear();
+                        if let Some(rd) = first.initial_round {
+                            self.league_round_spec = rd.to_string();
+                        } else {
+                            self.league_round_spec.clear();
+                        }
                         self.league_status = format!("Found {count} PGN link(s).");
+                        if count == 1 {
+                            self.start_league_roster_compile(
+                                first.pgn_url.clone(),
+                                first.title.clone(),
+                            );
+                        }
                     } else {
                         self.league_portal_selected_url = None;
                         self.league_portal_selected_label.clear();
@@ -26998,14 +29083,18 @@ impl App {
             match rx.try_recv() {
                 Ok(LeagueDetailMsg::LigaManager(Ok((prefix, dl)))) => {
                     self.league_lm_selected_prefix = Some(prefix);
-                    self.league_lm_selected_url = dl
+                    let compile_target = dl
                         .all_pgn_url
                         .clone()
                         .or_else(|| dl.rounds.first().map(|r| r.pgn_url.clone()));
+                    self.league_lm_selected_url = compile_target.clone();
                     let title = dl.title.clone();
                     let rounds = dl.rounds.len();
                     self.league_lm_downloads = Some(dl);
                     self.league_status = format!("Ready: {title} ({rounds} round PGNs available).");
+                    if let Some(url) = compile_target {
+                        self.start_league_roster_compile(url, title);
+                    }
                 }
                 Ok(LeagueDetailMsg::LigaManager(Err(err))) => {
                     self.league_status = format!("Could not load LigaManager PGNs: {err}");
@@ -27013,8 +29102,11 @@ impl App {
                 Ok(LeagueDetailMsg::Dsb(Ok((prefix, code, pgn)))) => {
                     self.league_dsb_season_prefix = prefix;
                     self.league_dsb_selected_code = Some(code);
-                    self.league_status = format!("PGN ready: {}", pgn.league_name);
+                    let compile_url = pgn.pgn_url.clone();
+                    let league_name = pgn.league_name.clone();
+                    self.league_status = format!("PGN ready: {league_name}");
                     self.league_dsb_pgn = Some(pgn);
+                    self.start_league_roster_compile(compile_url, league_name);
                 }
                 Ok(LeagueDetailMsg::Dsb(Err(err))) => {
                     self.league_status = format!("Could not load DSB PGN link: {err}");
@@ -27023,65 +29115,29 @@ impl App {
                 Err(TryRecvError::Disconnected) => {}
             }
         }
+        if let Some(rx) = self.league_roster_rx.take() {
+            match rx.try_recv() {
+                Ok(Ok(roster)) => {
+                    let p_cnt = roster.players.len();
+                    let c_cnt = roster.clubs.len();
+                    let g_cnt = roster.games.len();
+                    let r_cnt = roster.rounds.len();
+                    self.league_roster = Some(roster);
+                    self.league_status = format!(
+                        "Indexed {p_cnt} players, {c_cnt} clubs across {g_cnt} games ({r_cnt} rounds)."
+                    );
+                }
+                Ok(Err(err)) => {
+                    self.league_status = format!("Roster compilation failed: {err}");
+                }
+                Err(TryRecvError::Empty) => self.league_roster_rx = Some(rx),
+                Err(TryRecvError::Disconnected) => {}
+            }
+        }
         if let Some(rx) = self.league_download_rx.take() {
             match rx.try_recv() {
                 Ok(LeagueDownloadMsg::Done(Ok((downloaded, games, label)))) => {
-                    let kept = games.len();
-                    if games.is_empty() {
-                        self.league_status = if downloaded == 0 {
-                            format!("{label}: no games found in PGN.")
-                        } else {
-                            format!(
-                                "{label}: {downloaded} games downloaded, 0 matched filter '{}'.",
-                                self.league_player_filter.trim()
-                            )
-                        };
-                    } else {
-                        match self.league_destination {
-                            TwicDestination::ActiveDb => {
-                                let target = self.active_db_index;
-                                let (added, skipped) =
-                                    self.copy_games_to_shelf(games, target, None);
-                                self.league_status = format!(
-                                    "{label}: {downloaded} fetched, {kept} matched · {added} added to active DB ({skipped} duplicates skipped)."
-                                );
-                            }
-                            TwicDestination::MyGames => {
-                                let sec = self.league_my_games_section.clone();
-                                self.merge_games_into_my_games_section(games, sec);
-                                self.league_status = format!(
-                                    "{label}: {downloaded} fetched, {kept} merged into My Games."
-                                );
-                            }
-                            TwicDestination::NewDatabase => {
-                                if let Some(path) = self.league_new_db_path.take() {
-                                    let merged = players::deduplicate_and_merge_games(vec![(
-                                        players::SourceTag::Owoju,
-                                        games,
-                                    )]);
-                                    let unique: Vec<Game> =
-                                        merged.into_iter().map(|(_, g)| g).collect();
-                                    match my_games::write_games_to_path(&path, unique) {
-                                        Ok(written) => {
-                                            self.league_status = format!(
-                                                "Saved {} to {}.",
-                                                games_label(written),
-                                                path.display()
-                                            );
-                                            self.open_into_new_shelf = true;
-                                            self.load_file(&path);
-                                        }
-                                        Err(err) => {
-                                            self.league_status = format!(
-                                                "Could not write {}: {err:#}",
-                                                path.display()
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    self.import_filtered_league_games(downloaded, games, &label);
                 }
                 Ok(LeagueDownloadMsg::Done(Err(err))) => {
                     self.league_new_db_path = None;
@@ -27114,7 +29170,27 @@ impl App {
         self.league_open = open;
     }
 
-    fn league_panel_contents(&mut self, ui: &mut Ui, _max_h: f32) {
+    fn league_panel_contents(&mut self, ui: &mut Ui, max_h: f32) {
+        let mut hover_unused = None;
+        self.league_panel_contents_with_hover(ui, max_h, false, &mut hover_unused);
+    }
+
+    fn league_panel_contents_in_viewport(
+        &mut self,
+        ui: &mut Ui,
+        secondary_hover: &mut Option<(String, Game, usize, Option<Color>)>,
+    ) {
+        let avail_h = ui.ctx().content_rect().height().max(480.0);
+        self.league_panel_contents_with_hover(ui, avail_h, true, secondary_hover);
+    }
+
+    fn league_panel_contents_with_hover(
+        &mut self,
+        ui: &mut Ui,
+        max_h: f32,
+        use_panels: bool,
+        secondary_hover: &mut Option<(String, Game, usize, Option<Color>)>,
+    ) {
         let busy = self.league_dir_rx.is_some()
             || self.league_detail_rx.is_some()
             || self.league_download_rx.is_some();
@@ -27127,38 +29203,26 @@ impl App {
         let mut action_fetch_dsb_dir: Option<String> = None;
         let mut action_select_dsb_code: Option<(String, String)> = None;
         let mut action_fetch_broadcasts: Option<Option<String>> = None;
+        let mut action_fetch_cr = false;
         let mut action_scan_portal: Option<String> = None;
         let mut action_open_browser: Option<String> = None;
         let mut action_import: Option<(String, String)> = None;
+        let mut action_compile_roster: Option<(String, String)> = None;
         let mut action_fill_my_names = false;
+        let mut action_open_preview: Option<(Game, String)> = None;
 
-        ui.vertical(|ui| {
-                // Direct URL resolver bar
+        let render_provider_tree =
+            |this: &mut Self,
+             ui: &mut Ui,
+             tree_max_h: Option<f32>,
+             action_select_provider: &mut Option<&'static league_import::ProviderDescriptor>,
+             action_fetch_lm_season: &mut Option<Option<String>>,
+             action_fetch_dsb_dir: &mut Option<String>,
+             action_fetch_broadcasts: &mut Option<Option<String>>,
+             action_fetch_cr: &mut bool,
+             action_scan_portal: &mut Option<String>| {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("Paste URL:").small().strong());
-                    let resp = ui.add(
-                        egui::TextEdit::singleline(&mut self.league_url_input)
-                            .desired_width((ui.available_width() - 95.0).max(200.0))
-                            .hint_text("LigaManager, DSB, Lichess broadcast/study, regional portal, or direct .pgn URL"),
-                    );
-                    if (resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)))
-                        || ui
-                            .add_enabled(!busy, egui::Button::new("Load URL").small())
-                            .clicked()
-                    {
-                        action_resolve_url = true;
-                    }
-                });
-                ui.add_space(4.0);
-
-                // Searchable Provider Picker
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Provider:").small().strong());
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.league_provider_query)
-                            .desired_width((ui.available_width() - 190.0).max(180.0))
-                            .hint_text("Search provider (Bayern, DSB, NRW, Austria, Lichess, Custom…)"),
-                    );
+                    ui.label(RichText::new("Providers").small().strong());
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if ui
                             .add_enabled(!busy, egui::Button::new("Refresh").small())
@@ -27166,21 +29230,23 @@ impl App {
                         {
                             match active_provider.kind {
                                 ProviderKind::LigaManagerBayern => {
-                                    action_fetch_lm_season = Some(self.league_lm_season.clone());
+                                    *action_fetch_lm_season = Some(this.league_lm_season.clone());
                                 }
                                 ProviderKind::DsbErgebnisdienst => {
-                                    action_fetch_dsb_dir =
-                                        Some(self.league_dsb_season_prefix.clone());
+                                    *action_fetch_dsb_dir =
+                                        Some(this.league_dsb_season_prefix.clone());
                                 }
                                 ProviderKind::LichessBroadcast => {
-                                    let q = (!self.league_broadcast_query.trim().is_empty())
-                                        .then(|| self.league_broadcast_query.clone());
-                                    action_fetch_broadcasts = Some(q);
+                                    let q = (!this.league_broadcast_query.trim().is_empty())
+                                        .then(|| this.league_broadcast_query.clone());
+                                    *action_fetch_broadcasts = Some(q);
                                 }
-                                ProviderKind::RegionalHtmlPortal | ProviderKind::CustomUrl => {
-                                    if !self.league_portal_url.trim().is_empty() {
-                                        action_scan_portal =
-                                            Some(self.league_portal_url.clone());
+                                ProviderKind::ChessResultsFederation => {
+                                    *action_fetch_cr = true;
+                                }
+                    ProviderKind::RegionalHtmlPortal | ProviderKind::CustomUrl => {
+                                    if !this.league_portal_url.trim().is_empty() {
+                                        *action_scan_portal = Some(this.league_portal_url.clone());
                                     }
                                 }
                             }
@@ -27190,44 +29256,386 @@ impl App {
                         }
                     });
                 });
-                egui::ScrollArea::vertical()
-                    .id_salt("provider-picker-chips")
-                    .max_height(66.0)
-                    .show(ui, |ui| {
-                        ui.horizontal_wrapped(|ui| {
-                            let matches =
-                                league_import::filter_providers(&self.league_provider_query);
-                            if matches.is_empty() {
-                                ui.label(
-                                    RichText::new("No matching providers — use Custom URL.")
-                                        .small()
-                                        .weak(),
-                                );
+                ui.add_space(3.0);
+                ui.add(
+                    egui::TextEdit::singleline(&mut this.league_provider_query)
+                        .desired_width(ui.available_width())
+                        .hint_text("Search country or portal…"),
+                );
+                ui.add_space(4.0);
+
+                let matches = league_import::filter_providers(&this.league_provider_query);
+                let canonical_order = [
+                    "International",
+                    "Germany",
+                    "Austria",
+                    "Switzerland",
+                    "United Kingdom",
+                    "France",
+                    "Netherlands",
+                    "Spain",
+                    "Italy",
+                    "Poland",
+                    "Czechia / Slovakia",
+                    "Sweden",
+                    "Denmark",
+                    "Norway",
+                    "Hungary",
+                    "Romania",
+                    "Serbia",
+                    "Croatia",
+                    "Slovenia",
+                    "Turkey",
+                    "United States",
+                    "Custom",
+                ];
+                let mut grouped: Vec<(&'static str, &'static str, Vec<&'static league_import::ProviderDescriptor>)> =
+                    Vec::new();
+                for &cty in &canonical_order {
+                    let list: Vec<_> = matches
+                        .iter()
+                        .copied()
+                        .filter(|p| p.country_name == cty)
+                        .collect();
+                    if let Some(first) = list.first() {
+                        grouped.push((cty, first.country_code, list));
+                    }
+                }
+                for p in &matches {
+                    if !canonical_order.contains(&p.country_name)
+                        && !grouped.iter().any(|(c, _, _)| *c == p.country_name)
+                    {
+                        let list: Vec<_> = matches
+                            .iter()
+                            .copied()
+                            .filter(|x| x.country_name == p.country_name)
+                            .collect();
+                        grouped.push((p.country_name, p.country_code, list));
+                    }
+                }
+
+                let mut scroll = egui::ScrollArea::vertical()
+                    .id_salt("provider-country-tree")
+                    .auto_shrink([false, false]);
+                if let Some(mh) = tree_max_h {
+                    scroll = scroll.max_height(mh);
+                }
+                scroll.show(ui, |ui| {
+                    if grouped.is_empty() {
+                        ui.label(
+                            RichText::new("No matching providers — use Custom URL.")
+                                .small()
+                                .weak(),
+                        );
+                        return;
+                    }
+                    let searching = !this.league_provider_query.trim().is_empty();
+                    for (cty_name, cty_code, providers) in grouped {
+                        let contains_active =
+                            providers.iter().any(|p| p.id == this.league_provider_id);
+                        let default_open = contains_active
+                            || matches!(cty_name, "International" | "Germany" | "Austria");
+                        let mut hdr = egui::CollapsingHeader::new(
+                            RichText::new(format!("{cty_name} ({})", providers.len()))
+                                .small()
+                                .strong(),
+                        )
+                        .id_salt(("league-country-node", cty_name))
+                        .default_open(default_open);
+                        if searching {
+                            hdr = hdr.open(Some(true));
+                        }
+                        ui.horizontal(|ui| {
+                            if let Some(country) = country::normalize(cty_code) {
+                                let (rect, _) =
+                                    ui.allocate_exact_size(vec2(14.0, 10.0), Sense::hover());
+                                let painter = ui.painter_at(rect);
+                                flags::paint_flag(&painter, country, rect);
+                            } else {
+                                let icon = if cty_name == "Custom" { "🔗" } else { "🌐" };
+                                ui.label(RichText::new(icon).small().weak());
                             }
-                            for p in matches {
-                                let active = p.id == self.league_provider_id;
-                                let label = format!("{} · {}", p.name, p.region);
-                                if ui
-                                    .selectable_label(active, RichText::new(label).small())
-                                    .on_hover_text(p.url)
-                                    .clicked()
-                                {
-                                    action_select_provider = Some(p);
-                                }
-                            }
+                            ui.vertical(|ui| {
+                                hdr.show(ui, |ui| {
+                                    for p in providers {
+                                        let active = p.id == this.league_provider_id;
+                                        let label = if p.region == p.country_name
+                                            || p.region == "International"
+                                            || p.region == "Custom"
+                                        {
+                                            p.name.to_string()
+                                        } else {
+                                            format!("{} · {}", p.name, p.region)
+                                        };
+                                        let resp = ui
+                                            .add(
+                                                egui::Button::selectable(
+                                                    active,
+                                                    RichText::new(label).small(),
+                                                )
+                                                .truncate(),
+                                            )
+                                            .on_hover_text(if p.url.is_empty() {
+                                                p.name
+                                            } else {
+                                                p.url
+                                            });
+                                        if resp.clicked() {
+                                            *action_select_provider = Some(p);
+                                        }
+                                    }
+                                });
+                            });
                         });
+                    }
+                });
+            };
+
+        let render_bottom_bar =
+            |this: &mut Self,
+             ui: &mut Ui,
+             action_fill_my_names: &mut bool,
+             action_import: &mut Option<(String, String)>| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("Filter player/team:").small().strong());
+                    let prev_filter = this.league_player_filter.clone();
+                    ui.add(
+                        egui::TextEdit::singleline(&mut this.league_player_filter)
+                            .desired_width(210.0)
+                            .hint_text("Optional: player or team (use ; for multiple)"),
+                    );
+                    if this.league_player_filter != prev_filter {
+                        this.league_excluded_game_indices.clear();
+                    }
+                    if ui
+                        .small_button("My names")
+                        .on_hover_text(
+                            "Filter using your configured Preparation / ChessABC player names",
+                        )
+                        .clicked()
+                    {
+                        *action_fill_my_names = true;
+                    }
+                    if !this.league_player_filter.is_empty() && ui.small_button("Clear").clicked() {
+                        this.league_player_filter.clear();
+                        this.league_excluded_game_indices.clear();
+                    }
+                });
+
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("Destination:").small().strong());
+                    let active_title = this.shelf_entry_title(this.active_db_index);
+                    ui.radio_value(
+                        &mut this.league_destination,
+                        TwicDestination::ActiveDb,
+                        if this.shelf_entries.len() > 1 {
+                            "Open database:".to_string()
+                        } else {
+                            format!("Active DB ({active_title})")
+                        },
+                    );
+                    if this.league_destination == TwicDestination::ActiveDb
+                        && this.shelf_entries.len() > 1
+                    {
+                        let chosen = this
+                            .league_target_shelf_index
+                            .filter(|&i| i < this.shelf_entries.len())
+                            .unwrap_or(this.active_db_index);
+                        let chosen_title = this.shelf_entry_title(chosen);
+                        egui::ComboBox::from_id_salt("league-target-db-combo")
+                            .selected_text(chosen_title)
+                            .show_ui(ui, |ui| {
+                                for idx in 0..this.shelf_entries.len() {
+                                    let ro = this.shelf_entry_read_only(idx);
+                                    let lbl = if ro {
+                                        format!("{} [RO]", this.shelf_entry_title(idx))
+                                    } else {
+                                        this.shelf_entry_title(idx)
+                                    };
+                                    if ui
+                                        .add_enabled(
+                                            !ro,
+                                            egui::Button::selectable(chosen == idx, lbl),
+                                        )
+                                        .clicked()
+                                    {
+                                        this.league_target_shelf_index = Some(idx);
+                                    }
+                                }
+                            });
+                    }
+                    ui.add_enabled_ui(this.my_games_config.path.is_some(), |ui| {
+                        ui.radio_value(
+                            &mut this.league_destination,
+                            TwicDestination::MyGames,
+                            "My Games",
+                        );
                     });
+                    ui.radio_value(
+                        &mut this.league_destination,
+                        TwicDestination::NewDatabase,
+                        format!(
+                            "New database ({})",
+                            this.default_database_format.short_label()
+                        ),
+                    );
+                    if this.league_destination == TwicDestination::MyGames {
+                        ui.label(RichText::new("Section:").small().weak());
+                        for sec in [
+                            MyGamesSection::Classical,
+                            MyGamesSection::Rapid,
+                            MyGamesSection::Blitz,
+                        ] {
+                            ui.radio_value(
+                                &mut this.league_my_games_section,
+                                sec.clone(),
+                                sec.display_label(),
+                            );
+                        }
+                    }
+                });
+
+                ui.add_space(4.0);
+                let selected_target = match active_provider.kind {
+                    ProviderKind::LigaManagerBayern => {
+                        this.league_lm_selected_url.as_ref().map(|u| {
+                            let title = this
+                                .league_lm_downloads
+                                .as_ref()
+                                .map_or_else(|| "LigaManager".to_string(), |d| d.title.clone());
+                            (u.clone(), title)
+                        })
+                    }
+                    ProviderKind::DsbErgebnisdienst => this
+                        .league_dsb_pgn
+                        .as_ref()
+                        .map(|p| (p.pgn_url.clone(), p.league_name.clone())),
+                    ProviderKind::LichessBroadcast => {
+                        this.league_broadcast_selected_url.as_ref().map(|u| {
+                            let label = if this.league_broadcast_selected_label.is_empty() {
+                                "Lichess Broadcast".to_string()
+                            } else {
+                                this.league_broadcast_selected_label.clone()
+                            };
+                            (u.clone(), label)
+                        })
+                    }
+                    ProviderKind::ChessResultsFederation => {
+                        this.league_cr_selected_url.as_ref().map(|u| {
+                            let label = if this.league_cr_selected_label.is_empty() {
+                                "Chess-Results Tournament".to_string()
+                            } else {
+                                this.league_cr_selected_label.clone()
+                            };
+                            (u.clone(), label)
+                        })
+                    }
+                    ProviderKind::RegionalHtmlPortal | ProviderKind::CustomUrl => {
+                        this.league_portal_selected_url.as_ref().map(|u| {
+                            let label = if this.league_portal_selected_label.is_empty() {
+                                active_provider.name.to_string()
+                            } else {
+                                this.league_portal_selected_label.clone()
+                            };
+                            (u.clone(), label)
+                        })
+                    }
+                };
+                let (import_btn_label, roster_allows_import) =
+                    if let Some((target_url, _)) = &selected_target
+                        && let Some(roster) = &this.league_roster
+                        && roster.source_url == *target_url
+                    {
+                        let matched = league_import::filter_roster_game_indices(
+                            roster,
+                            &this.league_selected_players,
+                            &this.league_selected_clubs,
+                            &this.league_player_filter,
+                            &this.league_round_spec,
+                        );
+                        let included = matched
+                            .into_iter()
+                            .filter(|idx| !this.league_excluded_game_indices.contains(idx))
+                            .count();
+                        (
+                            format!("Download & Import ({})", games_label(included)),
+                            included > 0,
+                        )
+                    } else {
+                        ("Download & Import".to_string(), true)
+                    };
+
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(
+                            !busy && selected_target.is_some() && roster_allows_import,
+                            egui::Button::new(RichText::new(import_btn_label).strong()),
+                        )
+                        .clicked()
+                    {
+                        *action_import = selected_target;
+                    }
+                    if !this.league_status.is_empty() {
+                        ui.add(
+                            egui::Label::new(RichText::new(&this.league_status).small().weak())
+                                .wrap()
+                                .truncate(),
+                        );
+                    }
+                });
+            };
+
+        let render_workspace =
+            |this: &mut Self,
+             ui: &mut Ui,
+             workspace_h: f32,
+             action_resolve_url: &mut bool,
+             action_fetch_lm_season: &mut Option<Option<String>>,
+             action_select_lm_prefix: &mut Option<String>,
+             action_fetch_dsb_dir: &mut Option<String>,
+             action_select_dsb_code: &mut Option<(String, String)>,
+             action_fetch_broadcasts: &mut Option<Option<String>>,
+             action_fetch_cr: &mut bool,
+             action_scan_portal: &mut Option<String>,
+             action_open_browser: &mut Option<String>,
+             action_compile_roster: &mut Option<(String, String)>,
+             action_open_preview: &mut Option<(Game, String)>,
+             secondary_hover: &mut Option<(String, Game, usize, Option<Color>)>| {
+                // Direct URL resolver bar
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Paste URL:").small().strong());
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut this.league_url_input)
+                            .desired_width((ui.available_width() - 95.0).max(180.0))
+                            .hint_text("LigaManager, DSB, Chess-Results, Lichess broadcast/study, regional portal, or .pgn"),
+                    );
+                    if (resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)))
+                        || ui
+                            .add_enabled(!busy, egui::Button::new("Load URL").small())
+                            .clicked()
+                    {
+                        *action_resolve_url = true;
+                    }
+                });
+                ui.add_space(4.0);
                 ui.separator();
+
+                let has_roster = this.league_roster.is_some();
+                let upper_h = if has_roster {
+                    (workspace_h * 0.30).clamp(95.0, 185.0)
+                } else {
+                    (workspace_h * 0.56).clamp(150.0, 320.0)
+                };
 
                 match active_provider.kind {
                     ProviderKind::LigaManagerBayern => {
                         ui.horizontal_wrapped(|ui| {
                             ui.label(RichText::new("Season:").small().strong());
-                            let season_text = self
+                            let season_text = this
                                 .league_lm_season
                                 .clone()
                                 .unwrap_or_else(|| "Current".to_string());
-                            let seasons = self
+                            let seasons = this
                                 .league_lm_dir
                                 .as_ref()
                                 .map(|d| d.seasons.clone())
@@ -27238,27 +29646,28 @@ impl App {
                                     for s in seasons {
                                         if ui
                                             .selectable_label(
-                                                self.league_lm_season.as_deref() == Some(&s),
+                                                this.league_lm_season.as_deref() == Some(&s),
                                                 &s,
                                             )
                                             .clicked()
                                         {
-                                            action_fetch_lm_season = Some(Some(s));
+                                            *action_fetch_lm_season = Some(Some(s));
                                         }
                                     }
                                 });
                             ui.add(
-                                egui::TextEdit::singleline(&mut self.league_lm_query)
-                                    .desired_width(280.0)
+                                egui::TextEdit::singleline(&mut this.league_lm_query)
+                                    .desired_width(240.0)
                                     .hint_text("Search district, league, club, or team…"),
                             );
                         });
                         ui.add_space(4.0);
                         egui::ScrollArea::vertical()
                             .id_salt("lm-leagues-scroll")
-                            .max_height(160.0)
+                            .max_height(upper_h)
+                            .auto_shrink([false, false])
                             .show(ui, |ui| {
-                                let Some(dir) = &self.league_lm_dir else {
+                                let Some(dir) = &this.league_lm_dir else {
                                     ui.label(
                                         RichText::new("Click Refresh or paste any LigaManager URL above.")
                                             .small()
@@ -27268,14 +29677,14 @@ impl App {
                                 };
                                 let filtered = league_import::filter_ligamanager_leagues(
                                     &dir.leagues,
-                                    &self.league_lm_query,
+                                    &this.league_lm_query,
                                 );
                                 if filtered.is_empty() {
                                     ui.label(RichText::new("No matching leagues.").small().weak());
                                     return;
                                 }
                                 for item in filtered.into_iter().take(200) {
-                                    let selected = self.league_lm_selected_prefix.as_deref()
+                                    let selected = this.league_lm_selected_prefix.as_deref()
                                         == Some(&item.path_prefix);
                                     let label = if item.district.is_empty() {
                                         item.name.clone()
@@ -27283,37 +29692,49 @@ impl App {
                                         format!("[{}] {}", item.district, item.name)
                                     };
                                     if ui.selectable_label(selected, label).clicked() {
-                                        action_select_lm_prefix = Some(item.path_prefix.clone());
+                                        *action_select_lm_prefix = Some(item.path_prefix.clone());
                                     }
                                 }
                             });
-                        if let Some(dl) = &self.league_lm_downloads {
-                            ui.separator();
-                            ui.label(
-                                RichText::new(format!("{} ({}) — Choose PGN:", dl.title, dl.season))
-                                    .small()
-                                    .strong(),
-                            );
+                        if let Some(dl) = &this.league_lm_downloads {
+                            ui.add_space(3.0);
                             ui.horizontal_wrapped(|ui| {
+                                ui.label(
+                                    RichText::new(format!("{} ({}):", dl.title, dl.season))
+                                        .small()
+                                        .strong(),
+                                );
                                 if let Some(all_url) = &dl.all_pgn_url {
-                                    let active = self.league_lm_selected_url.as_deref()
+                                    let active = this.league_lm_selected_url.as_deref()
                                         == Some(all_url.as_str());
                                     if ui
-                                        .selectable_label(active, RichText::new("All rounds (alle.pgn)").strong())
+                                        .selectable_label(
+                                            active,
+                                            RichText::new("All rounds").small().strong(),
+                                        )
                                         .clicked()
                                     {
-                                        self.league_lm_selected_url = Some(all_url.clone());
+                                        this.league_lm_selected_url = Some(all_url.clone());
+                                        *action_compile_roster =
+                                            Some((all_url.clone(), dl.title.clone()));
                                     }
                                 }
                                 for round in &dl.rounds {
-                                    let active = self.league_lm_selected_url.as_deref()
+                                    let active = this.league_lm_selected_url.as_deref()
                                         == Some(round.pgn_url.as_str());
                                     let text = match &round.games_hint {
                                         Some(h) => format!("{} ({h})", round.label),
                                         None => round.label.clone(),
                                     };
-                                    if ui.selectable_label(active, text).clicked() {
-                                        self.league_lm_selected_url = Some(round.pgn_url.clone());
+                                    if ui
+                                        .selectable_label(active, RichText::new(text).small())
+                                        .clicked()
+                                    {
+                                        this.league_lm_selected_url = Some(round.pgn_url.clone());
+                                        *action_compile_roster = Some((
+                                            round.pgn_url.clone(),
+                                            format!("{} · {}", dl.title, round.label),
+                                        ));
                                     }
                                 }
                             });
@@ -27322,14 +29743,14 @@ impl App {
                     ProviderKind::DsbErgebnisdienst => {
                         ui.horizontal_wrapped(|ui| {
                             ui.label(RichText::new("Season:").small().strong());
-                            let seasons = self
+                            let seasons = this
                                 .league_dsb_dir
                                 .as_ref()
                                 .map(|d| d.seasons.clone())
                                 .unwrap_or_default();
                             let current_label = seasons
                                 .iter()
-                                .find(|s| s.prefix == self.league_dsb_season_prefix)
+                                .find(|s| s.prefix == this.league_dsb_season_prefix)
                                 .map_or_else(|| "Current".to_string(), |s| s.label.clone());
                             egui::ComboBox::from_id_salt("dsb-season-combo")
                                 .selected_text(current_label)
@@ -27337,27 +29758,28 @@ impl App {
                                     for s in seasons {
                                         if ui
                                             .selectable_label(
-                                                self.league_dsb_season_prefix == s.prefix,
+                                                this.league_dsb_season_prefix == s.prefix,
                                                 &s.label,
                                             )
                                             .clicked()
                                         {
-                                            action_fetch_dsb_dir = Some(s.prefix);
+                                            *action_fetch_dsb_dir = Some(s.prefix);
                                         }
                                     }
                                 });
                             ui.add(
-                                egui::TextEdit::singleline(&mut self.league_dsb_query)
-                                    .desired_width(240.0)
+                                egui::TextEdit::singleline(&mut this.league_dsb_query)
+                                    .desired_width(220.0)
                                     .hint_text("Filter league (Bundesliga, Oberliga, NRW…)"),
                             );
                         });
                         ui.add_space(4.0);
                         egui::ScrollArea::vertical()
                             .id_salt("dsb-leagues-scroll")
-                            .max_height(175.0)
+                            .max_height(upper_h)
+                            .auto_shrink([false, false])
                             .show(ui, |ui| {
-                                let Some(dir) = &self.league_dsb_dir else {
+                                let Some(dir) = &this.league_dsb_dir else {
                                     ui.label(
                                         RichText::new("Click Refresh or paste an ergebnisdienst.schachbund.de URL above.")
                                             .small()
@@ -27366,25 +29788,22 @@ impl App {
                                     return;
                                 };
                                 for item in
-                                    league_import::filter_dsb_leagues(&dir.leagues, &self.league_dsb_query)
+                                    league_import::filter_dsb_leagues(&dir.leagues, &this.league_dsb_query)
                                 {
-                                    let selected = self.league_dsb_selected_code.as_deref()
+                                    let selected = this.league_dsb_selected_code.as_deref()
                                         == Some(&item.code);
                                     let label = format!("{} ({})", item.name, item.code);
                                     if ui.selectable_label(selected, label).clicked() {
-                                        action_select_dsb_code = Some((
-                                            self.league_dsb_season_prefix.clone(),
+                                        *action_select_dsb_code = Some((
+                                            this.league_dsb_season_prefix.clone(),
                                             item.code.clone(),
                                         ));
                                     }
                                 }
                             });
-                        if let Some(pgn) = &self.league_dsb_pgn {
-                            ui.separator();
-                            let note = pgn
-                                .last_modified
-                                .as_deref()
-                                .unwrap_or(&pgn.pgn_url);
+                        if let Some(pgn) = &this.league_dsb_pgn {
+                            ui.add_space(2.0);
+                            let note = pgn.last_modified.as_deref().unwrap_or(&pgn.pgn_url);
                             ui.label(
                                 RichText::new(format!("Selected: {} · {note}", pgn.league_name))
                                     .small(),
@@ -27395,28 +29814,29 @@ impl App {
                         ui.horizontal(|ui| {
                             ui.label(RichText::new("Broadcast search:").small().strong());
                             let resp = ui.add(
-                                egui::TextEdit::singleline(&mut self.league_broadcast_query)
-                                    .desired_width(240.0)
+                                egui::TextEdit::singleline(&mut this.league_broadcast_query)
+                                    .desired_width(210.0)
                                     .hint_text("Event name (Tata Steel, Bundesliga, Candidates…)"),
                             );
                             if (resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)))
                                 || ui.add_enabled(!busy, egui::Button::new("Search").small()).clicked()
                             {
-                                let q = (!self.league_broadcast_query.trim().is_empty())
-                                    .then(|| self.league_broadcast_query.clone());
-                                action_fetch_broadcasts = Some(q);
+                                let q = (!this.league_broadcast_query.trim().is_empty())
+                                    .then(|| this.league_broadcast_query.clone());
+                                *action_fetch_broadcasts = Some(q);
                             }
                             if ui.add_enabled(!busy, egui::Button::new("Top").small()).clicked() {
-                                self.league_broadcast_query.clear();
-                                action_fetch_broadcasts = Some(None);
+                                this.league_broadcast_query.clear();
+                                *action_fetch_broadcasts = Some(None);
                             }
                         });
                         ui.add_space(4.0);
                         egui::ScrollArea::vertical()
                             .id_salt("lichess-broadcasts-scroll")
-                            .max_height(145.0)
+                            .max_height(upper_h)
+                            .auto_shrink([false, false])
                             .show(ui, |ui| {
-                                if self.league_broadcast_tours.is_empty() {
+                                if this.league_broadcast_tours.is_empty() {
                                     ui.label(
                                         RichText::new("Click Top or Search to load OTB & tournament broadcasts from Lichess.")
                                             .small()
@@ -27424,8 +29844,8 @@ impl App {
                                     );
                                     return;
                                 }
-                                let q_lower = self.league_broadcast_query.trim().to_lowercase();
-                                for tour in &self.league_broadcast_tours {
+                                let q_lower = this.league_broadcast_query.trim().to_lowercase();
+                                for tour in &this.league_broadcast_tours {
                                     if !q_lower.is_empty()
                                         && !tour.name.to_lowercase().contains(&q_lower)
                                         && !tour
@@ -27437,7 +29857,7 @@ impl App {
                                     {
                                         continue;
                                     }
-                                    let selected = self.league_broadcast_selected_tour.as_deref()
+                                    let selected = this.league_broadcast_selected_tour.as_deref()
                                         == Some(&tour.id);
                                     let mut label = tour.name.clone();
                                     if let Some(loc) = &tour.location {
@@ -27447,42 +29867,42 @@ impl App {
                                         label.push_str(&format!(" ({info})"));
                                     }
                                     if ui.selectable_label(selected, label).clicked() {
-                                        self.league_broadcast_selected_tour =
+                                        this.league_broadcast_selected_tour =
                                             Some(tour.id.clone());
-                                        self.league_broadcast_selected_url =
+                                        this.league_broadcast_selected_url =
                                             Some(tour.all_pgn_url.clone());
-                                        self.league_broadcast_selected_label = tour.name.clone();
+                                        this.league_broadcast_selected_label = tour.name.clone();
+                                        *action_compile_roster =
+                                            Some((tour.all_pgn_url.clone(), tour.name.clone()));
                                     }
                                 }
                             });
-                        if let Some(selected_tour) = self.league_broadcast_selected_tour.as_deref()
-                            && let Some(tour) = self
+                        if let Some(selected_tour) = this.league_broadcast_selected_tour.as_deref()
+                            && let Some(tour) = this
                                 .league_broadcast_tours
                                 .iter()
                                 .find(|t| t.id == selected_tour)
                         {
-                            ui.separator();
-                            ui.label(
-                                RichText::new(format!("{} — Choose PGN:", tour.name))
-                                    .small()
-                                    .strong(),
-                            );
+                            ui.add_space(3.0);
                             ui.horizontal_wrapped(|ui| {
-                                let all_active = self.league_broadcast_selected_url.as_deref()
+                                ui.label(RichText::new(format!("{}:", tour.name)).small().strong());
+                                let all_active = this.league_broadcast_selected_url.as_deref()
                                     == Some(tour.all_pgn_url.as_str());
                                 if ui
                                     .selectable_label(
                                         all_active,
-                                        RichText::new("All rounds (.pgn)").strong(),
+                                        RichText::new("All rounds").small().strong(),
                                     )
                                     .clicked()
                                 {
-                                    self.league_broadcast_selected_url =
+                                    this.league_broadcast_selected_url =
                                         Some(tour.all_pgn_url.clone());
-                                    self.league_broadcast_selected_label = tour.name.clone();
+                                    this.league_broadcast_selected_label = tour.name.clone();
+                                    *action_compile_roster =
+                                        Some((tour.all_pgn_url.clone(), tour.name.clone()));
                                 }
                                 for r in &tour.rounds {
-                                    let active = self.league_broadcast_selected_url.as_deref()
+                                    let active = this.league_broadcast_selected_url.as_deref()
                                         == Some(r.pgn_url.as_str());
                                     let badge = if r.ongoing {
                                         " [LIVE]"
@@ -27492,41 +29912,200 @@ impl App {
                                         ""
                                     };
                                     if ui
-                                        .selectable_label(active, format!("{}{badge}", r.name))
+                                        .selectable_label(
+                                            active,
+                                            RichText::new(format!("{}{badge}", r.name)).small(),
+                                        )
                                         .clicked()
                                     {
-                                        self.league_broadcast_selected_url =
+                                        this.league_broadcast_selected_url =
                                             Some(r.pgn_url.clone());
-                                        self.league_broadcast_selected_label =
+                                        this.league_broadcast_selected_label =
                                             format!("{} · {}", tour.name, r.name);
+                                        *action_compile_roster = Some((
+                                            r.pgn_url.clone(),
+                                            this.league_broadcast_selected_label.clone(),
+                                        ));
                                     }
                                 }
                             });
                         }
                     }
+                    ProviderKind::ChessResultsFederation => {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(RichText::new("Federation:").small().strong());
+                            let fed_codes = [
+                                ("-", "All"),
+                                ("AUT", "AUT (Austria)"),
+                                ("GER", "GER (Germany)"),
+                                ("SUI", "SUI (Switzerland)"),
+                                ("CRO", "CRO (Croatia)"),
+                                ("SLO", "SLO (Slovenia)"),
+                                ("SRB", "SRB (Serbia)"),
+                                ("HUN", "HUN (Hungary)"),
+                                ("CZE", "CZE (Czechia)"),
+                                ("SVK", "SVK (Slovakia)"),
+                                ("POL", "POL (Poland)"),
+                                ("ROU", "ROU (Romania)"),
+                                ("ESP", "ESP (Spain)"),
+                                ("ITA", "ITA (Italy)"),
+                                ("NED", "NED (Netherlands)"),
+                                ("FRA", "FRA (France)"),
+                                ("ENG", "ENG (England)"),
+                                ("SWE", "SWE (Sweden)"),
+                                ("NOR", "NOR (Norway)"),
+                                ("DEN", "DEN (Denmark)"),
+                                ("TUR", "TUR (Turkey)"),
+                                ("USA", "USA"),
+                            ];
+                            let cur_fed_label = fed_codes
+                                .iter()
+                                .find(|(c, _)| c.eq_ignore_ascii_case(this.league_cr_fed.trim()))
+                                .map(|(_, l)| *l)
+                                .unwrap_or_else(|| this.league_cr_fed.as_str());
+                            egui::ComboBox::from_id_salt("cr-fed-combo")
+                                .selected_text(cur_fed_label)
+                                .show_ui(ui, |ui| {
+                                    for &(code, lbl) in &fed_codes {
+                                        if ui
+                                            .selectable_label(
+                                                this.league_cr_fed.eq_ignore_ascii_case(code),
+                                                lbl,
+                                            )
+                                            .clicked()
+                                        {
+                                            this.league_cr_fed = code.to_string();
+                                            *action_fetch_cr = true;
+                                        }
+                                    }
+                                });
+                            ui.add(
+                                egui::TextEdit::singleline(&mut this.league_cr_fed)
+                                    .desired_width(48.0)
+                                    .hint_text("FIDE"),
+                            );
+                            egui::ComboBox::from_id_salt("cr-type-combo")
+                                .selected_text(this.league_cr_type.label())
+                                .show_ui(ui, |ui| {
+                                    for kind in league_import::ChessResultsTournamentType::ALL {
+                                        if ui
+                                            .selectable_label(
+                                                this.league_cr_type == kind,
+                                                kind.label(),
+                                            )
+                                            .clicked()
+                                        {
+                                            this.league_cr_type = kind;
+                                            *action_fetch_cr = true;
+                                        }
+                                    }
+                                });
+                            if ui
+                                .checkbox(&mut this.league_cr_only_games, "Only with PGNs")
+                                .on_hover_text(
+                                    "Only list tournaments/leagues that have uploaded games on Chess-Results",
+                                )
+                                .changed()
+                            {
+                                *action_fetch_cr = true;
+                            }
+                            let resp = ui.add(
+                                egui::TextEdit::singleline(&mut this.league_cr_query)
+                                    .desired_width(150.0)
+                                    .hint_text("Filter name (optional)…"),
+                            );
+                            if (resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)))
+                                || ui
+                                    .add_enabled(!busy, egui::Button::new("Search").small())
+                                    .clicked()
+                            {
+                                *action_fetch_cr = true;
+                            }
+                        });
+                        ui.add_space(4.0);
+                        egui::ScrollArea::vertical()
+                            .id_salt("cr-directory-scroll")
+                            .max_height(upper_h)
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                if this.league_cr_results.is_empty() {
+                                    ui.label(
+                                        RichText::new(
+                                            "Click Search / Refresh to load Chess-Results leagues & tournaments with uploaded games.",
+                                        )
+                                        .small()
+                                        .weak(),
+                                    );
+                                    return;
+                                }
+                                let q_lower = this.league_cr_query.trim().to_lowercase();
+                                for item in &this.league_cr_results {
+                                    if !q_lower.is_empty()
+                                        && !item.title.to_lowercase().contains(&q_lower)
+                                    {
+                                        continue;
+                                    }
+                                    let active = this.league_cr_selected_url.as_deref()
+                                        == Some(item.bulk_pgn_url.as_str());
+                                    let mut label = item.title.clone();
+                                    if !item.fed.is_empty() {
+                                        label.push_str(&format!(" [{}]", item.fed));
+                                    }
+                                    if !item.start_date.is_empty() {
+                                        label.push_str(&format!(" · {}", item.start_date));
+                                    }
+                                    if !item.last_update.is_empty() {
+                                        label.push_str(&format!(" · upd {}", item.last_update));
+                                    }
+                                    if ui
+                                        .add(
+                                            egui::Button::selectable(
+                                                active,
+                                                RichText::new(label).small(),
+                                            )
+                                            .truncate(),
+                                        )
+                                        .on_hover_text(format!(
+                                            "tnr={} · {} – {}",
+                                            item.tnr, item.start_date, item.end_date
+                                        ))
+                                        .clicked()
+                                    {
+                                        this.league_cr_selected_url =
+                                            Some(item.bulk_pgn_url.clone());
+                                        this.league_cr_selected_label = item.title.clone();
+                                        this.league_excluded_game_indices.clear();
+                                        *action_compile_roster = Some((
+                                            item.bulk_pgn_url.clone(),
+                                            item.title.clone(),
+                                        ));
+                                    }
+                                }
+                            });
+                    }
                     ProviderKind::RegionalHtmlPortal | ProviderKind::CustomUrl => {
                         ui.horizontal(|ui| {
                             ui.label(RichText::new("Portal / PGN URL:").small().strong());
                             let resp = ui.add(
-                                egui::TextEdit::singleline(&mut self.league_portal_url)
-                                    .desired_width((ui.available_width() - 255.0).max(180.0))
-                                    .hint_text("https://... (HTML page with .pgn links, Lichess study/broadcast, or direct .pgn)"),
+                                egui::TextEdit::singleline(&mut this.league_portal_url)
+                                    .desired_width((ui.available_width() - 255.0).max(160.0))
+                                    .hint_text("https://... (Chess-Results, tournament HTML, Lichess study, or .pgn)"),
                             );
                             if (resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)))
                                 || ui
                                     .add_enabled(!busy, egui::Button::new("Scan page for PGNs").small())
                                     .clicked()
                             {
-                                action_scan_portal = Some(self.league_portal_url.clone());
+                                *action_scan_portal = Some(this.league_portal_url.clone());
                             }
-                            if !self.league_portal_url.trim().is_empty()
+                            if !this.league_portal_url.trim().is_empty()
                                 && ui
                                     .small_button("Open in browser ↗")
                                     .on_hover_text("Open this portal in your browser to browse to the specific season or tournament page, then paste its URL here")
                                     .clicked()
                             {
-                                action_open_browser =
-                                    Some(self.league_portal_url.trim().to_string());
+                                *action_open_browser =
+                                    Some(this.league_portal_url.trim().to_string());
                             }
                         });
                         ui.label(
@@ -27540,9 +30119,10 @@ impl App {
                         ui.add_space(4.0);
                         egui::ScrollArea::vertical()
                             .id_salt("portal-pgn-links-scroll")
-                            .max_height(165.0)
+                            .max_height(upper_h)
+                            .auto_shrink([false, false])
                             .show(ui, |ui| {
-                                if self.league_portal_links.is_empty() {
+                                if this.league_portal_links.is_empty() {
                                     ui.label(
                                         RichText::new(
                                             "Click “Scan page for PGNs”, or paste any tournament/season sub-page or direct .pgn URL.",
@@ -27552,141 +30132,634 @@ impl App {
                                     );
                                     return;
                                 }
-                                for link in &self.league_portal_links {
-                                    let active = self.league_portal_selected_url.as_deref()
+                                for link in &this.league_portal_links {
+                                    let active = this.league_portal_selected_url.as_deref()
                                         == Some(link.pgn_url.as_str());
                                     if ui
-                                        .selectable_label(
-                                            active,
-                                            format!("{}  [{}]", link.title, link.source_label),
+                                        .add(
+                                            egui::Button::selectable(
+                                                active,
+                                                RichText::new(format!(
+                                                    "{}  [{}]",
+                                                    link.title, link.source_label
+                                                ))
+                                                .small(),
+                                            )
+                                            .truncate(),
                                         )
                                         .on_hover_text(&link.pgn_url)
                                         .clicked()
                                     {
-                                        self.league_portal_selected_url =
+                                        this.league_portal_selected_url =
                                             Some(link.pgn_url.clone());
-                                        self.league_portal_selected_label = link.title.clone();
+                                        this.league_portal_selected_label = link.title.clone();
+                                        this.league_excluded_game_indices.clear();
+                                        if let Some(rd) = link.initial_round {
+                                            this.league_round_spec = rd.to_string();
+                                        }
+                                        *action_compile_roster =
+                                            Some((link.pgn_url.clone(), link.title.clone()));
                                     }
                                 }
                             });
                     }
                 }
 
+                let busy_roster = this.league_roster_rx.is_some();
                 ui.add_space(4.0);
                 ui.separator();
+
+                // Players, Clubs & Rounds Roster Index + Right-hand Browseable Games Preview
                 ui.horizontal_wrapped(|ui| {
-                    ui.label(RichText::new("Filter player/team:").small().strong());
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.league_player_filter)
-                            .desired_width(220.0)
-                            .hint_text("Optional: player or team (use ; for multiple)"),
-                    );
-                    if ui
-                        .small_button("My names")
-                        .on_hover_text("Filter using your configured Preparation / ChessABC player names")
-                        .clicked()
-                    {
-                        action_fill_my_names = true;
+                    ui.label(RichText::new("Players, Clubs & Rounds Index:").small().strong());
+                    if let Some(roster) = &this.league_roster {
+                        ui.label(
+                            RichText::new(format!(
+                                "{} ({} games · {} players · {} clubs)",
+                                roster.title,
+                                roster.games.len(),
+                                roster.players.len(),
+                                roster.clubs.len()
+                            ))
+                            .small()
+                            .color(GOLD),
+                        );
+                    } else if busy_roster {
+                        ui.spinner();
+                        ui.label(RichText::new("Compiling roster index…").small().weak());
+                    } else {
+                        ui.label(
+                            RichText::new("Select a league or tournament above to index players, clubs & games.")
+                                .small()
+                                .weak(),
+                        );
                     }
-                    if !self.league_player_filter.is_empty() && ui.small_button("Clear").clicked() {
-                        self.league_player_filter.clear();
+                    let compile_src = match active_provider.kind {
+                        ProviderKind::LigaManagerBayern => this
+                            .league_lm_downloads
+                            .as_ref()
+                            .and_then(|d| {
+                                d.all_pgn_url
+                                    .clone()
+                                    .or_else(|| this.league_lm_selected_url.clone())
+                                    .map(|u| (u, d.title.clone()))
+                            }),
+                        ProviderKind::DsbErgebnisdienst => this
+                            .league_dsb_pgn
+                            .as_ref()
+                            .map(|p| (p.pgn_url.clone(), p.league_name.clone())),
+                        ProviderKind::LichessBroadcast => this
+                            .league_broadcast_selected_tour
+                            .as_deref()
+                            .and_then(|id| this.league_broadcast_tours.iter().find(|t| t.id == id))
+                            .map(|t| (t.all_pgn_url.clone(), t.name.clone())),
+                        ProviderKind::ChessResultsFederation => this
+                            .league_cr_selected_url
+                            .as_ref()
+                            .map(|u| (u.clone(), this.league_cr_selected_label.clone())),
+                        ProviderKind::RegionalHtmlPortal | ProviderKind::CustomUrl => this
+                            .league_portal_selected_url
+                            .as_ref()
+                            .map(|u| (u.clone(), this.league_portal_selected_label.clone())),
+                    };
+                    if let Some((cu, ct)) = compile_src
+                        && this.league_roster.as_ref().is_none_or(|r| r.source_url != cu)
+                        && ui
+                            .add_enabled(
+                                !busy_roster,
+                                egui::Button::new("Compile Players & Clubs").small(),
+                            )
+                            .clicked()
+                    {
+                        *action_compile_roster = Some((cu, ct));
                     }
                 });
 
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(RichText::new("Destination:").small().strong());
-                    ui.radio_value(
-                        &mut self.league_destination,
-                        TwicDestination::ActiveDb,
-                        "Active database",
+                if let Some(roster) = this.league_roster.take() {
+                    let my_matched_names: Vec<String> = roster
+                        .players
+                        .iter()
+                        .filter(|p| this.is_my_league_player(&p.name))
+                        .map(|p| p.name.clone())
+                        .collect();
+                    let my_name_set: BTreeSet<&str> =
+                        my_matched_names.iter().map(String::as_str).collect();
+                    ui.horizontal_wrapped(|ui| {
+                        ui.selectable_value(
+                            &mut this.league_roster_tab,
+                            LeagueRosterTab::Players,
+                            format!("Players ({})", roster.players.len()),
+                        );
+                        ui.selectable_value(
+                            &mut this.league_roster_tab,
+                            LeagueRosterTab::Clubs,
+                            format!("Clubs ({})", roster.clubs.len()),
+                        );
+                        ui.separator();
+                        ui.label(RichText::new("Sort:").small().weak());
+                        for (s, lbl) in [
+                            (LeagueRosterSort::GamesDesc, "Games ↓"),
+                            (LeagueRosterSort::EloDesc, "Elo ↓"),
+                            (LeagueRosterSort::Name, "A–Z"),
+                        ] {
+                            ui.selectable_value(&mut this.league_roster_sort, s, lbl);
+                        }
+                        ui.add(
+                            egui::TextEdit::singleline(&mut this.league_roster_query)
+                                .desired_width(140.0)
+                                .hint_text("Filter list…"),
+                        );
+                        if !my_matched_names.is_empty()
+                            && ui
+                                .small_button(format!("★ My names ({})", my_matched_names.len()))
+                                .on_hover_text("Select all players matching your configured names")
+                                .clicked()
+                        {
+                            for n in &my_matched_names {
+                                this.league_selected_players.insert(n.clone());
+                            }
+                            this.league_excluded_game_indices.clear();
+                        }
+                        if (!this.league_selected_players.is_empty()
+                            || !this.league_selected_clubs.is_empty())
+                            && ui.small_button("Clear selection").clicked()
+                        {
+                            this.league_selected_players.clear();
+                            this.league_selected_clubs.clear();
+                            this.league_excluded_game_indices.clear();
+                        }
+                    });
+                    if !roster.rounds.is_empty() {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(RichText::new("Rounds:").small().strong());
+                            let prev_rs = this.league_round_spec.clone();
+                            ui.add(
+                                egui::TextEdit::singleline(&mut this.league_round_spec)
+                                    .desired_width(115.0)
+                                    .hint_text("e.g. 1-3, 5"),
+                            );
+                            if this.league_round_spec != prev_rs {
+                                this.league_excluded_game_indices.clear();
+                            }
+                            let mut parsed_rounds =
+                                league_import::parse_round_spec(&this.league_round_spec);
+                            let format_rounds = |set: &BTreeSet<u16>| -> String {
+                                set.iter()
+                                    .map(|r| r.to_string())
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            };
+                            if ui
+                                .selectable_label(parsed_rounds.is_empty(), "All")
+                                .clicked()
+                            {
+                                this.league_round_spec.clear();
+                                this.league_excluded_game_indices.clear();
+                            }
+                            for &r in roster.rounds.iter().take(18) {
+                                let active = parsed_rounds.contains(&r);
+                                if ui.selectable_label(active, format!("R{r}")).clicked() {
+                                    if active {
+                                        parsed_rounds.remove(&r);
+                                    } else {
+                                        parsed_rounds.insert(r);
+                                    }
+                                    this.league_round_spec = format_rounds(&parsed_rounds);
+                                    this.league_excluded_game_indices.clear();
+                                }
+                            }
+                        });
+                    }
+
+                    let matched_indices = league_import::filter_roster_game_indices(
+                        &roster,
+                        &this.league_selected_players,
+                        &this.league_selected_clubs,
+                        &this.league_player_filter,
+                        &this.league_round_spec,
                     );
-                    ui.add_enabled_ui(self.my_games_config.path.is_some(), |ui| {
-                        ui.radio_value(
-                            &mut self.league_destination,
-                            TwicDestination::MyGames,
-                            "My Games",
+                    let included_count = matched_indices
+                        .iter()
+                        .filter(|idx| !this.league_excluded_game_indices.contains(idx))
+                        .count();
+
+                    let list_h = ui.available_height().max(160.0);
+                    let split_w = ui.available_width().max(420.0);
+                    let left_w = (split_w * 0.42).clamp(180.0, 360.0);
+                    let right_w = (split_w - left_w - 14.0).max(210.0);
+                    let q_list = this.league_roster_query.trim().to_lowercase();
+
+                    ui.horizontal_top(|ui| {
+                        ui.allocate_ui_with_layout(
+                            vec2(left_w, list_h),
+                            Layout::top_down(Align::Min),
+                            |ui| {
+                                ui.set_min_width(left_w);
+                                ui.set_max_width(left_w);
+                                egui::ScrollArea::vertical()
+                                    .id_salt("league-roster-scroll")
+                                    .max_height(list_h)
+                                    .auto_shrink([false, false])
+                                    .show(ui, |ui| {
+                                        ui.set_max_width(left_w - 8.0);
+                                        match this.league_roster_tab {
+                                    LeagueRosterTab::Players => {
+                                        let mut rows: Vec<(bool, &league_import::LeaguePlayerEntry)> =
+                                            roster
+                                                .players
+                                                .iter()
+                                                .filter(|p| {
+                                                    q_list.is_empty()
+                                                        || p.name.to_lowercase().contains(&q_list)
+                                                        || p.clubs
+                                                            .iter()
+                                                            .any(|c| c.to_lowercase().contains(&q_list))
+                                                })
+                                                .map(|p| (my_name_set.contains(p.name.as_str()), p))
+                                                .collect();
+                                        rows.sort_by(|(my_a, a), (my_b, b)| {
+                                            my_b.cmp(my_a).then_with(|| match this.league_roster_sort {
+                                                LeagueRosterSort::GamesDesc => b
+                                                    .games
+                                                    .cmp(&a.games)
+                                                    .then_with(|| a.name.cmp(&b.name)),
+                                                LeagueRosterSort::EloDesc => b
+                                                    .elo
+                                                    .unwrap_or(0)
+                                                    .cmp(&a.elo.unwrap_or(0))
+                                                    .then_with(|| a.name.cmp(&b.name)),
+                                                LeagueRosterSort::Name => a.name.cmp(&b.name),
+                                            })
+                                        });
+                                        for (is_me, p) in rows.into_iter().take(300) {
+                                            let selected =
+                                                this.league_selected_players.contains(&p.name);
+                                            let elo_part = p
+                                                .elo
+                                                .map(|e| format!(" ({e})"))
+                                                .unwrap_or_default();
+                                            let club_part = if p.clubs.is_empty() {
+                                                String::new()
+                                            } else {
+                                                format!(" · {}", p.clubs.join(", "))
+                                            };
+                                            let prefix = if is_me { "★ " } else { "" };
+                                            let label = format!(
+                                                "{prefix}{}{elo_part}{club_part} · {}g",
+                                                p.name, p.games
+                                            );
+                                            let text = if is_me {
+                                                RichText::new(label).small().strong().color(GOLD)
+                                            } else {
+                                                RichText::new(label).small()
+                                            };
+                                            if ui
+                                                .add_sized(
+                                                    [(left_w - 14.0).max(80.0), 20.0],
+                                                    egui::Button::selectable(selected, text).truncate(),
+                                                )
+                                                .clicked()
+                                            {
+                                                if selected {
+                                                    this.league_selected_players.remove(&p.name);
+                                                } else {
+                                                    this.league_selected_players
+                                                        .insert(p.name.clone());
+                                                }
+                                                this.league_excluded_game_indices.clear();
+                                            }
+                                        }
+                                    }
+                                    LeagueRosterTab::Clubs => {
+                                        let mut rows = roster
+                                            .clubs
+                                            .iter()
+                                            .filter(|c| {
+                                                q_list.is_empty()
+                                                    || c.name.to_lowercase().contains(&q_list)
+                                            })
+                                            .collect::<Vec<_>>();
+                                        rows.sort_by(|a, b| match this.league_roster_sort {
+                                            LeagueRosterSort::GamesDesc | LeagueRosterSort::EloDesc => {
+                                                b.games.cmp(&a.games).then_with(|| a.name.cmp(&b.name))
+                                            }
+                                            LeagueRosterSort::Name => a.name.cmp(&b.name),
+                                        });
+                                        for c in rows.into_iter().take(300) {
+                                            let selected =
+                                                this.league_selected_clubs.contains(&c.name);
+                                            let label = format!(
+                                                "{} · {} players · {}g",
+                                                c.name, c.players, c.games
+                                            );
+                                            if ui
+                                                .add_sized(
+                                                    [(left_w - 14.0).max(80.0), 20.0],
+                                                    egui::Button::selectable(
+                                                        selected,
+                                                        RichText::new(label).small(),
+                                                    )
+                                                    .truncate(),
+                                                )
+                                                .clicked()
+                                            {
+                                                if selected {
+                                                    this.league_selected_clubs.remove(&c.name);
+                                                } else {
+                                                    this.league_selected_clubs.insert(c.name.clone());
+                                                }
+                                                this.league_excluded_game_indices.clear();
+                                            }
+                                        }
+                                    }
+                                        }
+                                    });
+                            },
+                        );
+
+                        ui.separator();
+
+                        ui.allocate_ui_with_layout(
+                            vec2(right_w, list_h),
+                            Layout::top_down(Align::Min),
+                            |ui| {
+                                ui.set_min_width(right_w);
+                                ui.set_max_width(right_w);
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "Games to import ({included_count}/{})",
+                                            matched_indices.len()
+                                        ))
+                                        .small()
+                                        .strong(),
+                                    );
+                                    if !matched_indices.is_empty() {
+                                        if ui.small_button("All").clicked() {
+                                            this.league_excluded_game_indices.clear();
+                                        }
+                                        if ui.small_button("None").clicked() {
+                                            for &gi in &matched_indices {
+                                                this.league_excluded_game_indices.insert(gi);
+                                            }
+                                        }
+                                    }
+                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new("Hover + ←/→ preview · Click open")
+                                                    .small()
+                                                    .weak(),
+                                            )
+                                            .truncate(),
+                                        );
+                                    });
+                                });
+                                ui.add_space(3.0);
+                                if matched_indices.is_empty() {
+                                    ui.label(
+                                        RichText::new(
+                                            "No games match the selected players, clubs, or rounds.",
+                                        )
+                                        .small()
+                                        .weak()
+                                        .italics(),
+                                    );
+                                    return;
+                                }
+                                let games_scroll_h = (list_h - 24.0).max(110.0);
+                                egui::ScrollArea::vertical()
+                                    .id_salt("league-preview-games-scroll")
+                                    .max_height(games_scroll_h)
+                                    .auto_shrink([false, false])
+                                    .show_rows(ui, 38.0, matched_indices.len(), |ui, range| {
+                                        ui.set_max_width((right_w - 8.0).max(160.0));
+                                        for pos in range {
+                                            let Some(&g_idx) = matched_indices.get(pos) else {
+                                                continue;
+                                            };
+                                            let Some(game) = roster.games.get(g_idx) else {
+                                                continue;
+                                            };
+                                            let mut checked =
+                                                !this.league_excluded_game_indices.contains(&g_idx);
+                                            let w = game.white();
+                                            let b = game.black();
+                                            let welo = game
+                                                .header("WhiteElo")
+                                                .filter(|s| !s.is_empty() && *s != "?")
+                                                .map(|s| format!(" ({s})"))
+                                                .unwrap_or_default();
+                                            let belo = game
+                                                .header("BlackElo")
+                                                .filter(|s| !s.is_empty() && *s != "?")
+                                                .map(|s| format!(" ({s})"))
+                                                .unwrap_or_default();
+                                            let res = standardize_result_badge(game.result());
+                                            let moves = full_moves(game.mainline_len());
+                                            let r_txt = game
+                                                .header("Round")
+                                                .filter(|s| !s.is_empty() && *s != "?")
+                                                .map(|r| format!("R{r}"))
+                                                .unwrap_or_default();
+                                            let (wt, bt) = league_import::extract_game_clubs(game);
+                                            let teams = match (wt, bt) {
+                                                (Some(a), Some(c)) => format!("{a} – {c}"),
+                                                _ => format!("{} · {}", game.event(), game.date()),
+                                            };
+                                            let sub = if r_txt.is_empty() {
+                                                teams
+                                            } else {
+                                                format!("{r_txt} · {teams}")
+                                            };
+
+                                            ui.horizontal(|ui| {
+                                                if ui.checkbox(&mut checked, "").changed() {
+                                                    if checked {
+                                                        this.league_excluded_game_indices
+                                                            .remove(&g_idx);
+                                                    } else {
+                                                        this.league_excluded_game_indices
+                                                            .insert(g_idx);
+                                                    }
+                                                }
+                                                let row_w = (right_w - 38.0).max(120.0);
+                                                let (rect, row_resp) = ui.allocate_exact_size(
+                                                    vec2(row_w, 34.0),
+                                                    Sense::click(),
+                                                );
+                                                let painter = ui.painter_at(rect);
+                                                let bg = if row_resp.hovered() {
+                                                    ui.visuals().widgets.hovered.bg_fill
+                                                } else if !checked {
+                                                    Color32::from_rgba_unmultiplied(
+                                                        0x14, 0x17, 0x1C, 90,
+                                                    )
+                                                } else {
+                                                    Color32::TRANSPARENT
+                                                };
+                                                painter.rect_filled(rect, 3.0, bg);
+                                                let meta_txt = format!("{res}  {moves}m");
+                                                let meta_g = painter.layout_no_wrap(
+                                                    meta_txt,
+                                                    FontId::monospace(11.0),
+                                                    if checked { GOLD } else { MUTED },
+                                                );
+                                                let meta_x = (rect.right() - meta_g.size().x - 6.0)
+                                                    .max(rect.left() + 60.0);
+                                                painter.galley(
+                                                    pos2(meta_x, rect.top() + 3.0),
+                                                    meta_g,
+                                                    GOLD,
+                                                );
+
+                                                let title_avail =
+                                                    (meta_x - rect.left() - 10.0).max(40.0);
+                                                let mut job = LayoutJob::single_section(
+                                                    format!("{w}{welo} – {b}{belo}"),
+                                                    TextFormat {
+                                                        font_id: FontId::proportional(12.5),
+                                                        color: if checked { TEXT } else { MUTED },
+                                                        ..Default::default()
+                                                    },
+                                                );
+                                                job.wrap.max_width = title_avail;
+                                                job.wrap.max_rows = 1;
+                                                job.wrap.break_anywhere = true;
+                                                let title_g = painter.layout_job(job);
+                                                painter.galley(
+                                                    pos2(rect.left() + 4.0, rect.top() + 2.0),
+                                                    title_g,
+                                                    TEXT,
+                                                );
+
+                                                let mut sub_job = LayoutJob::single_section(
+                                                    sub,
+                                                    TextFormat {
+                                                        font_id: FontId::proportional(10.5),
+                                                        color: MUTED,
+                                                        ..Default::default()
+                                                    },
+                                                );
+                                                sub_job.wrap.max_width =
+                                                    (rect.width() - 10.0).max(40.0);
+                                                sub_job.wrap.max_rows = 1;
+                                                sub_job.wrap.break_anywhere = true;
+                                                let sub_g = painter.layout_job(sub_job);
+                                                painter.galley(
+                                                    pos2(rect.left() + 4.0, rect.top() + 18.0),
+                                                    sub_g,
+                                                    MUTED,
+                                                );
+
+                                                if row_resp.hovered() {
+                                                    let browse_id = format!(
+                                                        "league-roster:{}:{g_idx}",
+                                                        roster.source_url
+                                                    );
+                                                    *secondary_hover =
+                                                        Some((browse_id, game.clone(), 0, None));
+                                                }
+                                                if row_resp.clicked() {
+                                                    *action_open_preview = Some((
+                                                        game.clone(),
+                                                        format!("{} · {w} – {b}", roster.title),
+                                                    ));
+                                                }
+                                            });
+                                        }
+                                    });
+                            },
                         );
                     });
-                    ui.radio_value(
-                        &mut self.league_destination,
-                        TwicDestination::NewDatabase,
-                        format!("New database ({})", self.default_database_format.short_label()),
-                    );
-                    if self.league_destination == TwicDestination::MyGames {
-                        ui.label(RichText::new("Section:").small().weak());
-                        for sec in [
-                            MyGamesSection::Classical,
-                            MyGamesSection::Rapid,
-                            MyGamesSection::Blitz,
-                        ] {
-                            ui.radio_value(
-                                &mut self.league_my_games_section,
-                                sec.clone(),
-                                sec.display_label(),
-                            );
-                        }
-                    }
-                });
+                    this.league_roster = Some(roster);
+                }
+            };
 
-                ui.add_space(4.0);
-                let selected_target = match active_provider.kind {
-                    ProviderKind::LigaManagerBayern => {
-                        self.league_lm_selected_url.as_ref().map(|u| {
-                            let title = self
-                                .league_lm_downloads
-                                .as_ref()
-                                .map_or_else(|| "LigaManager".to_string(), |d| d.title.clone());
-                            (u.clone(), title)
-                        })
-                    }
-                    ProviderKind::DsbErgebnisdienst => self
-                        .league_dsb_pgn
-                        .as_ref()
-                        .map(|p| (p.pgn_url.clone(), p.league_name.clone())),
-                    ProviderKind::LichessBroadcast => {
-                        self.league_broadcast_selected_url.as_ref().map(|u| {
-                            let label = if self.league_broadcast_selected_label.is_empty() {
-                                "Lichess Broadcast".to_string()
-                            } else {
-                                self.league_broadcast_selected_label.clone()
-                            };
-                            (u.clone(), label)
-                        })
-                    }
-                    ProviderKind::RegionalHtmlPortal | ProviderKind::CustomUrl => {
-                        self.league_portal_selected_url.as_ref().map(|u| {
-                            let label = if self.league_portal_selected_label.is_empty() {
-                                active_provider.name.to_string()
-                            } else {
-                                self.league_portal_selected_label.clone()
-                            };
-                            (u.clone(), label)
-                        })
-                    }
-                };
-
-                ui.horizontal(|ui| {
-                    if ui
-                        .add_enabled(
-                            !busy && selected_target.is_some(),
-                            egui::Button::new(RichText::new("Download & Import").strong()),
-                        )
-                        .clicked()
-                    {
-                        action_import = selected_target;
-                    }
-                    if !self.league_status.is_empty() {
-                        ui.add(
-                            egui::Label::new(RichText::new(&self.league_status).small().weak())
-                                .wrap()
-                                .truncate(),
-                        );
-                    }
-                });
+        if use_panels {
+            egui::Panel::bottom("league-hub-bottom").show(ui, |ui| {
+                ui.add_space(2.0);
+                render_bottom_bar(self, ui, &mut action_fill_my_names, &mut action_import);
             });
+            egui::Panel::left("league-provider-tree")
+                .resizable(true)
+                .default_size(235.0)
+                .size_range(175.0..=340.0)
+                .show(ui, |ui| {
+                    render_provider_tree(
+                        self,
+                        ui,
+                        None,
+                        &mut action_select_provider,
+                        &mut action_fetch_lm_season,
+                        &mut action_fetch_dsb_dir,
+                        &mut action_fetch_broadcasts,
+                        &mut action_fetch_cr,
+                        &mut action_scan_portal,
+                    );
+                });
+            egui::CentralPanel::default_margins().show(ui, |ui| {
+                let ws_h = ui.available_height().max(320.0);
+                render_workspace(
+                    self,
+                    ui,
+                    ws_h,
+                    &mut action_resolve_url,
+                    &mut action_fetch_lm_season,
+                    &mut action_select_lm_prefix,
+                    &mut action_fetch_dsb_dir,
+                    &mut action_select_dsb_code,
+                    &mut action_fetch_broadcasts,
+                    &mut action_fetch_cr,
+                    &mut action_scan_portal,
+                    &mut action_open_browser,
+                    &mut action_compile_roster,
+                    &mut action_open_preview,
+                    secondary_hover,
+                );
+            });
+        } else {
+            ui.vertical(|ui| {
+                render_provider_tree(
+                    self,
+                    ui,
+                    Some(120.0),
+                    &mut action_select_provider,
+                    &mut action_fetch_lm_season,
+                    &mut action_fetch_dsb_dir,
+                    &mut action_fetch_broadcasts,
+                    &mut action_fetch_cr,
+                    &mut action_scan_portal,
+                );
+                ui.separator();
+                render_workspace(
+                    self,
+                    ui,
+                    (max_h * 0.65).max(320.0),
+                    &mut action_resolve_url,
+                    &mut action_fetch_lm_season,
+                    &mut action_select_lm_prefix,
+                    &mut action_fetch_dsb_dir,
+                    &mut action_select_dsb_code,
+                    &mut action_fetch_broadcasts,
+                    &mut action_fetch_cr,
+                    &mut action_scan_portal,
+                    &mut action_open_browser,
+                    &mut action_compile_roster,
+                    &mut action_open_preview,
+                    secondary_hover,
+                );
+                ui.separator();
+                render_bottom_bar(self, ui, &mut action_fill_my_names, &mut action_import);
+            });
+        }
 
         if let Some(p) = action_select_provider {
             self.league_provider_id = p.id;
+            self.league_roster = None;
+            self.league_selected_players.clear();
+            self.league_selected_clubs.clear();
+            self.league_excluded_game_indices.clear();
             match p.kind {
                 ProviderKind::LigaManagerBayern => {
                     self.league_portal = LeaguePortal::LigaManagerBayern;
@@ -27696,14 +30769,36 @@ impl App {
                 }
                 ProviderKind::DsbErgebnisdienst => {
                     self.league_portal = LeaguePortal::DsbErgebnisdienst;
+                    if let Some(q) = p.default_query {
+                        self.league_dsb_query = q.to_string();
+                    } else if p.id == "dsb-ergebnisdienst" {
+                        self.league_dsb_query.clear();
+                    }
                     if self.league_dsb_dir.is_none() && self.league_dir_rx.is_none() {
                         action_fetch_dsb_dir = Some(self.league_dsb_season_prefix.clone());
                     }
                 }
                 ProviderKind::LichessBroadcast => {
-                    if self.league_broadcast_tours.is_empty() && self.league_dir_rx.is_none() {
+                    if let Some(q) = p.default_query {
+                        self.league_broadcast_query = q.to_string();
+                        self.league_broadcast_selected_tour = None;
+                        self.league_broadcast_selected_url = None;
+                        action_fetch_broadcasts = Some(Some(q.to_string()));
+                    } else if self.league_broadcast_tours.is_empty() && self.league_dir_rx.is_none()
+                    {
+                        self.league_broadcast_query.clear();
                         action_fetch_broadcasts = Some(None);
                     }
+                }
+                ProviderKind::ChessResultsFederation => {
+                    let (fed, ttype) = league_import::parse_cr_default_query(p.default_query);
+                    self.league_cr_fed = fed;
+                    self.league_cr_type = ttype;
+                    self.league_cr_only_games = true;
+                    self.league_cr_query.clear();
+                    self.league_cr_selected_url = None;
+                    self.league_cr_selected_label.clear();
+                    action_fetch_cr = true;
                 }
                 ProviderKind::RegionalHtmlPortal | ProviderKind::CustomUrl => {
                     if !p.url.is_empty() {
@@ -27711,9 +30806,19 @@ impl App {
                         self.league_portal_links.clear();
                         self.league_portal_selected_url = None;
                         self.league_portal_selected_label.clear();
+                        if p.kind == ProviderKind::RegionalHtmlPortal && action_scan_portal.is_none()
+                        {
+                            action_scan_portal = Some(p.url.to_string());
+                        }
                     }
                 }
             }
+        }
+        if let Some((game, label)) = action_open_preview {
+            self.open_game_preview(game, label);
+        }
+        if let Some((cu, ct)) = action_compile_roster {
+            self.start_league_roster_compile(cu, ct);
         }
         if action_fill_my_names {
             let mut names: Vec<String> = self.prep_player_names.clone();
@@ -27730,6 +30835,7 @@ impl App {
                     "No player names configured in Preparation or My Games yet.".to_string();
             } else {
                 self.league_player_filter = names.join("; ");
+                self.league_excluded_game_indices.clear();
             }
         }
         if action_resolve_url {
@@ -27750,6 +30856,9 @@ impl App {
         }
         if let Some(query) = action_fetch_broadcasts {
             self.fetch_lichess_broadcasts(query);
+        }
+        if action_fetch_cr {
+            self.fetch_league_chess_results();
         }
         if let Some(url) = action_scan_portal {
             self.fetch_portal_pgn_links(url);
@@ -28414,7 +31523,11 @@ impl App {
                 }
             };
 
-            self.pos_search_last_label = if let Some(preset) = self.pos_search_query.structure {
+            self.pos_search_last_label = if let Some(plan_id) = self.pos_search_query.plan
+                && let Some(plan) = crate::structure_plans::find_plan(plan_id)
+            {
+                format!("Plan: {}", plan.title)
+            } else if let Some(preset) = self.pos_search_query.structure {
                 preset.label().to_string()
             } else if let Some(endgame) = self.pos_search_query.endgame {
                 endgame.preset.short_label().to_string()
@@ -29206,6 +32319,7 @@ impl App {
 
                 let row_h = 20.0;
                 let avail_w = ui.available_width();
+                let textures = &self.textures;
                 egui::ScrollArea::vertical()
                     .id_salt("eco-browser-list")
                     .max_height(185.0)
@@ -29258,21 +32372,104 @@ impl App {
                                 if is_sel { TEXT } else { MUTED },
                             );
 
-                            if !info.variations.is_empty() {
-                                let preview = info
-                                    .variations
-                                    .iter()
-                                    .take(8)
-                                    .cloned()
-                                    .collect::<Vec<_>>()
-                                    .join("\n");
-                                let extra = info.variations.len().saturating_sub(8);
-                                let tip = if extra > 0 {
-                                    format!("{}:\n{preview}\n(+{extra} more)", info.eco)
-                                } else {
-                                    format!("{}:\n{preview}", info.eco)
-                                };
-                                let _ = resp.on_hover_text(tip);
+                            let (branch_name, branch_pgn, branch_pos, branch_last_mv) =
+                                info.defining_branch_for_query(&query_lower);
+                            if !branch_pgn.is_empty() || !info.variations.is_empty() {
+                                resp.clone().on_hover_ui(|ui| {
+                                    ui.set_max_width(250.0);
+                                    ui.label(
+                                        RichText::new(format!("{} — {branch_name}", info.eco))
+                                            .small()
+                                            .strong(),
+                                    );
+                                    if !branch_pgn.is_empty() {
+                                        ui.label(
+                                            RichText::new(branch_pgn)
+                                                .small()
+                                                .monospace()
+                                                .color(GOLD),
+                                        );
+                                    }
+                                    if let Some(pos) = branch_pos.as_ref() {
+                                        ui.add_space(3.0);
+                                        let sq_size = 22.0;
+                                        let board_size = sq_size * 8.0;
+                                        let (board_rect, _) = ui.allocate_exact_size(
+                                            vec2(board_size, board_size),
+                                            Sense::hover(),
+                                        );
+                                        let painter = ui.painter_at(board_rect);
+                                        let light = Color32::from_rgb(0xDF, 0xCF, 0xB8);
+                                        let dark = Color32::from_rgb(0x9E, 0x7B, 0x56);
+                                        let board = pos.board();
+                                        for rank_row in 0..8usize {
+                                            for file_col in 0..8usize {
+                                                let rank = 7 - rank_row;
+                                                let sq = Square::from_coords(
+                                                    crate::chess::File::new(file_col as u32),
+                                                    crate::chess::Rank::new(rank as u32),
+                                                );
+                                                let sq_rect = Rect::from_min_size(
+                                                    pos2(
+                                                        board_rect.left() + file_col as f32 * sq_size,
+                                                        board_rect.top() + rank_row as f32 * sq_size,
+                                                    ),
+                                                    vec2(sq_size, sq_size),
+                                                );
+                                                let is_light = (rank + file_col) % 2 == 1;
+                                                painter.rect_filled(
+                                                    sq_rect,
+                                                    0.0,
+                                                    if is_light { light } else { dark },
+                                                );
+                                                if let Some((from_sq, to_sq)) = branch_last_mv
+                                                    && (sq == from_sq || sq == to_sq)
+                                                {
+                                                    painter.rect_filled(
+                                                        sq_rect,
+                                                        0.0,
+                                                        Color32::from_rgba_unmultiplied(
+                                                            218, 178, 72, 110,
+                                                        ),
+                                                    );
+                                                }
+                                                if let Some(piece) = board.piece_at(sq)
+                                                    && let Some(tex) = textures.get(piece)
+                                                {
+                                                    painter.image(
+                                                        tex.id(),
+                                                        sq_rect.shrink(1.5),
+                                                        Rect::from_min_max(
+                                                            pos2(0.0, 0.0),
+                                                            pos2(1.0, 1.0),
+                                                        ),
+                                                        Color32::WHITE,
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        painter.rect_stroke(
+                                            board_rect,
+                                            0.0,
+                                            Stroke::new(1.0, BORDER),
+                                            StrokeKind::Outside,
+                                        );
+                                    }
+                                    if !info.variations.is_empty() {
+                                        ui.add_space(3.0);
+                                        for var_name in info.variations.iter().take(5) {
+                                            ui.label(RichText::new(var_name).small().weak());
+                                        }
+                                        let extra = info.variations.len().saturating_sub(5);
+                                        if extra > 0 {
+                                            ui.label(
+                                                RichText::new(format!("(+{extra} more)"))
+                                                    .small()
+                                                    .weak(),
+                                            );
+                                        }
+                                    }
+                                });
                             }
 
                             if let Some(pos) = pointer_pos
@@ -29348,9 +32545,39 @@ impl App {
             return;
         }
         let mut open = self.pos_search_open;
+        let max_h = (ctx.content_rect().height() - 48.0).clamp(420.0, 820.0);
+        let mut actions = None;
+        let vp_id = egui::ViewportId::from_hash_of("brett-position-search-viewport");
+        let builder = egui::ViewportBuilder::default()
+            .with_title("Brett — Search Structures, Endgames, Positions & Mega Flags")
+            .with_inner_size([860.0, 720.0])
+            .with_min_inner_size([620.0, 440.0]);
+        ctx.show_viewport_immediate(vp_id, builder, |ui, class| {
+            if ui.ctx().input(|i| i.viewport().close_requested()) {
+                open = false;
+            }
+            if class == egui::ViewportClass::EmbeddedWindow {
+                actions = Some(self.position_search_dialog_body(ui, max_h));
+            } else {
+                let vp_h = ui.ctx().content_rect().height().max(480.0);
+                egui::CentralPanel::default_margins().show(ui, |panel_ui| {
+                    actions = Some(self.position_search_dialog_body(panel_ui, vp_h));
+                });
+            }
+        });
+        self.pos_search_open = open;
+        if let Some(act) = actions {
+            self.finish_position_search_frame(ctx, act);
+        }
+    }
+
+    fn position_search_dialog_body(
+        &mut self,
+        ui: &mut Ui,
+        max_h: f32,
+    ) -> PosSearchFrameActions {
         let running = self.pos_search_rx.is_some();
         let mut start_search_batch = false;
-        let mut start_search_all = false;
         let mut start_search_more = false;
         let mut start_search_all_remaining = false;
         let mut start_struct_build = false;
@@ -29397,17 +32624,9 @@ impl App {
                 None
             }
         };
-        let max_h = (ctx.content_rect().height() - 48.0).clamp(420.0, 820.0);
 
-        egui::Window::new("Search Structures, Endgames, Positions & Mega Flags")
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(true)
-            .default_width(820.0)
-            .max_height(max_h)
-            .show(ctx, |ui| {
-                // Top tab bar + scope + reset
-                ui.horizontal_wrapped(|ui| {
+        // Top tab bar + scope + reset
+        ui.horizontal_wrapped(|ui| {
                     ui.selectable_value(
                         &mut self.pos_search_tab,
                         PositionSearchTab::PlansStructures,
@@ -29451,6 +32670,8 @@ impl App {
                         self.pos_search_eco_drag = None;
                         self.pos_search_eco_last_anchor = None;
                     }
+                    ui.checkbox(&mut self.pos_search_close_on_open, "Close on open")
+                        .on_hover_text("Automatically close this search window when opening a matched game");
                     match struct_index_state {
                         Some(true) => {
                             ui.label(
@@ -29484,6 +32705,26 @@ impl App {
                 if let Some(st) = self.pos_search_query.structure {
                     summary_parts.push(format!("Structure: {}", st.label()));
                 }
+                if let Some(plan_id) = self.pos_search_query.plan
+                    && let Some(plan) = crate::structure_plans::find_plan(plan_id)
+                {
+                    let side_str = if plan.side == Color::White {
+                        "White"
+                    } else {
+                        "Black"
+                    };
+                    summary_parts.push(format!(
+                        "Plan: {} Plan {} — {}{}",
+                        side_str,
+                        plan.plan_number,
+                        plan.title,
+                        if self.pos_search_query.ignore_color_flip {
+                            " (+ reverse color)"
+                        } else {
+                            ""
+                        }
+                    ));
+                }
                 if let Some(eg) = &self.pos_search_query.endgame {
                     summary_parts.push(format!(
                         "Endgame: {}{}",
@@ -29515,11 +32756,21 @@ impl App {
                     summary_parts.push("Elo filter".to_string());
                 }
                 if !summary_parts.is_empty() {
-                    ui.label(
-                        RichText::new(summary_parts.join(" · "))
-                            .small()
-                            .color(GOLD),
-                    );
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(
+                            RichText::new(summary_parts.join(" · "))
+                                .small()
+                                .color(GOLD),
+                        );
+                        if self.pos_search_query.plan.is_some()
+                            && ui
+                                .small_button("× Clear plan")
+                                .on_hover_text("Clear active chronological plan filter")
+                                .clicked()
+                        {
+                            self.pos_search_query.set_plan(None);
+                        }
+                    });
                 }
                 ui.separator();
 
@@ -29563,13 +32814,19 @@ impl App {
                                     } else {
                                         preset.label().to_string()
                                     };
+                                    let locked_note = if preset.is_handcrafted() {
+                                        " · [Handcrafted — locked]"
+                                    } else {
+                                        ""
+                                    };
                                     let tip = if is_overridden {
                                         format!(
-                                            "{} (Overridden by saved custom preset — click Search or Tune to edit)",
-                                            preset.description()
+                                            "{}{} (Overridden by saved custom preset — click Search or Tune to edit)",
+                                            preset.description(),
+                                            locked_note
                                         )
                                     } else {
-                                        preset.description().to_string()
+                                        format!("{}{}", preset.description(), locked_note)
                                     };
                                     if ui
                                         .selectable_label(active, chip_label)
@@ -29811,9 +33068,10 @@ impl App {
                                             .strong(),
                                         );
                                     });
+                                    let mini_ctx = cols[1].ctx().clone();
                                     self.draw_structure_plan_mini_board(
                                         &mut cols[1],
-                                        ctx,
+                                        &mini_ctx,
                                         active_plan,
                                     );
                                     if !active_plan.animated_moves.is_empty() {
@@ -29830,18 +33088,52 @@ impl App {
                                     cols[1].label(
                                         RichText::new(active_plan.summary).small().weak(),
                                     );
-                                    if let Some(preset) = active_plan.search_preset
-                                        && cols[1]
-                                            .small_button(format!(
-                                                "Select structure filter: {}",
-                                                preset.label()
-                                            ))
+                                    let is_active_plan =
+                                        self.pos_search_query.plan == Some(active_plan.id());
+                                    let mut launch_plan_search = false;
+                                    cols[1].horizontal_wrapped(|ui| {
+                                        let search_label = if is_active_plan {
+                                            "Searching this plan ✓"
+                                        } else {
+                                            "Search this plan"
+                                        };
+                                        if ui
+                                            .selectable_label(is_active_plan, search_label)
+                                            .on_hover_text(
+                                                "Search games executing this strategic plan chronologically (reverse color ON by default)",
+                                            )
                                             .clicked()
-                                    {
-                                        self.pos_search_query.set_structure(Some(preset));
-                                        if self.pos_search_query.min_ply == 0 {
-                                            self.pos_search_query.min_ply = 8;
+                                        {
+                                            if is_active_plan {
+                                                self.pos_search_query.set_plan(None);
+                                            } else {
+                                                self.pos_search_query
+                                                    .set_plan(Some(active_plan.id()));
+                                                if self.pos_search_query.min_ply == 0 {
+                                                    self.pos_search_query.min_ply = 8;
+                                                }
+                                                if self.pos_search_query.max_ply < 140 {
+                                                    self.pos_search_query.max_ply = 140;
+                                                }
+                                                launch_plan_search = true;
+                                            }
                                         }
+                                        if let Some(preset) = active_plan.search_preset
+                                            && ui
+                                                .small_button(format!(
+                                                    "Select structure filter: {}",
+                                                    preset.label()
+                                                ))
+                                                .clicked()
+                                        {
+                                            self.pos_search_query.set_structure(Some(preset));
+                                            if self.pos_search_query.min_ply == 0 {
+                                                self.pos_search_query.min_ply = 8;
+                                            }
+                                        }
+                                    });
+                                    if launch_plan_search {
+                                        self.start_position_search();
                                     }
                                 });
                             }
@@ -29880,7 +33172,7 @@ impl App {
                         }
 
                         PositionSearchTab::Endgames => {
-                            // Endgame Constellation Selector (mutually exclusive with Structure)
+                            // Hierarchical Endgame Family -> Constellation Selector (mutually exclusive with Structure)
                             if self.pos_search_query.structure.is_some() {
                                 ui.label(
                                     RichText::new(
@@ -29891,23 +33183,31 @@ impl App {
                                 );
                             }
                             ui.horizontal_wrapped(|ui| {
-                                ui.label(
-                                    RichText::new("Endgame Constellation:")
-                                        .small()
-                                        .strong(),
-                                );
+                                ui.label(RichText::new("Endgame Family:").small().strong());
                                 if ui
                                     .selectable_label(self.pos_search_query.endgame.is_none(), "None")
                                     .clicked()
                                 {
                                     self.pos_search_query.set_endgame(None);
                                 }
-                                for preset in EndgamePreset::ALL {
+                                for fam in EndgameFamily::ALL {
+                                    let selected = self.pos_search_endgame_family == fam;
+                                    if ui.selectable_label(selected, fam.label()).clicked() {
+                                        self.pos_search_endgame_family = fam;
+                                    }
+                                }
+                            });
+                            ui.horizontal_wrapped(|ui| {
+                                for &preset in self.pos_search_endgame_family.presets() {
                                     let active = self
                                         .pos_search_query
                                         .endgame
                                         .is_some_and(|eg| eg.preset == preset);
-                                    if ui.selectable_label(active, preset.short_label()).clicked() {
+                                    if ui
+                                        .selectable_label(active, preset.short_label())
+                                        .on_hover_text(preset.description())
+                                        .clicked()
+                                    {
                                         if active {
                                             self.pos_search_query.set_endgame(None);
                                         } else {
@@ -29922,7 +33222,19 @@ impl App {
                             });
 
                             if let Some(eg) = self.pos_search_query.endgame.as_mut() {
+                                ui.label(RichText::new(eg.preset.description()).small().weak());
                                 ui.add_space(4.0);
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label(RichText::new("Pawn balance:").small().strong());
+                                    for bal in EndgamePawnBalance::ALL {
+                                        ui.selectable_value(&mut eg.pawn_balance, bal, bal.label());
+                                    }
+                                    ui.separator();
+                                    ui.label(RichText::new("Pawn wings:").small().strong());
+                                    for wing in EndgamePawnWings::ALL {
+                                        ui.selectable_value(&mut eg.pawn_wings, wing, wing.label());
+                                    }
+                                });
                                 ui.horizontal_wrapped(|ui| {
                                     ui.checkbox(
                                         &mut eg.swap_sides,
@@ -31065,27 +34377,20 @@ impl App {
                             cancel_search = true;
                         }
                     } else {
-                        if ui.button(RichText::new("Search (1,000)").strong()).clicked() {
+                        if ui.button(RichText::new("Search").strong()).clicked() {
                             start_search_batch = true;
-                        }
-                        if ui
-                            .button("Search all")
-                            .on_hover_text("Scan the entire target database without stopping at 1,000 hits")
-                            .clicked()
-                        {
-                            start_search_all = true;
                         }
                         if self.pos_search_has_more {
                             if ui
-                                .button(RichText::new("+1,000 more").strong().color(GOLD))
-                                .on_hover_text("Continue scanning from the last match for up to 1,000 more games")
+                                .button(RichText::new("More").strong().color(GOLD))
+                                .on_hover_text("Load the next batch of matching games")
                                 .clicked()
                             {
                                 start_search_more = true;
                             }
                             if ui
-                                .button("Search all remaining")
-                                .on_hover_text("Continue scanning through the rest of the database")
+                                .button("Find All")
+                                .on_hover_text("Continue scanning through the rest of the database for all matching games")
                                 .clicked()
                             {
                                 start_search_all_remaining = true;
@@ -31172,6 +34477,7 @@ impl App {
 
                 ui.separator();
                 let hit_count = self.pos_search_hits.len();
+                let mut pos_hit_medal: Option<(usize, MedalMenuAction)> = None;
                 egui::ScrollArea::vertical()
                     .id_salt("pos-search-hits")
                     .max_height(190.0)
@@ -31214,62 +34520,85 @@ impl App {
                             if resp.clicked() {
                                 clicked_hit = Some(idx);
                             }
+                            let hit_medals = hit.medals;
+                            resp.context_menu(|ui| {
+                                if let Some(action) = medals_context_submenu(ui, hit_medals) {
+                                    pos_hit_medal = Some((idx, action));
+                                }
+                            });
                         }
                     });
-            });
+                if let Some((idx, action)) = pos_hit_medal
+                    && let Some(hit) = self.pos_search_hits.get_mut(idx)
+                {
+                    let game_index = hit.game_index;
+                    hit.medals = Self::apply_medal_mask(hit.medals, action);
+                    let target_matches_active = self
+                        .pos_search_target_lib
+                        .as_ref()
+                        .zip(self.library.as_ref())
+                        .is_some_and(|(a, b)| same_path(a.path(), b.path()));
+                    if target_matches_active
+                        && let Some(slot_id) = self.session.source_slot(game_index)
+                    {
+                        self.apply_medal_toggle_to_slots(&[slot_id], action);
+                    }
+                }
+        let resolved_hover = hovered_hit.and_then(|hit_idx| {
+            let hit = self.pos_search_hits.get(hit_idx)?.clone();
+            let lib = self.pos_search_target_lib.clone()?;
+            let browse_id = format!("pos-hit:{}:{}", hit.game_index, hit.matched_ply);
+            let game = if let Some(browse) = &self.hovered_game_browse
+                && browse.id == browse_id
+            {
+                browse.game.clone()
+            } else {
+                lib.load(hit.game_index).ok()?
+            };
+            let orient = self
+                .pos_search_perspective
+                .orientation_for(hit.structure_side);
+            Some((browse_id, game, hit.matched_ply, orient))
+        });
 
-        self.pos_search_open = open;
-        if cancel_search && let Some(cancel) = &self.pos_search_cancel {
+        PosSearchFrameActions {
+            start_search_batch,
+            start_search_more,
+            start_search_all_remaining,
+            start_struct_build,
+            cancel_search,
+            clicked_hit,
+            hovered_hit: resolved_hover,
+            load_hits_into_list,
+            append_hits_to_db,
+        }
+    }
+
+    fn finish_position_search_frame(&mut self, ctx: &egui::Context, act: PosSearchFrameActions) {
+        if act.cancel_search && let Some(cancel) = &self.pos_search_cancel {
             cancel.store(true, std::sync::atomic::Ordering::Relaxed);
             self.pos_search_status = "Cancelling search…".to_string();
         }
-        if start_struct_build {
+        if act.start_struct_build {
             self.start_struct_index_build();
         }
-        if start_search_batch {
+        if act.start_search_batch {
             self.start_position_search_batch(POS_SEARCH_BATCH_SIZE, false);
         }
-        if start_search_all {
-            self.start_position_search_batch(usize::MAX, false);
-        }
-        if start_search_more {
+        if act.start_search_more {
             self.start_position_search_batch(POS_SEARCH_BATCH_SIZE, true);
         }
-        if start_search_all_remaining {
+        if act.start_search_all_remaining {
             self.start_position_search_batch(usize::MAX, true);
         }
-        if load_hits_into_list {
+        if act.load_hits_into_list {
             self.load_pos_search_hits_into_new_db();
         }
-        if append_hits_to_db {
+        if act.append_hits_to_db {
             self.append_pos_search_hits_to_current_db();
         }
-        if let Some(hit_idx) = hovered_hit
-            && let Some(hit) = self.pos_search_hits.get(hit_idx).cloned()
-            && let Some(lib) = self.pos_search_target_lib.clone()
-        {
-            let browse_id = format!("pos-hit:{}:{}", hit.game_index, hit.matched_ply);
-            if !self.touch_hovered_game(&browse_id)
-                && let Ok(game) = lib.load(hit.game_index)
-            {
-                self.activate_hovered_game_browse(browse_id, game);
-            }
-            if let Some(browse) = self.hovered_game_browse.as_mut() {
-                browse.hover_orientation = self
-                    .pos_search_perspective
-                    .orientation_for(hit.structure_side);
-                let target = hit
-                    .matched_ply
-                    .min(browse.game.nodes.len().saturating_sub(1));
-                browse.anchor_node = target;
-                browse.cursor_node = target;
-                self.hover_preview = browse.game.nodes.get(target).map(|node| HoverPreview {
-                    pos: node.pos.clone(),
-                    last_move: domain::last_move_squares(node),
-                });
-            }
-        }
-        if let Some(hit_idx) = clicked_hit
+        self.apply_secondary_hover_preview(ctx, act.hovered_hit);
+        if let Some(hit_idx) = act.clicked_hit
             && let Some(hit) = self.pos_search_hits.get(hit_idx).cloned()
             && let Some(lib) = self.pos_search_target_lib.clone()
         {
@@ -31291,6 +34620,9 @@ impl App {
                 .orientation_for(hit.structure_side)
             {
                 self.orientation = orient;
+            }
+            if self.pos_search_close_on_open {
+                self.pos_search_open = false;
             }
         }
     }
@@ -31401,7 +34733,7 @@ impl App {
                         && !self.active_db_is_read_only()
                         && self.session.len() <= 10_000
                     {
-                        self.save_database_now(false);
+                        self.request_save_database_ui(false);
                     }
                 }
                 self.status = if remembered_count > 0 {
@@ -31501,6 +34833,77 @@ impl App {
             self.execute_pending_delete_games(pending);
         } else if open && !cancel {
             self.pending_delete_games = Some(pending);
+        }
+    }
+
+    fn delete_database_confirm_dialog(&mut self, ctx: &egui::Context) {
+        let Some(pending) = self.pending_delete_database.take() else {
+            return;
+        };
+        let mut open = true;
+        let mut confirm = false;
+        let mut cancel = false;
+        egui::Window::new("Delete database?")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.set_min_width(360.0);
+                ui.set_max_width(480.0);
+                ui.label(
+                    RichText::new(format!("Permanently delete {}?", pending.title))
+                        .strong()
+                        .color(Color32::from_rgb(0xE0, 0x6C, 0x75)),
+                );
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(format!(
+                        "{} · This permanently removes the database files from disk and cannot be undone.",
+                        games_label(pending.count)
+                    ))
+                    .small()
+                    .weak(),
+                );
+                ui.add_space(6.0);
+                egui::ScrollArea::vertical()
+                    .id_salt("delete-db-files-scroll")
+                    .max_height(120.0)
+                    .show(ui, |ui| {
+                        for f in &pending.files {
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(f.display().to_string())
+                                        .small()
+                                        .monospace(),
+                                )
+                                .truncate(),
+                            );
+                        }
+                    });
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui
+                            .button(
+                                RichText::new("Yes, delete from disk")
+                                    .strong()
+                                    .color(Color32::from_rgb(0xE0, 0x6C, 0x75)),
+                            )
+                            .clicked()
+                        {
+                            confirm = true;
+                        }
+                    });
+                });
+            });
+        if confirm {
+            self.execute_pending_delete_database(pending);
+        } else if open && !cancel {
+            self.pending_delete_database = Some(pending);
         }
     }
 
@@ -33116,6 +36519,7 @@ impl eframe::App for App {
         self.poll_player_book();
         self.poll_prep_load();
         self.poll_wiki();
+        self.poll_online_identity();
         self.poll_reference();
         self.poll_ref_position_games();
         self.poll_correspondence();
@@ -33140,6 +36544,38 @@ impl eframe::App for App {
         self.poll_review();
         self.maybe_engine_analysis();
         self.maybe_request_bar_cloud();
+        let mut repainted_for_live = false;
+        if self.live_stream_rx.is_some()
+            || self.live_preview_rx.is_some()
+            || self.live_tour_rounds_rx.is_some()
+            || self.live_clock_state.as_ref().is_some_and(|s| s.ongoing)
+        {
+            let soonest_ms = self
+                .live_clock_state
+                .as_ref()
+                .filter(|s| s.ongoing)
+                .and_then(|s| match s.active_turn {
+                    Some(Color::White) => s.white_centis,
+                    Some(Color::Black) => s.black_centis,
+                    None => None,
+                })
+                .map(|c| {
+                    let elapsed = self
+                        .live_clock_state
+                        .as_ref()
+                        .map(|s| s.anchored_at.elapsed().as_millis() as u64 / 10)
+                        .unwrap_or(0);
+                    c.saturating_sub(elapsed)
+                });
+            let ms = if soonest_ms.is_some_and(|rem| rem <= 2500) {
+                100
+            } else {
+                250
+            };
+            ctx.request_repaint_after(Duration::from_millis(ms));
+            repainted_for_live = true;
+        }
+        let _ = repainted_for_live;
         if self.open_rx.is_some()
             || self.file_dialog_rx.is_some()
             || self.merge_load_rx.is_some()
@@ -33200,7 +36636,7 @@ impl eframe::App for App {
         // Hover previews are re-established by whichever candidate is under
         // the pointer during this frame. Clearing first makes the board snap
         // back to the selected game node as soon as the pointer leaves.
-        self.hover_preview = None;
+        self.hover_preview = self.secondary_hover_preview.clone();
 
         self.handle_keys(&ctx);
         // Hover state is refreshed by the game lists below; keys above used
@@ -33212,7 +36648,7 @@ impl eframe::App for App {
             self.online_reference_panel(ui);
         }
         self.moves_panel(ui);
-        if !self.hovered_game_active_this_frame {
+        if !self.hovered_game_active_this_frame && !self.secondary_hover_active {
             self.hovered_game_browse = None;
         }
         self.sync_current_slot();
@@ -33236,7 +36672,7 @@ impl eframe::App for App {
                 ui.add_space(6.0);
                 let hover = self.hover_preview.as_ref();
                 let (board_eval, eval_held) = self.current_board_eval_with_hold();
-                let (board_meta, move_counter_text, display_orientation) =
+                let (board_meta, move_counter_text, display_orientation, pending_online_reqs) =
                     if let Some((game, disp_node, is_hover_overlay)) =
                         self.active_display_game_and_node()
                     {
@@ -33247,19 +36683,75 @@ impl eframe::App for App {
                         let node = &game.nodes[disp_node];
                         let top_color = effective_orientation.other();
                         let bottom_color = effective_orientation;
-                        let show_clocks = self.show_clocks && game.has_clocks();
-                        let badge = |color: Color| {
+                        let at_mainline_tip = game
+                            .nodes
+                            .get(disp_node)
+                            .is_some_and(|n| n.children.is_empty());
+                        let live_clock_match = (!is_hover_overlay && at_mainline_tip)
+                            .then(|| {
+                                let gkey = format!(
+                                    "{}|{}",
+                                    players::player_key(game.white())
+                                        .unwrap_or_else(|| game.white().to_lowercase()),
+                                    players::player_key(game.black())
+                                        .unwrap_or_else(|| game.black().to_lowercase())
+                                );
+                                self.live_clock_state
+                                    .as_ref()
+                                    .filter(|st| st.game_key == gkey)
+                            })
+                            .flatten();
+                        let show_clocks = self.show_clocks
+                            && (game.has_clocks()
+                                || live_clock_match.is_some_and(|st| {
+                                    st.white_centis.is_some() || st.black_centis.is_some()
+                                }));
+                        let game_init_centis = live_clock_match
+                            .and_then(|st| st.initial_centis)
+                            .or_else(|| crate::live::parse_initial_time_centis(game));
+                        let mut pending_online_reqs: Vec<(OnlineSource, String)> = Vec::new();
+                        let game_online_src = Self::detect_game_online_source(game);
+                        let mut badge = |color: Color| {
                             let raw_name = if color == Color::White {
                                 game.white()
                             } else {
                                 game.black()
                             };
-                            let display_name = self.display_player_name(raw_name);
+                            let mut display_name =
+                                self.display_name_with_online_identity(raw_name, game_online_src);
+                            if display_name == raw_name
+                                && let Some((w, b)) = self.live_watching_meta.as_ref()
+                            {
+                                let live_real = if players::player_key(&w.name)
+                                    == players::player_key(raw_name)
+                                    || w.name.eq_ignore_ascii_case(raw_name)
+                                {
+                                    w.real_name.as_deref()
+                                } else if players::player_key(&b.name)
+                                    == players::player_key(raw_name)
+                                    || b.name.eq_ignore_ascii_case(raw_name)
+                                {
+                                    b.real_name.as_deref()
+                                } else {
+                                    None
+                                };
+                                if let Some(real) = live_real {
+                                    display_name = online::format_online_display_name(
+                                        &display_name,
+                                        Some(real),
+                                    );
+                                }
+                            }
+                            if let Some(src) = game_online_src
+                                && self.display_player_name(raw_name) == raw_name
+                            {
+                                pending_online_reqs.push((src, raw_name.to_string()));
+                            }
                             let country =
                                 player_country_with_directory(game, color, &self.players).or_else(
                                     || {
                                         (display_name != raw_name)
-                                            .then(|| players::player_key(display_name))
+                                            .then(|| players::player_key(&display_name))
                                             .flatten()
                                             .and_then(|key| {
                                                 self.players
@@ -33268,6 +36760,32 @@ impl eframe::App for App {
                                             })
                                     },
                                 );
+                            let (clock, clock_ticking) = if show_clocks {
+                                if let Some(st) = live_clock_match {
+                                    let base = match color {
+                                        Color::White => st.white_centis,
+                                        Color::Black => st.black_centis,
+                                    };
+                                    let ticking = st.ongoing && st.active_turn == Some(color);
+                                    let adjusted = base.map(|c| {
+                                        if ticking {
+                                            let elapsed = (st.anchored_at.elapsed().as_millis()
+                                                as u64)
+                                                / 10;
+                                            Clock {
+                                                centis: c.saturating_sub(elapsed),
+                                            }
+                                        } else {
+                                            Clock { centis: c }
+                                        }
+                                    });
+                                    (adjusted.or_else(|| game.clock_for(disp_node, color)), ticking)
+                                } else {
+                                    (game.clock_for(disp_node, color), false)
+                                }
+                            } else {
+                                (None, false)
+                            };
                             PlayerBadge {
                                 name: display_name.to_string(),
                                 title: self.title_for_game(game, color).map(str::to_string),
@@ -33280,11 +36798,9 @@ impl eframe::App for App {
                                     self.show_all_ratings,
                                 ),
                                 team: team_for(game, color).map(str::to_string),
-                                clock: if show_clocks {
-                                    game.clock_for(disp_node, color)
-                                } else {
-                                    None
-                                },
+                                clock,
+                                clock_ticking,
+                                initial_clock_centis: game_init_centis,
                                 color,
                             }
                         };
@@ -33307,10 +36823,13 @@ impl eframe::App for App {
                             full_moves(depth_of(game, disp_node)),
                             full_moves(game.mainline_len())
                         );
-                        (Some(meta), Some(counter), effective_orientation)
+                        (Some(meta), Some(counter), effective_orientation, pending_online_reqs)
                     } else {
-                        (None, None, self.orientation)
+                        (None, None, self.orientation, Vec::new())
                     };
+                for (src, uname) in pending_online_reqs {
+                    self.request_online_identity(src, &uname);
+                }
                 if let Some(meta) = board_meta {
                     let ctx = ui.ctx().clone();
                     let live_avatar_urls = self.live_watching_meta.as_ref().map(|(w, b)| {
@@ -33564,7 +37083,9 @@ impl eframe::App for App {
         self.pending_game_drop_dialog(&ctx);
         self.pending_merge_dialog(&ctx);
         self.delete_games_confirm_dialog(&ctx);
+        self.delete_database_confirm_dialog(&ctx);
         self.pending_open_dialog(&ctx);
+        self.in_place_save_dialog(&ctx);
         self.save_database_dialog(&ctx);
         self.close_confirmation_dialog(&ctx);
         self.correspondence_download_dialog(&ctx);
@@ -33580,6 +37101,167 @@ impl eframe::App for App {
 struct PlayerStripAction {
     photo_clicked: bool,
     name_clicked: bool,
+}
+
+fn is_supported_save_variant(raw: &str) -> bool {
+    let lower = raw.trim().to_ascii_lowercase();
+    lower.is_empty()
+        || lower.contains("960")
+        || lower.contains("fischer")
+        || matches!(
+            lower.as_str(),
+            "standard"
+                | "chess"
+                | "normal"
+                | "classical"
+                | "classic"
+                | "from position"
+                | "?"
+                | "-"
+        )
+}
+
+fn format_save_game_label(white: &str, black: &str, event: &str, result: &str) -> String {
+    let w = if white.trim().is_empty() {
+        "?"
+    } else {
+        white.trim()
+    };
+    let b = if black.trim().is_empty() {
+        "?"
+    } else {
+        black.trim()
+    };
+    let res = if result.trim().is_empty() {
+        "*"
+    } else {
+        result.trim()
+    };
+    let ev = event.trim();
+    if ev.is_empty() || ev == "?" {
+        format!("{w} – {b} [{res}]")
+    } else {
+        format!("{w} – {b} [{res}] · {ev}")
+    }
+}
+
+fn render_save_diff_ui(ui: &mut Ui, diff: &SaveDiffSummary) {
+    egui::Frame::new()
+        .fill(SURFACE_ALT)
+        .stroke(Stroke::new(1.0, BORDER))
+        .corner_radius(3.0)
+        .inner_margin(egui::Margin::symmetric(8, 6))
+        .show(ui, |ui| {
+            let prev_str = diff
+                .previous_games
+                .map_or_else(|| "existing".to_string(), |n| format!("{n} games"));
+            let summary_line = if diff.same_as_open_source {
+                format!(
+                    "Previous: {} → New: {} games  (+{} added · ~{} modified · -{} removed · {} unchanged)",
+                    prev_str,
+                    diff.new_games,
+                    diff.added_count,
+                    diff.modified_count,
+                    diff.removed_count,
+                    diff.unchanged_count
+                )
+            } else if diff.target_exists {
+                format!(
+                    "Overwrite existing file ({}) → New: {} games",
+                    prev_str, diff.new_games
+                )
+            } else {
+                format!("New target file · {} games", diff.new_games)
+            };
+            ui.label(
+                RichText::new(summary_line)
+                    .small()
+                    .monospace()
+                    .color(GOLD),
+            );
+
+            if !diff.unsupported_variants.is_empty() {
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(format!(
+                        "⚠ {} unsupported variant game(s) in this database may fail binary save:",
+                        diff.unsupported_variants.len()
+                    ))
+                    .small()
+                    .strong()
+                    .color(GOLD),
+                );
+                for (_, label) in diff.unsupported_variants.iter().take(6) {
+                    ui.label(RichText::new(format!("  ! {label}")).small().color(GOLD));
+                }
+            }
+
+            let has_samples = !diff.added_samples.is_empty()
+                || !diff.modified_samples.is_empty()
+                || !diff.removed_samples.is_empty();
+            if has_samples {
+                ui.add_space(4.0);
+                egui::ScrollArea::vertical()
+                    .id_salt("save-diff-samples-scroll")
+                    .max_height(140.0)
+                    .show(ui, |ui| {
+                        for label in &diff.added_samples {
+                            ui.label(
+                                RichText::new(format!("+ Added: {label}"))
+                                    .small()
+                                    .monospace()
+                                    .color(Color32::from_rgb(0x63, 0xD4, 0x85)),
+                            );
+                        }
+                        if diff.added_count > diff.added_samples.len() {
+                            ui.label(
+                                RichText::new(format!(
+                                    "  … +{} more added",
+                                    diff.added_count - diff.added_samples.len()
+                                ))
+                                .small()
+                                .weak(),
+                            );
+                        }
+                        for label in &diff.modified_samples {
+                            ui.label(
+                                RichText::new(format!("~ Modified: {label}"))
+                                    .small()
+                                    .monospace()
+                                    .color(GOLD),
+                            );
+                        }
+                        if diff.modified_count > diff.modified_samples.len() {
+                            ui.label(
+                                RichText::new(format!(
+                                    "  … +{} more modified",
+                                    diff.modified_count - diff.modified_samples.len()
+                                ))
+                                .small()
+                                .weak(),
+                            );
+                        }
+                        for label in &diff.removed_samples {
+                            ui.label(
+                                RichText::new(format!("- Removed: {label}"))
+                                    .small()
+                                    .monospace()
+                                    .color(Color32::from_rgb(0xE0, 0x6C, 0x75)),
+                            );
+                        }
+                        if diff.removed_count > diff.removed_samples.len() {
+                            ui.label(
+                                RichText::new(format!(
+                                    "  … +{} more removed",
+                                    diff.removed_count - diff.removed_samples.len()
+                                ))
+                                .small()
+                                .weak(),
+                            );
+                        }
+                    });
+            }
+        });
 }
 
 /// Player name, rating and (optionally) clock above/below the board.
@@ -33601,6 +37283,13 @@ fn player_strip(
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 4.0, PANEL);
     painter.rect_stroke(rect, 4.0, Stroke::new(1.0, BORDER), StrokeKind::Inside);
+    if player.clock_ticking {
+        let active_bar = Rect::from_min_max(
+            pos2(rect.left(), rect.top() + 3.0),
+            pos2(rect.left() + 3.0, rect.bottom() - 3.0),
+        );
+        painter.rect_filled(active_bar, 1.5, Color32::from_rgb(0x4E, 0xB8, 0x6B));
+    }
 
     let mut photo_clicked = false;
     let avatar = egui::Rect::from_min_size(
@@ -33758,29 +37447,126 @@ fn player_strip(
     if show_clock {
         let text = player
             .clock
-            .map(Clock::display)
+            .map(|clk| {
+                if clk.centis < 2000 {
+                    crate::live::format_live_clock(clk)
+                } else {
+                    clk.display()
+                }
+            })
             .unwrap_or_else(|| "--:--".to_string());
-        let color = if player.clock.is_some() {
-            Color32::from_rgb(0xEC, 0xEF, 0xF4)
-        } else {
-            MUTED
+        let frac = player.clock.zip(player.initial_clock_centis).and_then(|(clk, init)| {
+            (init > 0).then(|| (clk.centis as f32 / init as f32).clamp(0.0, 1.0))
+        });
+        #[derive(Clone, Copy)]
+        enum TimeSeverity {
+            Critical,
+            Low,
+            Healthy,
+        }
+        let severity = match (player.clock, frac) {
+            (Some(clk), Some(f)) if f <= 0.15 || clk.centis <= 1000 => TimeSeverity::Critical,
+            (Some(clk), Some(f)) if f <= 0.35 || clk.centis <= 3000 => TimeSeverity::Low,
+            (Some(clk), None) if clk.centis <= 1000 => TimeSeverity::Critical,
+            (Some(clk), None) if clk.centis <= 3000 => TimeSeverity::Low,
+            _ => TimeSeverity::Healthy,
         };
-        let clock_galley = painter.layout_no_wrap(text, FontId::monospace(15.0), color);
-        let clock_rect = egui::Rect::from_min_size(
+        let (text_col, pill_bg, pill_border, bar_col) = if player.clock.is_none() {
+            (MUTED, SURFACE_ALT, BORDER, MUTED)
+        } else {
+            match severity {
+                TimeSeverity::Critical => (
+                    Color32::from_rgb(0xF2, 0x7A, 0x7A),
+                    Color32::from_rgb(0x36, 0x1B, 0x20),
+                    Color32::from_rgb(0xE0, 0x5A, 0x5A),
+                    Color32::from_rgb(0xE0, 0x5A, 0x5A),
+                ),
+                TimeSeverity::Low => (
+                    Color32::from_rgb(0xF0, 0xC6, 0x6F),
+                    Color32::from_rgb(0x2E, 0x27, 0x1C),
+                    Color32::from_rgb(0xD9, 0xA2, 0x45),
+                    Color32::from_rgb(0xE5, 0xB5, 0x5A),
+                ),
+                TimeSeverity::Healthy => {
+                    if player.clock_ticking {
+                        (
+                            Color32::from_rgb(0xEC, 0xEF, 0xF4),
+                            Color32::from_rgb(0x1E, 0x27, 0x22),
+                            Color32::from_rgb(0x4E, 0xB8, 0x6B),
+                            Color32::from_rgb(0x4E, 0xB8, 0x6B),
+                        )
+                    } else {
+                        (
+                            Color32::from_rgb(0xEC, 0xEF, 0xF4),
+                            SURFACE_ALT,
+                            BORDER,
+                            Color32::from_rgb(0x56, 0x9C, 0x68),
+                        )
+                    }
+                }
+            }
+        };
+        let clock_galley = painter.layout_no_wrap(text, FontId::monospace(14.5), text_col);
+        let dot_w = if player.clock_ticking { 11.0 } else { 0.0 };
+        let pill_w = clock_galley.size().x + 14.0 + dot_w;
+        let pill_h = 26.0;
+        let pill_rect = egui::Rect::from_min_size(
             pos2(
-                rect.right() - clock_galley.size().x - 12.0,
-                rect.center().y - clock_galley.size().y / 2.0,
+                rect.right() - pill_w - 4.0,
+                rect.center().y - pill_h / 2.0,
             ),
-            clock_galley.size(),
+            vec2(pill_w, pill_h),
         );
-        painter.rect_filled(clock_rect.expand2(vec2(8.0, 4.0)), 4.0, SURFACE_ALT);
+        painter.rect_filled(pill_rect, 4.0, pill_bg);
         painter.rect_stroke(
-            clock_rect.expand2(vec2(8.0, 4.0)),
+            pill_rect,
             4.0,
-            Stroke::new(1.0, BORDER),
+            Stroke::new(if player.clock_ticking { 1.3 } else { 1.0 }, pill_border),
             StrokeKind::Inside,
         );
-        painter.galley(clock_rect.min, clock_galley, color);
+        if player.clock_ticking {
+            let t = ui.ctx().input(|i| i.time);
+            let alpha = (0.55 + 0.45 * (t * 4.5).sin()) as f32;
+            let dot_col = match severity {
+                TimeSeverity::Critical => Color32::from_rgb(0xE0, 0x5A, 0x5A),
+                TimeSeverity::Low => Color32::from_rgb(0xE5, 0xB5, 0x5A),
+                TimeSeverity::Healthy => Color32::from_rgb(0x4E, 0xB8, 0x6B),
+            }
+            .gamma_multiply(alpha);
+            painter.circle_filled(
+                pos2(pill_rect.left() + 8.0, pill_rect.center().y - 1.0),
+                3.2,
+                dot_col,
+            );
+        }
+        let text_pos = pos2(
+            pill_rect.left() + 7.0 + dot_w,
+            pill_rect.center().y - clock_galley.size().y / 2.0 - 1.0,
+        );
+        painter.galley(text_pos, clock_galley, text_col);
+        if let Some(f) = frac {
+            let bar_margin = 3.0;
+            let track = Rect::from_min_max(
+                pos2(pill_rect.left() + bar_margin, pill_rect.bottom() - 4.0),
+                pos2(pill_rect.right() - bar_margin, pill_rect.bottom() - 1.5),
+            );
+            painter.rect_filled(track, 1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 22));
+            let fill_w = (track.width() * f).max(if f > 0.0 { 2.0 } else { 0.0 });
+            if fill_w > 0.0 {
+                let fill_rect = Rect::from_min_size(track.min, vec2(fill_w, track.height()));
+                painter.rect_filled(fill_rect, 1.0, bar_col);
+            }
+        }
+        let clock_resp = ui.interact(pill_rect, response.id.with("clock"), Sense::hover());
+        if let Some(clk) = player.clock {
+            let tip = match (frac, player.clock_ticking) {
+                (Some(f), true) => format!("{} ({:.0}% of start time) · Clock ticking", clk.display(), f * 100.0),
+                (Some(f), false) => format!("{} ({:.0}% of start time)", clk.display(), f * 100.0),
+                (None, true) => format!("{} · Clock ticking", clk.display()),
+                (None, false) => clk.display(),
+            };
+            clock_resp.on_hover_text(tip);
+        }
     }
 
     if !crown_hovered && !name_response.hovered() {
@@ -34422,6 +38208,7 @@ fn pgn_tag_is_empty(value: &str) -> bool {
 /// changed. A field can be removed with its delete button and added back from
 /// the common-tag menu.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn game_tags_card(
     ui: &mut Ui,
     game: &Game,
@@ -34429,6 +38216,7 @@ fn game_tags_card(
     tag_delete: &mut Option<usize>,
     tag_add: &mut Option<&'static str>,
     tag_add_value: &mut Option<(&'static str, String)>,
+    card_expanded: &mut bool,
     expanded: &mut bool,
     show_empty: &mut bool,
     board_visible: &mut bool,
@@ -34465,15 +38253,35 @@ fn game_tags_card(
         .fill(SURFACE)
         .corner_radius(6.0)
         .stroke(Stroke::new(1.0, BORDER))
-        .inner_margin(10.0)
+        .inner_margin(if *card_expanded {
+            egui::Margin::same(10)
+        } else {
+            egui::Margin::symmetric(10, 6)
+        })
         .show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new(format!("PGN tags  ·  {}", game.headers.len()))
-                        .size(14.0)
-                        .strong(),
-                )
-                .on_hover_text("Click a value to edit it · click the date for a calendar");
+                let arrow = if *card_expanded { "▾" } else { "▸" };
+                if ui
+                    .add(
+                        egui::Button::new(
+                            RichText::new(format!("{arrow}  PGN tags  ·  {}", game.headers.len()))
+                                .size(14.0)
+                                .strong(),
+                        )
+                        .frame(false),
+                    )
+                    .on_hover_text(if *card_expanded {
+                        "Collapse PGN tags · click any field to edit"
+                    } else {
+                        "Expand PGN tags"
+                    })
+                    .clicked()
+                {
+                    *card_expanded = !*card_expanded;
+                }
+                if !*card_expanded {
+                    return;
+                }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.menu_button("+ Add tag", |ui| {
                         let mut any = false;
@@ -34516,6 +38324,9 @@ fn game_tags_card(
                     }
                 });
             });
+            if !*card_expanded {
+                return;
+            }
             ui.add_space(5.0);
 
             if game.headers.is_empty() {
@@ -34601,6 +38412,8 @@ fn game_tags_card(
             });
             let has_additional_row = game.headers.iter().any(|(name, value)| {
                 !is_default_pgn_tag(name)
+                    && !name.eq_ignore_ascii_case(db_medals::PGN_TAG)
+                    && !name.eq_ignore_ascii_case("Flags")
                     && (show_empty_now
                         || !pgn_tag_is_empty(value)
                         || forced_tags.contains(&name.to_ascii_lowercase()))
@@ -34645,6 +38458,8 @@ fn game_tags_card(
                 .enumerate()
                 .filter_map(|(index, (name, value))| {
                     (!is_default_pgn_tag(name)
+                        && !name.eq_ignore_ascii_case(db_medals::PGN_TAG)
+                        && !name.eq_ignore_ascii_case("Flags")
                         && (show_empty_now
                             || !pgn_tag_is_empty(value)
                             || forced_tags.contains(&name.to_ascii_lowercase())))
@@ -35282,6 +39097,190 @@ fn elo_of(header: Option<&str>) -> Option<u32> {
     header.and_then(parse_elo)
 }
 
+fn paint_game_row_medals(ui: &Ui, rect: Rect, mask: u16, has_badge: bool) {
+    if mask == 0 || rect.width() < 200.0 {
+        return;
+    }
+    let short = db_medals::format_short(mask);
+    if short.is_empty() {
+        return;
+    }
+    let first_bit = 1u16 << mask.trailing_zeros();
+    let [r, g, b] = db_medals::color_rgb(first_bit);
+    let fg = Color32::from_rgb(r, g, b);
+    let painter = ui.painter_at(rect);
+    let label = format!("[{short}]");
+    let galley = painter.layout_no_wrap(label, FontId::monospace(10.0), fg);
+    let right_x = rect.right() - if has_badge { 46.0 } else { 6.0 };
+    let pill_w = (galley.size().x + 8.0).min((rect.width() * 0.35).max(28.0));
+    let pill_rect = Rect::from_min_max(
+        pos2(right_x - pill_w, rect.top() + 4.0),
+        pos2(right_x, rect.top() + 18.0),
+    );
+    painter.rect_filled(pill_rect, 3.0, Color32::from_rgb(0x14, 0x17, 0x1C));
+    painter.rect_stroke(pill_rect, 3.0, Stroke::new(1.0, fg.linear_multiply(0.65)), StrokeKind::Inside);
+    painter.galley(
+        pos2(pill_rect.left() + 4.0, pill_rect.center().y - galley.size().y * 0.5),
+        galley,
+        fg,
+    );
+}
+
+fn medals_context_submenu(ui: &mut Ui, current_mask: u16) -> Option<MedalMenuAction> {
+    let mut action = None;
+    let header = if current_mask == 0 {
+        "Flags & Medals ▸".to_string()
+    } else {
+        format!("Flags & Medals ({}) ▸", db_medals::format_short(current_mask))
+    };
+    ui.menu_button(header, |ui| {
+        ui.set_min_width(220.0);
+        for group in [
+            db_medals::MedalGroup::Study,
+            db_medals::MedalGroup::Theme,
+            db_medals::MedalGroup::Mistake,
+        ] {
+            ui.label(RichText::new(group.label()).small().weak().strong());
+            for &(bit, label, code) in db_medals::ALL {
+                if db_medals::group(bit) != group {
+                    continue;
+                }
+                let active = current_mask & bit != 0;
+                let [r, g, b] = db_medals::color_rgb(bit);
+                let dot_color = Color32::from_rgb(r, g, b);
+                let mark = if active { "✓" } else { " " };
+                let text = RichText::new(format!("{mark} [{code}] {label}"))
+                    .small()
+                    .color(if active { dot_color } else { TEXT });
+                if ui.selectable_label(active, text).clicked() {
+                    action = Some(MedalMenuAction::Toggle(bit));
+                    ui.close();
+                }
+            }
+            ui.add_space(3.0);
+        }
+        if current_mask != 0 {
+            ui.separator();
+            if ui.button("Clear all flags").clicked() {
+                action = Some(MedalMenuAction::Clear);
+                ui.close();
+            }
+        }
+    });
+    action
+}
+
+fn game_flags_drawer(
+    ui: &mut Ui,
+    game: &Game,
+    expanded: &mut bool,
+    editable: bool,
+) -> Option<MedalMenuAction> {
+    let mask = db_medals::from_game(game);
+    let mut action = None;
+    egui::Frame::new()
+        .fill(SURFACE)
+        .corner_radius(6.0)
+        .stroke(Stroke::new(1.0, BORDER))
+        .inner_margin(egui::Margin::symmetric(10, 6))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                let arrow = if *expanded { "▾" } else { "▸" };
+                if ui
+                    .button(
+                        RichText::new(format!("{arrow} Flags & Medals"))
+                            .small()
+                            .strong()
+                            .color(MUTED),
+                    )
+                    .on_hover_text("Expand or collapse game classification flags (ChessBase-compatible Medals)")
+                    .clicked()
+                {
+                    *expanded = !*expanded;
+                }
+                if mask == 0 {
+                    ui.label(RichText::new("None").small().weak());
+                } else {
+                    for &(bit, label, code) in db_medals::ALL {
+                        if mask & bit == 0 {
+                            continue;
+                        }
+                        let [r, g, b] = db_medals::color_rgb(bit);
+                        let col = Color32::from_rgb(r, g, b);
+                        let resp = ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new(format!("[{code}]")).monospace().small().color(col),
+                                )
+                                .fill(Color32::from_rgb(0x14, 0x17, 0x1C))
+                                .stroke(Stroke::new(1.0, col.linear_multiply(0.7))),
+                            )
+                            .on_hover_text(if editable {
+                                format!("{label} (click to remove)")
+                            } else {
+                                label.to_string()
+                            });
+                        if editable && resp.clicked() {
+                            action = Some(MedalMenuAction::Toggle(bit));
+                        }
+                    }
+                    if editable {
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if ui
+                                .small_button("Clear")
+                                .on_hover_text("Clear all flags on this game")
+                                .clicked()
+                            {
+                                action = Some(MedalMenuAction::Clear);
+                            }
+                        });
+                    }
+                }
+            });
+            if *expanded {
+                ui.add_space(6.0);
+                for group in [
+                    db_medals::MedalGroup::Study,
+                    db_medals::MedalGroup::Theme,
+                    db_medals::MedalGroup::Mistake,
+                ] {
+                    ui.label(RichText::new(group.label()).small().weak().strong());
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
+                        for &(bit, label, code) in db_medals::ALL {
+                            if db_medals::group(bit) != group {
+                                continue;
+                            }
+                            let active = mask & bit != 0;
+                            let [r, g, b] = db_medals::color_rgb(bit);
+                            let col = Color32::from_rgb(r, g, b);
+                            let text = RichText::new(format!("[{code}] {label}"))
+                                .small()
+                                .color(if active { col } else { TEXT });
+                            let btn = egui::Button::new(text)
+                                .fill(if active {
+                                    Color32::from_rgb(0x1B, 0x20, 0x2A)
+                                } else {
+                                    PANEL
+                                })
+                                .stroke(Stroke::new(
+                                    1.0,
+                                    if active { col } else { BORDER },
+                                ));
+                            let resp = ui.add_enabled(editable, btn);
+                            if resp.clicked() {
+                                action = Some(MedalMenuAction::Toggle(bit));
+                            }
+                        }
+                    });
+                    ui.add_space(4.0);
+                }
+            }
+        });
+    action
+}
+
+#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 fn game_header_card(
     ui: &mut Ui,
@@ -35291,17 +39290,36 @@ fn game_header_card(
     prep: Option<&PrepSession>,
     priority: RatingPriority,
     show_all_ratings: bool,
+    expanded: &mut bool,
     date_clicked: &mut Option<egui::Pos2>,
 ) {
     egui::Frame::new()
         .fill(SURFACE)
         .corner_radius(6.0)
         .stroke(Stroke::new(1.0, BORDER))
-        .inner_margin(10.0)
+        .inner_margin(if *expanded {
+            egui::Margin::same(10)
+        } else {
+            egui::Margin::symmetric(10, 6)
+        })
         .show(ui, |ui| {
             if let Some(prep) = prep {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("PREPARATION").small().strong().color(GOLD));
+                    let arrow = if *expanded { "▾" } else { "▸" };
+                    let title = if *expanded {
+                        format!("{arrow}  PREPARATION")
+                    } else {
+                        format!("{arrow}  PREPARATION · vs {}", prep.player_name)
+                    };
+                    if ui
+                        .add(
+                            egui::Button::new(RichText::new(title).small().strong().color(GOLD))
+                                .frame(false),
+                        )
+                        .clicked()
+                    {
+                        *expanded = !*expanded;
+                    }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.label(
                             RichText::new(format!("You play {}", color_name(prep.our_color)))
@@ -35310,12 +39328,40 @@ fn game_header_card(
                         );
                     });
                 });
+                if !*expanded {
+                    return;
+                }
                 ui.label(RichText::new(format!("vs {}", prep.player_name)).heading());
                 ui.label(
                     RichText::new("Make a move on the board; the opponent tree will follow.")
                         .weak()
                         .small(),
                 );
+                return;
+            }
+
+            if !*expanded {
+                ui.horizontal(|ui| {
+                    let summary = format!("▸  {} – {}", display_names.0, display_names.1);
+                    let w = (ui.available_width() - 54.0).max(60.0);
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        result_badge(ui, game.result());
+                        ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                            ui.set_max_width(w);
+                            if ui
+                                .add(
+                                    egui::Button::new(RichText::new(&summary).small().strong())
+                                        .frame(false)
+                                        .truncate(),
+                                )
+                                .on_hover_text("Expand game header")
+                                .clicked()
+                            {
+                                *expanded = true;
+                            }
+                        });
+                    });
+                });
                 return;
             }
 
@@ -35390,6 +39436,13 @@ fn game_header_card(
                 // Two compact rows so small widths never overflow or force panel expansion
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing = vec2(6.0, 4.0);
+                    if ui
+                        .add(egui::Button::new(RichText::new("▾").small().weak()).frame(false))
+                        .on_hover_text("Collapse game header")
+                        .clicked()
+                    {
+                        *expanded = false;
+                    }
                     let event_width = (ui.available_width() - 56.0).max(40.0);
                     ui.add_sized(
                         [event_width, 20.0],
@@ -35421,12 +39474,19 @@ fn game_header_card(
             } else {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing = vec2(6.0, 4.0);
+                    if ui
+                        .add(egui::Button::new(RichText::new("▾").small().weak()).frame(false))
+                        .on_hover_text("Collapse game header")
+                        .clicked()
+                    {
+                        *expanded = false;
+                    }
                     let response = date_chip(ui, game.date());
                     if response.clicked() {
                         *date_clicked = Some(response.rect.left_bottom());
                     }
                     response.on_hover_text("Click to choose a date");
-                    let event_width = (available - reserve).max(30.0);
+                    let event_width = (available - reserve - 18.0).max(30.0);
                     ui.add_sized(
                         [event_width, 20.0],
                         egui::Label::new(RichText::new(event).small().strong().color(GOLD)).truncate(),
@@ -36747,6 +40807,62 @@ fn reference_star_button(
             }
         }
         painter.add(egui::Shape::closed_line(pts, Stroke::new(1.2, color)));
+    }
+    response.on_hover_text(tooltip)
+}
+
+/// Floppy-disk vector icon button for "Save database as…".
+fn save_database_as_button(ui: &mut Ui, enabled: bool, tooltip: &str) -> egui::Response {
+    let sense = if enabled {
+        Sense::click()
+    } else {
+        Sense::hover()
+    };
+    let (rect, response) = ui.allocate_exact_size(vec2(22.0, 20.0), sense);
+    if ui.is_rect_visible(rect) {
+        let visuals = ui.style().interact(&response);
+        let painter = ui.painter();
+        if enabled && (response.hovered() || response.has_focus()) {
+            painter.rect_filled(rect, 4.0, visuals.bg_fill);
+        }
+        let color = if enabled {
+            visuals.fg_stroke.color
+        } else {
+            ui.visuals().weak_text_color()
+        };
+        let stroke = Stroke::new(1.25, color);
+        let left = rect.left() + 4.0;
+        let right = rect.right() - 4.0;
+        let top = rect.top() + 3.5;
+        let bottom = rect.bottom() - 3.5;
+        // Floppy body with chamfered top-right corner
+        painter.add(egui::Shape::line(
+            vec![
+                pos2(left, top),
+                pos2(right - 3.0, top),
+                pos2(right, top + 3.0),
+                pos2(right, bottom),
+                pos2(left, bottom),
+                pos2(left, top),
+            ],
+            stroke,
+        ));
+        // Top shutter
+        let shutter_l = left + 3.0;
+        let shutter_r = right - 4.5;
+        painter.line_segment([pos2(shutter_l, top), pos2(shutter_l, top + 4.5)], stroke);
+        painter.line_segment(
+            [pos2(shutter_l, top + 4.5), pos2(shutter_r, top + 4.5)],
+            stroke,
+        );
+        painter.line_segment([pos2(shutter_r, top), pos2(shutter_r, top + 4.5)], stroke);
+        // Bottom label box
+        painter.rect_stroke(
+            Rect::from_min_max(pos2(left + 2.5, bottom - 5.5), pos2(right - 2.5, bottom)),
+            1.0,
+            stroke,
+            StrokeKind::Inside,
+        );
     }
     response.on_hover_text(tooltip)
 }
@@ -40970,10 +45086,13 @@ mod tests {
         let pgn = b"[White \"A\"]\n[Black \"B\"]\n\n1. e4 { [%eval +0.35] } 1... e5 2. Nf3 *\n";
         let games = crate::domain::parse_pgn(pgn).unwrap();
         app.current = Some(games.into_iter().next().unwrap());
-        app.goto(3); // after 2. Nf3, no eval at node 2 or 3, but node 1 has +0.35
-        let (eval, held) = app.current_board_eval_with_hold();
-        assert!(held, "expected held=true when inheriting ancestor eval");
-        assert_eq!(eval.unwrap().score, crate::eval::WhiteScore::Cp(35));
+        app.goto(3); // after 2. Nf3, no eval at node 3: must return None rather than stale book/ancestor score
+        let (eval, computing) = app.current_board_eval_with_hold();
+        assert!(!computing);
+        assert_eq!(eval, None, "un-evaluated ply must return None for neutral grey bar");
+        app.goto(1);
+        let (direct_eval, _) = app.current_board_eval_with_hold();
+        assert_eq!(direct_eval.unwrap().score, crate::eval::WhiteScore::Cp(35));
     }
 
     fn test_app() -> App {
@@ -41033,6 +45152,9 @@ mod tests {
             search_list_sort: search::PositionHitSort::default(),
             deleted_games: my_games::DeletedGamesRegistry::default(),
             pending_delete_games: None,
+            pending_delete_database: None,
+            shelf_focused: false,
+            hovered_shelf_index: None,
             player_profile_sorted_games: None,
             session_dirty: false,
             close_confirm_open: false,
@@ -41044,6 +45166,9 @@ mod tests {
             save_database_path: String::new(),
             save_database_close_after: false,
             save_database_error: String::new(),
+            save_dialog_diff_cache: None,
+            close_confirm_diff_cache: None,
+            pending_in_place_save: None,
             tree_path: String::new(),
             reference_mode: ReferenceMode::default(),
             ref_games_sort: RefGamesSort::default(),
@@ -41190,6 +45315,7 @@ mod tests {
             annotation_editor: None,
             annotation_focus: false,
             tags_expanded: false,
+            flags_expanded: false,
             show_empty_pgn_tags: false,
             board_tag_visible: false,
             forced_tag_visibility: HashSet::new(),
@@ -41215,6 +45341,9 @@ mod tests {
             touch_detected: false,
             board_draw_mode: None,
             show_pgn_tags: true,
+            header_card_expanded: true,
+            pgn_tags_card_expanded: true,
+            review_panel_expanded: false,
             show_annotations: false,
             date_picker: None,
             date_picker_anchor: None,
@@ -41223,6 +45352,8 @@ mod tests {
             hover_preview: None,
             hovered_game_browse: None,
             hovered_game_active_this_frame: false,
+            secondary_hover_active: false,
+            secondary_hover_preview: None,
             online_open: false,
             online_source: OnlineSource::Lichess,
             online_username: String::new(),
@@ -41232,13 +45363,29 @@ mod tests {
             hub_open: false,
             hub_tab: OnlineHubTab::LiveBroadcasts,
             live_sub_source: LiveSubSource::LichessBroadcasts,
+            live_broadcast_filter: LiveBroadcastFilter::All,
             live_username_input: String::new(),
             live_broadcasts: Vec::new(),
+            live_selected_tour: None,
             live_selected_round: None,
+            live_tour_rounds_cache: HashMap::new(),
+            live_tour_rounds_rx: None,
             live_entries: Vec::new(),
             live_rx: None,
+            live_stream_rx: None,
+            live_stream_stop: None,
+            live_clock_state: None,
+            live_preview_cache: HashMap::new(),
+            live_preview_in_flight: HashSet::new(),
+            live_preview_rx: None,
+            live_preview_tx: mpsc::channel().0,
+            live_close_on_open: false,
             live_status: String::new(),
             live_auto_refresh: true,
+            live_auto_rematch: true,
+            live_watching_ephemeral: false,
+            live_rematch_watch: None,
+            live_rematch_rx: None,
             live_watching_target: None,
             live_watching_meta: None,
             live_last_refresh: None,
@@ -41246,6 +45393,10 @@ mod tests {
             live_avatar_rx: None,
             live_avatar_tx: mpsc::channel().0,
             live_avatar_in_flight: HashSet::new(),
+            online_identity_cache: online::OnlineIdentityCache::load(),
+            online_identity_in_flight: HashSet::new(),
+            online_identity_tx: mpsc::channel().0,
+            online_identity_rx: None,
             twic_open: false,
             twic_tab: TwicTab::Weekly,
             twic_issue_spec: String::new(),
@@ -41299,6 +45450,23 @@ mod tests {
             league_portal_links: Vec::new(),
             league_portal_selected_url: None,
             league_portal_selected_label: String::new(),
+            league_roster: None,
+            league_roster_rx: None,
+            league_roster_tab: LeagueRosterTab::Players,
+            league_roster_sort: LeagueRosterSort::GamesDesc,
+            league_roster_query: String::new(),
+            league_selected_players: BTreeSet::new(),
+            league_selected_clubs: BTreeSet::new(),
+            league_round_spec: String::new(),
+            league_target_shelf_index: None,
+            league_excluded_game_indices: BTreeSet::new(),
+            league_cr_fed: "AUT".to_string(),
+            league_cr_type: league_import::ChessResultsTournamentType::TeamRoundRobin,
+            league_cr_only_games: true,
+            league_cr_query: String::new(),
+            league_cr_results: Vec::new(),
+            league_cr_selected_url: None,
+            league_cr_selected_label: String::new(),
             account_finder_open: false,
             account_finder_player_idx: None,
             account_finder_player_key: String::new(),
@@ -41314,8 +45482,10 @@ mod tests {
             account_finder_cancel: None,
             account_finder_repertoire_games: 0,
             pos_search_open: false,
+            pos_search_close_on_open: false,
             pos_search_tab: PositionSearchTab::PlansStructures,
             pos_search_structure_family: StructureFamily::Stonewall,
+            pos_search_endgame_family: EndgameFamily::Rook,
             pos_search_selected_plan: 0,
             pos_search_hover_plan: None,
             pos_search_plan_anim_start: None,
@@ -45021,6 +49191,8 @@ mod tests {
                 rating: Some("2882".to_string()),
                 team: None,
                 clock: None,
+                clock_ticking: false,
+                initial_clock_centis: None,
                 color: Color::White,
             };
             let action = player_strip(
@@ -46022,5 +50194,193 @@ mod tests {
         let (kept, skipped) = app.deleted_games.filter_games(games);
         assert!(kept.is_empty());
         assert_eq!(skipped, 1);
+    }
+
+    #[test]
+    fn medals_toggle_updates_game_and_session_headers() {
+        let mut app = test_app();
+        let games = domain::parse_pgn(
+            b"[Event \"Club\"]\n[White \"A\"]\n[Black \"B\"]\n[Result \"1-0\"]\n\n1. e4 e5 1-0\n",
+        )
+        .unwrap();
+        let slot_id = app.session.insert_game(games[0].clone(), None);
+        app.select_slot(slot_id);
+
+        app.apply_medal_toggle_to_slots(&[slot_id], MedalMenuAction::Toggle(db_medals::MODEL_GAME));
+        app.apply_medal_toggle_to_current(MedalMenuAction::Toggle(db_medals::SACRIFICE));
+        let mask = app.session.slot_medals(slot_id, &app.edited);
+        assert_eq!(mask, db_medals::MODEL_GAME | db_medals::SACRIFICE);
+        assert_eq!(
+            db_medals::from_game(app.current.as_ref().unwrap()),
+            db_medals::MODEL_GAME | db_medals::SACRIFICE
+        );
+
+        app.apply_medal_toggle_to_current(MedalMenuAction::Clear);
+        assert_eq!(app.session.slot_medals(slot_id, &app.edited), 0);
+    }
+
+    #[test]
+    fn delete_database_removes_companion_files_and_closes_shelf() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("brett-deldb-test-{stamp}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("temp_test.2cbh");
+        let games = domain::parse_pgn(
+            b"[Event \"T\"]\n[White \"A\"]\n[Black \"B\"]\n[Result \"*\"]\n\n1. e4 *\n",
+        )
+        .unwrap();
+        crate::my_games::write_games_to_path(&db_path, games).unwrap();
+
+        let lib: Arc<dyn GameLibrary> = crate::library::open_library(&db_path).unwrap();
+        let mut app = test_app();
+        app.install_library_with_session(lib, &db_path, None);
+        app.reference_path = db_path.display().to_string();
+        app.reference_enabled = true;
+
+        let files = crate::library::database_companion_files_for_deletion(&db_path);
+        assert!(!files.is_empty());
+        let pending = PendingDeleteDatabase {
+            shelf_index: 0,
+            title: "temp_test.2cbh".to_string(),
+            path: Some(db_path.clone()),
+            files: files.clone(),
+            count: 1,
+        };
+        app.execute_pending_delete_database(pending);
+
+        assert!(app.library.is_none());
+        assert_eq!(app.session.len(), 0);
+        assert!(app.reference_path.is_empty());
+        for f in files {
+            assert!(!f.exists(), "expected {} to be deleted", f.display());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn online_identity_expands_wiki_lookup_and_display_name() {
+        let mut app = test_app();
+        app.online_identity_cache.insert(
+            OnlineSource::Lichess,
+            "DrNykterstein",
+            Some(online::OnlinePlayerIdentity {
+                source: OnlineSource::Lichess,
+                username: "DrNykterstein".to_string(),
+                real_name: Some("Magnus Carlsen".to_string()),
+                title: Some(crate::titles::PlayerTitle::Gm),
+                country_code: Some("NOR".to_string()),
+                fide_rating: Some(2830),
+                avatar_url: None,
+            }),
+        );
+        assert_eq!(
+            app.display_name_with_online_identity("DrNykterstein", Some(OnlineSource::Lichess)),
+            "DrNykterstein (Magnus Carlsen)"
+        );
+        let p_idx = app.players.ensure_player("DrNykterstein");
+        let summary = app.players.get(p_idx).unwrap().clone();
+        assert_eq!(app.wiki_lookup_name(&summary), "Magnus Carlsen");
+    }
+
+    #[test]
+    fn compute_save_diff_tracks_added_modified_removed_and_unchanged_games() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("brett-save-diff-{stamp}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("work.pgn");
+        let initial_pgn = concat!(
+            "[Event \"Game One\"]\n[White \"Alice\"]\n[Black \"Bob\"]\n[Result \"1-0\"]\n\n1. e4 e5 *\n\n",
+            "[Event \"Game Two\"]\n[White \"Carol\"]\n[Black \"Dave\"]\n[Result \"0-1\"]\n\n1. d4 d5 *\n\n",
+            "[Event \"Game Three\"]\n[White \"Eve\"]\n[Black \"Frank\"]\n[Result \"*\"]\n\n1. c4 c5 *\n\n",
+        );
+        std::fs::write(&db_path, initial_pgn.as_bytes()).unwrap();
+
+        let mut app = test_app();
+        let lib = Arc::new(PgnLibrary::build(&db_path).unwrap());
+        app.install_library_with_session(lib, &db_path, None);
+
+        // Modify Game 1, remove Game 2, leave Game 3 unchanged, insert a new Game 4.
+        let id1 = app.session.id_at(0).unwrap();
+        app.select_slot(id1);
+        app.play_uci("g1f3");
+        app.persist_current_edit();
+
+        let id2 = app.session.id_at(1).unwrap();
+        app.session.remove(id2);
+
+        let extra = crate::domain::parse_pgn(
+            b"[Event \"Added Round\"]\n[White \"Grace\"]\n[Black \"Heidi\"]\n[Result \"1/2-1/2\"]\n\n1. Nf3 d5 *\n",
+        )
+        .unwrap()
+        .remove(0);
+        app.session.insert_game(extra, None);
+
+        let diff = app.compute_save_diff(&db_path, DatabaseFormat::Pgn);
+        assert!(diff.target_exists);
+        assert!(diff.same_as_open_source);
+        assert_eq!(diff.previous_games, Some(3));
+        assert_eq!(diff.new_games, 3);
+        assert_eq!(diff.modified_count, 1);
+        assert_eq!(diff.removed_count, 1);
+        assert_eq!(diff.unchanged_count, 1);
+        assert_eq!(diff.added_count, 1);
+        assert!(diff.modified_samples[0].contains("Alice"));
+        assert!(diff.removed_samples[0].contains("Carol"));
+        assert!(diff.added_samples[0].contains("Grace"));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn ephemeral_live_antichess_never_pollutes_session_or_save_diff() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("brett-ephemeral-anti-{stamp}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("my.pgn");
+        std::fs::write(
+            &db_path,
+            b"[Event \"Standard Game\"]\n[White \"Alpha\"]\n[Black \"Beta\"]\n[Result \"*\"]\n\n1. e4 e5 *\n",
+        )
+        .unwrap();
+
+        let mut app = test_app();
+        // Ephemeral live Antichess on an empty workspace cannot be saved accidentally.
+        let mut live_empty = Game::default();
+        live_empty.set_header("Variant", "Antichess".to_string());
+        app.load_ephemeral_live_game(live_empty, 0);
+        app.session = crate::session::GameList::empty();
+        assert!(!app.can_save_database());
+        app.ensure_current_game_in_session();
+        assert_eq!(app.session.len(), 0);
+
+        // Now open a real 1-game database and watch live Antichess again.
+        let lib = Arc::new(PgnLibrary::build(&db_path).unwrap());
+        app.install_library_with_session(lib, &db_path, None);
+        assert_eq!(app.session.len(), 1);
+
+        let mut live_game = Game::default();
+        live_game.set_header("Event", "Lichess Antichess".to_string());
+        live_game.set_header("Variant", "Antichess".to_string());
+        app.load_ephemeral_live_game(live_game, 0);
+        assert!(app.live_watching_ephemeral);
+        assert!(app.can_save_database());
+        assert_eq!(app.session.len(), 1);
+
+        // Saving the user's open database must neither include Antichess nor warn about it.
+        app.ensure_current_game_in_session();
+        assert_eq!(app.session.len(), 1);
+        let diff = app.compute_save_diff(&db_path, DatabaseFormat::Pgn);
+        assert!(diff.unsupported_variants.is_empty());
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

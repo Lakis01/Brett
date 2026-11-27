@@ -717,9 +717,23 @@ pub fn load_all_games_if_exists(path: &Path) -> Result<Vec<Game>> {
 /// games at `db_path`, and write the combined database back atomically.
 pub fn merge_games_into_my_games(
     db_path: &Path,
-    mut incoming: Vec<Game>,
+    incoming: Vec<Game>,
     section: &MyGamesSection,
 ) -> Result<MyGamesMergeReport> {
+    merge_games_into_my_games_canonical(db_path, incoming, section, None)
+}
+
+/// Same as [`merge_games_into_my_games`], optionally normalizing abbreviated/enumerated
+/// player names matching `canonical_my_name` (e.g. `Hinterreiter, M.` -> `Hinterreiter, Markus`).
+pub fn merge_games_into_my_games_canonical(
+    db_path: &Path,
+    mut incoming: Vec<Game>,
+    section: &MyGamesSection,
+    canonical_my_name: Option<&str>,
+) -> Result<MyGamesMergeReport> {
+    let canonical_pgn = canonical_my_name
+        .map(crate::players::canonical_pgn_player_name)
+        .filter(|s| !s.trim().is_empty());
     if incoming.is_empty() {
         let existing_count = load_all_games_if_exists(db_path)?.len();
         return Ok(MyGamesMergeReport {
@@ -730,8 +744,16 @@ pub fn merge_games_into_my_games(
     }
     for game in &mut incoming {
         tag_game_section(game, section);
+        if let Some(canon) = canonical_pgn.as_deref() {
+            crate::players::canonicalize_player_tags(game, canon);
+        }
     }
-    let existing = load_all_games_if_exists(db_path)?;
+    let mut existing = load_all_games_if_exists(db_path)?;
+    if let Some(canon) = canonical_pgn.as_deref() {
+        for game in &mut existing {
+            crate::players::canonicalize_player_tags(game, canon);
+        }
+    }
     let existing_count = existing.len();
     let incoming_count = incoming.len();
     let merged = deduplicate_and_merge_games(vec![
@@ -1147,15 +1169,14 @@ fn db_supports_game_variant(path: &Path, game: &Game) -> bool {
         || variant.contains("fischer")
 }
 
-/// Fetch games for all enabled Lichess / Chess.com accounts in `config`, tag
-/// each account's games under `Brett:Online:<Platform>:<User>`, deduplicate
-/// into `config.path`, and write back cleanly.
+/// Fetch games for all enabled Lichess / Chess.com / ChessABC accounts in `config`,
+/// tag each account's games, deduplicate into `config.path`, and write back cleanly.
 pub fn sync_online_accounts_into_db(
     config: &MyGamesConfig,
     lichess_token: Option<&str>,
 ) -> Result<MyGamesSyncReport> {
     let deleted = DeletedGamesRegistry::load();
-    sync_online_accounts_into_db_with_deleted(config, lichess_token, &deleted)
+    sync_online_accounts_into_db_with_options(config, lichess_token, &deleted, None)
 }
 
 /// Same as [`sync_online_accounts_into_db`], using an explicit [`DeletedGamesRegistry`].
@@ -1163,6 +1184,17 @@ pub fn sync_online_accounts_into_db_with_deleted(
     config: &MyGamesConfig,
     lichess_token: Option<&str>,
     deleted: &DeletedGamesRegistry,
+) -> Result<MyGamesSyncReport> {
+    sync_online_accounts_into_db_with_options(config, lichess_token, deleted, None)
+}
+
+/// Same as [`sync_online_accounts_into_db_with_deleted`], optionally canonicalizing
+/// abbreviated/enumerated OTB player tags (e.g. `Hinterreiter, M.` -> `Hinterreiter, Markus`).
+pub fn sync_online_accounts_into_db_with_options(
+    config: &MyGamesConfig,
+    lichess_token: Option<&str>,
+    deleted: &DeletedGamesRegistry,
+    canonical_my_name: Option<&str>,
 ) -> Result<MyGamesSyncReport> {
     let Some(db_path) = config.path.as_deref() else {
         bail!("No My Games database path is configured.");
@@ -1178,7 +1210,22 @@ pub fn sync_online_accounts_into_db_with_deleted(
         .unwrap_or_default()
         .as_secs();
 
+    let canonical_pgn = canonical_my_name
+        .map(crate::players::canonical_pgn_player_name)
+        .filter(|s| !s.trim().is_empty());
+
     let mut existing = load_all_games_if_exists(db_path)?;
+    let mut existing_healed = false;
+    if let Some(canon) = canonical_pgn.as_deref() {
+        for game in &mut existing {
+            let before_w = game.white().to_string();
+            let before_b = game.black().to_string();
+            crate::players::canonicalize_player_tags(game, canon);
+            if game.white() != before_w || game.black() != before_b {
+                existing_healed = true;
+            }
+        }
+    }
     let existing_count = existing.len();
     let mut sources: Vec<(SourceTag, Vec<Game>)> =
         vec![(SourceTag::Owoju, std::mem::take(&mut existing))];
@@ -1194,7 +1241,14 @@ pub fn sync_online_accounts_into_db_with_deleted(
             lichess_token,
         ) {
             Ok(games) => {
-                let games = filter_and_tag_synced_games(account, games);
+                let mut games = filter_and_tag_synced_games(account, games);
+                if account.source == OnlineSource::ChessAbc
+                    && let Some(canon) = canonical_pgn.as_deref()
+                {
+                    for game in &mut games {
+                        crate::players::canonicalize_player_tags(game, canon);
+                    }
+                }
                 let (games, skipped_deleted) = deleted.filter_games(games);
                 report.skipped_deleted += skipped_deleted;
                 let mut supported = Vec::with_capacity(games.len());
@@ -1226,7 +1280,7 @@ pub fn sync_online_accounts_into_db_with_deleted(
         }
     }
 
-    if report.accounts_synced > 0 && report.fetched > 0 {
+    if (report.accounts_synced > 0 && report.fetched > 0) || existing_healed {
         let merged = deduplicate_and_merge_games(sources);
         let all_games: Vec<Game> = merged.into_iter().map(|(_, g)| g).collect();
         report.total_games = all_games.len();
@@ -1909,5 +1963,30 @@ mod tests {
         assert_eq!(kept[0].header("Site"), distinct_game.header("Site"));
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn merge_games_canonicalizes_abbreviated_player_name() {
+        let path = temp_path("canon-merge").with_extension("2cbh");
+        create_empty_database(&path).unwrap();
+
+        let games = crate::domain::parse_pgn(
+            b"[Event \"Oberliga Bayern\"]\n[White \"Hinterreiter, M.\"]\n[Black \"Hinterreiter, A.\"]\n[Date \"2026.02.01\"]\n[Result \"1-0\"]\n\n1. d4 d5 1-0\n",
+        )
+        .unwrap();
+
+        merge_games_into_my_games_canonical(
+            &path,
+            games,
+            &MyGamesSection::Classical,
+            Some("Markus Hinterreiter"),
+        )
+        .unwrap();
+
+        let reloaded = open_library(&path).unwrap().load(0).unwrap();
+        assert_eq!(reloaded.white(), "Hinterreiter, Markus");
+        assert_eq!(reloaded.black(), "Hinterreiter, A.");
+
+        cleanup_db(&path);
     }
 }

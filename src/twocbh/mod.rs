@@ -59,7 +59,7 @@ const LID_FIRST: usize = 0xB8;
 const LID_STRIDE: usize = 0x108A;
 const LID_EVENT: usize = 0x400;
 const LID_SOURCE: usize = 0x860;
-const START_ID_BASE: u32 = 0xFC40;
+pub(crate) const START_ID_BASE: u32 = 0xFC40;
 const SEARCH_CACHE_MAX_GAMES: usize = 1_000_000;
 
 /// Upper safety bound on 2CBH slots to prevent integer overflow or runaway allocation.
@@ -1930,6 +1930,7 @@ fn base_headers(
     let white_elo = le_u16(&record[0x60..0x62]);
     let black_elo = le_u16(&record[0x70..0x72]);
     let eco = le_u16(&record[0x80..0x82]);
+    let medals = le_u16(&record[0x82..0x84]);
     let game_id = le_u64(&record[0x98..0xa0]);
     let beauty = le_u64(&record[0xb0..0xb8]);
     let date = le_u32(&record[0xbc..0xc0]);
@@ -1969,6 +1970,12 @@ fn base_headers(
     if let Some((title, publisher)) = source {
         push("SourceTitle", title);
         push("Source", publisher);
+    }
+    if medals != 0 {
+        push(
+            crate::library::medals::PGN_TAG,
+            crate::library::medals::format_short(medals),
+        );
     }
     headers
 }

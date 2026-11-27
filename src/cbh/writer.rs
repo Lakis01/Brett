@@ -371,6 +371,7 @@ impl CbhWriter {
         let white_elo = parse_elo(game.header("WhiteElo"));
         let black_elo = parse_elo(game.header("BlackElo"));
         let eco = encode_eco(game.header("ECO"));
+        let medals = crate::library::medals::from_game(game);
         let mainline_moves = game.mainline_len().div_ceil(2).min(255) as u8;
 
         let mut header = [0u8; RECORD_SIZE];
@@ -389,6 +390,7 @@ impl CbhWriter {
         header[31..33].copy_from_slice(&white_elo.to_be_bytes());
         header[33..35].copy_from_slice(&black_elo.to_be_bytes());
         header[35..37].copy_from_slice(&eco.to_be_bytes());
+        header[37..39].copy_from_slice(&medals.to_be_bytes());
         header[45] = mainline_moves;
 
         let cbh = self

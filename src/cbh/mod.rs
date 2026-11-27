@@ -799,6 +799,7 @@ fn base_headers(
     let white_elo = be_u16(&record[31..33]);
     let black_elo = be_u16(&record[33..35]);
     let eco = be_u16(&record[35..37]);
+    let medals = be_u16(&record[37..39]);
 
     let mut headers = Vec::with_capacity(12);
     headers.push((
@@ -843,6 +844,12 @@ fn base_headers(
     }
     if let Some(source) = entities.source_name(source_id) {
         headers.push((strings.intern("Source"), strings.intern(source)));
+    }
+    if medals != 0 {
+        headers.push((
+            strings.intern(crate::library::medals::PGN_TAG),
+            strings.intern(crate::library::medals::format_short(medals)),
+        ));
     }
     headers
 }

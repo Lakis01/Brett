@@ -16,7 +16,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::OnceLock;
 
-use crate::chess::{CastlingMode, Chess, Position, SanPlus, UciMove};
+use crate::chess::{CastlingMode, Chess, Position, SanPlus, Square, UciMove};
 use crate::domain::Game;
 use crate::library::{eco_code_to_str, eco_str_to_code};
 use crate::position;
@@ -83,7 +83,7 @@ static GLOBAL_TABLE: OnceLock<EcoTable> = OnceLock::new();
 static GLOBAL_CATALOG: OnceLock<Vec<EcoCodeInfo>> = OnceLock::new();
 
 /// Catalog entry aggregating all named opening lines for a single ECO code (`A00`..`E99`).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct EcoCodeInfo {
     pub code: u16,
     pub eco: String,
@@ -91,6 +91,10 @@ pub struct EcoCodeInfo {
     pub summary: String,
     pub variations: Vec<String>,
     pub search_haystack: String,
+    pub defining_pgn: String,
+    pub defining_pos: Option<Chess>,
+    pub defining_last_move: Option<(Square, Square)>,
+    pub variation_lines: Vec<(String, String)>,
 }
 
 impl EcoCodeInfo {
@@ -107,6 +111,30 @@ impl EcoCodeInfo {
             return found.as_str();
         }
         &self.summary
+    }
+
+    /// Return `(name, pgn, position, last_move)` for the matched variation or defining branch.
+    #[must_use]
+    pub fn defining_branch_for_query(
+        &self,
+        query_lower: &str,
+    ) -> (&str, &str, Option<Chess>, Option<(Square, Square)>) {
+        let q = query_lower.trim();
+        if !q.is_empty()
+            && let Some((name, pgn)) = self
+                .variation_lines
+                .iter()
+                .find(|(name, _)| name.to_ascii_lowercase().contains(q))
+            && let Some((pos, last_mv, _)) = replay_pgn_position(pgn)
+        {
+            return (name.as_str(), pgn.as_str(), Some(pos), last_mv);
+        }
+        (
+            &self.summary,
+            &self.defining_pgn,
+            self.defining_pos.clone(),
+            self.defining_last_move,
+        )
     }
 }
 
@@ -273,7 +301,7 @@ pub fn global_catalog() -> &'static [EcoCodeInfo] {
 }
 
 fn build_catalog_from_tsv_sources(sources: &[&str]) -> Vec<EcoCodeInfo> {
-    let mut by_code: BTreeMap<u16, Vec<String>> = BTreeMap::new();
+    let mut by_code: BTreeMap<u16, Vec<(String, String, u16)>> = BTreeMap::new();
     for code in 1u16..=500 {
         by_code.insert(code, Vec::new());
     }
@@ -284,7 +312,8 @@ fn build_catalog_from_tsv_sources(sources: &[&str]) -> Vec<EcoCodeInfo> {
                 continue;
             }
             let mut fields = line.splitn(3, '\t');
-            let (Some(eco_raw), Some(name_raw), _) = (fields.next(), fields.next(), fields.next())
+            let (Some(eco_raw), Some(name_raw), pgn_opt) =
+                (fields.next(), fields.next(), fields.next())
             else {
                 continue;
             };
@@ -296,22 +325,41 @@ fn build_catalog_from_tsv_sources(sources: &[&str]) -> Vec<EcoCodeInfo> {
             if name.is_empty() {
                 continue;
             }
+            let pgn = pgn_opt.unwrap_or("").trim();
+            let ply_count = replay_pgn_position(pgn).map_or(u16::MAX, |(_, _, p)| p);
             let list = by_code.entry(code).or_default();
-            if !list.iter().any(|existing| existing == name) {
-                list.push(name.to_string());
+            if !list.iter().any(|(existing, _, _)| existing == name) {
+                list.push((name.to_string(), pgn.to_string(), ply_count));
             }
         }
     }
     by_code
         .into_iter()
-        .filter_map(|(code, mut variations)| {
+        .filter_map(|(code, mut rows)| {
             let eco = eco_code_to_str(code)?;
             let volume = eco.chars().next().unwrap_or('A');
-            variations.sort_by_key(|v| (v.len(), v.clone()));
-            let summary = variations
-                .first()
-                .cloned()
+            rows.sort_by_key(|(name, _, _)| (name.len(), name.clone()));
+            let variations: Vec<String> = rows.iter().map(|(name, _, _)| name.clone()).collect();
+            let variation_lines: Vec<(String, String)> = rows
+                .iter()
+                .map(|(name, pgn, _)| (name.clone(), pgn.clone()))
+                .collect();
+            let best_branch = rows
+                .iter()
+                .min_by_key(|(name, _, plies)| (*plies, name.len(), name.clone()));
+            let summary = best_branch
+                .map(|(name, _, _)| name.clone())
+                .or_else(|| variations.first().cloned())
                 .unwrap_or_else(|| format!("ECO {eco}"));
+            let defining_pgn = best_branch
+                .map(|(_, pgn, _)| pgn.clone())
+                .unwrap_or_default();
+            let (defining_pos, defining_last_move) = if defining_pgn.is_empty() {
+                (None, None)
+            } else {
+                replay_pgn_position(&defining_pgn)
+                    .map_or((None, None), |(pos, last_mv, _)| (Some(pos), last_mv))
+            };
             let search_haystack = if variations.is_empty() {
                 eco.to_ascii_lowercase()
             } else {
@@ -324,6 +372,10 @@ fn build_catalog_from_tsv_sources(sources: &[&str]) -> Vec<EcoCodeInfo> {
                 summary,
                 variations,
                 search_haystack,
+                defining_pgn,
+                defining_pos,
+                defining_last_move,
+                variation_lines,
             })
         })
         .collect()
@@ -595,9 +647,10 @@ fn is_standard_start(game: &Game, root_pos: &Chess) -> bool {
     true
 }
 
-fn replay_defining_pgn(pgn: &str) -> Option<(u64, u16)> {
+fn replay_pgn_position(pgn: &str) -> Option<(Chess, Option<(Square, Square)>, u16)> {
     let mut pos = Chess::default();
     let mut plies = 0u16;
+    let mut last_move = None;
     for raw_token in pgn.split_whitespace() {
         let token = match raw_token.rfind('.') {
             Some(dot_idx) => &raw_token[dot_idx + 1..],
@@ -611,10 +664,15 @@ fn replay_defining_pgn(pgn: &str) -> Option<(u64, u16)> {
         }
         let san_plus = SanPlus::from_ascii(token.as_bytes()).ok()?;
         let mv = san_plus.san.to_move(&pos).ok()?;
+        last_move = mv.from().map(|from| (from, mv.to()));
         pos = pos.play(mv).ok()?;
         plies = plies.saturating_add(1);
     }
-    (plies > 0).then(|| (position::position_key(&pos), plies))
+    (plies > 0).then_some((pos, last_move, plies))
+}
+
+fn replay_defining_pgn(pgn: &str) -> Option<(u64, u16)> {
+    replay_pgn_position(pgn).map(|(pos, _, plies)| (position::position_key(&pos), plies))
 }
 
 #[cfg(test)]
@@ -817,6 +875,32 @@ C51\tAlternate Name\t1. e4 e5 2. Bc4 Nc6 3. Nf3
         assert!(
             b90.display_for_query("english attack")
                 .contains("English Attack")
+        );
+        let b90_pos = b90.defining_pos.as_ref().expect("B90 defining position");
+        assert_eq!(
+            b90_pos.board().piece_at(Square::A6),
+            Some(crate::chess::Piece::new(
+                crate::chess::Color::Black,
+                crate::chess::Role::Pawn
+            ))
+        );
+        assert_eq!(b90.defining_last_move, Some((Square::A7, Square::A6)));
+
+        let c65 = cat.iter().find(|e| e.eco == "C65").expect("C65 present");
+        let c65_pos = c65.defining_pos.as_ref().expect("C65 defining position");
+        assert_eq!(
+            c65_pos.board().piece_at(Square::F6),
+            Some(crate::chess::Piece::new(
+                crate::chess::Color::Black,
+                crate::chess::Role::Knight
+            ))
+        );
+        assert_eq!(
+            c65_pos.board().piece_at(Square::B5),
+            Some(crate::chess::Piece::new(
+                crate::chess::Color::White,
+                crate::chess::Role::Bishop
+            ))
         );
     }
 }

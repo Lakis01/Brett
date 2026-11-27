@@ -1974,6 +1974,35 @@ pub fn matches_truncated_or_enumerated_name(full: &str, cand: &str) -> bool {
     }
 }
 
+/// Convert a player name such as `"FM Markus Hinterreiter"` or `"Markus Hinterreiter"`
+/// into canonical PGN `"Last, First"` form (`"Hinterreiter, Markus"`).
+pub fn canonical_pgn_player_name(raw: &str) -> String {
+    let (_, clean) = parse_player_alias(raw);
+    if let Some((before, after)) = clean.split_once(',') {
+        let b = before.trim();
+        let a = after.trim();
+        if a.is_empty() {
+            return b.to_string();
+        }
+        return format!("{b}, {a}");
+    }
+    let words: Vec<&str> = clean.split_whitespace().filter(|w| !w.is_empty()).collect();
+    if words.len() < 2 {
+        return clean.to_string();
+    }
+    const PARTICLES: &[&str] = &[
+        "von", "van", "de", "del", "della", "di", "da", "la", "le", "der", "den", "ter", "ten",
+        "al", "el",
+    ];
+    let mut split_idx = words.len() - 1;
+    while split_idx > 1 && PARTICLES.contains(&words[split_idx - 1].to_ascii_lowercase().as_str()) {
+        split_idx -= 1;
+    }
+    let first = words[..split_idx].join(" ");
+    let last = words[split_idx..].join(" ");
+    format!("{last}, {first}")
+}
+
 /// Normalize the `White`/`Black` tags of a game to the canonical account
 /// name. The tag is rewritten when it names the same player as `username`
 /// (compared with [`player_key`], so spelling and word order do not matter)
@@ -2545,9 +2574,13 @@ pub fn classify_headers_category(
     if tokens.iter().any(|t| {
         matches!(
             t.as_str(),
-            "corr" | "iccf" | "bdg" | "email" | "post" | "postal"
+            "corr" | "iccf" | "bdg" | "bdf" | "email" | "postal" | "postschach"
         )
-    }) {
+    }) || contains_token_subslice(&tokens, &["by", "post"])
+        || contains_token_subslice(&tokens, &["per", "post"])
+        || contains_token_subslice(&tokens, &["post", "chess"])
+        || contains_token_subslice(&tokens, &["post", "match"])
+    {
         return GameCategory::Correspondence;
     }
     if event.is_none() && site.is_none() && time_control.is_none() {
@@ -6306,6 +6339,31 @@ mod tests {
     }
 
     #[test]
+    fn canonical_pgn_player_name_and_abbreviated_tags_normalize() {
+        assert_eq!(
+            canonical_pgn_player_name("Markus Hinterreiter"),
+            "Hinterreiter, Markus"
+        );
+        assert_eq!(
+            canonical_pgn_player_name("FM Markus Hinterreiter"),
+            "Hinterreiter, Markus"
+        );
+        assert_eq!(
+            canonical_pgn_player_name("Hinterreiter, Markus"),
+            "Hinterreiter, Markus"
+        );
+        assert_eq!(
+            canonical_pgn_player_name("Loek van Wely"),
+            "van Wely, Loek"
+        );
+
+        let mut g = otb_game("Hinterreiter, M.", "Hinterreiter, A.", "2026.02.01", "1. d4 d5 1-0");
+        canonicalize_player_tags(&mut g, "Hinterreiter, Markus");
+        assert_eq!(g.white(), "Hinterreiter, Markus");
+        assert_eq!(g.black(), "Hinterreiter, A.");
+    }
+
+    #[test]
     fn canonicalized_tags_keep_truncated_chessabc_games() {
         let mut game = otb_game("Hinterreiter,M 1", "Opponent", "2025.05.01", "1. e4 e5 1-0");
         canonicalize_player_tags(&mut game, "Hinterreiter, Martin");
@@ -7206,6 +7264,18 @@ mod tests {
             GameCategory::OtbClassical
         );
         assert_eq!(
+            classify_headers_category(
+                Some("SK Passau 1 - SG Post/Süd Regensburg 1"),
+                Some("Regensburg Post/Süd"),
+                None
+            ),
+            GameCategory::OtbClassical
+        );
+        assert_eq!(
+            classify_headers_category(Some("Post SV Ulm"), Some("Post-SV"), None),
+            GameCategory::OtbClassical
+        );
+        assert_eq!(
             classify_headers_category(Some("ICCF World Cup"), None, None),
             GameCategory::Correspondence
         );
@@ -7215,6 +7285,14 @@ mod tests {
         );
         assert_eq!(
             classify_headers_category(Some("World Correspondence Championship"), None, None),
+            GameCategory::Correspondence
+        );
+        assert_eq!(
+            classify_headers_category(Some("Fernschach Bundesliga"), None, None),
+            GameCategory::Correspondence
+        );
+        assert_eq!(
+            classify_headers_category(Some("Match by Post 1998"), None, None),
             GameCategory::Correspondence
         );
     }

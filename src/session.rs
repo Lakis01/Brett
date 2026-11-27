@@ -164,6 +164,14 @@ impl GameSlot {
         }
     }
 
+    pub fn is_primary(&self) -> bool {
+        matches!(self.source, SlotSource::Primary { .. })
+    }
+
+    pub fn has_header_override(&self) -> bool {
+        self.edited.is_some()
+    }
+
     fn matches_with(&self, needle: &str, primary: Option<&Arc<dyn GameLibrary>>) -> bool {
         if let Some(edited) = &self.edited {
             return edited.search.contains(needle);
@@ -705,6 +713,27 @@ impl GameList {
     pub fn update_headers(&mut self, id: usize, game: &Game) {
         if let Some(slot) = self.slot_mut(id) {
             slot.refresh_headers(game);
+        }
+    }
+
+    /// Resolve the active ChessBase / Mega medals bitmask for `id` in O(1).
+    pub fn slot_medals(&self, id: usize, edited: &HashMap<usize, Game>) -> u16 {
+        if let Some(game) = edited.get(&id) {
+            return crate::library::medals::from_game(game);
+        }
+        let Some(slot) = self.slot(id) else {
+            return 0;
+        };
+        if let Some(override_hdrs) = &slot.edited {
+            return crate::library::medals::from_headers(&override_hdrs.headers);
+        }
+        match &slot.source {
+            SlotSource::Primary { index } => self
+                .primary
+                .as_ref()
+                .map_or(0, |lib| lib.game_record_meta(*index).medals),
+            SlotSource::External { library, index } => library.game_record_meta(*index).medals,
+            SlotSource::Local(local) => crate::library::medals::from_headers(&local.headers),
         }
     }
 

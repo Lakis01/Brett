@@ -354,6 +354,12 @@ pub fn fetch_player_games_filtered_with_token(
                 download_chessabc_games(&agent, &player.fide_id, max_games, &mut |_| {})?;
             let mut games =
                 domain::parse_pgn(body.as_bytes()).context("parsing downloaded games")?;
+            let canonical_name = crate::players::canonical_pgn_player_name(&player.name);
+            if !canonical_name.trim().is_empty() {
+                for g in &mut games {
+                    crate::players::canonicalize_player_tags(g, &canonical_name);
+                }
+            }
             if let Some(filter) = filter {
                 games.retain(|g| filter.matches_game(g, as_of));
             }
@@ -2602,6 +2608,476 @@ pub fn fetch_candidate_sample_games(
     )
 }
 
+/// Resolved real-world identity metadata for a Lichess or Chess.com username.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct OnlinePlayerIdentity {
+    pub source: OnlineSource,
+    pub username: String,
+    pub real_name: Option<String>,
+    pub title: Option<crate::titles::PlayerTitle>,
+    pub country_code: Option<String>,
+    pub fide_rating: Option<u16>,
+    pub avatar_url: Option<String>,
+}
+
+/// Format an online username alongside its traced real name (`"DrNykterstein (Magnus Carlsen)"`).
+#[must_use]
+pub fn format_online_display_name(username: &str, real_name: Option<&str>) -> String {
+    let user = username.trim();
+    let Some(real) = real_name.map(str::trim).filter(|s| !s.is_empty()) else {
+        return user.to_string();
+    };
+    if real.eq_ignore_ascii_case(user) {
+        return user.to_string();
+    }
+    if user.contains(&format!("({real})")) {
+        return user.to_string();
+    }
+    format!("{user} ({real})")
+}
+
+/// Check if a candidate display/profile string looks like a plausible human name
+/// (at least two alphabetic words, total >= 4 letters, not a URL/email/handle).
+#[must_use]
+pub fn is_plausible_human_name(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || trimmed.len() > 80
+        || trimmed.contains("http")
+        || trimmed.contains('@')
+        || trimmed.contains('/')
+    {
+        return false;
+    }
+    let words: Vec<&str> = trimmed
+        .split_whitespace()
+        .map(|w| w.trim_matches(|c: char| !c.is_alphabetic()))
+        .filter(|w| !w.is_empty())
+        .collect();
+    if words.len() < 2 {
+        return false;
+    }
+    let alpha_count: usize = words
+        .iter()
+        .map(|w| w.chars().filter(|c| c.is_alphabetic()).count())
+        .sum();
+    let non_initial_words = words.iter().filter(|w| w.chars().count() >= 2).count();
+    alpha_count >= 4 && non_initial_words >= 2
+}
+
+/// Split CamelCase or underscore/hyphenated handles like `"MagnusCarlsen"` or
+/// `"Daniel_Naroditsky"` into `"Magnus Carlsen"` / `"Daniel Naroditsky"` for
+/// Wikipedia confirmation.
+#[must_use]
+pub fn split_handle_for_wiki_candidate(username: &str) -> Option<String> {
+    let trimmed = username.trim();
+    if trimmed.is_empty() || trimmed.len() > 48 {
+        return None;
+    }
+    let mut words: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut prev_lower = false;
+    for ch in trimmed.chars() {
+        if ch == '_' || ch == '-' || ch == '.' || ch.is_ascii_digit() {
+            if !cur.is_empty() {
+                words.push(std::mem::take(&mut cur));
+            }
+            prev_lower = false;
+            continue;
+        }
+        if !ch.is_alphabetic() {
+            return None;
+        }
+        if ch.is_uppercase() && prev_lower && !cur.is_empty() {
+            words.push(std::mem::take(&mut cur));
+        }
+        cur.push(ch);
+        prev_lower = ch.is_lowercase();
+    }
+    if !cur.is_empty() {
+        words.push(cur);
+    }
+    if words.len() < 2 || words.len() > 4 {
+        return None;
+    }
+    if words.iter().any(|w| w.chars().count() < 2) {
+        return None;
+    }
+    let candidate = words.join(" ");
+    is_plausible_human_name(&candidate).then_some(candidate)
+}
+
+fn parse_lichess_identity_json(username: &str, body: &str) -> Option<OnlinePlayerIdentity> {
+    let v: Value = serde_json::from_str(body).ok()?;
+    let uname = v
+        .get("username")
+        .or_else(|| v.get("id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(username)
+        .to_string();
+    let title = v
+        .get("title")
+        .and_then(Value::as_str)
+        .and_then(crate::titles::normalize);
+    let profile = v.get("profile");
+    let real_name_raw = profile
+        .and_then(|p| p.get("realName"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            let first = profile
+                .and_then(|p| p.get("firstName"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .unwrap_or("");
+            let last = profile
+                .and_then(|p| p.get("lastName"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .unwrap_or("");
+            let joined = format!("{first} {last}").trim().to_string();
+            (!joined.is_empty()).then_some(joined)
+        });
+    let real_name = real_name_raw.filter(|n| is_plausible_human_name(n));
+    let country_code = profile
+        .and_then(|p| p.get("flag").or_else(|| p.get("country")))
+        .and_then(Value::as_str)
+        .and_then(|c| crate::country::normalize(c).map(|co| co.code.to_string()));
+    let fide_rating = profile
+        .and_then(|p| p.get("fideRating"))
+        .and_then(Value::as_u64)
+        .and_then(|r| u16::try_from(r).ok())
+        .filter(|&r| r >= 800);
+    Some(OnlinePlayerIdentity {
+        source: OnlineSource::Lichess,
+        username: uname,
+        real_name,
+        title,
+        country_code,
+        fide_rating,
+        avatar_url: None,
+    })
+}
+
+fn parse_chesscom_identity_json(username: &str, body: &str) -> Option<OnlinePlayerIdentity> {
+    let v: Value = serde_json::from_str(body).ok()?;
+    let uname = v
+        .get("username")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(username)
+        .to_string();
+    let title = v
+        .get("title")
+        .and_then(Value::as_str)
+        .and_then(crate::titles::normalize);
+    let real_name = v
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case(&uname) && is_plausible_human_name(s))
+        .map(str::to_string);
+    let country_code = v
+        .get("country")
+        .and_then(Value::as_str)
+        .and_then(|url| url.rsplit('/').next())
+        .and_then(|iso2| crate::country::normalize(iso2).map(|c| c.code.to_string()));
+    let fide_rating = v
+        .get("fide")
+        .and_then(Value::as_u64)
+        .and_then(|r| u16::try_from(r).ok())
+        .filter(|&r| r >= 800);
+    let avatar_url = v
+        .get("avatar")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    Some(OnlinePlayerIdentity {
+        source: OnlineSource::ChessCom,
+        username: uname,
+        real_name,
+        title,
+        country_code,
+        fide_rating,
+        avatar_url,
+    })
+}
+
+fn encode_uri_component(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for b in raw.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*b as char);
+            }
+            b' ' => out.push_str("%20"),
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
+}
+
+fn wikipedia_chess_player_by_handle(agent: &ureq::Agent, username: &str) -> Option<String> {
+    let trimmed = username.trim();
+    if trimmed.len() < 4 {
+        return None;
+    }
+    // Tier 2: exact quoted handle + chess on Wikipedia search API
+    let query = format!("\"{trimmed}\" chess");
+    let url = format!(
+        "https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch={}&format=json&srlimit=3",
+        encode_uri_component(&query)
+    );
+    if let Ok(body) = get_text(agent, &url, Some("application/json"))
+        && let Ok(val) = serde_json::from_str::<Value>(&body)
+        && let Some(items) = val
+            .get("query")
+            .and_then(|q| q.get("search"))
+            .and_then(Value::as_array)
+    {
+        for item in items {
+            let Some(title) = item.get("title").and_then(Value::as_str).map(str::trim) else {
+                continue;
+            };
+            let low = title.to_ascii_lowercase();
+            if low == "lichess"
+                || low == "chess.com"
+                || low == "chess"
+                || low.starts_with("list of ")
+                || !is_plausible_human_name(title)
+            {
+                continue;
+            }
+            if let Ok(crate::wiki::Lookup::Summary(summary)) =
+                crate::wiki::lookup_with_fide(title, None)
+                && is_plausible_human_name(&summary.title)
+            {
+                return Some(summary.title);
+            }
+        }
+    }
+
+    // Tier 3: CamelCase / underscore handle split verified strictly via Wikipedia chess biography
+    if let Some(candidate) = split_handle_for_wiki_candidate(trimmed)
+        && let Ok(crate::wiki::Lookup::Summary(summary)) =
+            crate::wiki::lookup_with_fide(&candidate, None)
+        && is_plausible_human_name(&summary.title)
+    {
+        return Some(summary.title);
+    }
+    None
+}
+
+/// Persistent disk cache of traced online player identities (`~/.cache/brett/online_identity_cache.json`).
+#[derive(Clone, Debug, Default)]
+pub struct OnlineIdentityCache {
+    entries: std::collections::HashMap<String, Option<OnlinePlayerIdentity>>,
+}
+
+impl OnlineIdentityCache {
+    #[must_use]
+    pub fn key(source: OnlineSource, username: &str) -> String {
+        format!("{}:{}", source.slug(), username.trim().to_ascii_lowercase())
+    }
+
+    #[must_use]
+    pub fn path() -> PathBuf {
+        cache_root().join("online_identity_cache.json")
+    }
+
+    #[must_use]
+    pub fn load() -> Self {
+        let Ok(text) = fs::read_to_string(Self::path()) else {
+            return Self::default();
+        };
+        Self::from_json(&text)
+    }
+
+    #[must_use]
+    pub fn from_json(text: &str) -> Self {
+        let Ok(Value::Object(map)) = serde_json::from_str::<Value>(text) else {
+            return Self::default();
+        };
+        let mut entries = std::collections::HashMap::with_capacity(map.len());
+        for (k, v) in map {
+            if v.is_null() {
+                entries.insert(k, None);
+                continue;
+            }
+            let src = match v
+                .get("source")
+                .and_then(Value::as_str)
+                .unwrap_or("lichess")
+            {
+                "chesscom" => OnlineSource::ChessCom,
+                "chessabc" => OnlineSource::ChessAbc,
+                _ => OnlineSource::Lichess,
+            };
+            let username = v
+                .get("username")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            if username.is_empty() {
+                continue;
+            }
+            let real_name = v
+                .get("real_name")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let title = v
+                .get("title")
+                .and_then(Value::as_str)
+                .and_then(crate::titles::normalize);
+            let country_code = v
+                .get("country_code")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let fide_rating = v
+                .get("fide_rating")
+                .and_then(Value::as_u64)
+                .and_then(|r| u16::try_from(r).ok());
+            let avatar_url = v
+                .get("avatar_url")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            entries.insert(
+                k,
+                Some(OnlinePlayerIdentity {
+                    source: src,
+                    username,
+                    real_name,
+                    title,
+                    country_code,
+                    fide_rating,
+                    avatar_url,
+                }),
+            );
+        }
+        Self { entries }
+    }
+
+    #[must_use]
+    pub fn to_json(&self) -> String {
+        let mut map = serde_json::Map::new();
+        for (k, v) in self.entries.iter().take(4_000) {
+            match v {
+                None => {
+                    map.insert(k.clone(), Value::Null);
+                }
+                Some(id) => {
+                    map.insert(
+                        k.clone(),
+                        serde_json::json!({
+                            "source": id.source.slug(),
+                            "username": id.username,
+                            "real_name": id.real_name,
+                            "title": id.title.map(|t| t.short()),
+                            "country_code": id.country_code,
+                            "fide_rating": id.fide_rating,
+                            "avatar_url": id.avatar_url,
+                        }),
+                    );
+                }
+            }
+        }
+        serde_json::to_string_pretty(&Value::Object(map)).unwrap_or_else(|_| "{}".to_string())
+    }
+
+    pub fn save(&self) -> Result<()> {
+        let path = Self::path();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&path, self.to_json().as_bytes())?;
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn get(&self, source: OnlineSource, username: &str) -> Option<&Option<OnlinePlayerIdentity>> {
+        self.entries.get(&Self::key(source, username))
+    }
+
+    #[must_use]
+    pub fn get_any_source(&self, username: &str) -> Option<&OnlinePlayerIdentity> {
+        for src in [OnlineSource::Lichess, OnlineSource::ChessCom] {
+            if let Some(Some(id)) = self.get(src, username)
+                && id.real_name.is_some()
+            {
+                return Some(id);
+            }
+        }
+        None
+    }
+
+    pub fn insert(&mut self, source: OnlineSource, username: &str, val: Option<OnlinePlayerIdentity>) {
+        self.entries.insert(Self::key(source, username), val);
+    }
+}
+
+/// Resolve a Lichess or Chess.com username to an [`OnlinePlayerIdentity`]
+/// (including real name from the platform profile or Wikipedia fallback).
+pub fn resolve_online_player_identity(
+    source: OnlineSource,
+    username: &str,
+    lichess_token: Option<&str>,
+) -> Result<OnlinePlayerIdentity> {
+    let clean_user = validate_query(source, username)?;
+    let agent = ureq::AgentBuilder::new()
+        .user_agent(USER_AGENT)
+        .timeout_connect(Duration::from_secs(4))
+        .timeout_read(Duration::from_secs(6))
+        .build();
+
+    let mut identity = match source {
+        OnlineSource::Lichess => {
+            let url = format!("https://lichess.org/api/user/{clean_user}");
+            let mut req = agent.get(&url).set("Accept", "application/json");
+            if let Some(tok) = lichess_token.map(str::trim).filter(|t| !t.is_empty()) {
+                req = req.set("Authorization", &format!("Bearer {tok}"));
+            }
+            let mut body = String::new();
+            if let Ok(resp) = req.call() {
+                let _ = resp.into_reader().take(256 * 1024).read_to_string(&mut body);
+            }
+            parse_lichess_identity_json(clean_user, &body).unwrap_or(OnlinePlayerIdentity {
+                source,
+                username: clean_user.to_string(),
+                ..Default::default()
+            })
+        }
+        OnlineSource::ChessCom => {
+            let url = format!(
+                "https://api.chess.com/pub/player/{}",
+                clean_user.to_ascii_lowercase()
+            );
+            let body = get_text(&agent, &url, Some("application/json")).unwrap_or_default();
+            parse_chesscom_identity_json(clean_user, &body).unwrap_or(OnlinePlayerIdentity {
+                source,
+                username: clean_user.to_string(),
+                ..Default::default()
+            })
+        }
+        OnlineSource::ChessAbc => OnlinePlayerIdentity {
+            source,
+            username: clean_user.to_string(),
+            ..Default::default()
+        },
+    };
+
+    if identity.real_name.is_none() && source != OnlineSource::ChessAbc {
+        identity.real_name = wikipedia_chess_player_by_handle(&agent, &identity.username);
+    }
+
+    Ok(identity)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3075,5 +3551,87 @@ mod tests {
         assert_eq!(c_members.len(), 3);
         assert!(c_members[0].seen_recently);
         assert!(!c_members[2].seen_recently);
+    }
+
+    #[test]
+    fn online_identity_parsing_formatting_and_cache_work() {
+        assert_eq!(
+            format_online_display_name("DrNykterstein", Some("Magnus Carlsen")),
+            "DrNykterstein (Magnus Carlsen)"
+        );
+        assert_eq!(
+            format_online_display_name("Hikaru", Some("Hikaru")),
+            "Hikaru"
+        );
+        assert_eq!(
+            split_handle_for_wiki_candidate("Daniel_Naroditsky").as_deref(),
+            Some("Daniel Naroditsky")
+        );
+        assert_eq!(
+            split_handle_for_wiki_candidate("MagnusCarlsen").as_deref(),
+            Some("Magnus Carlsen")
+        );
+        assert_eq!(split_handle_for_wiki_candidate("penguingim1"), None);
+
+        let lichess_body = r#"{"id":"alireza2003","username":"Alireza2003","title":"GM","profile":{"flag":"FR","realName":"Alireza Firouzja","fideRating":2778}}"#;
+        let lid = parse_lichess_identity_json("Alireza2003", lichess_body).unwrap();
+        assert_eq!(lid.real_name.as_deref(), Some("Alireza Firouzja"));
+        assert_eq!(lid.title, Some(crate::titles::PlayerTitle::Gm));
+        assert_eq!(lid.country_code.as_deref(), Some("FRA"));
+        assert_eq!(lid.fide_rating, Some(2778));
+
+        let cc_body = r#"{"username":"hikaru","name":"Hikaru Nakamura","title":"GM","country":"https://api.chess.com/pub/country/US","fide":2802}"#;
+        let cid = parse_chesscom_identity_json("hikaru", cc_body).unwrap();
+        assert_eq!(cid.real_name.as_deref(), Some("Hikaru Nakamura"));
+        assert_eq!(cid.country_code.as_deref(), Some("USA"));
+        assert_eq!(cid.fide_rating, Some(2802));
+
+        let mut cache = OnlineIdentityCache::default();
+        cache.insert(OnlineSource::Lichess, "Alireza2003", Some(lid.clone()));
+        let json = cache.to_json();
+        let reloaded = OnlineIdentityCache::from_json(&json);
+        assert_eq!(
+            reloaded.get(OnlineSource::Lichess, "alireza2003"),
+            Some(&Some(lid))
+        );
+    }
+
+    #[test]
+    #[ignore = "live network smoke test"]
+    fn live_online_player_real_name_and_wiki() {
+        let lichess_id =
+            resolve_online_player_identity(OnlineSource::Lichess, "DrNykterstein", None)
+                .expect("resolve Lichess DrNykterstein");
+        println!("Lichess DrNykterstein -> {:?}", lichess_id.real_name);
+        assert!(
+            lichess_id
+                .real_name
+                .as_deref()
+                .is_some_and(|n| n.contains("Magnus Carlsen")),
+            "expected Magnus Carlsen, got {:?}",
+            lichess_id.real_name
+        );
+
+        let chesscom_id = resolve_online_player_identity(OnlineSource::ChessCom, "Hikaru", None)
+            .expect("resolve Chess.com Hikaru");
+        println!("Chess.com Hikaru -> {:?}", chesscom_id.real_name);
+        assert!(
+            chesscom_id
+                .real_name
+                .as_deref()
+                .is_some_and(|n| n.contains("Hikaru Nakamura")),
+            "expected Hikaru Nakamura, got {:?}",
+            chesscom_id.real_name
+        );
+
+        let real_name = chesscom_id.real_name.as_deref().unwrap();
+        let wiki_res = crate::wiki::lookup_with_fide(real_name, None).expect("wiki lookup");
+        match wiki_res {
+            crate::wiki::Lookup::Summary(summary) => {
+                println!("Wiki resolved: {} ({})", summary.title, summary.excerpt(100));
+                assert!(summary.title.contains("Hikaru Nakamura"));
+            }
+            other => panic!("expected wiki Summary for {real_name}, got {other:?}"),
+        }
     }
 }
