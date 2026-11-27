@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use crate::chess::{Chess, Color, File, Position, Rank, Square};
 use crate::domain::{Shape, ShapeColor};
 use egui::{Color32, PointerButton, Pos2, Rect, Sense, Stroke, StrokeKind, Ui, Vec2, pos2};
@@ -10,6 +12,39 @@ const LAST_MOVE: Color32 = Color32::from_rgba_premultiplied(0x58, 0x54, 0x15, 0x
 pub(crate) const SELECTED: Color32 = Color32::from_rgba_premultiplied(0x12, 0x51, 0x24, 0x90);
 const TARGET: Color32 = Color32::from_rgba_premultiplied(0x06, 0x13, 0x06, 0x66);
 const DROP_TARGET: Color32 = Color32::from_rgba_premultiplied(0xE6, 0xF0, 0xDA, 0x38);
+
+pub struct BoardAnimData {
+    time_elapsed: f32,
+    animated: HashMap<Square, Square>,
+}
+
+impl BoardAnimData {
+    pub fn from_animated_pairs(pairs: HashMap<Square, Square>) -> Self {
+        Self {
+            time_elapsed: 0.0,
+            animated: pairs,
+        }
+    }
+
+    pub fn progress(&self) -> f32 {
+        let normalized = self.time_elapsed / Self::duration();
+        if normalized <= 0.5 {
+            normalized * normalized * 2.0
+        } else {
+            let normalized_mirrored = 1.0 - normalized;
+            1.0 - (2.0 * normalized_mirrored * normalized_mirrored)
+        }
+    }
+
+    pub fn duration() -> f32 {
+        0.2
+    }
+
+    pub fn handle_dt(&mut self, dt: f32) -> bool {
+        self.time_elapsed += dt;
+        self.time_elapsed > Self::duration()
+    }
+}
 
 /// One user interaction on the board.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -56,6 +91,26 @@ pub struct BoardState<'a> {
     pub draw_mode: Option<ShapeColor>,
     /// Allow horizontal swipes on non-movable squares to step backward/forward.
     pub touch_swipe: bool,
+    /// progress, from, to
+    pub animation: &'a Option<BoardAnimData>,
+}
+
+pub fn mix_rects_for_anim(anim_prog: f32, rect1: Rect, rect2: Rect) -> Rect {
+    if anim_prog < 0.0 {
+        eprintln!("Invalid animation progress: {anim_prog}.");
+        return rect1;
+    } else if anim_prog > 1.0 {
+        eprintln!("Invalid animation progress: {anim_prog}.");
+        return rect2;
+    }
+    let center1 = rect1.center();
+    let center2 = rect2.center();
+    let anim_left = 1.0 - anim_prog;
+    let center_mixed = Pos2 {
+        x: center1.x * anim_left + center2.x * anim_prog,
+        y: center1.y * anim_left + center2.y * anim_prog,
+    };
+    Rect::from_center_size(center_mixed, rect2.size())
 }
 
 /// Draw an interactive board. Pieces can be moved by clicking or by dragging.
@@ -234,7 +289,12 @@ pub fn draw(ui: &mut Ui, tex: &PieceTextures, st: BoardState<'_>, side: f32) -> 
             if let Some(piece) = st.pos.board().piece_at(sq)
                 && let Some(texture) = tex.get(piece)
             {
-                let r = square_rect(sq).shrink(cell * 0.04);
+                let mut r = square_rect(sq).shrink(cell * 0.04);
+                if let Some(anim) = &st.animation
+                    && let Some(oldsq) = anim.animated.get(&sq) {
+                        let oldr = square_rect(*oldsq).shrink(cell * 0.04);
+                        r = mix_rects_for_anim(anim.progress(), oldr, r);
+                    }
                 painter.image(
                     texture.id(),
                     r,
@@ -612,6 +672,7 @@ mod tests {
                         drag_from: None,
                         draw_mode: Some(ShapeColor::Blue),
                         touch_swipe: true,
+                        animation: &None,
                     },
                     400.0,
                 );
