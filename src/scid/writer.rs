@@ -296,9 +296,11 @@ impl ScidWriter {
             | (encode_count(counts.nags) << 8)
             | (encode_count(counts.comments) << 4)
             | encode_count(counts.variations);
+        let medals = crate::library::medals::from_game(game);
         let entry_flags = u16::from(custom_start)
             | (u16::from(promotions) << 1)
-            | (u16::from(underpromotions) << 2);
+            | (u16::from(underpromotions) << 2)
+            | crate::library::medals::to_scid_entry_flags(medals);
 
         Ok(PreparedGame {
             record,

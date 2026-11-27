@@ -1364,6 +1364,12 @@ pub struct DisplayPrefs {
     pub touch_mode: TouchMode,
     /// Show the editable PGN-tags card above the move list.
     pub show_pgn_tags: bool,
+    /// Expand the very-top game header card above the move list.
+    pub header_card_expanded: bool,
+    /// Expand the PGN-tags card body above the move list.
+    pub pgn_tags_card_expanded: bool,
+    /// Expand the Game review options/body in the Engine tab.
+    pub review_panel_expanded: bool,
     /// Show the move annotations and comment editor card below the move list.
     pub show_annotations: bool,
     /// Show PGN clock times in the board strips when the game has clocks.
@@ -1427,6 +1433,9 @@ impl Default for DisplayPrefs {
             show_nav_buttons: false,
             touch_mode: TouchMode::default(),
             show_pgn_tags: true,
+            header_card_expanded: true,
+            pgn_tags_card_expanded: true,
+            review_panel_expanded: false,
             show_annotations: false,
             show_clocks: true,
             engine_bar: true,
@@ -1613,6 +1622,18 @@ impl DisplayPrefs {
             .get("show_pgn_tags")
             .and_then(Value::as_bool)
             .unwrap_or(true);
+        let header_card_expanded = value
+            .get("header_card_expanded")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        let pgn_tags_card_expanded = value
+            .get("pgn_tags_card_expanded")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        let review_panel_expanded = value
+            .get("review_panel_expanded")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let show_annotations = value
             .get("show_annotations")
             .and_then(Value::as_bool)
@@ -1750,6 +1771,9 @@ impl DisplayPrefs {
             show_nav_buttons,
             touch_mode,
             show_pgn_tags,
+            header_card_expanded,
+            pgn_tags_card_expanded,
+            review_panel_expanded,
             show_annotations,
             show_clocks,
             engine_bar,
@@ -1860,6 +1884,18 @@ impl DisplayPrefs {
             json!(self.touch_mode.config_value()),
         );
         map.insert("show_pgn_tags".to_string(), json!(self.show_pgn_tags));
+        map.insert(
+            "header_card_expanded".to_string(),
+            json!(self.header_card_expanded),
+        );
+        map.insert(
+            "pgn_tags_card_expanded".to_string(),
+            json!(self.pgn_tags_card_expanded),
+        );
+        map.insert(
+            "review_panel_expanded".to_string(),
+            json!(self.review_panel_expanded),
+        );
         map.insert("show_annotations".to_string(), json!(self.show_annotations));
         map.insert("show_clocks".to_string(), json!(self.show_clocks));
         map.insert("engine_bar".to_string(), json!(self.engine_bar));
@@ -2442,6 +2478,9 @@ processor\t: 4\nphysical id\t: 0\ncore id\t\t: 8\n";
             show_nav_buttons: true,
             touch_mode: TouchMode::On,
             show_pgn_tags: false,
+            header_card_expanded: false,
+            pgn_tags_card_expanded: false,
+            review_panel_expanded: true,
             show_annotations: false,
             show_clocks: false,
             engine_bar: false,

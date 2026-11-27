@@ -588,6 +588,11 @@ impl MatchOrientation {
     }
 
     #[must_use]
+    pub fn includes_normal(self) -> bool {
+        matches!(self, Self::Normal | Self::Both)
+    }
+
+    #[must_use]
     pub fn includes_flipped(self) -> bool {
         matches!(self, Self::Flipped | Self::Both)
     }
@@ -711,23 +716,37 @@ pub enum StructureFamily {
     Carlsbad,
     Iqp,
     HangingPawns,
-    MaroczyAndHedgehog,
+    Maroczy,
+    Hedgehog,
     Sicilian,
-    SlavAndGrunfeld,
-    ClosedChains,
+    Slav,
+    SemiSlav,
+    Grunfeld,
+    Botvinnik,
+    French,
+    KingsIndian,
+    Benoni,
+    NimzoDoubledC,
 }
 
 impl StructureFamily {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 16] = [
         Self::Stonewall,
         Self::Badewanne,
         Self::Carlsbad,
         Self::Iqp,
         Self::HangingPawns,
-        Self::MaroczyAndHedgehog,
+        Self::Maroczy,
+        Self::Hedgehog,
         Self::Sicilian,
-        Self::SlavAndGrunfeld,
-        Self::ClosedChains,
+        Self::Slav,
+        Self::SemiSlav,
+        Self::Grunfeld,
+        Self::Botvinnik,
+        Self::French,
+        Self::KingsIndian,
+        Self::Benoni,
+        Self::NimzoDoubledC,
     ];
 
     #[must_use]
@@ -738,10 +757,17 @@ impl StructureFamily {
             Self::Carlsbad => "Carlsbad",
             Self::Iqp => "IQP & Panov",
             Self::HangingPawns => "Hanging Pawns",
-            Self::MaroczyAndHedgehog => "Maróczy / Hedgehog",
+            Self::Maroczy => "Maróczy Bind",
+            Self::Hedgehog => "Hedgehog",
             Self::Sicilian => "Sicilian Structures",
-            Self::SlavAndGrunfeld => "Slav, Triangle & Grünfeld",
-            Self::ClosedChains => "Chains, French & KID",
+            Self::Slav => "Slav & Caro-Kann",
+            Self::SemiSlav => "Semi-Slav / Triangle",
+            Self::Grunfeld => "Grünfeld",
+            Self::Botvinnik => "Botvinnik",
+            Self::French => "French",
+            Self::KingsIndian => "King's Indian",
+            Self::Benoni => "Benoni",
+            Self::NimzoDoubledC => "Nimzo Doubled c-Pawns",
         }
     }
 
@@ -763,6 +789,10 @@ impl StructureFamily {
             ],
             Self::Carlsbad => &[
                 StructurePreset::CarlsbadAny,
+                StructurePreset::CarlsbadNoFianchettoBoth,
+                StructurePreset::CarlsbadBlackFianchetto,
+                StructurePreset::CarlsbadWhiteFianchetto,
+                StructurePreset::CarlsbadDoubleFianchetto,
                 StructurePreset::CarlsbadMinorityAttack,
                 StructurePreset::CarlsbadCentralE4,
                 StructurePreset::CarlsbadF3E4,
@@ -788,35 +818,47 @@ impl StructureFamily {
                 StructurePreset::HangingPawnsVsFianchetto,
                 StructurePreset::HangingPawnsDynamic,
             ],
-            Self::MaroczyAndHedgehog => &[
+            Self::Maroczy => &[
                 StructurePreset::MaroczyBindAny,
                 StructurePreset::MaroczyBindNoFianchetto,
                 StructurePreset::MaroczyBindFianchetto,
-                StructurePreset::Hedgehog,
             ],
+            Self::Hedgehog => &[StructurePreset::Hedgehog, StructurePreset::HedgehogVsBg2],
             Self::Sicilian => &[
                 StructurePreset::Boleslavsky,
                 StructurePreset::Scheveningen,
                 StructurePreset::Dragon,
                 StructurePreset::NajdorfStructure,
-                StructurePreset::NajdorfTypeII,
-                StructurePreset::NajdorfTypeIII,
+                StructurePreset::NajdorfQueensideB5,
+                StructurePreset::NajdorfE5VsF4,
             ],
-            Self::SlavAndGrunfeld => &[
-                StructurePreset::SlavCaroKann,
-                StructurePreset::SlavFormation,
+            Self::Slav => &[StructurePreset::SlavCaroKann, StructurePreset::SlavMainline],
+            Self::SemiSlav => &[StructurePreset::SlavFormation, StructurePreset::SemiSlavMeran],
+            Self::Grunfeld => &[
                 StructurePreset::GrunfeldCenter,
+                StructurePreset::GrunfeldD5PassedPawn,
+                StructurePreset::GrunfeldQueensideMajority,
+            ],
+            Self::Botvinnik => &[
                 StructurePreset::Botvinnik,
                 StructurePreset::BotvinnikTriangle,
             ],
-            Self::ClosedChains => &[
+            Self::French => &[
                 StructurePreset::FrenchChain,
+                StructurePreset::FrenchWinawerC4,
                 StructurePreset::FrenchTarraschDxE,
+            ],
+            Self::KingsIndian => &[
                 StructurePreset::KingsIndianChain,
                 StructurePreset::KingsIndianC5Chain,
-                StructurePreset::BenoniStructure,
-                StructurePreset::NimzoDoubledCPawns,
+                StructurePreset::KingsIndianExchange,
             ],
+            Self::Benoni => &[
+                StructurePreset::BenoniStructure,
+                StructurePreset::BenkoGambit,
+                StructurePreset::CzechBenoni,
+            ],
+            Self::NimzoDoubledC => &[StructurePreset::NimzoDoubledCPawns],
         }
     }
 }
@@ -839,6 +881,10 @@ pub enum StructurePreset {
     BadewanneCentral,
     // Carlsbad family
     CarlsbadAny,
+    CarlsbadNoFianchettoBoth,
+    CarlsbadBlackFianchetto,
+    CarlsbadWhiteFianchetto,
+    CarlsbadDoubleFianchetto,
     CarlsbadMinorityAttack,
     CarlsbadCentralE4,
     CarlsbadF3E4,
@@ -861,37 +907,53 @@ pub enum StructurePreset {
     HangingPawnsVsNoFianchetto,
     HangingPawnsVsFianchetto,
     HangingPawnsDynamic,
-    // Maróczy & Hedgehog
+    // Maróczy
     MaroczyBindAny,
     MaroczyBindNoFianchetto,
     MaroczyBindFianchetto,
+    // Hedgehog
     Hedgehog,
+    HedgehogVsBg2,
     // Sicilian structures
     Boleslavsky,
     Scheveningen,
     Dragon,
     NajdorfStructure,
-    NajdorfTypeII,
-    NajdorfTypeIII,
-    // Slav, Triangle & Grünfeld
+    NajdorfQueensideB5,
+    NajdorfE5VsF4,
+    // Slav & Caro-Kann
     SlavCaroKann,
+    SlavMainline,
+    // Semi-Slav / Triangle
     SlavFormation,
+    SemiSlavMeran,
+    // Grünfeld
     GrunfeldCenter,
+    GrunfeldD5PassedPawn,
+    GrunfeldQueensideMajority,
+    // Botvinnik
     Botvinnik,
     BotvinnikTriangle,
-    // Closed chains & semi-closed formations
+    // French
     FrenchChain,
+    FrenchWinawerC4,
     FrenchTarraschDxE,
+    // King's Indian
     KingsIndianChain,
     KingsIndianC5Chain,
+    KingsIndianExchange,
+    // Benoni
     BenoniStructure,
+    BenkoGambit,
+    CzechBenoni,
+    // Nimzo Doubled c-Pawns
     NimzoDoubledCPawns,
 }
 
 pub type StructuralPreset = StructurePreset;
 
 impl StructurePreset {
-    pub const ALL: [Self; 51] = [
+    pub const ALL: [Self; 64] = [
         Self::StonewallAny,
         Self::StonewallClassic,
         Self::StonewallNc6,
@@ -902,6 +964,10 @@ impl StructurePreset {
         Self::BadewanneFlexibleRim,
         Self::BadewanneCentral,
         Self::CarlsbadAny,
+        Self::CarlsbadNoFianchettoBoth,
+        Self::CarlsbadBlackFianchetto,
+        Self::CarlsbadWhiteFianchetto,
+        Self::CarlsbadDoubleFianchetto,
         Self::CarlsbadMinorityAttack,
         Self::CarlsbadCentralE4,
         Self::CarlsbadF3E4,
@@ -926,24 +992,48 @@ impl StructurePreset {
         Self::MaroczyBindNoFianchetto,
         Self::MaroczyBindFianchetto,
         Self::Hedgehog,
+        Self::HedgehogVsBg2,
         Self::Boleslavsky,
         Self::Scheveningen,
         Self::Dragon,
         Self::NajdorfStructure,
-        Self::NajdorfTypeII,
-        Self::NajdorfTypeIII,
+        Self::NajdorfQueensideB5,
+        Self::NajdorfE5VsF4,
         Self::SlavCaroKann,
+        Self::SlavMainline,
         Self::SlavFormation,
+        Self::SemiSlavMeran,
         Self::GrunfeldCenter,
+        Self::GrunfeldD5PassedPawn,
+        Self::GrunfeldQueensideMajority,
         Self::Botvinnik,
         Self::BotvinnikTriangle,
         Self::FrenchChain,
+        Self::FrenchWinawerC4,
         Self::FrenchTarraschDxE,
         Self::KingsIndianChain,
         Self::KingsIndianC5Chain,
+        Self::KingsIndianExchange,
         Self::BenoniStructure,
+        Self::BenkoGambit,
+        Self::CzechBenoni,
         Self::NimzoDoubledCPawns,
     ];
+
+    /// Presets explicitly hand-tuned by the user. Must never be overwritten by
+    /// automated batch structure updates (`docs/HANDCRAFTED_FILTERS.md`).
+    #[must_use]
+    pub const fn is_handcrafted(self) -> bool {
+        matches!(
+            self,
+            Self::MaroczyBindNoFianchetto
+                | Self::MaroczyBindFianchetto
+                | Self::Botvinnik
+                | Self::HangingPawnsClassic
+                | Self::CarlsbadAny
+                | Self::CarlsbadMinorityAttack
+        )
+    }
 
     #[must_use]
     pub fn family(self) -> StructureFamily {
@@ -958,6 +1048,10 @@ impl StructurePreset {
                 StructureFamily::Badewanne
             }
             Self::CarlsbadAny
+            | Self::CarlsbadNoFianchettoBoth
+            | Self::CarlsbadBlackFianchetto
+            | Self::CarlsbadWhiteFianchetto
+            | Self::CarlsbadDoubleFianchetto
             | Self::CarlsbadMinorityAttack
             | Self::CarlsbadCentralE4
             | Self::CarlsbadF3E4 => StructureFamily::Carlsbad,
@@ -980,25 +1074,30 @@ impl StructurePreset {
             | Self::HangingPawnsDynamic => StructureFamily::HangingPawns,
             Self::MaroczyBindAny
             | Self::MaroczyBindNoFianchetto
-            | Self::MaroczyBindFianchetto
-            | Self::Hedgehog => StructureFamily::MaroczyAndHedgehog,
+            | Self::MaroczyBindFianchetto => StructureFamily::Maroczy,
+            Self::Hedgehog | Self::HedgehogVsBg2 => StructureFamily::Hedgehog,
             Self::Boleslavsky
             | Self::Scheveningen
             | Self::Dragon
             | Self::NajdorfStructure
-            | Self::NajdorfTypeII
-            | Self::NajdorfTypeIII => StructureFamily::Sicilian,
-            Self::SlavCaroKann
-            | Self::SlavFormation
-            | Self::GrunfeldCenter
-            | Self::Botvinnik
-            | Self::BotvinnikTriangle => StructureFamily::SlavAndGrunfeld,
-            Self::FrenchChain
-            | Self::FrenchTarraschDxE
-            | Self::KingsIndianChain
+            | Self::NajdorfQueensideB5
+            | Self::NajdorfE5VsF4 => StructureFamily::Sicilian,
+            Self::SlavCaroKann | Self::SlavMainline => StructureFamily::Slav,
+            Self::SlavFormation | Self::SemiSlavMeran => StructureFamily::SemiSlav,
+            Self::GrunfeldCenter
+            | Self::GrunfeldD5PassedPawn
+            | Self::GrunfeldQueensideMajority => StructureFamily::Grunfeld,
+            Self::Botvinnik | Self::BotvinnikTriangle => StructureFamily::Botvinnik,
+            Self::FrenchChain | Self::FrenchWinawerC4 | Self::FrenchTarraschDxE => {
+                StructureFamily::French
+            }
+            Self::KingsIndianChain
             | Self::KingsIndianC5Chain
-            | Self::BenoniStructure
-            | Self::NimzoDoubledCPawns => StructureFamily::ClosedChains,
+            | Self::KingsIndianExchange => StructureFamily::KingsIndian,
+            Self::BenoniStructure | Self::BenkoGambit | Self::CzechBenoni => {
+                StructureFamily::Benoni
+            }
+            Self::NimzoDoubledCPawns => StructureFamily::NimzoDoubledC,
         }
     }
 
@@ -1010,11 +1109,15 @@ impl StructurePreset {
             Self::StonewallNc6 => "Stonewall + Nc6 (d5, e6/exd, f5, Nc6)",
             Self::StonewallBadBishopTrade => "Stonewall + b6 (Ba6 / LSB off)",
             Self::StonewallC5Break => "Stonewall + c5 (c5-d5-e6/exd-f5)",
-            Self::StonewallBd2e1h4 => "Stonewall + Bd2-e1-h4 Plan (vs Nf6)",
+            Self::StonewallBd2e1h4 => "Stonewall + Bc1-d2-e1-h4 Plan",
             Self::BadewanneAny => "Badewanne (any 4 files, ranks 3–5)",
             Self::BadewanneFlexibleRim => "Badewanne (flexible rim, ranks 3–5)",
             Self::BadewanneCentral => "Central Badewanne (c–f, ranks 3–5)",
             Self::CarlsbadAny => "Carlsbad (core)",
+            Self::CarlsbadNoFianchettoBoth => "Carlsbad — No K-fianchetto (W: no, B: no)",
+            Self::CarlsbadBlackFianchetto => "Carlsbad — Black K-fianchetto (W: no, B: yes)",
+            Self::CarlsbadWhiteFianchetto => "Carlsbad — White K-fianchetto (W: yes, B: no)",
+            Self::CarlsbadDoubleFianchetto => "Carlsbad — Double K-fianchetto (W: yes, B: yes)",
             Self::CarlsbadMinorityAttack => "Carlsbad + Minority Attack (b4/b5)",
             Self::CarlsbadCentralE4 => "Carlsbad + e4 Plan",
             Self::CarlsbadF3E4 => "Carlsbad + f3 Setup",
@@ -1039,22 +1142,31 @@ impl StructurePreset {
             Self::MaroczyBindNoFianchetto => "Maróczy — No K-side fianchetto",
             Self::MaroczyBindFianchetto => "Maróczy — K-side fianchetto (g3+Bg2)",
             Self::Hedgehog => "Hedgehog (a6-b6-d6-e6 vs c4+e4)",
+            Self::HedgehogVsBg2 => "Hedgehog vs White g3+Bg2",
             Self::Boleslavsky => "Boleslavsky Hole (d6-e5 vs e4)",
             Self::Scheveningen => "Small Center (d6-e6 vs e4)",
             Self::Dragon => "Dragon Formation (d6-g6-Bg7 vs e4)",
             Self::NajdorfStructure => "Najdorf — Classical / Flexible (a6-d6, e5/e6)",
-            Self::NajdorfTypeII => "Najdorf — Queenside ...b5 (a6-b5-d6)",
-            Self::NajdorfTypeIII => "Najdorf — ...e5 vs e4+f4 (a6-d6-e5)",
-            Self::SlavCaroKann => "Slav / Caro-Kann (c6-d5 vs d4)",
+            Self::NajdorfQueensideB5 => "Najdorf — Queenside ...b5 (a6-b5-d6)",
+            Self::NajdorfE5VsF4 => "Najdorf — ...e5 vs e4+f4 (a6-d6-e5)",
+            Self::SlavCaroKann => "Caro-Kann Formation (c6+e6/e7 vs d4+c2/c3)",
+            Self::SlavMainline => "Open Slav Mainline (c6-e6 vs d4)",
             Self::SlavFormation => "Semi-Slav Triangle (c3/c4-d4-e3 vs c6-d5-e6)",
+            Self::SemiSlavMeran => "Semi-Slav Meran (...a6-b5-e6 vs d4+e3/e4)",
             Self::GrunfeldCenter => "Grünfeld Center (d4+e4 vs g6+Bg7)",
+            Self::GrunfeldD5PassedPawn => "Grünfeld Passed d5 (d5+e4 vs g6+Bg7)",
+            Self::GrunfeldQueensideMajority => "Grünfeld 2v1 Queenside Majority",
             Self::Botvinnik => "Botvinnik",
             Self::BotvinnikTriangle => "Botvinnik Triangle (c4-d3-e4 + g3+Bg2)",
             Self::FrenchChain => "French Chain (d4-e5 vs d5-e6)",
+            Self::FrenchWinawerC4 => "French Tension + c4/c3 (vs ...c5+d5+e6)",
             Self::FrenchTarraschDxE => "Open French Tension (d4 vs c5+e6)",
             Self::KingsIndianChain => "KID Locked Center (c4-d5-e4 vs d6-e5)",
             Self::KingsIndianC5Chain => "KID + ...c5 Break (c4-d5-e4 vs c5-d6-e5)",
+            Self::KingsIndianExchange => "KID Exchange (c4+e4 vs e5+g6)",
             Self::BenoniStructure => "Benoni Wedge (c5-d6 vs d5-e4)",
+            Self::BenkoGambit => "Benko Gambit Half-Open a/b-Files",
+            Self::CzechBenoni => "Czech Benoni (c5-d6-e5 vs c4-d5-e4)",
             Self::NimzoDoubledCPawns => "Doubled c-Pawns (Nimzo: c3+c4, opp DSB off)",
         }
     }
@@ -1063,13 +1175,13 @@ impl StructurePreset {
     pub fn description(self) -> &'static str {
         match self {
             Self::StonewallAny => {
-                "Requires Stonewall triangle (d4-e3-f4 or cxd/exd trade with no own e-pawn and no opp c-pawn)."
+                "Stonewall triangle (d4-e3-f4 or cxd/exd trade) opposing central pawn tension."
             }
             Self::StonewallClassic => {
-                "c3-d4-e3-f4 pyramid (including cxd/exd recaptures) without e4."
+                "c3-d4-e3-f4 pyramid vs opposing d5 without e4 or c4."
             }
             Self::StonewallNc6 => {
-                "Chigorin/Botvinnik/Slav Stonewall: pawns d5-e6/exd-f5 + Nc6 (or d4-e3/exd-f4 + Nc3)."
+                "Chigorin/Botvinnik/Slav Stonewall: d5-e6/exd-f5 + Nc6 vs d4 (no c5)."
             }
             Self::StonewallBadBishopTrade => {
                 "b6 + Ba6 maneuver or bad bishop already exchanged off."
@@ -1078,7 +1190,7 @@ impl StructurePreset {
                 "Stonewall triangle with c5/c4 pawn tension against the center."
             }
             Self::StonewallBd2e1h4 => {
-                "Classic Stonewall bishop transfer via Bd2-e1-h4 facing a knight on f6."
+                "Classic Stonewall bishop transfer along Bc1-d2-e1-h4 toward the kingside."
             }
             Self::BadewanneAny => {
                 "Two backwards adjacent pawns strictly on ranks 3–5, flanked 1 rank ahead on outer files."
@@ -1090,10 +1202,24 @@ impl StructurePreset {
                 "Symmetric central bathtub on c–f files (d3-e3, d4-e4, or d5-e5)."
             }
             Self::CarlsbadAny => {
-                "Exchange QGD skeleton: d4+e3/e4 (no c-pawn) vs c6+d5 (no e-pawn)."
+                "Handcrafted Carlsbad core: h2-e3-d4, f2|f3, g2|g3, a/b shells vs c6-d5 (no W c-pawn, no B e-pawn)."
             }
-            Self::CarlsbadMinorityAttack => "Carlsbad structure with b4 or b5 pawn advance.",
-            Self::CarlsbadCentralE4 => "Botvinnik/Kasparov Carlsbad plan with pawn on e4.",
+            Self::CarlsbadNoFianchettoBoth => {
+                "Carlsbad core with g2 (no Bg2) on White (cxd) side and g7 (no Bg7) on Black (exd) side."
+            }
+            Self::CarlsbadBlackFianchetto => {
+                "Carlsbad core: White g2 (no Bg2) vs Black K-side fianchetto (g6+Bg7)."
+            }
+            Self::CarlsbadWhiteFianchetto => {
+                "Carlsbad core: White K-side fianchetto (g3+Bg2) vs Black g7 (no Bg7)."
+            }
+            Self::CarlsbadDoubleFianchetto => {
+                "Carlsbad core with K-side fianchettoes on both White (g3+Bg2) and Black (g6+Bg7)."
+            }
+            Self::CarlsbadMinorityAttack => {
+                "Handcrafted Carlsbad minority attack: b5+d4+e3 (no W c-pawn) vs c6+d5 (no B e-pawn)."
+            }
+            Self::CarlsbadCentralE4 => "Carlsbad central plan with pawn on e4 and intact wings.",
             Self::CarlsbadF3E4 => "f3 + e3/e4 preparation for central e4 expansion.",
             Self::IqpDFile => {
                 "Isolated d-pawn (d4/d5) with open c- and e-files and no opposing d-pawn."
@@ -1123,20 +1249,23 @@ impl StructurePreset {
             Self::IqpDynamic => "IQP middlegame with at least 2 minor pieces for the IQP holder.",
             Self::IqpBlockaded => "d4-pawn directly blockaded on d5 by opponent minor piece + e6.",
             Self::IqpAnyCentralFile => "Any isolated pawn on c, d, or e files on ranks 4–6.",
+            Self::PanovFormation => {
+                "Panov Attack tension: single White c4+d4 (no e-pawn) vs Black d5+e6 (no c-pawn, no f5)."
+            }
             Self::HangingPawnsClassic => {
                 "Hand-tuned hanging c4+d4 pawns (no own b/e pawns, no opp c/d pawns, opp b6/b7 & e6/e7)."
             }
             Self::HangingPawnsVsNoFianchetto => {
-                "Hanging c4+d4 pawns facing an opponent without a K-side fianchetto (g7, no Bg7)."
+                "Single hanging c4+d4 pawns with intact kingside vs opponent without K-side fianchetto."
             }
             Self::HangingPawnsVsFianchetto => {
-                "Hanging c4+d4 pawns facing an opponent K-side fianchetto (g6+Bg7)."
+                "Single hanging c4+d4 pawns with intact kingside vs opponent K-side fianchetto (g6+Bg7)."
             }
             Self::HangingPawnsDynamic => {
-                "Advanced or level hanging c/d pawn pair (ranks 4–5) without b/e support."
+                "Dynamic c/d hanging pawn pair (ranks 4–5) with 2+ minor pieces and intact kingside."
             }
             Self::MaroczyBindAny => {
-                "c4+e4 bind clamping d5 against Black's d6 setup (any kingside)."
+                "c4+e4 bind clamping d5 against d6 (no opponent e5 break) with open d/c half-files."
             }
             Self::MaroczyBindNoFianchetto => {
                 "Hand-tuned Maróczy bind without K-side fianchetto (a2/g2/c4/e4, b2|b3, f2|f3, h2|h3 vs b7/d6/f7/g6, a6|a7, e6|e7, h6|h7)."
@@ -1144,44 +1273,76 @@ impl StructurePreset {
             Self::MaroczyBindFianchetto => {
                 "Maróczy bind with K-side fianchetto (a2/c4/f2/g3+Bg2, b2|b3, e2|e3|e4, h2|h3 vs b7/d6/f7/g6/h7+Bg7, a7|a6, e7|e6, no W d-pawn or B c-pawn)."
             }
-            Self::Hedgehog => "a6-b6-d6-e6 Hedgehog shell without c-pawn facing c4+e4.",
-            Self::Boleslavsky => "d6+e5 Sicilian center leaving a backward d5 square vs White e4.",
-            Self::Scheveningen => "d6+e6 Small Center vs White e4 with open c- and d-files.",
-            Self::Dragon => "d6+g6+Bg7 fianchetto vs e4 with open c- and d-files.",
-            Self::NajdorfStructure => "a6+d6+(e5/e6) flexible classical Najdorf shell vs White e4.",
-            Self::NajdorfTypeII => {
-                "Najdorf queenside expansion: a6+b5+d6 without c-pawn vs White e4."
+            Self::Hedgehog => "a6-b6-d6-e6 Hedgehog shell (no c-pawn, no d5/e5 break) facing c4+e4.",
+            Self::HedgehogVsBg2 => {
+                "Hedgehog a6-b6-d6-e6 shell facing White's c4+e4+g3+Bg2 setup."
             }
-            Self::NajdorfTypeIII => "Najdorf e5+f4 battle: a6+d6+e5 without c-pawn vs White e4+f4.",
-            Self::PanovFormation => {
-                "Panov Attack tension: White c4+d4 (no e-pawn) vs Black d5+e6 (no c-pawn)."
+            Self::Boleslavsky => "d6+e5 Sicilian center vs White e4 (no c4) with backward d6.",
+            Self::Scheveningen => "d6+e6 Small Center vs White e4 (no c4, no g6) with open c/d half-files.",
+            Self::Dragon => "d6+g6+Bg7 Dragon vs White e4 (no c4, no e5) with open c/d half-files.",
+            Self::NajdorfStructure => {
+                "a6+d6+(e5/e6) flexible classical Najdorf shell (no g6/b6) vs White e4 (no c4)."
+            }
+            Self::NajdorfQueensideB5 => {
+                "Najdorf queenside expansion: a6+b5+d6+(e6/e5) without c-pawn vs White e4 (no c4)."
+            }
+            Self::NajdorfE5VsF4 => "Najdorf e5+f4 battle: a6+d6+e5 without c-pawn vs White e4+f4 (no c4).",
+            Self::SlavCaroKann => {
+                "Caro-Kann half-open center: Black c6+(e6/e7) (no d-pawn) vs White d4+(c2/c3) (no e-pawn)."
+            }
+            Self::SlavMainline => {
+                "Open Slav structure after ...dxc4: Black c6+e6 (no d-pawn) vs White d4+(e3/e4)."
             }
             Self::SlavFormation => {
-                "Semi-Slav / Triangle shell: c3/c4+d4+e3 against Black's solid c6-d5-e6."
+                "Semi-Slav / Triangle shell: c3/c4+d4+e3 (no e4) against Black's solid c6-d5-e6."
+            }
+            Self::SemiSlavMeran => {
+                "Meran / Anti-Meran queenside structure: ...a6+b5+e6 (no d-pawn) vs d4+e3/e4 (no c-pawn)."
             }
             Self::GrunfeldCenter => {
-                "Grünfeld central duo: White d4+e4 (no c4-pawn, allowing Exchange c3) vs Black g6+Bg7 (no d-pawn)."
+                "Grünfeld central duo: White d4+e4 (with c3 or no c-pawn) vs Black c7/c5+g6+Bg7 (no d-pawn)."
+            }
+            Self::GrunfeldD5PassedPawn => {
+                "Grünfeld passed d-pawn: White d5+e4 (no c4) vs Black g6+Bg7 (open c/d-files)."
+            }
+            Self::GrunfeldQueensideMajority => {
+                "Grünfeld endgame/late middlegame: Black a/b-pawns (vs missing White a/b pawn) + g6+Bg7."
             }
             Self::Botvinnik => {
                 "Botvinnik System: c4-d3-e4 + b2-f2-g3-h2 + a2/a3 with Nc3, Ne2, and Bg2."
             }
             Self::BotvinnikTriangle => {
-                "Botvinnik English/Closed Sicilian setup: c4-d3-e4 triangle with g3+Bg2."
+                "Botvinnik English/Closed Sicilian setup: c4-d3-e4 triangle (no d4/e3) with g3+Bg2."
             }
-            Self::FrenchChain => "Locked d4-e5 vs d5-e6 French pawn chain.",
+            Self::FrenchChain => {
+                "Locked d4-e5 vs d5-e6 French chain (excluding Caro-Kann c6)."
+            }
+            Self::FrenchWinawerC4 => {
+                "Locked French chain d4-e5+(c3/c4) with active Black ...c5+d5+e6 pressure."
+            }
             Self::FrenchTarraschDxE => {
-                "Released French tension: White d4 (no e-pawn) vs Black c5+e6 (no d-pawn)."
+                "Released French tension: White c2/c3+d4 (no e-pawn) vs Black c5+e6 (no d-pawn)."
             }
-            Self::KingsIndianChain => "Closed KID chain: c4-d5-e4 vs d6-e5-g6.",
+            Self::KingsIndianChain => {
+                "Closed KID chain: c4-d5-e4 vs d6-e5-g6+Bg7 (no c5)."
+            }
             Self::KingsIndianC5Chain => {
-                "King's Indian with counterbreak: c4-d5-e4 locked against c5-d6-e5."
+                "King's Indian with ...c5 counterbreak: c4-d5-e4 vs c5-d6-e5-g6."
             }
-            Self::BenoniStructure => "Asymmetric Benoni c5-d6 wedge vs White d5-e4.",
-            Self::SlavCaroKann => {
-                "Solid c6-d5 foundation vs White d4+(c4/e4) with e-file half-open."
+            Self::KingsIndianExchange => {
+                "KID Exchange structure: c4+e4 (no d-pawn) vs e5+g6+Bg7 (no d-pawn)."
+            }
+            Self::BenoniStructure => {
+                "Modern Benoni c5-d6-g6 wedge vs White d5-e4 (no Black e-pawn, no White c-pawn)."
+            }
+            Self::BenkoGambit => {
+                "Benko Gambit structure: Black c5+d6+g6+Bg7 with open a- and b-files vs d5."
+            }
+            Self::CzechBenoni => {
+                "Czech Benoni locked center: Black c5-d6-e5 (no g6) vs White c4-d5-e4."
             }
             Self::NimzoDoubledCPawns => {
-                "Structural doubled c-pawns (Nimzo/Sämisch: c3+c4 + d/e pawns, opponent DSB traded off)."
+                "Nimzo/Sämisch doubled c-pawns (c3+c4/c5, open b-file, d/e center, opponent DSB off)."
             }
         }
     }
@@ -1194,14 +1355,20 @@ impl StructurePreset {
             | Self::StonewallBadBishopTrade
             | Self::StonewallC5Break
             | Self::Hedgehog
+            | Self::HedgehogVsBg2
             | Self::Boleslavsky
             | Self::Scheveningen
             | Self::Dragon
             | Self::NajdorfStructure
-            | Self::NajdorfTypeII
-            | Self::NajdorfTypeIII
+            | Self::NajdorfQueensideB5
+            | Self::NajdorfE5VsF4
+            | Self::SlavCaroKann
+            | Self::SlavMainline
+            | Self::SemiSlavMeran
+            | Self::GrunfeldQueensideMajority
             | Self::BenoniStructure
-            | Self::SlavCaroKann => Color::Black,
+            | Self::BenkoGambit
+            | Self::CzechBenoni => Color::Black,
             _ => Color::White,
         }
     }
@@ -1269,6 +1436,15 @@ impl StructurePreset {
         let not_own_pawn = |f: usize, r: usize| {
             AtomPredicate::NotPiece(sq_in_frame(f, r), Piece::new(side, Role::Pawn))
         };
+        let not_opp_pawn = |f: usize, r: usize| {
+            AtomPredicate::NotPiece(sq_in_frame(f, r), Piece::new(opp, Role::Pawn))
+        };
+        let own_bishop = |f: usize, r: usize| {
+            AtomPredicate::HasPiece(sq_in_frame(f, r), Piece::new(side, Role::Bishop))
+        };
+        let opp_bishop = |f: usize, r: usize| {
+            AtomPredicate::HasPiece(sq_in_frame(f, r), Piece::new(opp, Role::Bishop))
+        };
         let put_own = |file: usize, rank_0: usize, role: Role| {
             let sq = sq_in_frame(file, rank_0);
             squares.borrow_mut()[sq.to_u32() as usize] =
@@ -1280,11 +1456,44 @@ impl StructurePreset {
                 SquareConstraint::Piece(Piece::new(opp, role));
         };
 
+        let emit_carlsbad_fian_base = |clauses: &mut Vec<PatternClause>| {
+            put_own(7, 1, Role::Pawn);
+            put_own(4, 2, Role::Pawn);
+            put_own(3, 3, Role::Pawn);
+            put_opp(3, 4, Role::Pawn);
+            put_opp(2, 5, Role::Pawn);
+            clauses.push(PatternClause {
+                op: ClauseOp::AllOf,
+                atoms: vec![no_own_pawn_file(2), no_opp_pawn_file(4)],
+            });
+            clauses.push(PatternClause {
+                op: ClauseOp::AnyOf,
+                atoms: vec![own_pawn(5, 1), own_pawn(5, 2)],
+            });
+            clauses.push(PatternClause {
+                op: ClauseOp::AnyOf,
+                atoms: vec![own_pawn(1, 1), own_pawn(1, 2), own_pawn(1, 3)],
+            });
+            clauses.push(PatternClause {
+                op: ClauseOp::AnyOf,
+                atoms: vec![own_pawn(0, 1), own_pawn(0, 2), own_pawn(0, 3)],
+            });
+            clauses.push(PatternClause {
+                op: ClauseOp::AnyOf,
+                atoms: vec![opp_pawn(1, 6), opp_pawn(1, 5)],
+            });
+            clauses.push(PatternClause {
+                op: ClauseOp::AnyOf,
+                atoms: vec![opp_pawn(0, 6), opp_pawn(0, 5), opp_pawn(0, 4)],
+            });
+        };
+
         match self {
             Self::StonewallAny => {
                 put_own(3, 3, Role::Pawn);
                 put_own(4, 2, Role::Pawn);
                 put_own(5, 3, Role::Pawn);
+                put_opp(3, 4, Role::Pawn);
                 clauses.push(PatternClause {
                     op: ClauseOp::NoneOf,
                     atoms: vec![own_pawn(4, 3)],
@@ -1295,9 +1504,10 @@ impl StructurePreset {
                 put_own(3, 3, Role::Pawn);
                 put_own(4, 2, Role::Pawn);
                 put_own(5, 3, Role::Pawn);
+                put_opp(3, 4, Role::Pawn);
                 clauses.push(PatternClause {
                     op: ClauseOp::NoneOf,
-                    atoms: vec![own_pawn(4, 3)],
+                    atoms: vec![own_pawn(4, 3), own_pawn(2, 3)],
                 });
             }
             Self::StonewallNc6 => {
@@ -1305,9 +1515,10 @@ impl StructurePreset {
                 put_own(4, 2, Role::Pawn);
                 put_own(5, 3, Role::Pawn);
                 put_own(2, 2, Role::Knight);
+                put_opp(3, 4, Role::Pawn);
                 clauses.push(PatternClause {
                     op: ClauseOp::NoneOf,
-                    atoms: vec![own_pawn(4, 3)],
+                    atoms: vec![own_pawn(4, 3), own_pawn(2, 2), own_pawn(2, 3)],
                 });
             }
             Self::StonewallBadBishopTrade => {
@@ -1315,16 +1526,14 @@ impl StructurePreset {
                 put_own(3, 3, Role::Pawn);
                 put_own(4, 2, Role::Pawn);
                 put_own(5, 3, Role::Pawn);
+                put_opp(3, 4, Role::Pawn);
                 clauses.push(PatternClause {
                     op: ClauseOp::NoneOf,
                     atoms: vec![own_pawn(4, 3)],
                 });
                 clauses.push(PatternClause {
                     op: ClauseOp::AnyOf,
-                    atoms: vec![
-                        AtomPredicate::HasPiece(sq_in_frame(0, 2), Piece::new(side, Role::Bishop)),
-                        AtomPredicate::IsEmpty(sq_in_frame(2, 0)),
-                    ],
+                    atoms: vec![own_bishop(0, 2), AtomPredicate::IsEmpty(sq_in_frame(2, 0))],
                 });
             }
             Self::StonewallC5Break => {
@@ -1332,6 +1541,7 @@ impl StructurePreset {
                 put_own(3, 3, Role::Pawn);
                 put_own(4, 2, Role::Pawn);
                 put_own(5, 3, Role::Pawn);
+                put_opp(3, 4, Role::Pawn);
                 clauses.push(PatternClause {
                     op: ClauseOp::NoneOf,
                     atoms: vec![own_pawn(4, 3)],
@@ -1342,14 +1552,10 @@ impl StructurePreset {
                 put_own(3, 3, Role::Pawn);
                 put_own(4, 2, Role::Pawn);
                 put_own(5, 3, Role::Pawn);
-                put_opp(5, 5, Role::Knight);
+                put_opp(3, 4, Role::Pawn);
                 clauses.push(PatternClause {
                     op: ClauseOp::AnyOf,
-                    atoms: vec![
-                        AtomPredicate::HasPiece(sq_in_frame(3, 1), Piece::new(side, Role::Bishop)),
-                        AtomPredicate::HasPiece(sq_in_frame(4, 0), Piece::new(side, Role::Bishop)),
-                        AtomPredicate::HasPiece(sq_in_frame(7, 3), Piece::new(side, Role::Bishop)),
-                    ],
+                    atoms: vec![own_bishop(4, 0), own_bishop(7, 3)],
                 });
                 clauses.push(PatternClause {
                     op: ClauseOp::NoneOf,
@@ -1357,7 +1563,6 @@ impl StructurePreset {
                 });
             }
             Self::BadewanneAny | Self::BadewanneFlexibleRim => {
-                // Seed the classic central Badewanne pattern plus an OR option shifted one rank higher.
                 put_own(2, 3, Role::Pawn);
                 put_own(3, 2, Role::Pawn);
                 put_own(4, 2, Role::Pawn);
@@ -1377,31 +1582,57 @@ impl StructurePreset {
                     atoms: vec![not_own_pawn(3, 3), not_own_pawn(4, 3)],
                 });
             }
+            // HANDCRAFTED (DO NOT OVERWRITE IN BATCH CHANGES — see docs/HANDCRAFTED_FILTERS.md)
             Self::CarlsbadAny => {
-                put_own(3, 3, Role::Pawn);
-                put_opp(2, 5, Role::Pawn);
-                put_opp(3, 4, Role::Pawn);
+                emit_carlsbad_fian_base(&mut clauses);
                 clauses.push(PatternClause {
                     op: ClauseOp::AnyOf,
-                    atoms: vec![own_pawn(4, 2), own_pawn(4, 3)],
-                });
-                clauses.push(PatternClause {
-                    op: ClauseOp::AllOf,
-                    atoms: vec![no_own_pawn_file(2), no_opp_pawn_file(4)],
+                    atoms: vec![own_pawn(6, 1), own_pawn(6, 2)],
                 });
             }
+            Self::CarlsbadNoFianchettoBoth => {
+                emit_carlsbad_fian_base(&mut clauses);
+                put_own(6, 1, Role::Pawn);
+                put_opp(6, 6, Role::Pawn);
+                clauses.push(PatternClause {
+                    op: ClauseOp::NoneOf,
+                    atoms: vec![own_pawn(6, 2), own_bishop(6, 1), opp_pawn(6, 5), opp_bishop(6, 6)],
+                });
+            }
+            Self::CarlsbadBlackFianchetto => {
+                emit_carlsbad_fian_base(&mut clauses);
+                put_own(6, 1, Role::Pawn);
+                put_opp(6, 5, Role::Pawn);
+                put_opp(6, 6, Role::Bishop);
+                clauses.push(PatternClause {
+                    op: ClauseOp::NoneOf,
+                    atoms: vec![own_pawn(6, 2), own_bishop(6, 1)],
+                });
+            }
+            Self::CarlsbadWhiteFianchetto => {
+                emit_carlsbad_fian_base(&mut clauses);
+                put_own(6, 2, Role::Pawn);
+                put_own(6, 1, Role::Bishop);
+                put_opp(6, 6, Role::Pawn);
+                clauses.push(PatternClause {
+                    op: ClauseOp::NoneOf,
+                    atoms: vec![opp_pawn(6, 5), opp_bishop(6, 6)],
+                });
+            }
+            Self::CarlsbadDoubleFianchetto => {
+                emit_carlsbad_fian_base(&mut clauses);
+                put_own(6, 2, Role::Pawn);
+                put_own(6, 1, Role::Bishop);
+                put_opp(6, 5, Role::Pawn);
+                put_opp(6, 6, Role::Bishop);
+            }
+            // HANDCRAFTED (DO NOT OVERWRITE IN BATCH CHANGES — see docs/HANDCRAFTED_FILTERS.md)
             Self::CarlsbadMinorityAttack => {
+                put_own(4, 2, Role::Pawn);
                 put_own(3, 3, Role::Pawn);
-                put_opp(2, 5, Role::Pawn);
+                put_own(1, 4, Role::Pawn);
                 put_opp(3, 4, Role::Pawn);
-                clauses.push(PatternClause {
-                    op: ClauseOp::AnyOf,
-                    atoms: vec![own_pawn(4, 2), own_pawn(4, 3)],
-                });
-                clauses.push(PatternClause {
-                    op: ClauseOp::AnyOf,
-                    atoms: vec![own_pawn(1, 3), own_pawn(1, 4)],
-                });
+                put_opp(2, 5, Role::Pawn);
                 clauses.push(PatternClause {
                     op: ClauseOp::AllOf,
                     atoms: vec![no_own_pawn_file(2), no_opp_pawn_file(4)],
@@ -1415,6 +1646,14 @@ impl StructurePreset {
                 clauses.push(PatternClause {
                     op: ClauseOp::AllOf,
                     atoms: vec![no_own_pawn_file(2), no_opp_pawn_file(4)],
+                });
+                clauses.push(PatternClause {
+                    op: ClauseOp::AnyOf,
+                    atoms: vec![own_pawn(7, 1), own_pawn(7, 2)],
+                });
+                clauses.push(PatternClause {
+                    op: ClauseOp::AnyOf,
+                    atoms: vec![opp_pawn(1, 6), opp_pawn(1, 5)],
                 });
             }
             Self::CarlsbadF3E4 => {
@@ -1442,6 +1681,8 @@ impl StructurePreset {
                         no_own_pawn_file(2),
                         no_own_pawn_file(4),
                         no_opp_pawn_file(3),
+                        not_own_pawn(3, 1),
+                        not_own_pawn(3, 2),
                     ],
                 });
             }
@@ -1461,6 +1702,8 @@ impl StructurePreset {
                     no_own_pawn_file(2),
                     no_own_pawn_file(4),
                     no_opp_pawn_file(3),
+                    not_own_pawn(3, 1),
+                    not_own_pawn(3, 2),
                 ];
                 if matches!(
                     self,
@@ -1494,13 +1737,7 @@ impl StructurePreset {
                     put_opp(6, 6, Role::Pawn);
                     clauses.push(PatternClause {
                         op: ClauseOp::NoneOf,
-                        atoms: vec![
-                            opp_pawn(6, 5),
-                            AtomPredicate::HasPiece(
-                                sq_in_frame(6, 6),
-                                Piece::new(opp, Role::Bishop),
-                            ),
-                        ],
+                        atoms: vec![opp_pawn(6, 5), opp_bishop(6, 6)],
                     });
                 } else if matches!(
                     self,
@@ -1535,9 +1772,8 @@ impl StructurePreset {
                     atoms: vec![own_pawn(2, 3), own_pawn(3, 3), own_pawn(4, 3)],
                 });
             }
-            Self::HangingPawnsClassic
-            | Self::HangingPawnsVsNoFianchetto
-            | Self::HangingPawnsVsFianchetto => {
+            // HANDCRAFTED (DO NOT OVERWRITE IN BATCH CHANGES — see docs/HANDCRAFTED_FILTERS.md)
+            Self::HangingPawnsClassic => {
                 put_own(2, 3, Role::Pawn);
                 put_own(3, 3, Role::Pawn);
                 clauses.push(PatternClause {
@@ -1557,19 +1793,46 @@ impl StructurePreset {
                     op: ClauseOp::AnyOf,
                     atoms: vec![opp_pawn(4, 6), opp_pawn(4, 5)],
                 });
+            }
+            Self::HangingPawnsVsNoFianchetto | Self::HangingPawnsVsFianchetto => {
+                put_own(2, 3, Role::Pawn);
+                put_own(3, 3, Role::Pawn);
+                clauses.push(PatternClause {
+                    op: ClauseOp::AllOf,
+                    atoms: vec![
+                        no_own_pawn_file(4),
+                        no_own_pawn_file(1),
+                        no_opp_pawn_file(2),
+                        no_opp_pawn_file(3),
+                        not_own_pawn(2, 1),
+                        not_own_pawn(2, 2),
+                        not_own_pawn(3, 1),
+                        not_own_pawn(3, 2),
+                    ],
+                });
+                clauses.push(PatternClause {
+                    op: ClauseOp::AnyOf,
+                    atoms: vec![opp_pawn(1, 6), opp_pawn(1, 5)],
+                });
+                clauses.push(PatternClause {
+                    op: ClauseOp::AnyOf,
+                    atoms: vec![opp_pawn(4, 6), opp_pawn(4, 5)],
+                });
+                clauses.push(PatternClause {
+                    op: ClauseOp::AnyOf,
+                    atoms: vec![own_pawn(5, 1), own_pawn(5, 2)],
+                });
+                clauses.push(PatternClause {
+                    op: ClauseOp::AnyOf,
+                    atoms: vec![own_pawn(7, 1), own_pawn(7, 2)],
+                });
                 if self == Self::HangingPawnsVsNoFianchetto {
                     put_opp(6, 6, Role::Pawn);
                     clauses.push(PatternClause {
                         op: ClauseOp::NoneOf,
-                        atoms: vec![
-                            opp_pawn(6, 5),
-                            AtomPredicate::HasPiece(
-                                sq_in_frame(6, 6),
-                                Piece::new(opp, Role::Bishop),
-                            ),
-                        ],
+                        atoms: vec![opp_pawn(6, 5), opp_bishop(6, 6)],
                     });
-                } else if self == Self::HangingPawnsVsFianchetto {
+                } else {
                     put_opp(6, 5, Role::Pawn);
                     put_opp(6, 6, Role::Bishop);
                 }
@@ -1592,6 +1855,14 @@ impl StructurePreset {
                         no_opp_pawn_file(3),
                     ],
                 });
+                clauses.push(PatternClause {
+                    op: ClauseOp::AnyOf,
+                    atoms: vec![own_pawn(5, 1), own_pawn(5, 2)],
+                });
+                clauses.push(PatternClause {
+                    op: ClauseOp::AnyOf,
+                    atoms: vec![own_pawn(7, 1), own_pawn(7, 2)],
+                });
             }
             Self::MaroczyBindAny => {
                 put_own(2, 3, Role::Pawn);
@@ -1599,9 +1870,26 @@ impl StructurePreset {
                 put_opp(3, 5, Role::Pawn);
                 clauses.push(PatternClause {
                     op: ClauseOp::AllOf,
-                    atoms: vec![no_own_pawn_file(3), no_opp_pawn_file(2)],
+                    atoms: vec![
+                        no_own_pawn_file(3),
+                        no_opp_pawn_file(2),
+                        not_opp_pawn(4, 4),
+                        not_own_pawn(2, 1),
+                        not_own_pawn(2, 2),
+                        not_own_pawn(4, 1),
+                        not_own_pawn(4, 2),
+                    ],
+                });
+                clauses.push(PatternClause {
+                    op: ClauseOp::AnyOf,
+                    atoms: vec![opp_pawn(1, 6), opp_pawn(1, 5)],
+                });
+                clauses.push(PatternClause {
+                    op: ClauseOp::AnyOf,
+                    atoms: vec![opp_pawn(5, 6), opp_pawn(5, 5)],
                 });
             }
+            // HANDCRAFTED (DO NOT OVERWRITE IN BATCH CHANGES — see docs/HANDCRAFTED_FILTERS.md)
             Self::MaroczyBindNoFianchetto => {
                 put_own(0, 1, Role::Pawn);
                 put_own(6, 1, Role::Pawn);
@@ -1640,6 +1928,7 @@ impl StructurePreset {
                     atoms: vec![own_pawn(7, 1), own_pawn(7, 2)],
                 });
             }
+            // HANDCRAFTED (DO NOT OVERWRITE IN BATCH CHANGES — see docs/HANDCRAFTED_FILTERS.md)
             Self::MaroczyBindFianchetto => {
                 put_own(0, 1, Role::Pawn);
                 put_own(5, 1, Role::Pawn);
@@ -1677,7 +1966,7 @@ impl StructurePreset {
                     atoms: vec![no_opp_pawn_file(2), no_own_pawn_file(3)],
                 });
             }
-            Self::Hedgehog => {
+            Self::Hedgehog | Self::HedgehogVsBg2 => {
                 put_own(0, 2, Role::Pawn);
                 put_own(1, 2, Role::Pawn);
                 put_own(3, 2, Role::Pawn);
@@ -1686,16 +1975,41 @@ impl StructurePreset {
                 put_opp(4, 4, Role::Pawn);
                 clauses.push(PatternClause {
                     op: ClauseOp::AllOf,
-                    atoms: vec![no_own_pawn_file(2), no_opp_pawn_file(3)],
+                    atoms: vec![
+                        no_own_pawn_file(2),
+                        no_opp_pawn_file(3),
+                        not_own_pawn(3, 3),
+                        not_own_pawn(4, 3),
+                    ],
                 });
+                clauses.push(PatternClause {
+                    op: ClauseOp::AnyOf,
+                    atoms: vec![own_pawn(5, 1), own_pawn(5, 2)],
+                });
+                clauses.push(PatternClause {
+                    op: ClauseOp::AnyOf,
+                    atoms: vec![own_pawn(6, 1), own_pawn(6, 2)],
+                });
+                if self == Self::HedgehogVsBg2 {
+                    put_opp(6, 5, Role::Pawn);
+                    put_opp(6, 6, Role::Bishop);
+                }
             }
             Self::Boleslavsky => {
                 put_own(3, 2, Role::Pawn);
                 put_own(4, 3, Role::Pawn);
                 put_opp(4, 4, Role::Pawn);
                 clauses.push(PatternClause {
+                    op: ClauseOp::AnyOf,
+                    atoms: vec![opp_pawn(2, 6), opp_pawn(2, 5)],
+                });
+                clauses.push(PatternClause {
                     op: ClauseOp::AllOf,
-                    atoms: vec![no_own_pawn_file(2), no_opp_pawn_file(3)],
+                    atoms: vec![
+                        no_own_pawn_file(2),
+                        no_opp_pawn_file(3),
+                        not_opp_pawn(2, 4),
+                    ],
                 });
             }
             Self::Scheveningen => {
@@ -1703,8 +2017,17 @@ impl StructurePreset {
                 put_own(4, 2, Role::Pawn);
                 put_opp(4, 4, Role::Pawn);
                 clauses.push(PatternClause {
+                    op: ClauseOp::AnyOf,
+                    atoms: vec![opp_pawn(2, 6), opp_pawn(2, 5)],
+                });
+                clauses.push(PatternClause {
                     op: ClauseOp::AllOf,
-                    atoms: vec![no_own_pawn_file(2), no_opp_pawn_file(3)],
+                    atoms: vec![
+                        no_own_pawn_file(2),
+                        no_opp_pawn_file(3),
+                        not_opp_pawn(2, 4),
+                        not_own_pawn(6, 2),
+                    ],
                 });
             }
             Self::Dragon => {
@@ -1713,8 +2036,17 @@ impl StructurePreset {
                 put_own(6, 1, Role::Bishop);
                 put_opp(4, 4, Role::Pawn);
                 clauses.push(PatternClause {
+                    op: ClauseOp::AnyOf,
+                    atoms: vec![opp_pawn(2, 6), opp_pawn(2, 5)],
+                });
+                clauses.push(PatternClause {
                     op: ClauseOp::AllOf,
-                    atoms: vec![no_own_pawn_file(2), no_opp_pawn_file(3)],
+                    atoms: vec![
+                        no_own_pawn_file(2),
+                        no_opp_pawn_file(3),
+                        not_opp_pawn(2, 4),
+                        not_own_pawn(4, 3),
+                    ],
                 });
             }
             Self::NajdorfStructure => {
@@ -1726,29 +2058,59 @@ impl StructurePreset {
                     atoms: vec![own_pawn(4, 2), own_pawn(4, 3)],
                 });
                 clauses.push(PatternClause {
+                    op: ClauseOp::AnyOf,
+                    atoms: vec![opp_pawn(2, 6), opp_pawn(2, 5)],
+                });
+                clauses.push(PatternClause {
                     op: ClauseOp::AllOf,
-                    atoms: vec![no_own_pawn_file(2), no_opp_pawn_file(3)],
+                    atoms: vec![
+                        no_own_pawn_file(2),
+                        no_opp_pawn_file(3),
+                        not_opp_pawn(2, 4),
+                        not_own_pawn(6, 2),
+                        not_own_pawn(1, 2),
+                    ],
                 });
             }
-            Self::NajdorfTypeII => {
+            Self::NajdorfQueensideB5 => {
                 put_own(0, 2, Role::Pawn);
                 put_own(1, 3, Role::Pawn);
                 put_own(3, 2, Role::Pawn);
                 put_opp(4, 4, Role::Pawn);
                 clauses.push(PatternClause {
+                    op: ClauseOp::AnyOf,
+                    atoms: vec![own_pawn(4, 2), own_pawn(4, 3)],
+                });
+                clauses.push(PatternClause {
+                    op: ClauseOp::AnyOf,
+                    atoms: vec![opp_pawn(2, 6), opp_pawn(2, 5)],
+                });
+                clauses.push(PatternClause {
                     op: ClauseOp::AllOf,
-                    atoms: vec![no_own_pawn_file(2), no_opp_pawn_file(3)],
+                    atoms: vec![
+                        no_own_pawn_file(2),
+                        no_opp_pawn_file(3),
+                        not_opp_pawn(2, 4),
+                    ],
                 });
             }
-            Self::NajdorfTypeIII => {
+            Self::NajdorfE5VsF4 => {
                 put_own(0, 2, Role::Pawn);
                 put_own(3, 2, Role::Pawn);
                 put_own(4, 3, Role::Pawn);
                 put_opp(4, 4, Role::Pawn);
                 put_opp(5, 4, Role::Pawn);
                 clauses.push(PatternClause {
+                    op: ClauseOp::AnyOf,
+                    atoms: vec![opp_pawn(2, 6), opp_pawn(2, 5)],
+                });
+                clauses.push(PatternClause {
                     op: ClauseOp::AllOf,
-                    atoms: vec![no_own_pawn_file(2), no_opp_pawn_file(3)],
+                    atoms: vec![
+                        no_own_pawn_file(2),
+                        no_opp_pawn_file(3),
+                        not_opp_pawn(2, 4),
+                    ],
                 });
             }
             Self::PanovFormation => {
@@ -1758,7 +2120,44 @@ impl StructurePreset {
                 put_opp(4, 5, Role::Pawn);
                 clauses.push(PatternClause {
                     op: ClauseOp::AllOf,
-                    atoms: vec![no_own_pawn_file(4), no_opp_pawn_file(2)],
+                    atoms: vec![
+                        no_own_pawn_file(4),
+                        no_opp_pawn_file(2),
+                        not_own_pawn(2, 1),
+                        not_own_pawn(2, 2),
+                        not_own_pawn(3, 1),
+                        not_own_pawn(3, 2),
+                        not_opp_pawn(5, 4),
+                    ],
+                });
+            }
+            Self::SlavCaroKann => {
+                put_own(2, 2, Role::Pawn);
+                put_opp(3, 4, Role::Pawn);
+                clauses.push(PatternClause {
+                    op: ClauseOp::AnyOf,
+                    atoms: vec![own_pawn(4, 2), own_pawn(4, 1)],
+                });
+                clauses.push(PatternClause {
+                    op: ClauseOp::AnyOf,
+                    atoms: vec![opp_pawn(2, 5), opp_pawn(2, 6)],
+                });
+                clauses.push(PatternClause {
+                    op: ClauseOp::AllOf,
+                    atoms: vec![no_own_pawn_file(3), no_opp_pawn_file(4)],
+                });
+            }
+            Self::SlavMainline => {
+                put_own(2, 2, Role::Pawn);
+                put_own(4, 2, Role::Pawn);
+                put_opp(3, 4, Role::Pawn);
+                clauses.push(PatternClause {
+                    op: ClauseOp::AnyOf,
+                    atoms: vec![opp_pawn(4, 5), opp_pawn(4, 4)],
+                });
+                clauses.push(PatternClause {
+                    op: ClauseOp::AllOf,
+                    atoms: vec![no_own_pawn_file(3), no_opp_pawn_file(2)],
                 });
             }
             Self::SlavFormation => {
@@ -1771,6 +2170,24 @@ impl StructurePreset {
                     op: ClauseOp::AnyOf,
                     atoms: vec![own_pawn(2, 2), own_pawn(2, 3)],
                 });
+                clauses.push(PatternClause {
+                    op: ClauseOp::NoneOf,
+                    atoms: vec![own_pawn(4, 3), opp_pawn(2, 4), opp_pawn(4, 4)],
+                });
+            }
+            Self::SemiSlavMeran => {
+                put_own(0, 2, Role::Pawn);
+                put_own(1, 3, Role::Pawn);
+                put_own(4, 2, Role::Pawn);
+                put_opp(3, 4, Role::Pawn);
+                clauses.push(PatternClause {
+                    op: ClauseOp::AnyOf,
+                    atoms: vec![opp_pawn(4, 5), opp_pawn(4, 4)],
+                });
+                clauses.push(PatternClause {
+                    op: ClauseOp::AllOf,
+                    atoms: vec![no_own_pawn_file(3), no_opp_pawn_file(2)],
+                });
             }
             Self::GrunfeldCenter => {
                 put_own(3, 3, Role::Pawn);
@@ -1778,14 +2195,57 @@ impl StructurePreset {
                 put_opp(6, 5, Role::Pawn);
                 put_opp(6, 6, Role::Bishop);
                 clauses.push(PatternClause {
-                    op: ClauseOp::NoneOf,
-                    atoms: vec![own_pawn(2, 3)],
+                    op: ClauseOp::AnyOf,
+                    atoms: vec![own_pawn(2, 2), no_own_pawn_file(2)],
                 });
                 clauses.push(PatternClause {
                     op: ClauseOp::AllOf,
-                    atoms: vec![no_opp_pawn_file(3)],
+                    atoms: vec![no_opp_pawn_file(3), not_opp_pawn(2, 5)],
                 });
             }
+            Self::GrunfeldD5PassedPawn => {
+                put_own(3, 4, Role::Pawn);
+                put_own(4, 3, Role::Pawn);
+                put_opp(6, 5, Role::Pawn);
+                put_opp(6, 6, Role::Bishop);
+                clauses.push(PatternClause {
+                    op: ClauseOp::AllOf,
+                    atoms: vec![
+                        no_opp_pawn_file(2),
+                        no_opp_pawn_file(3),
+                        not_own_pawn(2, 3),
+                    ],
+                });
+            }
+            Self::GrunfeldQueensideMajority => {
+                put_own(6, 2, Role::Pawn);
+                put_own(6, 1, Role::Bishop);
+                clauses.push(PatternClause {
+                    op: ClauseOp::AnyOf,
+                    atoms: vec![own_pawn(0, 1), own_pawn(0, 2), own_pawn(0, 3)],
+                });
+                clauses.push(PatternClause {
+                    op: ClauseOp::AnyOf,
+                    atoms: vec![own_pawn(1, 1), own_pawn(1, 2), own_pawn(1, 3)],
+                });
+                clauses.push(PatternClause {
+                    op: ClauseOp::AnyOf,
+                    atoms: vec![opp_pawn(4, 4), opp_pawn(3, 4)],
+                });
+                clauses.push(PatternClause {
+                    op: ClauseOp::AnyOf,
+                    atoms: vec![no_opp_pawn_file(0), no_opp_pawn_file(1)],
+                });
+                clauses.push(PatternClause {
+                    op: ClauseOp::AllOf,
+                    atoms: vec![
+                        no_own_pawn_file(2),
+                        no_own_pawn_file(3),
+                        no_opp_pawn_file(2),
+                    ],
+                });
+            }
+            // HANDCRAFTED (DO NOT OVERWRITE IN BATCH CHANGES — see docs/HANDCRAFTED_FILTERS.md)
             Self::Botvinnik => {
                 put_own(1, 1, Role::Pawn);
                 put_own(4, 1, Role::Knight);
@@ -1808,12 +2268,39 @@ impl StructurePreset {
                 put_own(4, 3, Role::Pawn);
                 put_own(6, 2, Role::Pawn);
                 put_own(6, 1, Role::Bishop);
+                clauses.push(PatternClause {
+                    op: ClauseOp::NoneOf,
+                    atoms: vec![own_pawn(3, 3), own_pawn(4, 2)],
+                });
+                clauses.push(PatternClause {
+                    op: ClauseOp::AnyOf,
+                    atoms: vec![own_pawn(1, 1), own_pawn(1, 2)],
+                });
+                clauses.push(PatternClause {
+                    op: ClauseOp::AnyOf,
+                    atoms: vec![own_pawn(5, 1), own_pawn(5, 2), own_pawn(5, 3)],
+                });
             }
             Self::FrenchChain => {
                 put_own(3, 3, Role::Pawn);
                 put_own(4, 4, Role::Pawn);
                 put_opp(3, 4, Role::Pawn);
                 put_opp(4, 5, Role::Pawn);
+                clauses.push(PatternClause {
+                    op: ClauseOp::NoneOf,
+                    atoms: vec![own_pawn(4, 3), own_pawn(3, 2), opp_pawn(2, 5)],
+                });
+            }
+            Self::FrenchWinawerC4 => {
+                put_own(3, 3, Role::Pawn);
+                put_own(4, 4, Role::Pawn);
+                put_opp(2, 4, Role::Pawn);
+                put_opp(3, 4, Role::Pawn);
+                put_opp(4, 5, Role::Pawn);
+                clauses.push(PatternClause {
+                    op: ClauseOp::AnyOf,
+                    atoms: vec![own_pawn(2, 2), own_pawn(2, 3)],
+                });
                 clauses.push(PatternClause {
                     op: ClauseOp::NoneOf,
                     atoms: vec![own_pawn(4, 3)],
@@ -1824,8 +2311,12 @@ impl StructurePreset {
                 put_opp(2, 4, Role::Pawn);
                 put_opp(4, 5, Role::Pawn);
                 clauses.push(PatternClause {
+                    op: ClauseOp::AnyOf,
+                    atoms: vec![own_pawn(2, 1), own_pawn(2, 2)],
+                });
+                clauses.push(PatternClause {
                     op: ClauseOp::AllOf,
-                    atoms: vec![no_own_pawn_file(4), no_opp_pawn_file(3)],
+                    atoms: vec![no_own_pawn_file(4), no_opp_pawn_file(3), not_own_pawn(3, 2)],
                 });
             }
             Self::KingsIndianChain => {
@@ -1835,6 +2326,11 @@ impl StructurePreset {
                 put_opp(3, 5, Role::Pawn);
                 put_opp(4, 4, Role::Pawn);
                 put_opp(6, 5, Role::Pawn);
+                put_opp(6, 6, Role::Bishop);
+                clauses.push(PatternClause {
+                    op: ClauseOp::NoneOf,
+                    atoms: vec![opp_pawn(2, 4)],
+                });
             }
             Self::KingsIndianC5Chain => {
                 put_own(2, 3, Role::Pawn);
@@ -1843,36 +2339,75 @@ impl StructurePreset {
                 put_opp(2, 4, Role::Pawn);
                 put_opp(3, 5, Role::Pawn);
                 put_opp(4, 4, Role::Pawn);
+                put_opp(6, 5, Role::Pawn);
+                clauses.push(PatternClause {
+                    op: ClauseOp::NoneOf,
+                    atoms: vec![own_pawn(3, 3), own_pawn(4, 4)],
+                });
+            }
+            Self::KingsIndianExchange => {
+                put_own(2, 3, Role::Pawn);
+                put_own(4, 3, Role::Pawn);
+                put_opp(4, 4, Role::Pawn);
+                put_opp(6, 5, Role::Pawn);
+                put_opp(6, 6, Role::Bishop);
+                clauses.push(PatternClause {
+                    op: ClauseOp::AllOf,
+                    atoms: vec![no_own_pawn_file(3), no_opp_pawn_file(3)],
+                });
             }
             Self::BenoniStructure => {
                 put_own(2, 3, Role::Pawn);
                 put_own(3, 2, Role::Pawn);
+                put_own(6, 2, Role::Pawn);
                 put_opp(3, 3, Role::Pawn);
                 put_opp(4, 4, Role::Pawn);
                 clauses.push(PatternClause {
                     op: ClauseOp::AllOf,
                     atoms: vec![no_own_pawn_file(4), no_opp_pawn_file(2)],
                 });
-            }
-            Self::SlavCaroKann => {
-                put_own(2, 2, Role::Pawn);
-                put_own(3, 3, Role::Pawn);
-                put_opp(3, 4, Role::Pawn);
                 clauses.push(PatternClause {
                     op: ClauseOp::AnyOf,
-                    atoms: vec![opp_pawn(2, 4), opp_pawn(4, 4)],
+                    atoms: vec![own_pawn(0, 1), own_pawn(0, 2)],
                 });
                 clauses.push(PatternClause {
+                    op: ClauseOp::AnyOf,
+                    atoms: vec![own_pawn(1, 1), own_pawn(1, 2), own_pawn(1, 3)],
+                });
+            }
+            Self::BenkoGambit => {
+                put_own(2, 3, Role::Pawn);
+                put_own(3, 2, Role::Pawn);
+                put_own(6, 2, Role::Pawn);
+                put_own(6, 1, Role::Bishop);
+                put_opp(3, 3, Role::Pawn);
+                clauses.push(PatternClause {
                     op: ClauseOp::AllOf,
-                    atoms: vec![
-                        no_own_pawn_file(4),
-                        AtomPredicate::NotPiece(sq_in_frame(3, 3), Piece::new(opp, Role::Pawn)),
-                    ],
+                    atoms: vec![no_own_pawn_file(0), no_own_pawn_file(1), no_opp_pawn_file(2)],
+                });
+            }
+            Self::CzechBenoni => {
+                put_own(2, 3, Role::Pawn);
+                put_own(3, 2, Role::Pawn);
+                put_own(4, 3, Role::Pawn);
+                put_opp(2, 4, Role::Pawn);
+                put_opp(3, 3, Role::Pawn);
+                put_opp(4, 4, Role::Pawn);
+                clauses.push(PatternClause {
+                    op: ClauseOp::NoneOf,
+                    atoms: vec![own_pawn(6, 2)],
                 });
             }
             Self::NimzoDoubledCPawns => {
                 put_own(2, 2, Role::Pawn);
-                put_own(2, 3, Role::Pawn);
+                clauses.push(PatternClause {
+                    op: ClauseOp::AllOf,
+                    atoms: vec![no_own_pawn_file(1)],
+                });
+                clauses.push(PatternClause {
+                    op: ClauseOp::AnyOf,
+                    atoms: vec![own_pawn(2, 3), own_pawn(2, 4)],
+                });
                 clauses.push(PatternClause {
                     op: ClauseOp::AnyOf,
                     atoms: vec![own_pawn(3, 2), own_pawn(3, 3)],
@@ -2005,6 +2540,10 @@ impl NormalizedBoard {
     fn matches_badewanne(self, file_start: usize, file_end: usize, flexible_rim: bool) -> bool {
         // Backwards pawns strictly on ranks 3..=5 (0-based indices 2..=4).
         for f in file_start..=file_end {
+            if f == 4 && (self.own_bishops & sq_bit(6, 1)) != 0 {
+                // Exclude kingside fianchetto structures (g3+Bg2) mistaken for e4-f3-g3-h4.
+                continue;
+            }
             for r in 2..=4 {
                 let inner_l = sq_bit(f + 1, r);
                 let inner_r = sq_bit(f + 2, r);
@@ -2045,6 +2584,7 @@ impl NormalizedBoard {
 
     fn has_iqp_d_core(self) -> bool {
         (self.own_pawns & (sq_bit(3, 3) | sq_bit(3, 4))) != 0
+            && (self.is_union || (self.own_pawns & FILE_MASKS[3]).count_ones() == 1)
             && self.no_own_pawns(FILE_MASKS[2] | FILE_MASKS[4])
             && self.no_opp_pawns(FILE_MASKS[3])
     }
@@ -2057,6 +2597,28 @@ impl NormalizedBoard {
         self.has_opp_pawns(sq_bit(6, 6))
             && self.no_opp_pawns(sq_bit(6, 5))
             && (self.is_union || (self.opp_bishops & sq_bit(6, 6)) == 0)
+    }
+
+    fn has_own_k_fianchetto(self) -> bool {
+        self.has_own_pawns(sq_bit(6, 2)) && (self.own_bishops & sq_bit(6, 1)) != 0
+    }
+
+    fn has_own_no_k_fianchetto(self) -> bool {
+        self.has_own_pawns(sq_bit(6, 1))
+            && self.no_own_pawns(sq_bit(6, 2))
+            && (self.is_union || (self.own_bishops & sq_bit(6, 1)) == 0)
+    }
+
+    fn has_carlsbad_fian_base(self) -> bool {
+        self.has_own_pawns(sq_bit(7, 1) | sq_bit(4, 2) | sq_bit(3, 3))
+            && self.no_own_pawns(FILE_MASKS[2])
+            && (self.own_pawns & (sq_bit(5, 1) | sq_bit(5, 2))) != 0
+            && (self.own_pawns & (sq_bit(1, 1) | sq_bit(1, 2) | sq_bit(1, 3))) != 0
+            && (self.own_pawns & (sq_bit(0, 1) | sq_bit(0, 2) | sq_bit(0, 3))) != 0
+            && self.has_opp_pawns(sq_bit(3, 4) | sq_bit(2, 5))
+            && self.no_opp_pawns(FILE_MASKS[4])
+            && (self.opp_pawns & (sq_bit(1, 6) | sq_bit(1, 5))) != 0
+            && (self.opp_pawns & (sq_bit(0, 6) | sq_bit(0, 5) | sq_bit(0, 4))) != 0
     }
 
     fn has_opp_e_pawn_iqp(self) -> bool {
@@ -2076,13 +2638,19 @@ impl NormalizedBoard {
     }
 
     fn has_stonewall_core(self) -> bool {
+        let opp_center = (self.opp_pawns & sq_bit(3, 4)) != 0
+            || (self.has_own_pawns(sq_bit(2, 2))
+                && (self.opp_pawns & (sq_bit(2, 4) | sq_bit(3, 4) | sq_bit(4, 4))) != 0);
         let intact = self.has_own_pawns(sq_bit(3, 3) | sq_bit(4, 2) | sq_bit(5, 3))
-            && self.no_own_pawns(sq_bit(4, 3));
+            && self.no_own_pawns(sq_bit(4, 3))
+            && opp_center;
         // Also match cxd / exd captures where the Stonewall side recaptured exd on d4
-        // (no own e-pawn remaining and no opponent c-pawn remaining).
+        // (no own e-pawn remaining, no opp c-pawn remaining, opp d5 present, no c4).
         let traded_exd = self.has_own_pawns(sq_bit(3, 3) | sq_bit(5, 3))
             && self.no_own_pawns(FILE_MASKS[4])
-            && self.no_opp_pawns(FILE_MASKS[2]);
+            && self.no_opp_pawns(FILE_MASKS[2])
+            && self.has_opp_pawns(sq_bit(3, 4))
+            && self.no_own_pawns(sq_bit(2, 3));
         intact || traded_exd
     }
 
@@ -2090,51 +2658,78 @@ impl NormalizedBoard {
         match preset {
             StructurePreset::StonewallAny => self.has_stonewall_core(),
             StructurePreset::StonewallClassic => {
-                self.has_stonewall_core() && self.has_own_pawns(sq_bit(2, 2))
+                self.has_stonewall_core()
+                    && self.has_own_pawns(sq_bit(2, 2))
+                    && self.has_opp_pawns(sq_bit(3, 4))
+                    && self.no_own_pawns(sq_bit(2, 3))
             }
             StructurePreset::StonewallNc6 => {
-                // Normalized Black (d5,e6/exd,f5,Nc6) -> own stonewall core + own Nc3 (sq(2,2))
                 self.has_stonewall_core()
-                    && self.no_own_pawns(sq_bit(2, 2))
+                    && self.no_own_pawns(sq_bit(2, 2) | sq_bit(2, 3))
                     && (self.own_knights & sq_bit(2, 2)) != 0
+                    && self.has_opp_pawns(sq_bit(3, 4))
             }
             StructurePreset::StonewallBadBishopTrade => {
-                // d4, e3/exd, f4, b3 + (Ba3 or bad bishop on dark squares traded off)
                 self.has_stonewall_core()
                     && self.has_own_pawns(sq_bit(1, 2))
+                    && self.has_opp_pawns(sq_bit(3, 4))
                     && (self.is_union
                         || (self.own_bishops & sq_bit(0, 2)) != 0
                         || (self.own_bishops & DARK_SQUARES_MASK) == 0)
             }
             StructurePreset::StonewallC5Break => {
-                self.has_stonewall_core() && self.has_own_pawns(sq_bit(2, 3))
+                self.has_stonewall_core()
+                    && self.has_own_pawns(sq_bit(2, 3))
+                    && self.has_opp_pawns(sq_bit(3, 4))
             }
             StructurePreset::StonewallBd2e1h4 => {
-                // Stonewall core + Bishop executing Bd2-e1-h4 maneuver facing Nf6 (sq(5,5))
                 self.has_stonewall_core()
-                    && (self.own_bishops & (sq_bit(3, 1) | sq_bit(4, 0) | sq_bit(7, 3))) != 0
-                    && (self.opp_knights & sq_bit(5, 5)) != 0
+                    && self.has_own_pawns(sq_bit(2, 2))
+                    && self.has_opp_pawns(sq_bit(3, 4))
+                    && (self.own_bishops & (sq_bit(4, 0) | sq_bit(7, 3))) != 0
             }
             StructurePreset::BadewanneAny => self.matches_badewanne(0, 4, false),
             StructurePreset::BadewanneFlexibleRim => self.matches_badewanne(0, 4, true),
             StructurePreset::BadewanneCentral => self.matches_badewanne(2, 2, false),
+            // HANDCRAFTED (DO NOT OVERWRITE IN BATCH CHANGES — see docs/HANDCRAFTED_FILTERS.md)
             StructurePreset::CarlsbadAny => {
-                // Own d4 + (e3 or e4), no c-pawn; Opp c6 (rank 5) + d5 (rank 4), no e-pawn
-                self.has_own_pawns(sq_bit(3, 3))
-                    && (self.own_pawns & (sq_bit(4, 2) | sq_bit(4, 3))) != 0
-                    && self.no_own_pawns(FILE_MASKS[2])
-                    && self.has_opp_pawns(sq_bit(2, 5) | sq_bit(3, 4))
-                    && self.no_opp_pawns(FILE_MASKS[4])
+                self.has_carlsbad_fian_base()
+                    && (self.own_pawns & (sq_bit(6, 1) | sq_bit(6, 2))) != 0
             }
+            StructurePreset::CarlsbadNoFianchettoBoth => {
+                self.has_carlsbad_fian_base()
+                    && self.has_own_no_k_fianchetto()
+                    && self.has_opp_no_k_fianchetto()
+            }
+            StructurePreset::CarlsbadBlackFianchetto => {
+                self.has_carlsbad_fian_base()
+                    && self.has_own_no_k_fianchetto()
+                    && self.has_opp_k_fianchetto()
+            }
+            StructurePreset::CarlsbadWhiteFianchetto => {
+                self.has_carlsbad_fian_base()
+                    && self.has_own_k_fianchetto()
+                    && self.has_opp_no_k_fianchetto()
+            }
+            StructurePreset::CarlsbadDoubleFianchetto => {
+                self.has_carlsbad_fian_base()
+                    && self.has_own_k_fianchetto()
+                    && self.has_opp_k_fianchetto()
+            }
+            // HANDCRAFTED (DO NOT OVERWRITE IN BATCH CHANGES — see docs/HANDCRAFTED_FILTERS.md)
             StructurePreset::CarlsbadMinorityAttack => {
-                self.matches_structure(StructurePreset::CarlsbadAny)
-                    && (self.own_pawns & (sq_bit(1, 3) | sq_bit(1, 4))) != 0
+                self.has_own_pawns(sq_bit(4, 2) | sq_bit(3, 3) | sq_bit(1, 4))
+                    && self.no_own_pawns(FILE_MASKS[2])
+                    && self.has_opp_pawns(sq_bit(3, 4) | sq_bit(2, 5))
+                    && self.no_opp_pawns(FILE_MASKS[4])
             }
             StructurePreset::CarlsbadCentralE4 => {
                 self.has_own_pawns(sq_bit(3, 3) | sq_bit(4, 3))
                     && self.no_own_pawns(FILE_MASKS[2])
+                    && (self.own_pawns & (sq_bit(7, 1) | sq_bit(7, 2))) != 0
                     && self.has_opp_pawns(sq_bit(2, 5) | sq_bit(3, 4))
                     && self.no_opp_pawns(FILE_MASKS[4])
+                    && (self.opp_pawns & (sq_bit(1, 6) | sq_bit(1, 5))) != 0
             }
             StructurePreset::CarlsbadF3E4 => {
                 self.has_own_pawns(sq_bit(3, 3) | sq_bit(5, 2))
@@ -2189,25 +2784,42 @@ impl NormalizedBoard {
                 }
                 false
             }
+            // HANDCRAFTED (DO NOT OVERWRITE IN BATCH CHANGES — see docs/HANDCRAFTED_FILTERS.md)
             StructurePreset::HangingPawnsClassic => self.has_hanging_pawns_classic(),
             StructurePreset::HangingPawnsVsNoFianchetto => {
-                self.has_hanging_pawns_classic() && self.has_opp_no_k_fianchetto()
+                self.has_hanging_pawns_classic()
+                    && self.no_own_pawns(sq_bit(2, 1) | sq_bit(2, 2) | sq_bit(3, 1) | sq_bit(3, 2))
+                    && (self.own_pawns & (sq_bit(5, 1) | sq_bit(5, 2))) != 0
+                    && (self.own_pawns & (sq_bit(7, 1) | sq_bit(7, 2))) != 0
+                    && self.has_opp_no_k_fianchetto()
             }
             StructurePreset::HangingPawnsVsFianchetto => {
-                self.has_hanging_pawns_classic() && self.has_opp_k_fianchetto()
+                self.has_hanging_pawns_classic()
+                    && self.no_own_pawns(sq_bit(2, 1) | sq_bit(2, 2) | sq_bit(3, 1) | sq_bit(3, 2))
+                    && (self.own_pawns & (sq_bit(5, 1) | sq_bit(5, 2))) != 0
+                    && (self.own_pawns & (sq_bit(7, 1) | sq_bit(7, 2))) != 0
+                    && self.has_opp_k_fianchetto()
             }
             StructurePreset::HangingPawnsDynamic => {
                 (self.own_pawns & (sq_bit(2, 3) | sq_bit(2, 4))) != 0
                     && (self.own_pawns & (sq_bit(3, 3) | sq_bit(3, 4))) != 0
                     && self.no_own_pawns(FILE_MASKS[1] | FILE_MASKS[4])
                     && self.no_opp_pawns(FILE_MASKS[2] | FILE_MASKS[3])
+                    && (self.own_pawns & (sq_bit(5, 1) | sq_bit(5, 2))) != 0
+                    && (self.own_pawns & (sq_bit(7, 1) | sq_bit(7, 2))) != 0
+                    && (self.own_knights | self.own_bishops).count_ones() >= 2
             }
             StructurePreset::MaroczyBindAny => {
                 self.has_own_pawns(sq_bit(2, 3) | sq_bit(4, 3))
                     && self.no_own_pawns(FILE_MASKS[3])
+                    && self.no_own_pawns(sq_bit(2, 1) | sq_bit(2, 2) | sq_bit(4, 1) | sq_bit(4, 2))
                     && self.has_opp_pawns(sq_bit(3, 5))
                     && self.no_opp_pawns(FILE_MASKS[2])
+                    && self.no_opp_pawns(sq_bit(4, 4))
+                    && (self.opp_pawns & (sq_bit(1, 6) | sq_bit(1, 5))) != 0
+                    && (self.opp_pawns & (sq_bit(5, 6) | sq_bit(5, 5))) != 0
             }
+            // HANDCRAFTED (DO NOT OVERWRITE IN BATCH CHANGES — see docs/HANDCRAFTED_FILTERS.md)
             StructurePreset::MaroczyBindNoFianchetto => {
                 self.has_own_pawns(sq_bit(0, 1) | sq_bit(2, 3) | sq_bit(4, 3) | sq_bit(6, 1))
                     && (self.own_pawns & (sq_bit(1, 1) | sq_bit(1, 2))) != 0
@@ -2220,6 +2832,7 @@ impl NormalizedBoard {
                     && (self.opp_pawns & (sq_bit(7, 5) | sq_bit(7, 6))) != 0
                     && self.no_opp_pawns(FILE_MASKS[2])
             }
+            // HANDCRAFTED (DO NOT OVERWRITE IN BATCH CHANGES — see docs/HANDCRAFTED_FILTERS.md)
             StructurePreset::MaroczyBindFianchetto => {
                 self.has_own_pawns(sq_bit(0, 1) | sq_bit(5, 1) | sq_bit(6, 2) | sq_bit(2, 3))
                     && (self.own_bishops & sq_bit(6, 1)) != 0
@@ -2236,73 +2849,140 @@ impl NormalizedBoard {
                     && self.no_opp_pawns(FILE_MASKS[2])
             }
             StructurePreset::Hedgehog => {
-                // Normalized Black -> own on a3, b3, d3, e3 (Black a6, b6, d6, e6), opp on c5+e5 (White c4+e4)
                 self.has_own_pawns(sq_bit(0, 2) | sq_bit(1, 2) | sq_bit(3, 2) | sq_bit(4, 2))
                     && self.no_own_pawns(FILE_MASKS[2])
+                    && self.no_own_pawns(sq_bit(3, 3) | sq_bit(4, 3))
+                    && (self.own_pawns & (sq_bit(5, 1) | sq_bit(5, 2))) != 0
+                    && (self.own_pawns & (sq_bit(6, 1) | sq_bit(6, 2))) != 0
                     && self.has_opp_pawns(sq_bit(2, 4) | sq_bit(4, 4))
                     && self.no_opp_pawns(FILE_MASKS[3])
             }
+            StructurePreset::HedgehogVsBg2 => {
+                self.matches_structure(StructurePreset::Hedgehog)
+                    && self.has_opp_pawns(sq_bit(6, 5))
+                    && (self.opp_bishops & sq_bit(6, 6)) != 0
+            }
             StructurePreset::Boleslavsky => {
-                // Normalized Black -> own on d3+e4 (Black d6+e5), opp on e5 (White e4)
+                // Normalized Black: opp c2|c3, no opp c4, no opp d-file, opp e4; own d6+e5, no own c-file.
                 self.has_own_pawns(sq_bit(3, 2) | sq_bit(4, 3))
                     && self.no_own_pawns(FILE_MASKS[2])
                     && self.has_opp_pawns(sq_bit(4, 4))
+                    && (self.opp_pawns & (sq_bit(2, 6) | sq_bit(2, 5))) != 0
+                    && self.no_opp_pawns(sq_bit(2, 4))
                     && self.no_opp_pawns(FILE_MASKS[3])
             }
             StructurePreset::Scheveningen => {
-                // Normalized Black -> own on d3+e3 (Black d6+e6), opp on e5 (White e4)
                 self.has_own_pawns(sq_bit(3, 2) | sq_bit(4, 2))
                     && self.no_own_pawns(FILE_MASKS[2])
+                    && self.no_own_pawns(sq_bit(6, 2))
                     && self.has_opp_pawns(sq_bit(4, 4))
+                    && (self.opp_pawns & (sq_bit(2, 6) | sq_bit(2, 5))) != 0
+                    && self.no_opp_pawns(sq_bit(2, 4))
                     && self.no_opp_pawns(FILE_MASKS[3])
             }
             StructurePreset::Dragon => {
-                // Normalized Black -> own on d3+g3 + Bg2, opp on e5
                 self.has_own_pawns(sq_bit(3, 2) | sq_bit(6, 2))
                     && (self.own_bishops & sq_bit(6, 1)) != 0
                     && self.no_own_pawns(FILE_MASKS[2])
+                    && self.no_own_pawns(sq_bit(4, 3))
                     && self.has_opp_pawns(sq_bit(4, 4))
+                    && (self.opp_pawns & (sq_bit(2, 6) | sq_bit(2, 5))) != 0
+                    && self.no_opp_pawns(sq_bit(2, 4))
                     && self.no_opp_pawns(FILE_MASKS[3])
             }
             StructurePreset::NajdorfStructure => {
                 self.has_own_pawns(sq_bit(0, 2) | sq_bit(3, 2))
                     && (self.own_pawns & (sq_bit(4, 2) | sq_bit(4, 3))) != 0
                     && self.no_own_pawns(FILE_MASKS[2])
+                    && self.no_own_pawns(sq_bit(6, 2) | sq_bit(1, 2))
                     && self.has_opp_pawns(sq_bit(4, 4))
+                    && (self.opp_pawns & (sq_bit(2, 6) | sq_bit(2, 5))) != 0
+                    && self.no_opp_pawns(sq_bit(2, 4))
                     && self.no_opp_pawns(FILE_MASKS[3])
             }
-            StructurePreset::NajdorfTypeII => {
-                // Normalized Black -> own a6 (0,2), b5 (1,3), d6 (3,2); opp e4 (4,4)
+            StructurePreset::NajdorfQueensideB5 => {
                 self.has_own_pawns(sq_bit(0, 2) | sq_bit(1, 3) | sq_bit(3, 2))
+                    && (self.own_pawns & (sq_bit(4, 2) | sq_bit(4, 3))) != 0
                     && self.no_own_pawns(FILE_MASKS[2])
                     && self.has_opp_pawns(sq_bit(4, 4))
+                    && (self.opp_pawns & (sq_bit(2, 6) | sq_bit(2, 5))) != 0
+                    && self.no_opp_pawns(sq_bit(2, 4))
                     && self.no_opp_pawns(FILE_MASKS[3])
             }
-            StructurePreset::NajdorfTypeIII => {
-                // Normalized Black -> own a6 (0,2), d6 (3,2), e5 (4,3); opp e4 (4,4), f4 (5,4)
+            StructurePreset::NajdorfE5VsF4 => {
                 self.has_own_pawns(sq_bit(0, 2) | sq_bit(3, 2) | sq_bit(4, 3))
                     && self.no_own_pawns(FILE_MASKS[2])
                     && self.has_opp_pawns(sq_bit(4, 4) | sq_bit(5, 4))
+                    && (self.opp_pawns & (sq_bit(2, 6) | sq_bit(2, 5))) != 0
+                    && self.no_opp_pawns(sq_bit(2, 4))
                     && self.no_opp_pawns(FILE_MASKS[3])
             }
             StructurePreset::PanovFormation => {
                 self.has_own_pawns(sq_bit(2, 3) | sq_bit(3, 3))
                     && self.no_own_pawns(FILE_MASKS[4])
+                    && self.no_own_pawns(sq_bit(2, 1) | sq_bit(2, 2) | sq_bit(3, 1) | sq_bit(3, 2))
                     && self.has_opp_pawns(sq_bit(3, 4) | sq_bit(4, 5))
+                    && self.no_opp_pawns(FILE_MASKS[2])
+                    && self.no_opp_pawns(sq_bit(5, 4))
+            }
+            StructurePreset::SlavCaroKann => {
+                // Normalized Black (Caro-Kann formation): own c6+(e6|e7) (no d-file) vs opp d4+(c2|c3) (no e-file).
+                self.has_own_pawns(sq_bit(2, 2))
+                    && (self.own_pawns & (sq_bit(4, 2) | sq_bit(4, 1))) != 0
+                    && self.no_own_pawns(FILE_MASKS[3])
+                    && self.has_opp_pawns(sq_bit(3, 4))
+                    && (self.opp_pawns & (sq_bit(2, 5) | sq_bit(2, 6))) != 0
+                    && self.no_opp_pawns(FILE_MASKS[4])
+            }
+            StructurePreset::SlavMainline => {
+                // Normalized Black: own c6+e6 (no d-file), opp d4+(e3|e4), no opp c-file.
+                self.has_own_pawns(sq_bit(2, 2) | sq_bit(4, 2))
+                    && self.no_own_pawns(FILE_MASKS[3])
+                    && self.has_opp_pawns(sq_bit(3, 4))
+                    && (self.opp_pawns & (sq_bit(4, 5) | sq_bit(4, 4))) != 0
                     && self.no_opp_pawns(FILE_MASKS[2])
             }
             StructurePreset::SlavFormation => {
                 self.has_own_pawns(sq_bit(3, 3) | sq_bit(4, 2))
                     && (self.own_pawns & (sq_bit(2, 2) | sq_bit(2, 3))) != 0
+                    && self.no_own_pawns(sq_bit(4, 3))
                     && self.has_opp_pawns(sq_bit(2, 5) | sq_bit(3, 4) | sq_bit(4, 5))
+                    && self.no_opp_pawns(sq_bit(2, 4) | sq_bit(4, 4))
+            }
+            StructurePreset::SemiSlavMeran => {
+                // Normalized Black: own a6+b5+e6 (no d-file) vs opp d4+(e3|e4) (no c-file).
+                self.has_own_pawns(sq_bit(0, 2) | sq_bit(1, 3) | sq_bit(4, 2))
+                    && self.no_own_pawns(FILE_MASKS[3])
+                    && self.has_opp_pawns(sq_bit(3, 4))
+                    && (self.opp_pawns & (sq_bit(4, 5) | sq_bit(4, 4))) != 0
+                    && self.no_opp_pawns(FILE_MASKS[2])
             }
             StructurePreset::GrunfeldCenter => {
                 self.has_own_pawns(sq_bit(3, 3) | sq_bit(4, 3))
-                    && self.no_own_pawns(sq_bit(2, 3))
+                    && (self.has_own_pawns(sq_bit(2, 2)) || self.no_own_pawns(FILE_MASKS[2]))
+                    && self.no_opp_pawns(sq_bit(2, 5))
                     && self.has_opp_pawns(sq_bit(6, 5))
                     && (self.opp_bishops & sq_bit(6, 6)) != 0
                     && self.no_opp_pawns(FILE_MASKS[3])
             }
+            StructurePreset::GrunfeldD5PassedPawn => {
+                self.has_own_pawns(sq_bit(3, 4) | sq_bit(4, 3))
+                    && self.no_own_pawns(sq_bit(2, 3))
+                    && self.has_opp_pawns(sq_bit(6, 5))
+                    && (self.opp_bishops & sq_bit(6, 6)) != 0
+                    && self.no_opp_pawns(FILE_MASKS[2] | FILE_MASKS[3])
+            }
+            StructurePreset::GrunfeldQueensideMajority => {
+                self.has_own_pawns(sq_bit(6, 2))
+                    && (self.own_bishops & sq_bit(6, 1)) != 0
+                    && (self.own_pawns & (sq_bit(0, 1) | sq_bit(0, 2) | sq_bit(0, 3))) != 0
+                    && (self.own_pawns & (sq_bit(1, 1) | sq_bit(1, 2) | sq_bit(1, 3))) != 0
+                    && self.no_own_pawns(FILE_MASKS[2] | FILE_MASKS[3])
+                    && (self.opp_pawns & (sq_bit(4, 4) | sq_bit(3, 4))) != 0
+                    && self.no_opp_pawns(FILE_MASKS[2])
+                    && (self.no_opp_pawns(FILE_MASKS[0]) || self.no_opp_pawns(FILE_MASKS[1]))
+            }
+            // HANDCRAFTED (DO NOT OVERWRITE IN BATCH CHANGES — see docs/HANDCRAFTED_FILTERS.md)
             StructurePreset::Botvinnik => {
                 self.has_own_pawns(
                     sq_bit(1, 1)
@@ -2320,43 +3000,72 @@ impl NormalizedBoard {
             StructurePreset::BotvinnikTriangle => {
                 self.has_own_pawns(sq_bit(2, 3) | sq_bit(3, 2) | sq_bit(4, 3) | sq_bit(6, 2))
                     && (self.own_bishops & sq_bit(6, 1)) != 0
+                    && self.no_own_pawns(sq_bit(3, 3) | sq_bit(4, 2))
+                    && (self.own_pawns & (sq_bit(1, 1) | sq_bit(1, 2))) != 0
+                    && (self.own_pawns & (sq_bit(5, 1) | sq_bit(5, 2) | sq_bit(5, 3))) != 0
             }
             StructurePreset::FrenchChain => {
                 self.has_own_pawns(sq_bit(3, 3) | sq_bit(4, 4))
                     && self.has_opp_pawns(sq_bit(3, 4) | sq_bit(4, 5))
+                    && self.no_own_pawns(sq_bit(4, 3) | sq_bit(3, 2))
+                    && self.no_opp_pawns(sq_bit(2, 5))
+            }
+            StructurePreset::FrenchWinawerC4 => {
+                self.has_own_pawns(sq_bit(3, 3) | sq_bit(4, 4))
+                    && (self.own_pawns & (sq_bit(2, 2) | sq_bit(2, 3))) != 0
                     && self.no_own_pawns(sq_bit(4, 3))
+                    && self.has_opp_pawns(sq_bit(2, 4) | sq_bit(3, 4) | sq_bit(4, 5))
             }
             StructurePreset::FrenchTarraschDxE => {
                 self.has_own_pawns(sq_bit(3, 3))
+                    && (self.own_pawns & (sq_bit(2, 1) | sq_bit(2, 2))) != 0
                     && self.no_own_pawns(FILE_MASKS[4])
+                    && self.no_own_pawns(sq_bit(3, 2))
                     && self.has_opp_pawns(sq_bit(2, 4) | sq_bit(4, 5))
                     && self.no_opp_pawns(FILE_MASKS[3])
             }
             StructurePreset::KingsIndianChain => {
                 self.has_own_pawns(sq_bit(2, 3) | sq_bit(3, 4) | sq_bit(4, 3))
                     && self.has_opp_pawns(sq_bit(3, 5) | sq_bit(4, 4) | sq_bit(6, 5))
+                    && (self.opp_bishops & sq_bit(6, 6)) != 0
+                    && self.no_opp_pawns(sq_bit(2, 4))
             }
             StructurePreset::KingsIndianC5Chain => {
                 self.has_own_pawns(sq_bit(2, 3) | sq_bit(3, 4) | sq_bit(4, 3))
-                    && self.has_opp_pawns(sq_bit(2, 4) | sq_bit(3, 5) | sq_bit(4, 4))
+                    && self.no_own_pawns(sq_bit(3, 3) | sq_bit(4, 4))
+                    && self.has_opp_pawns(sq_bit(2, 4) | sq_bit(3, 5) | sq_bit(4, 4) | sq_bit(6, 5))
+            }
+            StructurePreset::KingsIndianExchange => {
+                self.has_own_pawns(sq_bit(2, 3) | sq_bit(4, 3))
+                    && self.no_own_pawns(FILE_MASKS[3])
+                    && self.has_opp_pawns(sq_bit(4, 4) | sq_bit(6, 5))
+                    && (self.opp_bishops & sq_bit(6, 6)) != 0
+                    && self.no_opp_pawns(FILE_MASKS[3])
             }
             StructurePreset::BenoniStructure => {
-                // Normalized Black -> own c4+d3 (Black c5+d6), opp d4+e5 (White d5+e4)
-                self.has_own_pawns(sq_bit(2, 3) | sq_bit(3, 2))
+                self.has_own_pawns(sq_bit(2, 3) | sq_bit(3, 2) | sq_bit(6, 2))
+                    && (self.own_pawns & (sq_bit(0, 1) | sq_bit(0, 2))) != 0
+                    && (self.own_pawns & (sq_bit(1, 1) | sq_bit(1, 2) | sq_bit(1, 3))) != 0
                     && self.no_own_pawns(FILE_MASKS[4])
                     && self.has_opp_pawns(sq_bit(3, 3) | sq_bit(4, 4))
                     && self.no_opp_pawns(FILE_MASKS[2])
             }
-            StructurePreset::SlavCaroKann => {
-                // Normalized Black -> own c3+d4 (Black c6+d5), opp d5+(c5 or e5) (White d4+c4/e4)
-                self.has_own_pawns(sq_bit(2, 2) | sq_bit(3, 3))
-                    && self.no_own_pawns(FILE_MASKS[4])
-                    && self.has_opp_pawns(sq_bit(3, 4))
-                    && (self.opp_pawns & (sq_bit(2, 4) | sq_bit(4, 4))) != 0
-                    && self.no_opp_pawns(FILE_MASKS[3] & sq_bit(3, 3))
+            StructurePreset::BenkoGambit => {
+                self.has_own_pawns(sq_bit(2, 3) | sq_bit(3, 2) | sq_bit(6, 2))
+                    && (self.own_bishops & sq_bit(6, 1)) != 0
+                    && self.no_own_pawns(FILE_MASKS[0] | FILE_MASKS[1])
+                    && self.has_opp_pawns(sq_bit(3, 3))
+                    && self.no_opp_pawns(FILE_MASKS[2])
+            }
+            StructurePreset::CzechBenoni => {
+                self.has_own_pawns(sq_bit(2, 3) | sq_bit(3, 2) | sq_bit(4, 3))
+                    && self.no_own_pawns(sq_bit(6, 2))
+                    && self.has_opp_pawns(sq_bit(2, 4) | sq_bit(3, 3) | sq_bit(4, 4))
             }
             StructurePreset::NimzoDoubledCPawns => {
-                (self.own_pawns & FILE_MASKS[2]).count_ones() >= 2
+                self.has_own_pawns(sq_bit(2, 2))
+                    && (self.own_pawns & (sq_bit(2, 3) | sq_bit(2, 4))) != 0
+                    && self.no_own_pawns(FILE_MASKS[1])
                     && (self.is_union || (self.opp_bishops & DARK_SQUARES_MASK) == 0)
                     && (self.own_pawns & (sq_bit(3, 2) | sq_bit(3, 3))) != 0
                     && (self.own_pawns & (sq_bit(4, 2) | sq_bit(4, 3))) != 0
@@ -2469,74 +3178,404 @@ impl SideMaterialSpec {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum EndgameFamily {
+    Pawn,
+    #[default]
+    Rook,
+    MinorPiece,
+    RookAndMinor,
+    Queen,
+    Imbalanced,
+}
+
+impl EndgameFamily {
+    pub const ALL: [Self; 6] = [
+        Self::Pawn,
+        Self::Rook,
+        Self::MinorPiece,
+        Self::RookAndMinor,
+        Self::Queen,
+        Self::Imbalanced,
+    ];
+
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Pawn => "Pawn Endgames",
+            Self::Rook => "Rook Endgames",
+            Self::MinorPiece => "Minor Pieces",
+            Self::RookAndMinor => "Rook + Minor",
+            Self::Queen => "Queen Endgames",
+            Self::Imbalanced => "Imbalanced / Exchange",
+        }
+    }
+
+    #[must_use]
+    pub fn presets(self) -> &'static [EndgamePreset] {
+        match self {
+            Self::Pawn => &[
+                EndgamePreset::PurePawnEndgame,
+                EndgamePreset::KingPawnVsKing,
+                EndgamePreset::KingMultiPawnsVsKing,
+            ],
+            Self::Rook => &[
+                EndgamePreset::RookVsRook,
+                EndgamePreset::RookOnePawnVsRook,
+                EndgamePreset::RookTwoPawnsVsRookOnePawn,
+                EndgamePreset::DoubleRooks,
+                EndgamePreset::RookVsPawn,
+                EndgamePreset::DoubleRookPlusMinor,
+            ],
+            Self::MinorPiece => &[
+                EndgamePreset::BishopVsKnight,
+                EndgamePreset::OppositeColoredBishops,
+                EndgamePreset::SameColoredBishops,
+                EndgamePreset::KnightVsKnight,
+                EndgamePreset::BishopPairEndgame,
+                EndgamePreset::TwoBishopsVsTwoBishops,
+                EndgamePreset::BishopKnightVsTwoMinors,
+                EndgamePreset::TwoKnightsVsTwoKnights,
+                EndgamePreset::MinorVsNoPiece,
+            ],
+            Self::RookAndMinor => &[
+                EndgamePreset::RookBishopVsRook,
+                EndgamePreset::RookKnightVsRook,
+                EndgamePreset::RookBishopVsRookKnight,
+                EndgamePreset::RookSameBishops,
+                EndgamePreset::RookOppBishops,
+                EndgamePreset::RookKnightVsRookKnight,
+                EndgamePreset::RookBishopKnightVsRookBishopKnight,
+                EndgamePreset::RookBishopKnightVsRookTwoMinors,
+                EndgamePreset::DoubleRookBishopVsDoubleRookBishop,
+            ],
+            Self::Queen => &[
+                EndgamePreset::QueenVsQueen,
+                EndgamePreset::QueenBishopVsQueenBishop,
+                EndgamePreset::QueenBishopVsQueenKnight,
+                EndgamePreset::QueenKnightVsQueenKnight,
+                EndgamePreset::QueenRookVsQueenRook,
+                EndgamePreset::QueenMinorVsQueenMinor,
+                EndgamePreset::QueenVsPawns,
+            ],
+            Self::Imbalanced => &[
+                EndgamePreset::QueenVsTwoRooks,
+                EndgamePreset::QueenVsRookMinor,
+                EndgamePreset::QueenVsRook,
+                EndgamePreset::QueenVsThreeMinors,
+                EndgamePreset::QueenVsTwoMinors,
+                EndgamePreset::RookVsMinor,
+                EndgamePreset::RookVsTwoMinors,
+                EndgamePreset::RookBishopVsTwoMinors,
+                EndgamePreset::Custom,
+            ],
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum EndgamePawnBalance {
+    #[default]
+    Any,
+    EqualPawns,
+    SideAUpOne,
+    SideAUpTwoPlus,
+    Pawnless,
+}
+
+impl EndgamePawnBalance {
+    pub const ALL: [Self; 5] = [
+        Self::Any,
+        Self::EqualPawns,
+        Self::SideAUpOne,
+        Self::SideAUpTwoPlus,
+        Self::Pawnless,
+    ];
+
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Any => "Any pawns",
+            Self::EqualPawns => "Equal",
+            Self::SideAUpOne => "Side A +1",
+            Self::SideAUpTwoPlus => "Side A +2+",
+            Self::Pawnless => "Pawnless",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum EndgamePawnWings {
+    #[default]
+    Any,
+    SameWingOnly,
+    BothWings,
+    PassedPawnSideA,
+}
+
+impl EndgamePawnWings {
+    pub const ALL: [Self; 4] = [
+        Self::Any,
+        Self::SameWingOnly,
+        Self::BothWings,
+        Self::PassedPawnSideA,
+    ];
+
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Any => "Any wings",
+            Self::SameWingOnly => "Same wing only",
+            Self::BothWings => "Both wings",
+            Self::PassedPawnSideA => "Side A passer",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EndgamePreset {
+    // Pawn
+    PurePawnEndgame,
+    KingPawnVsKing,
+    KingMultiPawnsVsKing,
+    // Rook
     RookVsRook,
-    RookBishopVsRook,
-    RookKnightVsRook,
-    RookBishopVsRookKnight,
-    RookSameBishops,
-    RookOppBishops,
+    RookOnePawnVsRook,
+    RookTwoPawnsVsRookOnePawn,
     DoubleRooks,
+    RookVsPawn,
+    DoubleRookPlusMinor,
+    // Minor pieces
     BishopVsKnight,
     OppositeColoredBishops,
     SameColoredBishops,
     KnightVsKnight,
     BishopPairEndgame,
+    TwoBishopsVsTwoBishops,
+    BishopKnightVsTwoMinors,
+    TwoKnightsVsTwoKnights,
+    MinorVsNoPiece,
+    // Rook + Minor
+    RookBishopVsRook,
+    RookKnightVsRook,
+    RookBishopVsRookKnight,
+    RookSameBishops,
+    RookOppBishops,
+    RookKnightVsRookKnight,
+    RookBishopKnightVsRookBishopKnight,
+    RookBishopKnightVsRookTwoMinors,
+    DoubleRookBishopVsDoubleRookBishop,
+    // Queen
     QueenVsQueen,
+    QueenBishopVsQueenBishop,
+    QueenBishopVsQueenKnight,
+    QueenKnightVsQueenKnight,
+    QueenRookVsQueenRook,
+    QueenMinorVsQueenMinor,
+    QueenVsPawns,
+    // Imbalanced
     QueenVsTwoRooks,
     QueenVsRookMinor,
+    QueenVsRook,
+    QueenVsThreeMinors,
+    QueenVsTwoMinors,
     RookVsMinor,
     RookVsTwoMinors,
-    PurePawnEndgame,
+    RookBishopVsTwoMinors,
     Custom,
 }
 
 impl EndgamePreset {
-    pub const ALL: [Self; 19] = [
+    pub const ALL: [Self; 43] = [
+        Self::PurePawnEndgame,
+        Self::KingPawnVsKing,
+        Self::KingMultiPawnsVsKing,
         Self::RookVsRook,
-        Self::RookBishopVsRook,
-        Self::RookKnightVsRook,
-        Self::RookBishopVsRookKnight,
-        Self::RookSameBishops,
-        Self::RookOppBishops,
+        Self::RookOnePawnVsRook,
+        Self::RookTwoPawnsVsRookOnePawn,
         Self::DoubleRooks,
+        Self::RookVsPawn,
+        Self::DoubleRookPlusMinor,
         Self::BishopVsKnight,
         Self::OppositeColoredBishops,
         Self::SameColoredBishops,
         Self::KnightVsKnight,
         Self::BishopPairEndgame,
+        Self::TwoBishopsVsTwoBishops,
+        Self::BishopKnightVsTwoMinors,
+        Self::TwoKnightsVsTwoKnights,
+        Self::MinorVsNoPiece,
+        Self::RookBishopVsRook,
+        Self::RookKnightVsRook,
+        Self::RookBishopVsRookKnight,
+        Self::RookSameBishops,
+        Self::RookOppBishops,
+        Self::RookKnightVsRookKnight,
+        Self::RookBishopKnightVsRookBishopKnight,
+        Self::RookBishopKnightVsRookTwoMinors,
+        Self::DoubleRookBishopVsDoubleRookBishop,
         Self::QueenVsQueen,
+        Self::QueenBishopVsQueenBishop,
+        Self::QueenBishopVsQueenKnight,
+        Self::QueenKnightVsQueenKnight,
+        Self::QueenRookVsQueenRook,
+        Self::QueenMinorVsQueenMinor,
+        Self::QueenVsPawns,
         Self::QueenVsTwoRooks,
         Self::QueenVsRookMinor,
+        Self::QueenVsRook,
+        Self::QueenVsThreeMinors,
+        Self::QueenVsTwoMinors,
         Self::RookVsMinor,
         Self::RookVsTwoMinors,
-        Self::PurePawnEndgame,
+        Self::RookBishopVsTwoMinors,
         Self::Custom,
     ];
 
     #[must_use]
+    pub fn family(self) -> EndgameFamily {
+        match self {
+            Self::PurePawnEndgame | Self::KingPawnVsKing | Self::KingMultiPawnsVsKing => {
+                EndgameFamily::Pawn
+            }
+            Self::RookVsRook
+            | Self::RookOnePawnVsRook
+            | Self::RookTwoPawnsVsRookOnePawn
+            | Self::DoubleRooks
+            | Self::RookVsPawn
+            | Self::DoubleRookPlusMinor => EndgameFamily::Rook,
+            Self::BishopVsKnight
+            | Self::OppositeColoredBishops
+            | Self::SameColoredBishops
+            | Self::KnightVsKnight
+            | Self::BishopPairEndgame
+            | Self::TwoBishopsVsTwoBishops
+            | Self::BishopKnightVsTwoMinors
+            | Self::TwoKnightsVsTwoKnights
+            | Self::MinorVsNoPiece => EndgameFamily::MinorPiece,
+            Self::RookBishopVsRook
+            | Self::RookKnightVsRook
+            | Self::RookBishopVsRookKnight
+            | Self::RookSameBishops
+            | Self::RookOppBishops
+            | Self::RookKnightVsRookKnight
+            | Self::RookBishopKnightVsRookBishopKnight
+            | Self::RookBishopKnightVsRookTwoMinors
+            | Self::DoubleRookBishopVsDoubleRookBishop => EndgameFamily::RookAndMinor,
+            Self::QueenVsQueen
+            | Self::QueenBishopVsQueenBishop
+            | Self::QueenBishopVsQueenKnight
+            | Self::QueenKnightVsQueenKnight
+            | Self::QueenRookVsQueenRook
+            | Self::QueenMinorVsQueenMinor
+            | Self::QueenVsPawns => EndgameFamily::Queen,
+            Self::QueenVsTwoRooks
+            | Self::QueenVsRookMinor
+            | Self::QueenVsRook
+            | Self::QueenVsThreeMinors
+            | Self::QueenVsTwoMinors
+            | Self::RookVsMinor
+            | Self::RookVsTwoMinors
+            | Self::RookBishopVsTwoMinors
+            | Self::Custom => EndgameFamily::Imbalanced,
+        }
+    }
+
+    #[must_use]
     pub fn short_label(self) -> &'static str {
         match self {
+            Self::PurePawnEndgame => "K+P vs K+P",
+            Self::KingPawnVsKing => "K+P vs K",
+            Self::KingMultiPawnsVsKing => "Multi-Pawn (2+)",
             Self::RookVsRook => "R vs R",
-            Self::RookBishopVsRook => "R+B vs R",
-            Self::RookKnightVsRook => "R+N vs R",
-            Self::RookBishopVsRookKnight => "R+B vs R+N",
-            Self::RookSameBishops => "R+B vs R+B (Same)",
-            Self::RookOppBishops => "R+B vs R+B (Opp)",
+            Self::RookOnePawnVsRook => "R+P vs R",
+            Self::RookTwoPawnsVsRookOnePawn => "R+2P vs R+P",
             Self::DoubleRooks => "2R vs 2R",
+            Self::RookVsPawn => "R vs Pawns",
+            Self::DoubleRookPlusMinor => "2R vs R+Minor",
             Self::BishopVsKnight => "B vs N",
             Self::OppositeColoredBishops => "B vs B (Opp)",
             Self::SameColoredBishops => "B vs B (Same)",
             Self::KnightVsKnight => "N vs N",
             Self::BishopPairEndgame => "2B vs B+N / 2N",
+            Self::TwoBishopsVsTwoBishops => "2B vs 2B",
+            Self::BishopKnightVsTwoMinors => "B+N vs 2 Minors",
+            Self::TwoKnightsVsTwoKnights => "2N vs 2N",
+            Self::MinorVsNoPiece => "Minor vs Pawns",
+            Self::RookBishopVsRook => "R+B vs R",
+            Self::RookKnightVsRook => "R+N vs R",
+            Self::RookBishopVsRookKnight => "R+B vs R+N",
+            Self::RookSameBishops => "R+B vs R+B (Same)",
+            Self::RookOppBishops => "R+B vs R+B (Opp)",
+            Self::RookKnightVsRookKnight => "R+N vs R+N",
+            Self::RookBishopKnightVsRookBishopKnight => "R+B+N vs R+B+N",
+            Self::RookBishopKnightVsRookTwoMinors => "R+2M vs R+2M",
+            Self::DoubleRookBishopVsDoubleRookBishop => "2R+B vs 2R+B",
             Self::QueenVsQueen => "Q vs Q",
+            Self::QueenBishopVsQueenBishop => "Q+B vs Q+B",
+            Self::QueenBishopVsQueenKnight => "Q+B vs Q+N",
+            Self::QueenKnightVsQueenKnight => "Q+N vs Q+N",
+            Self::QueenRookVsQueenRook => "Q+R vs Q+R",
+            Self::QueenMinorVsQueenMinor => "Q+M vs Q+M",
+            Self::QueenVsPawns => "Q vs Pawns",
             Self::QueenVsTwoRooks => "Q vs 2R",
             Self::QueenVsRookMinor => "Q vs R+Minor",
+            Self::QueenVsRook => "Q vs R",
+            Self::QueenVsThreeMinors => "Q vs 3 Minors",
+            Self::QueenVsTwoMinors => "Q vs 2 Minors",
             Self::RookVsMinor => "R vs Minor",
             Self::RookVsTwoMinors => "R vs 2 Minors",
-            Self::PurePawnEndgame => "Pawn Endgame",
+            Self::RookBishopVsTwoMinors => "R+B vs 2 Minors",
             Self::Custom => "Custom",
+        }
+    }
+
+    #[must_use]
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::PurePawnEndgame => "King & pawn endgames with all pieces traded off.",
+            Self::KingPawnVsKing => "Fundamental K+P vs bare K theoretical opposition studies.",
+            Self::KingMultiPawnsVsKing => "Multi-pawn (2+ per side) breakthroughs and outside passers.",
+            Self::RookVsRook => "Single rook endgames with pawns (Lucena, Philidor, Vancura).",
+            Self::RookOnePawnVsRook => "Critical R+1P vs R theoretical winning & drawing positions.",
+            Self::RookTwoPawnsVsRookOnePawn => "R+2P vs R+1P technical conversion & same-wing defense.",
+            Self::DoubleRooks => "Four-rook endgames combining king safety and file infiltration.",
+            Self::RookVsPawn => "Rook fighting connected or passed pawns without an opposing rook.",
+            Self::DoubleRookPlusMinor => "Two rooks facing rook + minor piece (+ pawn compensation).",
+            Self::BishopVsKnight => "Classical bishop vs knight minor-piece imbalance.",
+            Self::OppositeColoredBishops => "Pure opposite-colored bishop endgames (blockades & fortresses).",
+            Self::SameColoredBishops => "Same-colored bishop endgames (good vs bad bishop, Zugzwang).",
+            Self::KnightVsKnight => "Pure knight endgames mirroring pawn-ending principles.",
+            Self::BishopPairEndgame => "Two bishops battling B+N or 2N on open/semi-open boards.",
+            Self::TwoBishopsVsTwoBishops => "Two minor-bishop pairs with symmetric piece balance.",
+            Self::BishopKnightVsTwoMinors => "B+N against two opposing minor pieces (good knight vs bad B).",
+            Self::TwoKnightsVsTwoKnights => "Two knights per side with structural tension.",
+            Self::MinorVsNoPiece => "Side with extra minor piece testing winning thresholds vs pawns.",
+            Self::RookBishopVsRook => "R+B vs R (exchange up / extra bishop theoretical tests).",
+            Self::RookKnightVsRook => "R+N vs R fortress vs winning technique.",
+            Self::RookBishopVsRookKnight => "Rook + bishop vs rook + knight strategic battleground.",
+            Self::RookSameBishops => "R+B vs R+B with same-colored bishops.",
+            Self::RookOppBishops => "R+B vs R+B with opposite-colored bishops (attacking bias).",
+            Self::RookKnightVsRookKnight => "R+N vs R+N tactical endgames with fixed pawn weaknesses.",
+            Self::RookBishopKnightVsRookBishopKnight => "Complex R+B+N vs R+B+N transitions.",
+            Self::RookBishopKnightVsRookTwoMinors => "Rook + any 2 minors per side.",
+            Self::DoubleRookBishopVsDoubleRookBishop => "Heavy technical 2R+B vs 2R+B positions.",
+            Self::QueenVsQueen => "Pure queen + pawn endgames (perpetual check vs race).",
+            Self::QueenBishopVsQueenBishop => "Q+B vs Q+B attacking & bishop-color coordination.",
+            Self::QueenBishopVsQueenKnight => "Q+B vs Q+N classic Capablanca/Botvinnik imbalance.",
+            Self::QueenKnightVsQueenKnight => "Q+N vs Q+N tactical perpetuals and outposts.",
+            Self::QueenRookVsQueenRook => "Heavy-piece Q+R vs Q+R endgames.",
+            Self::QueenMinorVsQueenMinor => "Queen + one minor piece per side.",
+            Self::QueenVsPawns => "Queen battling advanced 6th/7th-rank passed pawns.",
+            Self::QueenVsTwoRooks => "Queen against two connected or uncoordinated rooks.",
+            Self::QueenVsRookMinor => "Queen vs R+B or R+N fortress battle.",
+            Self::QueenVsRook => "Queen vs Rook theoretical Philidor/drawing-zone tests.",
+            Self::QueenVsThreeMinors => "Queen facing three active minor pieces.",
+            Self::QueenVsTwoMinors => "Queen vs two minor pieces with compensation.",
+            Self::RookVsMinor => "Exchange-up R vs B or R vs N endgames.",
+            Self::RookVsTwoMinors => "Rook vs two minor pieces imbalance.",
+            Self::RookBishopVsTwoMinors => "R+B vs two minor pieces (often fortress/pawn compensation).",
+            Self::Custom => "Editable piece-count & pawn-wing matrix.",
         }
     }
 
@@ -2547,13 +3586,101 @@ impl EndgamePreset {
             side_a: SideMaterialSpec::default(),
             side_b: SideMaterialSpec::default(),
             bishop_colors: BishopColorRelation::Any,
+            pawn_balance: EndgamePawnBalance::Any,
+            pawn_wings: EndgamePawnWings::Any,
             require_any_pawns: false,
             swap_sides: false,
         };
         match self {
+            Self::PurePawnEndgame => {
+                f.side_a.pawns = PieceCountRange::range(1, 8);
+                f.side_b.pawns = PieceCountRange::range(1, 8);
+                f.require_any_pawns = true;
+            }
+            Self::KingPawnVsKing => {
+                f.side_a.pawns = PieceCountRange::exact(1);
+                f.side_b.pawns = PieceCountRange::exact(0);
+                f.require_any_pawns = true;
+            }
+            Self::KingMultiPawnsVsKing => {
+                f.side_a.pawns = PieceCountRange::range(2, 8);
+                f.side_b.pawns = PieceCountRange::range(2, 8);
+                f.require_any_pawns = true;
+            }
             Self::RookVsRook => {
                 f.side_a.rooks = PieceCountRange::exact(1);
                 f.side_b.rooks = PieceCountRange::exact(1);
+                f.require_any_pawns = true;
+            }
+            Self::RookOnePawnVsRook => {
+                f.side_a.rooks = PieceCountRange::exact(1);
+                f.side_a.pawns = PieceCountRange::exact(1);
+                f.side_b.rooks = PieceCountRange::exact(1);
+                f.side_b.pawns = PieceCountRange::exact(0);
+                f.require_any_pawns = true;
+            }
+            Self::RookTwoPawnsVsRookOnePawn => {
+                f.side_a.rooks = PieceCountRange::exact(1);
+                f.side_a.pawns = PieceCountRange::exact(2);
+                f.side_b.rooks = PieceCountRange::exact(1);
+                f.side_b.pawns = PieceCountRange::exact(1);
+                f.require_any_pawns = true;
+            }
+            Self::DoubleRooks => {
+                f.side_a.rooks = PieceCountRange::exact(2);
+                f.side_b.rooks = PieceCountRange::exact(2);
+            }
+            Self::RookVsPawn => {
+                f.side_a.rooks = PieceCountRange::exact(1);
+                f.side_b.pawns = PieceCountRange::range(1, 8);
+                f.require_any_pawns = true;
+            }
+            Self::DoubleRookPlusMinor => {
+                f.side_a.rooks = PieceCountRange::exact(2);
+                f.side_b.rooks = PieceCountRange::exact(1);
+                f.side_b.bishops = PieceCountRange::range(0, 1);
+                f.side_b.knights = PieceCountRange::range(0, 1);
+            }
+            Self::BishopVsKnight => {
+                f.side_a.bishops = PieceCountRange::exact(1);
+                f.side_b.knights = PieceCountRange::exact(1);
+            }
+            Self::OppositeColoredBishops => {
+                f.side_a.bishops = PieceCountRange::exact(1);
+                f.side_b.bishops = PieceCountRange::exact(1);
+                f.bishop_colors = BishopColorRelation::OppositeColored;
+            }
+            Self::SameColoredBishops => {
+                f.side_a.bishops = PieceCountRange::exact(1);
+                f.side_b.bishops = PieceCountRange::exact(1);
+                f.bishop_colors = BishopColorRelation::SameColored;
+            }
+            Self::KnightVsKnight => {
+                f.side_a.knights = PieceCountRange::exact(1);
+                f.side_b.knights = PieceCountRange::exact(1);
+            }
+            Self::BishopPairEndgame => {
+                f.side_a.bishops = PieceCountRange::exact(2);
+                f.side_b.bishops = PieceCountRange::range(0, 1);
+                f.side_b.knights = PieceCountRange::range(1, 2);
+            }
+            Self::TwoBishopsVsTwoBishops => {
+                f.side_a.bishops = PieceCountRange::exact(2);
+                f.side_b.bishops = PieceCountRange::exact(2);
+            }
+            Self::BishopKnightVsTwoMinors => {
+                f.side_a.bishops = PieceCountRange::exact(1);
+                f.side_a.knights = PieceCountRange::exact(1);
+                f.side_b.bishops = PieceCountRange::range(0, 2);
+                f.side_b.knights = PieceCountRange::range(0, 2);
+            }
+            Self::TwoKnightsVsTwoKnights => {
+                f.side_a.knights = PieceCountRange::exact(2);
+                f.side_b.knights = PieceCountRange::exact(2);
+            }
+            Self::MinorVsNoPiece => {
+                f.side_a.bishops = PieceCountRange::range(0, 1);
+                f.side_a.knights = PieceCountRange::range(0, 1);
                 f.require_any_pawns = true;
             }
             Self::RookBishopVsRook => {
@@ -2586,36 +3713,74 @@ impl EndgamePreset {
                 f.side_b.bishops = PieceCountRange::exact(1);
                 f.bishop_colors = BishopColorRelation::OppositeColored;
             }
-            Self::DoubleRooks => {
-                f.side_a.rooks = PieceCountRange::exact(2);
-                f.side_b.rooks = PieceCountRange::exact(2);
-            }
-            Self::BishopVsKnight => {
-                f.side_a.bishops = PieceCountRange::exact(1);
-                f.side_b.knights = PieceCountRange::exact(1);
-            }
-            Self::OppositeColoredBishops => {
-                f.side_a.bishops = PieceCountRange::exact(1);
-                f.side_b.bishops = PieceCountRange::exact(1);
-                f.bishop_colors = BishopColorRelation::OppositeColored;
-            }
-            Self::SameColoredBishops => {
-                f.side_a.bishops = PieceCountRange::exact(1);
-                f.side_b.bishops = PieceCountRange::exact(1);
-                f.bishop_colors = BishopColorRelation::SameColored;
-            }
-            Self::KnightVsKnight => {
+            Self::RookKnightVsRookKnight => {
+                f.side_a.rooks = PieceCountRange::exact(1);
                 f.side_a.knights = PieceCountRange::exact(1);
+                f.side_b.rooks = PieceCountRange::exact(1);
                 f.side_b.knights = PieceCountRange::exact(1);
             }
-            Self::BishopPairEndgame => {
-                f.side_a.bishops = PieceCountRange::exact(2);
-                f.side_b.bishops = PieceCountRange::range(0, 1);
-                f.side_b.knights = PieceCountRange::range(1, 2);
+            Self::RookBishopKnightVsRookBishopKnight => {
+                f.side_a.rooks = PieceCountRange::exact(1);
+                f.side_a.bishops = PieceCountRange::exact(1);
+                f.side_a.knights = PieceCountRange::exact(1);
+                f.side_b.rooks = PieceCountRange::exact(1);
+                f.side_b.bishops = PieceCountRange::exact(1);
+                f.side_b.knights = PieceCountRange::exact(1);
+            }
+            Self::RookBishopKnightVsRookTwoMinors => {
+                f.side_a.rooks = PieceCountRange::exact(1);
+                f.side_a.bishops = PieceCountRange::range(0, 2);
+                f.side_a.knights = PieceCountRange::range(0, 2);
+                f.side_b.rooks = PieceCountRange::exact(1);
+                f.side_b.bishops = PieceCountRange::range(0, 2);
+                f.side_b.knights = PieceCountRange::range(0, 2);
+            }
+            Self::DoubleRookBishopVsDoubleRookBishop => {
+                f.side_a.rooks = PieceCountRange::exact(2);
+                f.side_a.bishops = PieceCountRange::exact(1);
+                f.side_b.rooks = PieceCountRange::exact(2);
+                f.side_b.bishops = PieceCountRange::exact(1);
             }
             Self::QueenVsQueen => {
                 f.side_a.queens = PieceCountRange::exact(1);
                 f.side_b.queens = PieceCountRange::exact(1);
+            }
+            Self::QueenBishopVsQueenBishop => {
+                f.side_a.queens = PieceCountRange::exact(1);
+                f.side_a.bishops = PieceCountRange::exact(1);
+                f.side_b.queens = PieceCountRange::exact(1);
+                f.side_b.bishops = PieceCountRange::exact(1);
+            }
+            Self::QueenBishopVsQueenKnight => {
+                f.side_a.queens = PieceCountRange::exact(1);
+                f.side_a.bishops = PieceCountRange::exact(1);
+                f.side_b.queens = PieceCountRange::exact(1);
+                f.side_b.knights = PieceCountRange::exact(1);
+            }
+            Self::QueenKnightVsQueenKnight => {
+                f.side_a.queens = PieceCountRange::exact(1);
+                f.side_a.knights = PieceCountRange::exact(1);
+                f.side_b.queens = PieceCountRange::exact(1);
+                f.side_b.knights = PieceCountRange::exact(1);
+            }
+            Self::QueenRookVsQueenRook => {
+                f.side_a.queens = PieceCountRange::exact(1);
+                f.side_a.rooks = PieceCountRange::exact(1);
+                f.side_b.queens = PieceCountRange::exact(1);
+                f.side_b.rooks = PieceCountRange::exact(1);
+            }
+            Self::QueenMinorVsQueenMinor => {
+                f.side_a.queens = PieceCountRange::exact(1);
+                f.side_a.bishops = PieceCountRange::range(0, 1);
+                f.side_a.knights = PieceCountRange::range(0, 1);
+                f.side_b.queens = PieceCountRange::exact(1);
+                f.side_b.bishops = PieceCountRange::range(0, 1);
+                f.side_b.knights = PieceCountRange::range(0, 1);
+            }
+            Self::QueenVsPawns => {
+                f.side_a.queens = PieceCountRange::exact(1);
+                f.side_b.pawns = PieceCountRange::range(1, 8);
+                f.require_any_pawns = true;
             }
             Self::QueenVsTwoRooks => {
                 f.side_a.queens = PieceCountRange::exact(1);
@@ -2627,6 +3792,20 @@ impl EndgamePreset {
                 f.side_b.bishops = PieceCountRange::range(0, 1);
                 f.side_b.knights = PieceCountRange::range(0, 1);
             }
+            Self::QueenVsRook => {
+                f.side_a.queens = PieceCountRange::exact(1);
+                f.side_b.rooks = PieceCountRange::exact(1);
+            }
+            Self::QueenVsThreeMinors => {
+                f.side_a.queens = PieceCountRange::exact(1);
+                f.side_b.bishops = PieceCountRange::range(0, 2);
+                f.side_b.knights = PieceCountRange::range(0, 2);
+            }
+            Self::QueenVsTwoMinors => {
+                f.side_a.queens = PieceCountRange::exact(1);
+                f.side_b.bishops = PieceCountRange::range(0, 2);
+                f.side_b.knights = PieceCountRange::range(0, 2);
+            }
             Self::RookVsMinor => {
                 f.side_a.rooks = PieceCountRange::exact(1);
                 f.side_b.bishops = PieceCountRange::range(0, 1);
@@ -2637,9 +3816,11 @@ impl EndgamePreset {
                 f.side_b.bishops = PieceCountRange::range(0, 2);
                 f.side_b.knights = PieceCountRange::range(0, 2);
             }
-            Self::PurePawnEndgame => {
-                f.side_a.pawns = PieceCountRange::range(1, 8);
-                f.side_b.pawns = PieceCountRange::range(0, 8);
+            Self::RookBishopVsTwoMinors => {
+                f.side_a.rooks = PieceCountRange::exact(1);
+                f.side_a.bishops = PieceCountRange::exact(1);
+                f.side_b.bishops = PieceCountRange::range(0, 2);
+                f.side_b.knights = PieceCountRange::range(0, 2);
             }
             Self::Custom => {
                 f.side_a.rooks = PieceCountRange::range(0, 2);
@@ -2650,14 +3831,16 @@ impl EndgamePreset {
     }
 }
 
-/// Piece-count & bishop-color endgame constellation filter.
-/// Linkable with pawn structures and Board patterns under consistent side orientation.
+/// Piece-count, bishop-color, and pawn-balance/wing endgame constellation filter.
+/// Linkable with Board patterns under consistent side orientation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EndgameFilter {
     pub preset: EndgamePreset,
     pub side_a: SideMaterialSpec,
     pub side_b: SideMaterialSpec,
     pub bishop_colors: BishopColorRelation,
+    pub pawn_balance: EndgamePawnBalance,
+    pub pawn_wings: EndgamePawnWings,
     pub require_any_pawns: bool,
     pub swap_sides: bool,
 }
@@ -2666,6 +3849,42 @@ impl Default for EndgameFilter {
     fn default() -> Self {
         EndgamePreset::RookBishopVsRook.to_filter()
     }
+}
+
+const QUEENSIDE_WING_MASK: u64 =
+    FILE_MASKS[0] | FILE_MASKS[1] | FILE_MASKS[2] | FILE_MASKS[3];
+const KINGSIDE_WING_MASK: u64 =
+    FILE_MASKS[4] | FILE_MASKS[5] | FILE_MASKS[6] | FILE_MASKS[7];
+
+fn has_passed_pawn_for(own_pawns: u64, opp_pawns: u64, color: Color) -> bool {
+    let mut rem = own_pawns;
+    while rem != 0 {
+        let sq = rem.trailing_zeros() as usize;
+        rem &= rem - 1;
+        let f = sq % 8;
+        let r = sq / 8;
+        let mut front_files = FILE_MASKS[f];
+        if f > 0 {
+            front_files |= FILE_MASKS[f - 1];
+        }
+        if f < 7 {
+            front_files |= FILE_MASKS[f + 1];
+        }
+        let ahead = match color {
+            Color::White => ranks_gt_mask(r),
+            Color::Black => {
+                if r == 0 {
+                    0
+                } else {
+                    ranks_le_mask(r - 1)
+                }
+            }
+        };
+        if (opp_pawns & front_files & ahead) == 0 {
+            return true;
+        }
+    }
+    false
 }
 
 impl EndgameFilter {
@@ -2681,52 +3900,87 @@ impl EndgameFilter {
         if !self.side_a.matches(&board, effective_a) || !self.side_b.matches(&board, effective_b) {
             return false;
         }
+        let minor_count = |color: Color| -> u32 {
+            board.colored_pieces_mask(color, Role::Bishop).count_ones()
+                + board.colored_pieces_mask(color, Role::Knight).count_ones()
+        };
         // Special total-minor constraints for presets where B+N sum matters
         match self.preset {
-            EndgamePreset::BishopPairEndgame => {
-                let b_minors = board
-                    .colored_pieces_mask(effective_b, Role::Bishop)
-                    .count_ones()
-                    + board
-                        .colored_pieces_mask(effective_b, Role::Knight)
-                        .count_ones();
-                if b_minors != 2 {
+            EndgamePreset::MinorVsNoPiece => {
+                if minor_count(effective_a) != 1 {
                     return false;
                 }
             }
-            EndgamePreset::QueenVsRookMinor | EndgamePreset::RookVsMinor => {
-                let b_minors = board
-                    .colored_pieces_mask(effective_b, Role::Bishop)
-                    .count_ones()
-                    + board
-                        .colored_pieces_mask(effective_b, Role::Knight)
-                        .count_ones();
-                if b_minors != 1 {
+            EndgamePreset::BishopPairEndgame
+            | EndgamePreset::BishopKnightVsTwoMinors
+            | EndgamePreset::RookVsTwoMinors
+            | EndgamePreset::RookBishopVsTwoMinors
+            | EndgamePreset::QueenVsTwoMinors => {
+                if minor_count(effective_b) != 2 {
                     return false;
                 }
             }
-            EndgamePreset::RookVsTwoMinors => {
-                let b_minors = board
-                    .colored_pieces_mask(effective_b, Role::Bishop)
-                    .count_ones()
-                    + board
-                        .colored_pieces_mask(effective_b, Role::Knight)
-                        .count_ones();
-                if b_minors != 2 {
+            EndgamePreset::QueenVsRookMinor
+            | EndgamePreset::RookVsMinor
+            | EndgamePreset::DoubleRookPlusMinor => {
+                if minor_count(effective_b) != 1 {
+                    return false;
+                }
+            }
+            EndgamePreset::QueenMinorVsQueenMinor => {
+                if minor_count(effective_a) != 1 || minor_count(effective_b) != 1 {
+                    return false;
+                }
+            }
+            EndgamePreset::RookBishopKnightVsRookTwoMinors => {
+                if minor_count(effective_a) != 2 || minor_count(effective_b) != 2 {
+                    return false;
+                }
+            }
+            EndgamePreset::QueenVsThreeMinors => {
+                if minor_count(effective_b) != 3 {
                     return false;
                 }
             }
             _ => {}
         }
-        if self.require_any_pawns {
-            let pawns = board
-                .colored_pieces_mask(Color::White, Role::Pawn)
-                .count_ones()
-                + board
-                    .colored_pieces_mask(Color::Black, Role::Pawn)
-                    .count_ones();
-            if pawns == 0 {
-                return false;
+        let a_pawns_mask = board.colored_pieces_mask(effective_a, Role::Pawn);
+        let b_pawns_mask = board.colored_pieces_mask(effective_b, Role::Pawn);
+        let a_pawns = a_pawns_mask.count_ones();
+        let b_pawns = b_pawns_mask.count_ones();
+        if self.require_any_pawns && (a_pawns + b_pawns) == 0 {
+            return false;
+        }
+        match self.pawn_balance {
+            EndgamePawnBalance::Any => {}
+            EndgamePawnBalance::EqualPawns if a_pawns != b_pawns => return false,
+            EndgamePawnBalance::SideAUpOne if a_pawns != b_pawns + 1 => return false,
+            EndgamePawnBalance::SideAUpTwoPlus if a_pawns < b_pawns + 2 => return false,
+            EndgamePawnBalance::Pawnless if (a_pawns + b_pawns) != 0 => return false,
+            _ => {}
+        }
+        let all_pawns_mask = a_pawns_mask | b_pawns_mask;
+        match self.pawn_wings {
+            EndgamePawnWings::Any => {}
+            EndgamePawnWings::SameWingOnly => {
+                if all_pawns_mask == 0
+                    || ((all_pawns_mask & QUEENSIDE_WING_MASK) != 0
+                        && (all_pawns_mask & KINGSIDE_WING_MASK) != 0)
+                {
+                    return false;
+                }
+            }
+            EndgamePawnWings::BothWings => {
+                if (all_pawns_mask & QUEENSIDE_WING_MASK) == 0
+                    || (all_pawns_mask & KINGSIDE_WING_MASK) == 0
+                {
+                    return false;
+                }
+            }
+            EndgamePawnWings::PassedPawnSideA => {
+                if !has_passed_pawn_for(a_pawns_mask, b_pawns_mask, effective_a) {
+                    return false;
+                }
             }
         }
         if self.bishop_colors != BishopColorRelation::Any {
@@ -2747,7 +4001,14 @@ impl EndgameFilter {
     }
 
     fn may_exist_in_sig(&self, sig: &GameStructSig, side_a_color: Color) -> bool {
-        if self.require_any_pawns && (sig.flags & 4) == 0 {
+        if (self.require_any_pawns
+            || matches!(
+                self.pawn_balance,
+                EndgamePawnBalance::SideAUpOne | EndgamePawnBalance::SideAUpTwoPlus
+            )
+            || self.pawn_wings != EndgamePawnWings::Any)
+            && (sig.flags & 4) == 0
+        {
             return false;
         }
         match self.bishop_colors {
@@ -2784,10 +4045,15 @@ impl EndgameFilter {
                 sig.min_white_pawns,
             )
         };
+        let (max_a_p, max_b_p) = if self.pawn_balance == EndgamePawnBalance::Pawnless {
+            (0, 0)
+        } else {
+            (self.side_a.pawns.hi(), self.side_b.pawns.hi())
+        };
         min_a_np <= max_a_np
             && min_b_np <= max_b_np
-            && min_a_p <= self.side_a.pawns.hi()
-            && min_b_p <= self.side_b.pawns.hi()
+            && min_a_p <= max_a_p
+            && min_b_p <= max_b_p
     }
 }
 
@@ -2800,6 +4066,7 @@ pub struct PositionQuery {
     /// Color mirroring (`ON` by default for flexible structure & endgame search).
     pub ignore_color_flip: bool,
     pub structure: Option<StructurePreset>,
+    pub plan: Option<crate::structure_plans::PlanId>,
     pub primary_side_override: Option<Color>,
     pub endgame: Option<EndgameFilter>,
     pub metadata: MetadataFilter,
@@ -2816,6 +4083,7 @@ impl Default for PositionQuery {
             side_to_move: SideToMoveFilter::Any,
             ignore_color_flip: true,
             structure: None,
+            plan: None,
             primary_side_override: None,
             endgame: None,
             metadata: MetadataFilter::default(),
@@ -2844,6 +4112,7 @@ impl PositionQuery {
             side_to_move: SideToMoveFilter::from_color(pos.turn()),
             ignore_color_flip: mode != PositionSearchMode::Absolute,
             structure: None,
+            plan: None,
             primary_side_override: None,
             endgame: None,
             metadata: MetadataFilter::default(),
@@ -2892,6 +4161,7 @@ impl PositionQuery {
             side_to_move: SideToMoveFilter::Any,
             ignore_color_flip: true,
             structure: None,
+            plan: None,
             primary_side_override: None,
             endgame: None,
             metadata: MetadataFilter::default(),
@@ -2903,23 +4173,35 @@ impl PositionQuery {
     #[must_use]
     pub fn primary_side(&self) -> Color {
         self.primary_side_override
+            .or_else(|| self.plan.map(|p| p.side))
             .or_else(|| self.structure.map(StructurePreset::primary_side))
             .unwrap_or(Color::White)
     }
 
-    /// Select a middlegame structure preset, clearing any conflicting endgame filter.
+    /// Select a middlegame structure preset, clearing any conflicting endgame or plan filter.
     pub fn set_structure(&mut self, structure: Option<StructurePreset>) {
         self.structure = structure;
         if structure.is_some() {
             self.endgame = None;
+            self.plan = None;
         }
     }
 
-    /// Select an endgame filter, clearing any conflicting structure preset.
+    /// Select a searchable chronological structure plan, clearing conflicting structure/endgame presets.
+    pub fn set_plan(&mut self, plan: Option<crate::structure_plans::PlanId>) {
+        self.plan = plan;
+        if plan.is_some() {
+            self.structure = None;
+            self.endgame = None;
+        }
+    }
+
+    /// Select an endgame filter, clearing any conflicting structure or plan filter.
     pub fn set_endgame(&mut self, endgame: Option<EndgameFilter>) {
         self.endgame = endgame;
         if endgame.is_some() {
             self.structure = None;
+            self.plan = None;
         }
     }
 
@@ -3088,6 +4370,10 @@ pub struct CompiledPattern {
     extra_clauses: Vec<PatternClause>,
     mirrored_clauses: Option<Vec<PatternClause>>,
     structure: Option<StructurePreset>,
+    plan_base_structure: Option<StructurePreset>,
+    plan_base_flipped: bool,
+    plan_stages: Vec<Vec<AtomPredicate>>,
+    mirrored_plan_stages: Option<Vec<Vec<AtomPredicate>>>,
     endgame: Option<EndgameFilter>,
     ignore_color_flip: bool,
     primary_side: Color,
@@ -3135,6 +4421,18 @@ impl CompiledPattern {
                 .map(PatternClause::mirrored_colors)
                 .collect()
         });
+        let (plan_base_structure, plan_base_flipped, plan_stages) = query
+            .plan
+            .and_then(crate::structure_plans::find_plan)
+            .map(crate::structure_plans::plan_search_spec)
+            .map(|spec| (spec.base_structure, spec.base_flipped, spec.stages))
+            .unwrap_or((None, false, Vec::new()));
+        let mirrored_plan_stages = (query.ignore_color_flip && !plan_stages.is_empty()).then(|| {
+            plan_stages
+                .iter()
+                .map(|stage| stage.iter().map(|a| a.mirrored_colors()).collect())
+                .collect()
+        });
         let (min_ply, max_ply) = if query.min_ply <= query.max_ply {
             (query.min_ply, query.max_ply)
         } else {
@@ -3148,7 +4446,11 @@ impl CompiledPattern {
             extra_clauses: active_clauses,
             mirrored_clauses,
             structure: query.structure,
-            endgame: if query.structure.is_some() {
+            plan_base_structure,
+            plan_base_flipped,
+            plan_stages,
+            mirrored_plan_stages,
+            endgame: if query.structure.is_some() || query.plan.is_some() {
                 None
             } else {
                 query.endgame
@@ -3168,12 +4470,18 @@ impl CompiledPattern {
 
     #[must_use]
     pub fn is_empty_partial(&self) -> bool {
-        !self.has_board_pattern && self.structure.is_none() && self.endgame.is_none()
+        !self.has_board_pattern
+            && self.structure.is_none()
+            && self.plan_stages.is_empty()
+            && self.endgame.is_none()
     }
 
     #[must_use]
     pub fn has_position_criteria(&self) -> bool {
-        self.has_board_pattern || self.structure.is_some() || self.endgame.is_some()
+        self.has_board_pattern
+            || self.structure.is_some()
+            || !self.plan_stages.is_empty()
+            || self.endgame.is_some()
     }
 
     #[must_use]
@@ -3270,6 +4578,33 @@ impl CompiledPattern {
         if let Some(structure) = self.structure {
             let norm_ok = structure.matches_sig_oriented(sig, false);
             let flip_ok = self.ignore_color_flip && structure.matches_sig_oriented(sig, true);
+            let m = match (norm_ok, flip_ok) {
+                (true, true) => Some(MatchOrientation::Both),
+                (true, false) => Some(MatchOrientation::Normal),
+                (false, true) => Some(MatchOrientation::Flipped),
+                (false, false) => None,
+            };
+            let Some(next) = MatchOrientation::combine(Some(acc), m) else {
+                return false;
+            };
+            acc = next;
+        }
+        if !self.plan_stages.is_empty() {
+            let norm_ok = self
+                .plan_base_structure
+                .is_none_or(|s| s.matches_sig_oriented(sig, self.plan_base_flipped))
+                && self
+                    .plan_stages
+                    .iter()
+                    .all(|st| st.iter().all(|a| a.may_exist_in_sig(sig)));
+            let flip_ok = self.ignore_color_flip
+                && self
+                    .plan_base_structure
+                    .is_none_or(|s| s.matches_sig_oriented(sig, !self.plan_base_flipped))
+                && self
+                    .mirrored_plan_stages
+                    .as_ref()
+                    .is_some_and(|sts| sts.iter().all(|st| st.iter().all(|a| a.may_exist_in_sig(sig))));
             let m = match (norm_ok, flip_ok) {
                 (true, true) => Some(MatchOrientation::Both),
                 (true, false) => Some(MatchOrientation::Normal),
@@ -4102,6 +5437,31 @@ where
 /// Search `library` in parallel across games starting at candidate index
 /// `start_candidate_index`, returning at most `max_hits` hits along with the
 /// exact cursor (`next_start_index`) to resume searching in intervals.
+#[derive(Clone, Copy, Debug)]
+struct PlanTrack {
+    base_seen: bool,
+    extra_seen: bool,
+    stage: usize,
+}
+
+impl PlanTrack {
+    const fn new(base_seen: bool, extra_seen: bool) -> Self {
+        Self {
+            base_seen,
+            extra_seen,
+            stage: 0,
+        }
+    }
+
+    const fn is_done(self, total_stages: usize) -> bool {
+        self.base_seen && self.extra_seen && self.stage >= total_stages
+    }
+}
+
+fn self_has_extra_pos_criteria(compiled: &CompiledPattern) -> bool {
+    compiled.has_board_pattern || compiled.structure.is_some() || compiled.endgame.is_some()
+}
+
 pub fn search_library_from<F>(
     library: &dyn GameLibrary,
     query: &PositionQuery,
@@ -4244,11 +5604,24 @@ where
 
             // Tier 3: Zero-allocation mainline bitboard scan.
             let mut match_found: Option<(usize, bool)> = None;
-            let streamed = library
-                .scan_mainline_positions(idx, compiled.max_ply, &mut |ply, pos| {
-                    if ply < compiled.min_ply {
-                        return true;
-                    }
+            let has_extra_pos_criteria =
+                self_has_extra_pos_criteria(&compiled);
+            let mut normal_track = PlanTrack::new(
+                compiled.plan_base_structure.is_none(),
+                !has_extra_pos_criteria,
+            );
+            let mut flipped_track = compiled.ignore_color_flip.then(|| {
+                PlanTrack::new(
+                    compiled.plan_base_structure.is_none(),
+                    !has_extra_pos_criteria,
+                )
+            });
+
+            let mut inspect_ply = |ply: u32, pos: &Chess| -> bool {
+                if ply < compiled.min_ply {
+                    return true;
+                }
+                if compiled.plan_stages.is_empty() {
                     if let Some(orient) = compiled.matches_position_oriented(pos)
                         && compiled.accepts_result_for_orientation(meta.result, orient)
                     {
@@ -4257,8 +5630,79 @@ where
                         match_found = Some((ply as usize, flipped));
                         return false;
                     }
-                    true
-                })
+                    return true;
+                }
+                let board = pos.board();
+                let extra_orient = if has_extra_pos_criteria {
+                    compiled.matches_position_oriented(pos)
+                } else {
+                    Some(MatchOrientation::Both)
+                };
+                if let Some(base) = compiled.plan_base_structure
+                    && !normal_track.base_seen
+                    && base.matches_oriented(pos, compiled.plan_base_flipped)
+                {
+                    normal_track.base_seen = true;
+                }
+                if !normal_track.extra_seen
+                    && extra_orient.is_some_and(MatchOrientation::includes_normal)
+                {
+                    normal_track.extra_seen = true;
+                }
+                while normal_track.stage < compiled.plan_stages.len()
+                    && compiled.plan_stages[normal_track.stage]
+                        .iter()
+                        .all(|a| a.matches(&board))
+                {
+                    normal_track.stage += 1;
+                }
+
+                if let (Some(ft), Some(flipped_stages)) =
+                    (flipped_track.as_mut(), compiled.mirrored_plan_stages.as_ref())
+                {
+                    if let Some(base) = compiled.plan_base_structure
+                        && !ft.base_seen
+                        && base.matches_oriented(pos, !compiled.plan_base_flipped)
+                    {
+                        ft.base_seen = true;
+                    }
+                    if !ft.extra_seen
+                        && extra_orient.is_some_and(MatchOrientation::includes_flipped)
+                    {
+                        ft.extra_seen = true;
+                    }
+                    while ft.stage < flipped_stages.len()
+                        && flipped_stages[ft.stage].iter().all(|a| a.matches(&board))
+                    {
+                        ft.stage += 1;
+                    }
+                }
+
+                let norm_done = normal_track.is_done(compiled.plan_stages.len());
+                let flip_done = flipped_track.as_ref().is_some_and(|ft| {
+                    compiled
+                        .mirrored_plan_stages
+                        .as_ref()
+                        .is_some_and(|s| ft.is_done(s.len()))
+                });
+                let orient = match (norm_done, flip_done) {
+                    (true, true) => Some(MatchOrientation::Both),
+                    (true, false) => Some(MatchOrientation::Normal),
+                    (false, true) => Some(MatchOrientation::Flipped),
+                    (false, false) => None,
+                };
+                if let Some(orient) = orient
+                    && compiled.accepts_result_for_orientation(meta.result, orient)
+                {
+                    let flipped = orient == MatchOrientation::Flipped;
+                    match_found = Some((ply as usize, flipped));
+                    return false;
+                }
+                true
+            };
+
+            let streamed = library
+                .scan_mainline_positions(idx, compiled.max_ply, &mut inspect_ply)
                 .ok()
                 .unwrap_or(false);
 
@@ -4270,13 +5714,7 @@ where
                     if ply > compiled.max_ply {
                         break;
                     }
-                    if ply >= compiled.min_ply
-                        && let Some(orient) =
-                            compiled.matches_position_oriented(&game.nodes[node_idx].pos)
-                        && compiled.accepts_result_for_orientation(meta.result, orient)
-                    {
-                        let flipped = orient == MatchOrientation::Flipped;
-                        match_found = Some((ply as usize, flipped));
+                    if !inspect_ply(ply, &game.nodes[node_idx].pos) {
                         break;
                     }
                     let Some(&next) = game.nodes[node_idx].children.first() else {
@@ -4861,7 +6299,7 @@ mod tests {
 [White \"Carlsbad\"]
 [Black \"Opponent\"]
 [SetUp \"1\"]
-[FEN \"2r3k1/1p3ppp/2p5/3p4/3P4/3BP3/5PPP/2R3K1 w - - 0 30\"]
+[FEN \"2r3k1/pp3ppp/2p5/3p4/3P4/3BP3/PP3PPP/2R3K1 w - - 0 30\"]
 [Result \"1-0\"]
 
 30. Kf1 Rc7 31. Ke2 Kf8 32. Kd2 Ke7 1-0
@@ -5046,29 +6484,32 @@ mod tests {
     }
 
     #[test]
-    fn najdorf_types_and_custom_preset_override_lookup_work() {
-        let type1 = pos_from_fen("r2q1rk1/1p2bppp/p2ppn2/8/3NP3/2N1B3/PPP1BPPP/R2Q1RK1 b - - 0 1");
-        let type2 = pos_from_fen("r2q1rk1/3nbppp/p2pp3/1p6/4P3/1NN1BP2/PPPQ2PP/2KR1B1R b - - 0 1");
-        let type3 = pos_from_fen("r2q1rk1/1p2bppp/p2p1n2/4p3/4PP2/2N1B3/PPPQ2PP/R4RK1 b - - 0 1");
+    fn najdorf_variants_and_custom_preset_override_lookup_work() {
+        let classical = pos_from_fen("r2q1rk1/1p2bppp/p2ppn2/8/3NP3/2N1B3/PPP1BPPP/R2Q1RK1 b - - 0 1");
+        let b5_plan = pos_from_fen("r2q1rk1/3nbppp/p2pp3/1p6/4P3/1NN1BP2/PPPQ2PP/2KR1B1R b - - 0 1");
+        let e5_f4 = pos_from_fen("r2q1rk1/1p2bppp/p2p1n2/4p3/4PP2/2N1B3/PPPQ2PP/R4RK1 b - - 0 1");
 
-        assert!(StructurePreset::NajdorfStructure.matches_oriented(&type1, false));
-        assert!(StructurePreset::NajdorfTypeII.matches_oriented(&type2, false));
-        assert!(StructurePreset::NajdorfTypeIII.matches_oriented(&type3, false));
-        assert!(!StructurePreset::NajdorfTypeIII.matches_oriented(&type1, false));
+        assert!(StructurePreset::NajdorfStructure.matches_oriented(&classical, false));
+        assert!(StructurePreset::NajdorfQueensideB5.matches_oriented(&b5_plan, false));
+        assert!(StructurePreset::NajdorfE5VsF4.matches_oriented(&e5_f4, false));
+        assert!(!StructurePreset::NajdorfE5VsF4.matches_oriented(&classical, false));
 
         let ov = CustomStructurePreset {
-            name: StructurePreset::NajdorfTypeII.label().to_string(),
+            name: StructurePreset::NajdorfQueensideB5.label().to_string(),
             squares: [SquareConstraint::Any; 64],
             extra_clauses: Vec::new(),
             side_to_move: SideToMoveFilter::Any,
             ignore_color_flip: true,
         };
-        let found = find_custom_override(std::slice::from_ref(&ov), StructurePreset::NajdorfTypeII);
+        let found = find_custom_override(
+            std::slice::from_ref(&ov),
+            StructurePreset::NajdorfQueensideB5,
+        );
         assert_eq!(
             found.map(|p| p.name.as_str()),
-            Some(StructurePreset::NajdorfTypeII.label())
+            Some(StructurePreset::NajdorfQueensideB5.label())
         );
-        assert!(find_custom_override(&[ov], StructurePreset::najdorf_type_i_compat()).is_none());
+        assert!(find_custom_override(&[ov], StructurePreset::najdorf_classical_compat()).is_none());
     }
 
     #[test]
@@ -5315,12 +6756,154 @@ mod tests {
     }
 
     trait StructurePresetCompat {
-        fn najdorf_type_i_compat() -> Self;
+        fn najdorf_classical_compat() -> Self;
     }
 
     impl StructurePresetCompat for StructurePreset {
-        fn najdorf_type_i_compat() -> Self {
+        fn najdorf_classical_compat() -> Self {
             Self::NajdorfStructure
         }
+    }
+
+    #[test]
+    fn handcrafted_flags_carlsbad_fianchetto_subcategories_and_tightened_matchers_work() {
+        let handcrafted: Vec<_> = StructurePreset::ALL
+            .iter()
+            .copied()
+            .filter(|p| p.is_handcrafted())
+            .collect();
+        assert_eq!(handcrafted.len(), 6);
+        assert!(StructurePreset::Botvinnik.is_handcrafted());
+        assert!(StructurePreset::CarlsbadAny.is_handcrafted());
+        assert!(StructurePreset::CarlsbadMinorityAttack.is_handcrafted());
+        assert!(StructurePreset::HangingPawnsClassic.is_handcrafted());
+        assert!(StructurePreset::MaroczyBindFianchetto.is_handcrafted());
+        assert!(StructurePreset::MaroczyBindNoFianchetto.is_handcrafted());
+        assert!(!StructurePreset::CarlsbadWhiteFianchetto.is_handcrafted());
+
+        // Carlsbad 4 K-side fianchetto subcategories (W cxd side x B exd side)
+        let cb_none =
+            pos_from_fen("r1bqrnk1/pp2bppp/2p2n2/3p4/3P4/2NBPN2/PPQ2PPP/1R2R1K1 w - - 0 1");
+        let cb_black_fian =
+            pos_from_fen("r1bqr1k1/pp3pbp/2p2np1/3p4/3P4/2NBPN2/PPQ2PPP/1R2R1K1 w - - 0 1");
+        let cb_white_fian =
+            pos_from_fen("r1bqrnk1/pp2bppp/2p2n2/3p4/3P4/2NBPNP1/PPQ2PBP/1R2R1K1 w - - 0 1");
+        let cb_both_fian =
+            pos_from_fen("r1bqr1k1/pp3pbp/2p2np1/3p4/3P4/2NBPNP1/PPQ2PBP/1R2R1K1 w - - 0 1");
+        assert!(StructurePreset::CarlsbadAny.matches_oriented(&cb_none, false));
+        assert!(StructurePreset::CarlsbadNoFianchettoBoth.matches_oriented(&cb_none, false));
+        assert!(!StructurePreset::CarlsbadBlackFianchetto.matches_oriented(&cb_none, false));
+        assert!(StructurePreset::CarlsbadBlackFianchetto.matches_oriented(&cb_black_fian, false));
+        assert!(StructurePreset::CarlsbadWhiteFianchetto.matches_oriented(&cb_white_fian, false));
+        assert!(StructurePreset::CarlsbadDoubleFianchetto.matches_oriented(&cb_both_fian, false));
+        assert!(!StructurePreset::CarlsbadDoubleFianchetto.matches_oriented(&cb_none, false));
+
+        // Carlsbad minority attack (handcrafted b5)
+        let cb_min =
+            pos_from_fen("r1bqrnk1/1p3p1p/2pb1np1/1P1p2B1/3P4/2NBPN2/2Q2PPP/1R3RK1 b - - 0 1");
+        assert!(StructurePreset::CarlsbadMinorityAttack.matches_oriented(&cb_min, false));
+
+        // Stonewall Bc1-d2-e1-h4 matches without requiring Black Nf6!
+        let sw_bh4_no_nf6 =
+            pos_from_fen("rnbq1rk1/pp2bppp/2p1p3/3p4/3P1P1B/2PBPN2/PP4PP/RN1Q1RK1 b - - 0 1");
+        assert!(StructurePreset::StonewallBd2e1h4.matches_oriented(&sw_bh4_no_nf6, false));
+
+        // Sicilian rejects Maroczy Bind (c4); FrenchChain rejects Caro-Kann (c6); SlavCaroKann fixed
+        let maroczy =
+            pos_from_fen("r2q1rk1/1p1bppbp/p2p1np1/8/2P1P3/2N1B1P1/PP3PBP/R2Q1RK1 w - - 0 1");
+        assert!(!StructurePreset::NajdorfStructure.matches_oriented(&maroczy, false));
+        let caro_advance =
+            pos_from_fen("rn1qkbnr/pp3ppp/2p1p3/3pP3/3P4/2N5/PPP2PPP/R1BQKBNR w KQkq - 0 1");
+        assert!(!StructurePreset::FrenchChain.matches_oriented(&caro_advance, false));
+        let caro_base =
+            pos_from_fen("r2qkbnr/pp2pppp/2p5/8/3P4/2P2N2/PP3PPP/RNBQKB1R b KQkq - 0 6");
+        assert!(StructurePreset::SlavCaroKann.matches_oriented(&caro_base, false));
+    }
+
+    #[test]
+    fn endgame_families_pawn_balance_wings_and_sigs_work() {
+        assert_eq!(StructureFamily::ALL.len(), 16);
+        assert_eq!(EndgameFamily::ALL.len(), 6);
+        assert_eq!(EndgamePreset::RookKnightVsRookKnight.family(), EndgameFamily::RookAndMinor);
+
+        // White up 1 pawn on kingside (e5+h2 vs h7), passed pawn on e5, both R+N
+        let eg_same_wing_passer = pos_from_fen("6k1/7p/5n2/4P3/8/5N2/6KP/3rR3 w - - 0 1");
+        let mut f = EndgamePreset::RookKnightVsRookKnight.to_filter();
+        f.pawn_balance = EndgamePawnBalance::SideAUpOne;
+        f.pawn_wings = EndgamePawnWings::SameWingOnly;
+        assert!(f.matches_with_side_a(&eg_same_wing_passer, Color::White));
+        f.pawn_wings = EndgamePawnWings::BothWings;
+        assert!(!f.matches_with_side_a(&eg_same_wing_passer, Color::White));
+        f.pawn_wings = EndgamePawnWings::PassedPawnSideA;
+        assert!(f.matches_with_side_a(&eg_same_wing_passer, Color::White));
+
+        // Pawnless filter rejects position with pawns
+        let mut f_pawnless = EndgamePreset::RookVsRook.to_filter();
+        f_pawnless.require_any_pawns = false;
+        f_pawnless.pawn_balance = EndgamePawnBalance::Pawnless;
+        assert!(!f_pawnless.matches_with_side_a(&eg_same_wing_passer, Color::White));
+        let pawnless_rook = pos_from_fen("6k1/8/8/8/8/8/6K1/3rR3 w - - 0 1");
+        assert!(f_pawnless.matches_with_side_a(&pawnless_rook, Color::White));
+    }
+
+    #[test]
+    fn searchable_plans_match_stonewall_transfer_and_maroczy_regrouping() {
+        let pgn = concat!(
+            "[Event \"Stonewall White Transfer\"]\n[Result \"*\"]\n\n",
+            "1. d4 d5 2. e3 Nf6 3. Bd3 e6 4. f4 c5 5. c3 Nc6 6. Nf3 Be7 7. O-O O-O 8. Qe2 b6 9. Bd2 Bb7 10. Be1 Rc8 11. Bh4 *\n\n",
+            "[Event \"Stonewall Without Transfer\"]\n[Result \"*\"]\n\n",
+            "1. d4 d5 2. e3 Nf6 3. Bd3 e6 4. f4 c5 5. c3 Nc6 6. Nf3 Be7 7. O-O O-O 8. Qe2 b6 9. b3 Bb7 10. Bb2 Rc8 11. Nbd2 *\n\n",
+            "[Event \"Stonewall Black Mirrored Transfer\"]\n[Result \"*\"]\n\n",
+            "1. c4 f5 2. Nc3 Nf6 3. Nf3 e6 4. g3 d5 5. Bg2 c6 6. O-O Bd6 7. d3 O-O 8. b3 Qe7 9. Re1 b6 10. Bb2 Bd7 11. Rc1 Be8 12. Qd2 Bh5 *\n\n",
+            "[Event \"Maroczy Qa5 Rfc8\"]\n[Result \"*\"]\n\n",
+            "1. e4 c5 2. Nf3 Nc6 3. d4 cxd4 4. Nxd4 g6 5. c4 Bg7 6. Be3 Nf6 7. Nc3 O-O 8. Be2 d6 9. O-O Bd7 10. Qd2 Nxd4 11. Bxd4 a6 12. f3 Qa5 13. Rfd1 Rfc8 *\n\n",
+            "[Event \"Maroczy Rac8 Qa5\"]\n[Result \"*\"]\n\n",
+            "1. e4 c5 2. Nf3 Nc6 3. d4 cxd4 4. Nxd4 g6 5. c4 Bg7 6. Be3 Nf6 7. Nc3 O-O 8. Be2 d6 9. O-O Bd7 10. Qd2 Nxd4 11. Bxd4 a6 12. f3 Rac8 13. Rfd1 Qa5 *\n\n",
+            "[Event \"Maroczy Without Regrouping\"]\n[Result \"*\"]\n\n",
+            "1. e4 c5 2. Nf3 Nc6 3. d4 cxd4 4. Nxd4 g6 5. c4 Bg7 6. Be3 Nf6 7. Nc3 O-O 8. Be2 d6 9. O-O Bd7 10. Qd2 Nxd4 11. Bxd4 a6 12. f3 Qc7 *\n\n",
+        );
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "brett-plan-search-{}-{nanos}.pgn",
+            std::process::id()
+        ));
+        fs::write(&path, pgn.as_bytes()).unwrap();
+        let lib = PgnLibrary::build(&path).unwrap();
+        let cancel = AtomicBool::new(false);
+
+        let mut q_sw = PositionQuery::default();
+        q_sw.set_plan(Some(crate::structure_plans::PlanId {
+            family: StructureFamily::Stonewall,
+            side: Color::White,
+            plan_number: 1,
+        }));
+        q_sw.min_ply = 8;
+        assert!(q_sw.ignore_color_flip);
+        let hits_flip = search_library(&lib, &q_sw, 50, |_, _, _| {}, &cancel);
+        let hit_indices_flip: Vec<usize> = hits_flip.iter().map(|h| h.game_index).collect();
+        assert_eq!(hit_indices_flip, vec![0, 2]);
+        assert!(!hits_flip[0].matched_flipped);
+        assert!(hits_flip[1].matched_flipped);
+
+        q_sw.ignore_color_flip = false;
+        let hits_no_flip = search_library(&lib, &q_sw, 50, |_, _, _| {}, &cancel);
+        let hit_indices_no_flip: Vec<usize> = hits_no_flip.iter().map(|h| h.game_index).collect();
+        assert_eq!(hit_indices_no_flip, vec![0]);
+
+        let mut q_mar = PositionQuery::default();
+        q_mar.set_plan(Some(crate::structure_plans::PlanId {
+            family: StructureFamily::Maroczy,
+            side: Color::Black,
+            plan_number: 4,
+        }));
+        q_mar.min_ply = 8;
+        let hits_mar = search_library(&lib, &q_mar, 50, |_, _, _| {}, &cancel);
+        let hit_indices_mar: Vec<usize> = hits_mar.iter().map(|h| h.game_index).collect();
+        assert_eq!(hit_indices_mar, vec![3, 4]);
+
+        let _ = fs::remove_file(path);
     }
 }

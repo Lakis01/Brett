@@ -384,28 +384,8 @@ impl GameLibrary for ScidLibrary {
             let basic = (u32::from(entry.eco) - 1) / 131;
             if basic <= 499 { (basic + 1) as u16 } else { 0 }
         };
-        let mut medals = 0u16;
-        if entry.flags & (1 << 7) != 0 {
-            medals |= db_medals::ENDGAME;
-        }
-        if entry.flags & (1 << 8) != 0 {
-            medals |= db_medals::NOVELTY;
-        }
-        if entry.flags & (1 << 9) != 0 {
-            medals |= db_medals::PAWN_STRUCTURE;
-        }
-        if entry.flags & (1 << 10) != 0 {
-            medals |= db_medals::TACTICS;
-        }
-        if entry.flags & (1 << 13) != 0 {
-            medals |= db_medals::BEST_GAME;
-        }
-        if entry.flags & (1 << 14) != 0 {
-            medals |= db_medals::TACTICAL_BLUNDER;
-        }
-        if entry.flags & (1 << 15) != 0 {
-            medals |= db_medals::USER;
-        }
+        let medals = db_medals::from_scid_entry_flags(entry.flags)
+            | db_medals::from_headers(self.games.get(index).map_or(&[], |g| g.headers()));
         let mut vcs = 0u32;
         if entry.flags & 1 != 0 {
             vcs |= vcs_flags::CUSTOM_START;
@@ -859,6 +839,13 @@ fn base_headers(entry: &Entry, names: &Names) -> Vec<(String, String)> {
     if entry.event_date > 0 {
         headers.push(("EventDate".to_string(), date_string(entry.event_date)));
     }
+    let medals = db_medals::from_scid_entry_flags(entry.flags);
+    if medals != 0 {
+        headers.push((
+            db_medals::PGN_TAG.to_string(),
+            db_medals::format_short(medals),
+        ));
+    }
     headers
 }
 
@@ -1013,8 +1000,22 @@ fn decode_record(bytes: &[u8], mut headers: Vec<(String, String)>) -> Result<Gam
         bail!("empty game record");
     }
     let mut cursor = 0usize;
+    let index_medals = header_value(&headers, db_medals::PGN_TAG)
+        .map(db_medals::parse_mask)
+        .unwrap_or(0);
     for (key, value) in read_tags(bytes, &mut cursor)? {
-        set_header(&mut headers, &key, value);
+        if key.eq_ignore_ascii_case(db_medals::PGN_TAG) {
+            let combined = index_medals | db_medals::parse_mask(&value);
+            if combined != 0 {
+                set_header(
+                    &mut headers,
+                    db_medals::PGN_TAG,
+                    db_medals::format_short(combined),
+                );
+            }
+        } else {
+            set_header(&mut headers, &key, value);
+        }
     }
 
     if let Some(variant) = header_value(&headers, "Variant") {

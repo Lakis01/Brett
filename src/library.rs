@@ -69,6 +69,50 @@ pub mod medals {
         (USER, "User Marker", "Usr"),
     ];
 
+    pub const PGN_TAG: &str = "Medals";
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum MedalGroup {
+        Study,
+        Theme,
+        Mistake,
+    }
+
+    impl MedalGroup {
+        #[must_use]
+        pub fn label(self) -> &'static str {
+            match self {
+                Self::Study => "Study & Quality",
+                Self::Theme => "Themes & Phases",
+                Self::Mistake => "Mistakes & User",
+            }
+        }
+    }
+
+    #[must_use]
+    pub fn group(bit: u16) -> MedalGroup {
+        match bit {
+            MODEL_GAME | BEST_GAME | DECIDED_TOURNAMENT | NOVELTY => MedalGroup::Study,
+            TACTICAL_BLUNDER | STRATEGICAL_BLUNDER | USER => MedalGroup::Mistake,
+            _ => MedalGroup::Theme,
+        }
+    }
+
+    /// Clean Operate-mode accent color `[r, g, b]` for a single medal bit.
+    #[must_use]
+    pub fn color_rgb(bit: u16) -> [u8; 3] {
+        match bit {
+            MODEL_GAME | BEST_GAME | DECIDED_TOURNAMENT => [0xE6, 0xB4, 0x50], // Gold
+            NOVELTY => [0x4C, 0x9A, 0xFF],                                     // Accent blue
+            PAWN_STRUCTURE | STRATEGY | PIECE_PLAY => [0x7E, 0xD3, 0x8A],      // Emerald
+            TACTICS | WITH_ATTACK | SACRIFICE => [0xE5, 0xC0, 0x7B],           // Amber
+            DEFENSE | MATERIAL | ENDGAME => [0x56, 0xB6, 0xC2],                // Teal
+            TACTICAL_BLUNDER | STRATEGICAL_BLUNDER => [0xE0, 0x6C, 0x75],      // Coral red
+            USER => [0xB4, 0x8E, 0xAD],                                        // Plum
+            _ => [0x9A, 0xA3, 0xB2],
+        }
+    }
+
     #[must_use]
     pub fn format_short(mask: u16) -> String {
         if mask == 0 {
@@ -81,6 +125,149 @@ pub mod medals {
             }
         }
         out.join(",")
+    }
+
+    #[must_use]
+    pub fn format_long(mask: u16) -> String {
+        if mask == 0 {
+            return String::new();
+        }
+        let mut out = Vec::new();
+        for &(bit, label, _code) in ALL {
+            if mask & bit != 0 {
+                out.push(label);
+            }
+        }
+        out.join(", ")
+    }
+
+    #[must_use]
+    pub fn parse_mask(raw: &str) -> u16 {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return 0;
+        }
+        if let Some(hex) = trimmed.strip_prefix("0x").or_else(|| trimmed.strip_prefix("0X"))
+            && let Ok(val) = u16::from_str_radix(hex.trim(), 16)
+        {
+            return val;
+        }
+        let mut mask = 0u16;
+        for token in trimmed.split([',', ';', '|']) {
+            let t = token.trim();
+            if t.is_empty() {
+                continue;
+            }
+            let lower = t.to_ascii_lowercase();
+            let mut matched = false;
+            for &(bit, label, code) in ALL {
+                if lower == code.to_ascii_lowercase() || lower == label.to_ascii_lowercase() {
+                    mask |= bit;
+                    matched = true;
+                    break;
+                }
+            }
+            if !matched {
+                // Also support whitespace-separated tokens if caller used spaces.
+                for sub in t.split_whitespace() {
+                    let sub_low = sub.to_ascii_lowercase();
+                    for &(bit, label, code) in ALL {
+                        if sub_low == code.to_ascii_lowercase()
+                            || sub_low == label.to_ascii_lowercase()
+                        {
+                            mask |= bit;
+                        }
+                    }
+                }
+            }
+        }
+        mask
+    }
+
+    #[must_use]
+    pub fn from_headers(headers: &[(super::SharedStr, super::SharedStr)]) -> u16 {
+        let mut mask = 0u16;
+        for (k, v) in headers {
+            if k.eq_ignore_ascii_case(PGN_TAG) || k.eq_ignore_ascii_case("Flags") {
+                mask |= parse_mask(v);
+            }
+        }
+        mask
+    }
+
+    #[must_use]
+    pub fn from_game(game: &crate::domain::Game) -> u16 {
+        let mut mask = 0u16;
+        for (k, v) in &game.headers {
+            if k.eq_ignore_ascii_case(PGN_TAG) || k.eq_ignore_ascii_case("Flags") {
+                mask |= parse_mask(v);
+            }
+        }
+        mask
+    }
+
+    pub fn set_on_game(game: &mut crate::domain::Game, mask: u16) {
+        if mask == 0 {
+            game.remove_header(PGN_TAG);
+            game.remove_header("Flags");
+        } else {
+            game.remove_header("Flags");
+            game.set_header(PGN_TAG, format_short(mask));
+        }
+    }
+
+    #[must_use]
+    pub fn from_scid_entry_flags(flags: u32) -> u16 {
+        let mut mask = 0u16;
+        if flags & (1 << 7) != 0 {
+            mask |= ENDGAME;
+        }
+        if flags & (1 << 8) != 0 {
+            mask |= NOVELTY;
+        }
+        if flags & (1 << 9) != 0 {
+            mask |= PAWN_STRUCTURE;
+        }
+        if flags & (1 << 10) != 0 {
+            mask |= TACTICS;
+        }
+        if flags & (1 << 13) != 0 {
+            mask |= BEST_GAME;
+        }
+        if flags & (1 << 14) != 0 {
+            mask |= TACTICAL_BLUNDER;
+        }
+        if flags & (1 << 15) != 0 {
+            mask |= USER;
+        }
+        mask
+    }
+
+    #[must_use]
+    pub fn to_scid_entry_flags(mask: u16) -> u16 {
+        let mut flags = 0u16;
+        if mask & ENDGAME != 0 {
+            flags |= 1 << 7;
+        }
+        if mask & NOVELTY != 0 {
+            flags |= 1 << 8;
+        }
+        if mask & PAWN_STRUCTURE != 0 {
+            flags |= 1 << 9;
+        }
+        if mask & TACTICS != 0 {
+            flags |= 1 << 10;
+        }
+        if mask & BEST_GAME != 0 {
+            flags |= 1 << 13;
+        }
+        if mask & TACTICAL_BLUNDER != 0 {
+            flags |= 1 << 14;
+        }
+        if mask & USER != 0 {
+            flags |= 1 << 15;
+        }
+        flags
     }
 }
 
@@ -556,6 +743,7 @@ pub trait GameLibrary: Send + Sync {
         let date_num = date_str.map_or(0, parse_date_num);
         let result = header("Result").map_or(3, parse_result_code);
         let eco_code = header("ECO").map_or(0, eco_str_to_code);
+        let medals = medals::from_headers(headers);
         GameRecordMeta {
             white_elo,
             black_elo,
@@ -563,9 +751,10 @@ pub trait GameLibrary: Send + Sync {
             date_num,
             result,
             eco_code,
-            medals: 0,
+            medals,
             vcs_flags: 0,
-            annotated: header("Annotator").is_some_and(|v| !v.trim().is_empty() && v.trim() != "?"),
+            annotated: medals != 0
+                || header("Annotator").is_some_and(|v| !v.trim().is_empty() && v.trim() != "?"),
             deleted,
         }
     }
@@ -1193,4 +1382,124 @@ pub fn open_library(path: &Path) -> Result<Arc<dyn GameLibrary>> {
         );
     }
     result
+}
+
+/// Enumerate every on-disk file belonging to the database at `path` (including
+/// format companion files and Brett sidecars sharing the exact stem) so
+/// deleting a database removes all its parts without touching unrelated files.
+#[must_use]
+pub fn database_companion_files_for_deletion(path: &Path) -> Vec<PathBuf> {
+    let resolved = if path.is_dir() {
+        find_database_in_dir(path).unwrap_or_else(|_| path.to_path_buf())
+    } else {
+        path.to_path_buf()
+    };
+    let ext = resolved
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    match ext.as_str() {
+        "2cbh" | "2cbg" | "2cba" | "2lid" => {
+            candidates.extend(crate::twocbh::existing_companion_files(&resolved));
+        }
+        "cbh" => {
+            candidates.extend(crate::cbh::existing_companion_files(&resolved));
+        }
+        "si4" | "si3" => {
+            for e in ["si4", "si3", "sg4", "sg3", "sn4", "sn3", "stc", "ssc"] {
+                let p = resolved.with_extension(e);
+                if p.is_file() {
+                    candidates.push(p);
+                }
+            }
+        }
+        _ => {
+            if resolved.is_file() {
+                candidates.push(resolved.clone());
+            }
+        }
+    }
+    for sidecar in ["brettpos", "brettidx", "brettacc", "brettann"] {
+        let p = resolved.with_extension(sidecar);
+        if p.is_file() {
+            candidates.push(p);
+        }
+    }
+    if resolved.is_file() {
+        candidates.push(resolved);
+    }
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for p in candidates {
+        if p.is_file() {
+            let key = std::fs::canonicalize(&p).unwrap_or_else(|_| p.clone());
+            if seen.insert(key) {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod medals_and_delete_tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn medals_parse_format_and_round_trip_all_formats() {
+        let mut g = crate::domain::parse_pgn(
+            b"[Event \"Study\"]\n[White \"A\"]\n[Black \"B\"]\n[Result \"1-0\"]\n\n1. e4 e5 1-0\n",
+        )
+        .unwrap()
+        .remove(0);
+
+        let mask = medals::MODEL_GAME | medals::SACRIFICE | medals::ENDGAME;
+        medals::set_on_game(&mut g, mask);
+        assert_eq!(medals::from_game(&g), mask);
+        assert_eq!(medals::parse_mask("Model Game, Sac, End"), mask);
+
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("brett-medals-test-{}-{stamp}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        for ext in ["2cbh", "cbh", "si4", "pgn"] {
+            let path = dir.join(format!("test.{ext}"));
+            crate::my_games::write_games_to_path(&path, vec![g.clone()]).unwrap();
+            let lib = open_library(&path).unwrap();
+            assert_eq!(lib.len(), 1);
+            let expected_meta = if ext == "si4" {
+                // SCID4 .si4 index only encodes 7 native flags; the remaining
+                // ChessBase medals live in the .sg4 [Medals "..."] tag loaded below.
+                medals::ENDGAME
+            } else {
+                mask
+            };
+            assert_eq!(
+                lib.game_record_meta(0).medals,
+                expected_meta,
+                "game_record_meta.medals failed for .{ext}"
+            );
+            let loaded = lib.load(0).unwrap();
+            assert_eq!(
+                medals::from_game(&loaded),
+                mask,
+                "load() medals failed for .{ext}"
+            );
+            drop(lib);
+
+            let companions = database_companion_files_for_deletion(&path);
+            assert!(!companions.is_empty(), "expected companion files for .{ext}");
+            for c in companions {
+                std::fs::remove_file(c).unwrap();
+            }
+            assert!(!path.exists(), "primary file for .{ext} should be deleted");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

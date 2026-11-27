@@ -1019,13 +1019,17 @@ impl TwoCbhWriter {
         record[0x60..0x64].copy_from_slice(&parse_elo(game.header("WhiteElo")).to_le_bytes());
         record[0x70..0x74].copy_from_slice(&parse_elo(game.header("BlackElo")).to_le_bytes());
         if let Some(start_id) = start_id {
-            record[0x80..0x84]
-                .copy_from_slice(&(START_ID_BASE + u32::from(start_id)).to_le_bytes());
+            let packed_start = START_ID_BASE as u16 + start_id;
+            record[0x80..0x82].copy_from_slice(&packed_start.to_le_bytes());
         } else {
             let eco = crate::cbh::writer::encode_eco(game.header("ECO"));
             if eco > 0 {
                 record[0x80..0x82].copy_from_slice(&eco.to_le_bytes());
             }
+        }
+        let medals = crate::library::medals::from_game(&game);
+        if medals != 0 {
+            record[0x82..0x84].copy_from_slice(&medals.to_le_bytes());
         }
         record[0x98..0xa0].copy_from_slice(&parse_u64_header(game.header("GameId")).to_le_bytes());
         record[0xb0..0xb8].copy_from_slice(&parse_u64_header(game.header("Beauty")).to_le_bytes());
@@ -2239,13 +2243,17 @@ fn merge_cbv_source(archive: &Path, sink: &mut MergeSink<'_>) -> Result<()> {
         record[0x60..0x64].copy_from_slice(&parse_elo(game.header("WhiteElo")).to_le_bytes());
         record[0x70..0x74].copy_from_slice(&parse_elo(game.header("BlackElo")).to_le_bytes());
         if let Some(start_id) = start_id {
-            record[0x80..0x84]
-                .copy_from_slice(&(START_ID_BASE + u32::from(start_id)).to_le_bytes());
+            let packed_start = START_ID_BASE as u16 + start_id;
+            record[0x80..0x82].copy_from_slice(&packed_start.to_le_bytes());
         } else {
             let eco = crate::cbh::writer::encode_eco(game.header("ECO"));
             if eco > 0 {
                 record[0x80..0x82].copy_from_slice(&eco.to_le_bytes());
             }
+        }
+        let medals = crate::library::medals::from_game(&game);
+        if medals != 0 {
+            record[0x82..0x84].copy_from_slice(&medals.to_le_bytes());
         }
         record[0x98..0xa0].copy_from_slice(&parse_u64_header(game.header("GameId")).to_le_bytes());
         record[0xb0..0xb8].copy_from_slice(&parse_u64_header(game.header("Beauty")).to_le_bytes());
